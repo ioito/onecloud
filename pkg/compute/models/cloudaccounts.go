@@ -514,6 +514,36 @@ func (self *SCloudaccount) getPassword() (string, error) {
 	return utils.DescryptAESBase64(self.Id, self.Secret)
 }
 
+func (self *SCloudaccount) AllowPerformCreateSubscription(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
+	return db.IsAdminAllowPerform(userCred, self, "create-subscription")
+}
+
+// 创建子订阅
+func (self *SCloudaccount) PerformCreateSubscription(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.CloudaccountCreateSubscriptionInput) (jsonutils.JSONObject, error) {
+	if len(input.SubscriptionName) == 0 {
+		return nil, httperrors.NewMissingParameterError("subscription_name")
+	}
+	factory, err := self.GetProviderFactory()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrap(err, "GetProviderFactory"))
+	}
+	if !factory.IsSubpportCreateSubscription() {
+		return nil, httperrors.NewUnsupportOperationError("Not support create subscription for %s", self.Provider)
+	}
+	params := jsonutils.Marshal(input).(*jsonutils.JSONDict)
+	return nil, self.StartCreateSubscriptionTask(ctx, userCred, params, "")
+}
+
+func (self *SCloudaccount) StartCreateSubscriptionTask(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict, parentTaskId string) error {
+	task, err := taskman.TaskManager.NewTask(ctx, "CloudaccountCreateSubscriptionTask", self, userCred, params, parentTaskId, "", nil)
+	if err != nil {
+		return errors.Wrap(err, "NewTask")
+	}
+	//self.SetStatus(userCred, api.CLOUD_PROVIDER_START_DELETE, "CloudaccountCreateSubscriptionTask")
+	task.ScheduleRun(nil)
+	return nil
+}
+
 func (self *SCloudaccount) AllowPerformSync(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
 	return db.IsAdminAllowPerform(userCred, self, "sync")
 }

@@ -319,3 +319,8 @@ type CloudaccountPerformPublicInput struct {
 	// example: provider_domain
 	ShareMode string `json:"share_mode"`
 }
+
+type CloudaccountCreateSubscriptionInput struct {
+	// 子订阅名称
+	SubscriptionName string `json:"subscription_name"`
+}

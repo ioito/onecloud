@@ -171,6 +171,7 @@ type ICloudProviderFactory interface {
 	IsPublicCloud() bool
 	IsOnPremise() bool
 	IsSupportPrepaidResources() bool
+	IsSubpportCreateSubscription() bool
 	NeedSyncSkuFromCloud() bool
 
 	IsCloudeventRegional() bool
@@ -392,6 +393,10 @@ func (factory *baseProviderFactory) GetMaxCloudEventSyncDays() int {
 
 func (factory *baseProviderFactory) GetMaxCloudEventKeepDays() int {
 	return 7
+}
+
+func (factory *baseProviderFactory) IsSubpportCreateSubscription() bool {
+	return false
 }
 
 type SPremiseBaseProviderFactory struct {

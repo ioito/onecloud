@@ -1027,4 +1027,18 @@ func init() {
 		return nil
 	})
 
+	type ClouaccountCreateSubscriptionOptions struct {
+		ID                string `help:"ID or name of cloudaccount" json:"-"`
+		SUBSCRIPTION_NAME string `json:"subscription_name" help:"target domain"`
+	}
+	R(&ClouaccountCreateSubscriptionOptions{}, "cloud-account-create-subscription", "Create subscription for cloudaccount", func(s *mcclient.ClientSession, args *ClouaccountCreateSubscriptionOptions) error {
+		params := jsonutils.Marshal(args)
+		ret, err := modules.Cloudaccounts.PerformAction(s, args.ID, "create-subscription", params)
+		if err != nil {
+			return err
+		}
+		printObject(ret)
+		return nil
+	})
+
 }
