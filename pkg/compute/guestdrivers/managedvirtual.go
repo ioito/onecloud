@@ -344,6 +344,8 @@ func (self *SManagedVirtualizedGuestDriver) RequestDeployGuestOnHost(ctx context
 			desc.UserData = oUserData.UserDataScriptBase64()
 		case cloudprovider.CLOUD_SHELL_WITHOUT_ENCRYPT:
 			desc.UserData = oUserData.UserDataScript()
+		case cloudprovider.CLOUD_CONFIG_WITHOUT_ENCRYPT:
+			desc.UserData = oUserData.UserData()
 		default:
 			desc.UserData = oUserData.UserDataBase64()
 		}

@@ -122,6 +122,10 @@ func (self *SOpenStackGuestDriver) IsRebuildRootSupportChangeImage() bool {
 	return true
 }
 
+func (self *SOpenStackGuestDriver) GetUserDataType() string {
+	return cloudprovider.CLOUD_CONFIG_WITHOUT_ENCRYPT
+}
+
 func (self *SOpenStackGuestDriver) GetDeployStatus() ([]string, error) {
 	return []string{api.VM_RUNNING}, nil
 }

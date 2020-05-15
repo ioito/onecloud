@@ -34,11 +34,12 @@ type SDiskInfo struct {
 }
 
 const (
-	CLOUD_SHELL                 = "cloud-shell"
-	CLOUD_SHELL_WITHOUT_ENCRYPT = "cloud-shell-without-encrypt"
-	CLOUD_CONFIG                = "cloud-config"
-	CLOUD_POWER_SHELL           = "powershell"
-	CLOUD_EC2                   = "ec2"
+	CLOUD_SHELL                  = "cloud-shell"
+	CLOUD_SHELL_WITHOUT_ENCRYPT  = "cloud-shell-without-encrypt"
+	CLOUD_CONFIG_WITHOUT_ENCRYPT = "cloud-config-without-encrypt"
+	CLOUD_CONFIG                 = "cloud-config"
+	CLOUD_POWER_SHELL            = "powershell"
+	CLOUD_EC2                    = "ec2"
 )
 
 type SManagedVMCreateConfig struct {
