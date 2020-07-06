@@ -890,6 +890,10 @@ func (manager *SCloudaccountManager) ValidateCreateData(
 		input.SyncIntervalSeconds = options.Options.MinimalSyncIntervalSeconds
 	}
 
+	if providerDriver.IsNeedAutoCreateProject() {
+		input.AutoCreateProject = true
+	}
+
 	if !input.AutoCreateProject {
 		if userCred.GetProjectDomainId() != ownerId.GetProjectDomainId() {
 			s := auth.GetAdminSession(ctx, consts.GetRegion(), "v1")
@@ -1335,7 +1339,11 @@ func (self *SCloudaccount) importSubAccount(ctx context.Context, userCred mcclie
 		}
 		newCloudprovider.HealthStatus = self.HealthStatus
 		newCloudprovider.Name = newName
-		if !self.AutoCreateProject || len(self.ProjectId) > 0 {
+		factory, err := self.GetProviderFactory()
+		if err != nil {
+			return nil, errors.Wrap(err, "GetProviderFactory")
+		}
+		if !self.AutoCreateProject || len(self.ProjectId) > 0 || !factory.IsSubscriptionNeedAutoCreateProject() {
 			ownerId := self.GetOwnerId()
 			if len(self.ProjectId) > 0 {
 				t, err := db.TenantCacheManager.FetchTenantById(ctx, self.ProjectId)

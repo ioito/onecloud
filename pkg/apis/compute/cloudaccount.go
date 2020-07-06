@@ -181,6 +181,24 @@ type CloudaccountCreateInput struct {
 	SyncIntervalSeconds int `json:"sync_interval_seconds"`
 
 	// 自动根据云上项目或订阅创建本地项目
+	//
+	//
+	// | Provider  | 支持参数 | 说明			|
+	// |-----------|------------|-------------------------------------|
+	// | VMware    | true|false | 若为true, 则会根据VMware平台的resource pool在本地创建名称相同的项目|
+	// | OpenStack | true       | 默认true, 则会根据OpenStack平台的项目在本地创建名称相同的项目|
+	// | ZStack    | false		| ZStack平台无项目概念, 此参数不生效|
+	// | Aliyun    | true|false | 若为true, 则会根据Aliyun平台的资源组在本地创建名称相同的项目|
+	// | Aws       | false      | 尚未实现，都使用云上默认资源组|
+	// | Azure     | true|false | 若为true, 订阅会根据名称自动在本地创建项目，并且会根据云上资源组创建本地项目|
+	// | Google    | true|false | 若为true，订阅会根据名称自动在本地创建项目|
+	// | Qcloud    | true|false | 若为true, 会根据腾讯云平台项目创建本地同名项目|
+	// | Huawei    | true|false | 若为true, 会根据华为云企业项目创建本地同名项目|
+	// | Ucloud    | false      | 不支持项目同步|
+	// | Ctyun     | false		| 不支持项目同步|
+	// | S3        | false      | 不支持项目同步|
+	// | Ceph      | false      | 不支持项目同步|
+	// | Xsky      | false      | 不支持项目同步|
 	// default: false
 	AutoCreateProject bool `json:"auto_create_project"`
 

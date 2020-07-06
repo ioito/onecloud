@@ -49,6 +49,10 @@ func (self *SGoogleProviderFactory) IsSupportPrepaidResources() bool {
 	return false
 }
 
+func (self *SGoogleProviderFactory) IsSubscriptionNeedAutoCreateProject() bool {
+	return true
+}
+
 func (self *SGoogleProviderFactory) IsClouduserSupportPassword() bool {
 	return false
 }

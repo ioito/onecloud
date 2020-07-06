@@ -54,6 +54,10 @@ func (self *SAzureProviderFactory) IsCloudeventRegional() bool {
 	return false
 }
 
+func (self *SAzureProviderFactory) IsSubscriptionNeedAutoCreateProject() bool {
+	return true
+}
+
 func (self *SAzureProviderFactory) ValidateChangeBandwidth(instanceId string, bandwidth int64) error {
 	return fmt.Errorf("Changing %s bandwidth is not supported", azure.CLOUD_PROVIDER_AZURE)
 }

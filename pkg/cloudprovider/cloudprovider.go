@@ -180,6 +180,8 @@ type ICloudProviderFactory interface {
 	ValidateCreateCloudaccountData(ctx context.Context, userCred mcclient.TokenCredential, input SCloudaccountCredential) (SCloudaccount, error)
 	ValidateUpdateCloudaccountCredential(ctx context.Context, userCred mcclient.TokenCredential, input SCloudaccountCredential, cloudaccount string) (SCloudaccount, error)
 	GetSupportedBrands() []string
+	IsNeedAutoCreateProject() bool
+	IsSubscriptionNeedAutoCreateProject() bool
 
 	IsPublicCloud() bool
 	IsOnPremise() bool
@@ -448,6 +450,14 @@ func (factory *baseProviderFactory) ValidateChangeBandwidth(instanceId string, b
 
 func (factory *baseProviderFactory) GetSupportedBrands() []string {
 	return []string{}
+}
+
+func (factory *baseProviderFactory) IsNeedAutoCreateProject() bool {
+	return false
+}
+
+func (factory *baseProviderFactory) IsSubscriptionNeedAutoCreateProject() bool {
+	return false
 }
 
 func (factory *baseProviderFactory) GetProvider(providerId, providerName, url, username, password string) (ICloudProvider, error) {

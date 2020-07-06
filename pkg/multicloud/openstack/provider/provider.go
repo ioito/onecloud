@@ -154,6 +154,10 @@ func (self *SOpenStackProviderFactory) GetClientRC(url, account, secret string) 
 	}, nil
 }
 
+func (self *SOpenStackProviderFactory) IsNeedAutoCreateProject() bool {
+	return true
+}
+
 func init() {
 	factory := SOpenStackProviderFactory{}
 	cloudprovider.RegisterFactory(&factory)
