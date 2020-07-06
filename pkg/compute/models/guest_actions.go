@@ -1350,7 +1350,7 @@ func (self *SGuest) PerformRebuildRoot(ctx context.Context, userCred mcclient.To
 		if err != nil {
 			return nil, errors.Wrap(err, "FetchModelObjects")
 		}
-		if len(images) == 2 && images[0].UEFI != images[1].UEFI {
+		if len(images) == 2 && images[0].UEFI.Bool() != images[1].UEFI.Bool() {
 			return nil, httperrors.NewUnsupportOperationError("Can not rebuild root with with diff uefi image")
 		}
 	}
