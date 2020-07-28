@@ -23,6 +23,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/sqlchemy"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
@@ -239,4 +240,42 @@ func (globalVpc *SGlobalVpc) GetRequiredSharedDomainIds() []string {
 		requires[i] = db.ISharableChangeOwnerCandidateDomainIds(&vpcs[i])
 	}
 	return db.ISharableMergeShareRequireDomainIds(requires...)
+}
+
+// 设置共享
+func (globalVpc *SGlobalVpc) PerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicDomainInput) (jsonutils.JSONObject, error) {
+	if rbacutils.String2ScopeDefault(input.Scope, rbacutils.ScopeSystem) != rbacutils.ScopeSystem {
+		return nil, httperrors.NewForbiddenError("For default vpc, only system level sharing can be set")
+	}
+	_, err := globalVpc.SEnabledStatusInfrasResourceBase.PerformPublic(ctx, userCred, query, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBase.PerformPublic")
+	}
+	// perform public for all emulated wires
+	vpcs, err := globalVpc.GetVpcs()
+	if err != nil {
+		return nil, errors.Wrap(err, "GetVpcs")
+	}
+	for i := range vpcs {
+		_, err := vpcs[i].PerformPublic(ctx, userCred, query, input)
+		if err != nil {
+			return nil, errors.Wrap(err, "vpc.PerformPublic")
+		}
+	}
+	return nil, nil
+}
+
+// 恢复私有
+func (globalVpc *SGlobalVpc) PerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) (jsonutils.JSONObject, error) {
+	vpcs, err := globalVpc.GetVpcs()
+	if err != nil {
+		return nil, errors.Wrap(err, "GetVpcs")
+	}
+	for i := range vpcs {
+		_, err = vpcs[i].PerformPrivate(ctx, userCred, query, input)
+		if err != nil {
+			return nil, errors.Wrapf(err, "PerformPrivate for vpc %s(%s)", vpcs[i].Name, vpcs[i].Id)
+		}
+	}
+	return globalVpc.SEnabledStatusInfrasResourceBase.PerformPrivate(ctx, userCred, query, input)
 }
