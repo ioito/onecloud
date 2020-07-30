@@ -197,6 +197,8 @@ type ICloudProviderFactory interface {
 	IsClouduserNeedInitPolicy() bool
 	IsClouduserBelongCloudprovider() bool
 	IsSupportCreateCloudgroup() bool
+
+	IsSamlProviderLocalize() bool
 }
 
 type ICloudProvider interface {
@@ -240,6 +242,10 @@ type ICloudProvider interface {
 
 	GetEnrollmentAccounts() ([]SEnrollmentAccount, error)
 	CreateSubscription(SubscriptionCreateInput) error
+
+	GetICloudSAMLProviders() ([]ICloudSAMLProvider, error)
+	GetICloudSAMLProviderById(id string) (ICloudSAMLProvider, error)
+	CreateSAMLProvider(opts *SAMLProviderCreateOptions) (ICloudSAMLProvider, error)
 }
 
 func IsSupportProject(prod ICloudProvider) bool {
@@ -398,6 +404,18 @@ func NewBaseProvider(factory ICloudProviderFactory) SBaseProvider {
 	return SBaseProvider{factory: factory}
 }
 
+func (self *SBaseProvider) GetICloudSAMLProviders() ([]ICloudSAMLProvider, error) {
+	return nil, ErrNotImplemented
+}
+
+func (self *SBaseProvider) GetICloudSAMLProviderById(id string) (ICloudSAMLProvider, error) {
+	return nil, ErrNotImplemented
+}
+
+func (self *SBaseProvider) CreateSAMLProvider(opts *SAMLProviderCreateOptions) (ICloudSAMLProvider, error) {
+	return nil, ErrNotImplemented
+}
+
 func GetPublicProviders() []string {
 	providers := make([]string, 0)
 	for p, d := range providerTable {
@@ -509,6 +527,10 @@ func (factory *baseProviderFactory) IsSupportCreateCloudgroup() bool {
 }
 
 func (factory *baseProviderFactory) IsClouduserBelongCloudprovider() bool {
+	return false
+}
+
+func (factory *baseProviderFactory) IsSamlProviderLocalize() bool {
 	return false
 }
 

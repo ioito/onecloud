@@ -20,9 +20,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 
 	"yunion.io/x/log"
 	"yunion.io/x/log/hooks"
@@ -297,4 +299,8 @@ func ParseOptions(optStruct interface{}, args []string, configFileName string, s
 	}
 
 	consts.SetDomainizedNamespace(optionsRef.DomainizedNamespace)
+}
+
+func (opts *BaseOptions) GetEntityId() string {
+	return fmt.Sprintf("https://%s", net.JoinHostPort(opts.Address, strconv.Itoa(opts.Port)))
 }

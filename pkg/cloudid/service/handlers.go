@@ -1,5 +1,3 @@
-package service
-
 // Copyright 2019 Yunion
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +12,8 @@ package service
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package service
+
 import (
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
@@ -21,6 +21,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/proxy"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudid/models"
+	"yunion.io/x/onecloud/pkg/cloudid/saml"
 )
 
 func InitHandlers(app *appsrv.Application) {
@@ -28,6 +29,8 @@ func InitHandlers(app *appsrv.Application) {
 
 	taskman.AddTaskHandler("v1", app)
 	db.AddScopeResourceCountHandler("", app)
+
+	saml.InitHandlers(app)
 
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
@@ -50,6 +53,7 @@ func InitHandlers(app *appsrv.Application) {
 		models.CloudgroupManager,
 		models.CloudgroupcacheManager,
 		models.CloudpolicyManager,
+		models.SamlProviderManager,
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)

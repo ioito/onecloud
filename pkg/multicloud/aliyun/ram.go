@@ -301,3 +301,20 @@ func (self *SAliyunClient) attachPolicy2Role(policyType string, policyName strin
 
 	return nil
 }
+
+type SamlProvider struct {
+}
+
+func (self *SAliyunClient) ListSAMLProviders() ([]SamlProvider, error) {
+	params := make(map[string]string)
+	resp, err := self.ramRequest("ListSAMLProviders", params)
+	if err != nil {
+		return nil, errors.Wrap(err, "ListSAMLProviders")
+	}
+	sps := []SamlProvider{}
+	err = resp.Unmarshal(&sps)
+	if err != nil {
+		return nil, errors.Wrap(err, "resp.Unmarshal")
+	}
+	return sps, nil
+}

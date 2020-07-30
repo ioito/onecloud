@@ -23,6 +23,7 @@ import (
 
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/billing"
+	"yunion.io/x/onecloud/pkg/util/samlutils"
 )
 
 type ICloudResource interface {
@@ -994,5 +995,13 @@ type ICloudgroup interface {
 	AttachSystemPolicy(policyId string) error
 	DetachSystemPolicy(policyId string) error
 
+	Delete() error
+}
+
+type ICloudSAMLProvider interface {
+	GetGlobalId() string
+	GetName() string
+	GetDescription() string
+	GetEntityDescripter() (samlutils.EntityDescriptor, error)
 	Delete() error
 }

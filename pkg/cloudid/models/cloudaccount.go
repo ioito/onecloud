@@ -45,7 +45,7 @@ import (
 
 // +onecloud:swagger-gen-ignore
 type SCloudaccountManager struct {
-	db.SDomainLevelResourceBaseManager
+	db.SInfrasResourceBaseManager
 }
 
 var CloudaccountManager *SCloudaccountManager
@@ -53,7 +53,7 @@ var isCloudacountSynced bool
 
 func init() {
 	CloudaccountManager = &SCloudaccountManager{
-		SDomainLevelResourceBaseManager: db.NewDomainLevelResourceBaseManager(
+		SInfrasResourceBaseManager: db.NewInfrasResourceBaseManager(
 			SCloudaccount{},
 			"cloudaccounts_tbl",
 			"cloudaccount",
@@ -65,8 +65,7 @@ func init() {
 }
 
 type SCloudaccount struct {
-	db.SStandaloneResourceBase
-	db.SDomainizedResourceBase
+	db.SInfrasResourceBase
 
 	Provider    string `width:"64" charset:"ascii" list:"domain"`
 	Brand       string `width:"64" charset:"utf8" nullable:"true" list:"domain"`
