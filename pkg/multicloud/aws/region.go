@@ -41,6 +41,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudprovider"
@@ -85,6 +86,9 @@ const (
 
 	STS_SERVICE_NAME = "sts"
 	STS_SERVICE_ID   = "STS"
+
+	ROUTE53_SERVICE_NAME = "route53"
+	ROUTE53_SERVICE_ID   = "Route 53"
 
 	CLOUDWATCH_SERVICE_NAME = "monitoring"
 	CLOUDWATCH_SERVICE_ID   = "CloudWatch"
@@ -180,7 +184,7 @@ func Unmarshal(r *request.Request) {
 		} else {
 			decoder = xml.NewDecoder(r.HTTPResponse.Body)
 		}
-		if r.ClientInfo.ServiceID == EC2_SERVICE_ID {
+		if utils.IsInStringArray(r.ClientInfo.ServiceID, []string{EC2_SERVICE_ID, ROUTE53_SERVICE_ID}) {
 			err := decoder.Decode(r.Data)
 			if err != nil {
 				r.Error = awserr.NewRequestFailure(

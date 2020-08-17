@@ -451,12 +451,17 @@ func (self *SAwsClient) request(regionId, serviceName, serviceId, apiVersion str
 
 	client := client.New(*c.Config, metadata, c.Handlers)
 	client.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
-	client.Handlers.Build.PushBackNamed(buildHandler)
+	switch serviceName {
+	case ROUTE53_SERVICE_NAME:
+		client.Handlers.Build.PushBackNamed(restHandler)
+	default:
+		client.Handlers.Build.PushBackNamed(buildHandler)
+	}
 	client.Handlers.Unmarshal.PushBackNamed(UnmarshalHandler)
 	client.Handlers.UnmarshalMeta.PushBackNamed(query.UnmarshalMetaHandler)
 	client.Handlers.UnmarshalError.PushBackNamed(query.UnmarshalErrorHandler)
 	client.Handlers.Validate.Remove(corehandlers.ValidateEndpointHandler)
-	return jsonRequest(client, apiName, params, retval, true)
+	return jsonRequest(client, serviceName, apiName, params, retval, true)
 
 }
 
@@ -468,7 +473,11 @@ func (self *SAwsClient) stsRequest(apiName string, params map[string]string, ret
 	return self.request("", STS_SERVICE_NAME, STS_SERVICE_ID, "2011-06-15", apiName, params, retval)
 }
 
-func jsonRequest(cli *client.Client, apiName string, params map[string]string, retval interface{}, debug bool) error {
+func (self *SAwsClient) route53Request(apiName string, params map[string]string, retval interface{}) error {
+	return self.request("", ROUTE53_SERVICE_NAME, ROUTE53_SERVICE_ID, "2013-04-01", apiName, params, retval)
+}
+
+func jsonRequest(cli *client.Client, serviceName, apiName string, params map[string]string, retval interface{}, debug bool) error {
 	op := &request.Operation{
 		Name:       apiName,
 		HTTPMethod: "POST",
@@ -479,6 +488,16 @@ func jsonRequest(cli *client.Client, apiName string, params map[string]string, r
 			LimitToken:      "MaxResults",
 			TruncationToken: "",
 		},
+	}
+	switch serviceName {
+	case ROUTE53_SERVICE_NAME:
+		switch apiName {
+		case "ListHostedZones":
+			op.HTTPPath = "/2013-04-01/hostedzone"
+			op.HTTPMethod = "GET"
+		default:
+			op.HTTPPath = fmt.Sprintf("/2013-04-01/%s", strings.ToLower(apiName))
+		}
 	}
 
 	req := cli.NewRequest(op, params, retval)
@@ -503,6 +522,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 		// cloudprovider.CLOUD_CAPABILITY_CACHE,
 		// cloudprovider.CLOUD_CAPABILITY_EVENT,
 		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
+		cloudprovider.CLOUD_CAPABILITY_DNSZONE,
 	}
 	return caps
 }

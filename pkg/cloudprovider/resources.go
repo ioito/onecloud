@@ -1014,3 +1014,37 @@ type ICloudgroup interface {
 
 	Delete() error
 }
+
+type ICloudDnsZone interface {
+	ICloudResource
+
+	GetZoneType() TDnsZoneType
+	GetOptions() *jsonutils.JSONDict
+
+	GetICloudVpcIds() ([]string, error)
+	AddVpc(vpcId string) error
+	RemoveVpc(vpcId string) error
+
+	GetIDnsRecordSets() ([]ICloudDnsRecordSet, error)
+	AddDnsRecordSet(opts *SAddDnsRecordSetOptions) error
+	RemoveDnsRecordSet(opts *SRemoveDnsRecordSetOptions) error
+}
+
+type ICloudDnsRecordSet interface {
+	//GetGlobalId() string
+	GetDnsName() string
+	GetStatus() string
+	GetDnsType() string
+	GetDnsValue() string
+	GetTTL() int
+
+	GetPolicyType() TDnsPolicyType
+	GetPolicyParams() *jsonutils.JSONDict
+	//GetICloudDnsTrafficPolicy() (ICloudDnsTrafficPolicy, error)
+	//SetICloudDnsTrafficePolicy(opts *SDnsTrafficPolicySetOptions) error
+}
+
+type ICloudDnsTrafficPolicy interface {
+	GetPolicyType() TDnsPolicyType
+	GetParams() *jsonutils.JSONDict
+}
