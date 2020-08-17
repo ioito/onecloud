@@ -209,4 +209,9 @@ const (
 	ACT_PULL_SUBCONTACT   = "拉取联系方式"
 	ACT_SEND_NOTIFICATION = "发送通知消息"
 	ACT_SEND_VERIFICATION = "发送验证消息"
+
+	ACT_ADD_VPCS    = "添加VPC"
+	ACT_REMOVE_VPCS = "移除VPC"
+
+	ACT_SYNC_RECORD_SETS = "同步解析列表"
 )
