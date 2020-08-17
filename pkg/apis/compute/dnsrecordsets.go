@@ -47,6 +47,7 @@ type DnsRecordSetListInput struct {
 
 	DnsZoneFilterListBase
 }
+<<<<<<< HEAD
 
 type DnsRecordEnableInput struct {
 	apis.PerformEnableInput
@@ -59,3 +60,5 @@ type DnsRecordDisableInput struct {
 type DnsRecordSetTrafficPoliciesInput struct {
 	TrafficPolicies []DnsRecordPolicy `json:"traffic_policies"`
 }
+=======
+>>>>>>> feature: add dns interface
