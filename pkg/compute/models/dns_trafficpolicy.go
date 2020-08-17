@@ -18,7 +18,6 @@ import (
 	"context"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/pkg/errors"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -110,25 +109,4 @@ func (manager *SDnsTrafficPolicyManager) FetchCustomizeColumns(
 		}
 	}
 	return rows
-}
-
-func (manager *SDnsTrafficPolicyManager) getOrCreateTrafficPolicy(ctx context.Context, userCred mcclient.TokenCredential, policyType string, params *jsonutils.JSONDict) (*SDnsTrafficPolicy, error) {
-	q := manager.Query().Equals("policy_type", policyType).Equals("params", params)
-	policies := []SDnsTrafficPolicy{}
-	err := db.FetchModelObjects(manager, q, &policies)
-	if err != nil {
-		return nil, errors.Wrapf(err, "db.FetchModelObjects")
-	}
-	if len(policies) > 0 {
-		return &policies[0], nil
-	}
-	policy := &SDnsTrafficPolicy{}
-	policy.SetModelManager(manager, policy)
-	policy.Name, err = db.GenerateName(manager, userCred, policyType)
-	if err != nil {
-		return nil, errors.Wrapf(err, "db.GenerateName")
-	}
-	policy.PolicyType = policyType
-	policy.Params = params
-	return policy, manager.TableSpec().Insert(ctx, policy)
 }

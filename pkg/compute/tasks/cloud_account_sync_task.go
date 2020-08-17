@@ -142,8 +142,28 @@ func (self *CloudAccountSyncInfoTask) OnCloudaccountSyncReady(ctx context.Contex
 }
 
 func syncDnsRecordSets(ctx context.Context, userCred mcclient.TokenCredential, localDnsZone *models.SDnsZone, remoteDnsZone cloudprovider.ICloudDnsZone) {
-	result := localDnsZone.SyncDnsRecordSets(ctx, userCred, remoteDnsZone)
+	localRecords, remoteRecords, result := localDnsZone.SyncDnsRecordSets(ctx, userCred, remoteDnsZone)
 	log.Infof("Sync dns records for dns zone %s result: %s", localDnsZone.GetName(), result.Result())
+
+	for i := 0; i < len(localRecords); i++ {
+		func() {
+			lockman.LockObject(ctx, &localRecords[i])
+			defer lockman.ReleaseObject(ctx, &localRecords[i])
+
+			policy, err := remoteRecords[i].GetICloudDnsTrafficPolicy()
+			if err != nil {
+				log.Errorf("failed to get record policy for record %s error: %v", localRecords[i].Name, err)
+				return
+			}
+			if policy != nil {
+				err := localRecords[i].SyncDnsTrafficPolicy(ctx, userCred, policy)
+				if err != nil {
+					log.Errorf("failed to sync dns traffic policy for record %s(%s) error: %v", localRecords[i].Name, localRecords[i].Id, err)
+					return
+				}
+			}
+		}()
+	}
 }
 
 func (self *CloudAccountSyncInfoTask) OnCloudaccountSyncComplete(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {

@@ -1031,17 +1031,15 @@ type ICloudDnsZone interface {
 }
 
 type ICloudDnsRecordSet interface {
-	//GetGlobalId() string
+	GetGlobalId() string
 	GetDnsName() string
 	GetStatus() string
 	GetDnsType() string
 	GetDnsValue() string
 	GetTTL() int
 
-	GetPolicyType() TDnsPolicyType
-	GetPolicyParams() *jsonutils.JSONDict
-	//GetICloudDnsTrafficPolicy() (ICloudDnsTrafficPolicy, error)
-	//SetICloudDnsTrafficePolicy(opts *SDnsTrafficPolicySetOptions) error
+	GetICloudDnsTrafficPolicy() (ICloudDnsTrafficPolicy, error)
+	SetICloudDnsTrafficePolicy(opts *SDnsTrafficPolicySetOptions) error
 }
 
 type ICloudDnsTrafficPolicy interface {

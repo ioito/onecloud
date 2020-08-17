@@ -553,13 +553,13 @@ func (manager *SDnsRecordManager) FetchCustomizeColumns(
 	return rows
 }
 
-func (self *SDnsRecordSet) syncWithCloudDnsRecord(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.DnsRecordSet) error {
+func (self *SDnsRecordSet) syncWithCloudDnsRecord(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsRecordSet) error {
 	_, err := db.Update(self, func() error {
-		self.Name = ext.DnsName
-		self.Status = ext.Status
-		self.TTL = ext.Ttl
-		self.DnsType = ext.DnsType
-		self.DnsValue = ext.DnsValue
+		self.Name = ext.GetDnsName()
+		self.Status = ext.GetStatus()
+		self.TTL = ext.GetTTL()
+		self.DnsType = ext.GetDnsType()
+		self.DnsValue = ext.GetDnsValue()
 		return nil
 	})
 	return err

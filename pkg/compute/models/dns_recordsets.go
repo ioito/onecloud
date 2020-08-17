@@ -16,6 +16,7 @@ package models
 
 import (
 	"context"
+	"fmt"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -23,6 +24,7 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -30,6 +32,7 @@ import (
 
 type SDnsRecordSetManager struct {
 	db.SEnabledStatusStandaloneResourceBaseManager
+	db.SExternalizedResourceBaseManager
 
 	SDnsZoneResourceBaseManager
 }
@@ -51,6 +54,7 @@ func init() {
 
 type SDnsRecordSet struct {
 	db.SEnabledStatusStandaloneResourceBase
+	db.SExternalizedResourceBase
 	SDnsZoneResourceBase
 
 	DnsType             string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"required"`
@@ -111,12 +115,17 @@ func (self *SDnsRecordSet) syncRemove(ctx context.Context, userCred mcclient.Tok
 	return self.Delete(ctx, userCred)
 }
 
-func (self *SDnsRecordSet) GetDnsTrafficPolicy() (*SDnsTrafficPolicy, error) {
-	policy, err := DnsTrafficPolicyManager.FetchById(self.DnsTrafficePolicyId)
-	if err != nil {
-		return nil, errors.Wrapf(err, "DnsTrafficPolicyManager.FetchById(%s)", self.DnsTrafficePolicyId)
+func (self *SDnsRecordSet) GetDnsTrafficPolicies(policyType string) ([]SDnsTrafficPolicy, error) {
+	q := DnsTrafficPolicyManager.Query()
+	if len(policyType) > 0 {
+		q = q.Equals("policy_type", policyType)
 	}
-	return policy.(*SDnsTrafficPolicy), nil
+	policies := []SDnsTrafficPolicy{}
+	err := db.FetchModelObjects(DnsTrafficPolicyManager, q, &policies)
+	if err != nil {
+		return nil, errors.Wrapf(err, "db.FetchModelObjects")
+	}
+	return policies, nil
 }
 
 func (self *SDnsRecordSet) GetDnsZone() (*SDnsZone, error) {
@@ -125,4 +134,54 @@ func (self *SDnsRecordSet) GetDnsZone() (*SDnsZone, error) {
 		return nil, errors.Wrapf(err, "DnsZoneManager.FetchById(%s)", self.DnsZoneId)
 	}
 	return dnsZone.(*SDnsZone), nil
+}
+
+func (self *SDnsRecordSet) newFromDnsTrafficPolicy(ctx context.Context, userCred mcclient.TokenCredential, policyType string, params *jsonutils.JSONDict) (*SDnsTrafficPolicy, error) {
+	dnsZone, err := self.GetDnsZone()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetDnsZone")
+	}
+
+	policy := &SDnsTrafficPolicy{}
+	policy.SetModelManager(DnsTrafficPolicyManager, policy)
+	name := fmt.Sprintf("traffic policy for %s", self.Name)
+	policy.Name, err = db.GenerateName(DnsTrafficPolicyManager, userCred, name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "db.GenerateName")
+	}
+	policy.PolicyType = policyType
+	policy.Params = params
+	err = DnsTrafficPolicyManager.TableSpec().Insert(ctx, policy)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Insert")
+	}
+	SyncCloudDomain(userCred, policy, dnsZone.GetOwnerId())
+	return policy, nil
+}
+
+func (self *SDnsRecordSet) SyncDnsTrafficPolicy(ctx context.Context, userCred mcclient.TokenCredential, policy cloudprovider.ICloudDnsTrafficPolicy) error {
+	policyType, params := policy.GetPolicyType(), policy.GetParams()
+	policies, err := self.GetDnsTrafficPolicies(string(policyType))
+	if err != nil {
+		return errors.Wrapf(err, "GetDnsTrafficPolicies(%s)", policyType)
+	}
+	policyId := ""
+	for i := range policies {
+		if policies[i].Params == params || (params != nil && policies[i].Params != nil && params.Equals(policies[i].Params)) {
+			policyId = policies[i].Id
+			break
+		}
+	}
+	if len(policyId) == 0 {
+		policy, err := self.newFromDnsTrafficPolicy(ctx, userCred, string(policyType), params)
+		if err != nil {
+			return errors.Wrapf(err, "newFromDnsTrafficPolicy")
+		}
+		policyId = policy.Id
+	}
+	_, err = db.Update(self, func() error {
+		self.DnsTrafficePolicyId = policyId
+		return nil
+	})
+	return err
 }

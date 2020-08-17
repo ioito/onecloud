@@ -281,103 +281,86 @@ func (self *SDnsZone) GetDnsRecordSets() ([]SDnsRecordSet, error) {
 	return records, nil
 }
 
-func (self *SDnsZone) SyncDnsRecordSets(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsZone) compare.SyncResult {
+func (self *SDnsZone) SyncDnsRecordSets(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsZone) ([]SDnsRecordSet, []cloudprovider.ICloudDnsRecordSet, compare.SyncResult) {
 	lockman.LockRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 	defer lockman.ReleaseRawObject(ctx, self.Keyword(), fmt.Sprintf("%s-records", self.Id))
 
 	result := compare.SyncResult{}
 
+	localRecords := []SDnsRecordSet{}
+	remoteRecords := []cloudprovider.ICloudDnsRecordSet{}
+
 	iRecords, err := ext.GetIDnsRecordSets()
 	if err != nil {
 		result.Error(errors.Wrapf(err, "GetIDnsRecordSets"))
-		return result
+		return nil, nil, result
 	}
 
 	dbRecords, err := self.GetDnsRecordSets()
 	if err != nil {
 		result.Error(errors.Wrapf(err, "GetDnsRecordSets"))
-		return result
-	}
-	local := []cloudprovider.DnsRecordSet{}
-	for i := range dbRecords {
-		policy, err := dbRecords[i].GetDnsTrafficPolicy()
-		if err != nil {
-			result.Error(errors.Wrapf(err, "GetDnsTrafficPolicy for %s(%s)", dbRecords[i].Name, dbRecords[i].Id))
-			return result
-		}
-		local = append(local, cloudprovider.DnsRecordSet{
-			Id:          dbRecords[i].Id,
-			DnsName:     dbRecords[i].Name,
-			DnsType:     dbRecords[i].DnsType,
-			DnsValue:    dbRecords[i].DnsValue,
-			Ttl:         dbRecords[i].TTL,
-			PolicyType:  cloudprovider.TDnsPolicyType(policy.PolicyType),
-			PolicyParms: policy.Params,
-		})
+		return nil, nil, result
 	}
 
-	_, del, add, update := cloudprovider.CompareDnsRecordSet(iRecords, local)
-	for i := range add {
-		_, err := self.newFromCloudDnsRecordSet(ctx, userCred, add[i])
-		if err != nil {
-			result.AddError(err)
-			continue
-		}
-		result.Add()
+	removed := make([]SDnsRecordSet, 0)
+	commondb := make([]SDnsRecordSet, 0)
+	commonext := make([]cloudprovider.ICloudDnsRecordSet, 0)
+	added := make([]cloudprovider.ICloudDnsRecordSet, 0)
+
+	err = compare.CompareSets(dbRecords, iRecords, &removed, &commondb, &commonext, &added)
+	if err != nil {
+		result.Error(err)
+		return nil, nil, result
 	}
 
-	for i := range del {
-		_record, err := DnsRecordSetManager.FetchById(del[i].Id)
+	for i := 0; i < len(removed); i += 1 {
+		err = removed[i].syncRemove(ctx, userCred)
 		if err != nil {
-			result.DeleteError(errors.Wrapf(err, "DnsRecordSetManager.FetchById(%s)", del[i].Id))
-			continue
-		}
-		record := _record.(*SDnsRecordSet)
-		err = record.syncRemove(ctx, userCred)
-		if err != nil {
-			result.DeleteError(errors.Wrapf(err, "syncRemove"))
+			result.DeleteError(err)
 			continue
 		}
 		result.Delete()
 	}
 
-	if self.ZoneType == string(cloudprovider.PrivateZone) {
-		for i := range update {
-			_record, err := DnsRecordSetManager.FetchById(update[i].Id)
+	for i := 0; i < len(commondb); i += 1 {
+		if self.ZoneType == string(cloudprovider.PrivateZone) {
+			err = commondb[i].syncWithCloudDnsRecord(ctx, userCred, commonext[i])
 			if err != nil {
-				result.UpdateError(errors.Wrapf(err, "DnsRecordSetManager.FetchById(%s)", del[i].Id))
+				result.UpdateError(err)
 				continue
 			}
-			record := _record.(*SDnsRecordSet)
-			err = record.syncWithCloudDnsRecord(ctx, userCred, update[i])
-			if err != nil {
-				result.UpdateError(errors.Wrapf(err, "syncWithCloudDnsRecord"))
-				continue
-			}
-			result.Update()
+			localRecords = append(localRecords, commondb[i])
+			remoteRecords = append(remoteRecords, commonext[i])
 		}
+		result.Update()
 	}
 
-	return result
+	for i := 0; i < len(added); i += 1 {
+		record, err := self.newFromCloudDnsRecordSet(ctx, userCred, added[i])
+		if err != nil {
+			result.AddError(err)
+			continue
+		}
+		localRecords = append(localRecords, *record)
+		remoteRecords = append(remoteRecords, added[i])
+		result.Add()
+	}
+
+	return localRecords, remoteRecords, result
 }
 
-func (self *SDnsZone) newFromCloudDnsRecordSet(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.DnsRecordSet) (*SDnsRecordSet, error) {
-	policy, err := DnsTrafficPolicyManager.getOrCreateTrafficPolicy(ctx, userCred, string(ext.PolicyType), ext.PolicyParms)
-	if err != nil {
-		return nil, errors.Wrapf(err, "etOrCreateTrafficPolicy")
-	}
-
+func (self *SDnsZone) newFromCloudDnsRecordSet(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsRecordSet) (*SDnsRecordSet, error) {
 	record := &SDnsRecordSet{}
 	record.SetModelManager(DnsRecordSetManager, record)
 	record.DnsZoneId = self.Id
-	record.Name = ext.DnsName
-	record.Status = ext.Status
-	record.TTL = ext.Ttl
-	record.DnsType = ext.DnsType
-	record.DnsValue = ext.DnsValue
-	record.DnsTrafficePolicyId = policy.Id
+	record.Name = ext.GetDnsName()
+	record.Status = ext.GetStatus()
+	record.ExternalId = ext.GetGlobalId()
+	record.TTL = ext.GetTTL()
+	record.DnsType = ext.GetDnsType()
+	record.DnsValue = ext.GetDnsValue()
 
-	err = DnsRecordSetManager.TableSpec().Insert(ctx, record)
+	err := DnsRecordSetManager.TableSpec().Insert(ctx, record)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Insert")
 	}
