@@ -503,6 +503,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 		// cloudprovider.CLOUD_CAPABILITY_CACHE,
 		// cloudprovider.CLOUD_CAPABILITY_EVENT,
 		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
+		cloudprovider.CLOUD_CAPABILITY_DNSZONE,
 	}
 	return caps
 }

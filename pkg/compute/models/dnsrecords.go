@@ -16,6 +16,7 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ import (
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -330,7 +333,7 @@ func (man *SDnsRecordManager) validateModelData(
 	return records, nil
 }
 
-func (man *SDnsRecordManager) ValidateCreateData(
+func (man *SDnsRecordManager) ValidaeCreateData(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	ownerId mcclient.IIdentityProvider,
@@ -565,4 +568,58 @@ func (manager *SDnsRecordManager) FetchCustomizeColumns(
 	}
 
 	return rows
+}
+
+func (self *SDnsRecordSet) syncWithCloudDnsRecord(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.DnsRecordSet) error {
+	_, err := db.Update(self, func() error {
+		self.Name = ext.DnsName
+		self.Status = ext.Status
+		self.TTL = ext.Ttl
+		self.DnsType = string(ext.DnsType)
+		self.DnsValue = ext.DnsValue
+		return nil
+	})
+	return err
+}
+
+func (self *SDnsRecordSet) RemovePolicy(ctx context.Context, userCred mcclient.TokenCredential, policyId string) error {
+	q := DnsRecordSetTrafficPolicyManager.Query().Equals("dns_recordset_id", self.Id).Equals("dns_trafficpolicy_id", policyId)
+	removed := []SDnsRecordSetTrafficPolicy{}
+	err := db.FetchModelObjects(DnsRecordSetTrafficPolicyManager, q, &removed)
+	if err != nil {
+		return errors.Wrapf(err, "db.FetchModelObjects")
+	}
+	for i := range removed {
+		err = removed[i].Detach(ctx, userCred)
+		if err != nil {
+			return errors.Wrapf(err, "Detach")
+		}
+	}
+	return nil
+}
+
+func (self *SDnsRecordSet) setTrafficPolicy(ctx context.Context, userCred mcclient.TokenCredential, provider string, policyType cloudprovider.TDnsPolicyType, policyValue cloudprovider.TDnsPolicyTypeValue) error {
+	lockman.LockObject(ctx, self)
+	defer lockman.ReleaseObject(ctx, self)
+
+	policy, err := self.GetDnsTrafficPolicy(provider)
+	if err != nil && errors.Cause(err) != sql.ErrNoRows {
+		return errors.Wrapf(err, "GetDnsTrafficPolicy(%s)", provider)
+	}
+	if policy != nil {
+		if cloudprovider.TDnsPolicyType(policy.PolicyType) == policyType && cloudprovider.IsPolicyValueEqual(
+			cloudprovider.TDnsPolicyTypeValue(policy.Params),
+			policyValue,
+		) {
+			return nil
+		}
+		self.RemovePolicy(ctx, userCred, policy.Id)
+	}
+	/*
+		policy, err := DnsTrafficPolicyManager.Register(ctx, userCred, provider, policyType, policyValue)
+		if err != nil {
+			return errors.Wrapf(err, "DnsTrafficPolicyManager.Register")
+		}
+	*/
+	return nil
 }
