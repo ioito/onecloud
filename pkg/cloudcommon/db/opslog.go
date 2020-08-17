@@ -278,6 +278,9 @@ const (
 
 	ACT_FLUSH_INSTANCE      = "flush_instance"
 	ACT_FLUSH_INSTANCE_FAIL = "flush_instance_fail"
+
+	ACT_ADD_VPCS    = "add_vpcs"
+	ACT_REMOVE_VPCS = "remove_vpcs"
 )
 
 type SOpsLogManager struct {

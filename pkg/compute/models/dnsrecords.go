@@ -28,6 +28,7 @@ import (
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudprovider"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -550,4 +551,16 @@ func (manager *SDnsRecordManager) FetchCustomizeColumns(
 	}
 
 	return rows
+}
+
+func (self *SDnsRecordSet) syncWithCloudDnsRecord(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.DnsRecordSet) error {
+	_, err := db.Update(self, func() error {
+		self.Name = ext.DnsName
+		self.Status = ext.Status
+		self.TTL = ext.Ttl
+		self.DnsType = ext.DnsType
+		self.DnsValue = ext.DnsValue
+		return nil
+	})
+	return err
 }

@@ -247,10 +247,18 @@ type ICloudProvider interface {
 
 	GetEnrollmentAccounts() ([]SEnrollmentAccount, error)
 	CreateSubscription(SubscriptionCreateInput) error
+
+	GetICloudDnsZones() ([]ICloudDnsZone, error)
+	GetICloudDnsZoneById(id string) (ICloudDnsZone, error)
+	CreateICloudDnsZone(opts *SDnsZoneCreateOptions) (ICloudDnsZone, error)
 }
 
 func IsSupportProject(prod ICloudProvider) bool {
 	return utils.IsInStringArray(CLOUD_CAPABILITY_PROJECT, prod.GetCapabilities())
+}
+
+func IsSupportDnsZone(prod ICloudProvider) bool {
+	return utils.IsInStringArray(CLOUD_CAPABILITY_DNSZONE, prod.GetCapabilities())
 }
 
 func IsSupportCompute(prod ICloudProvider) bool {
@@ -399,6 +407,18 @@ func (self *SBaseProvider) GetEnrollmentAccounts() ([]SEnrollmentAccount, error)
 
 func (self *SBaseProvider) CreateSubscription(SubscriptionCreateInput) error {
 	return ErrNotImplemented
+}
+
+func (self *SBaseProvider) GetICloudDnsZones() ([]ICloudDnsZone, error) {
+	return nil, ErrNotImplemented
+}
+
+func (self *SBaseProvider) GetICloudDnsZoneById(id string) (ICloudDnsZone, error) {
+	return nil, ErrNotImplemented
+}
+
+func (self *SBaseProvider) CreateICloudDnsZone(opts *SDnsZoneCreateOptions) (ICloudDnsZone, error) {
+	return nil, ErrNotImplemented
 }
 
 func (self *SBaseProvider) GetCloudRegionExternalIdPrefix() string {

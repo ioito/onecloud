@@ -205,4 +205,7 @@ const (
 
 	ACT_UPDATE_BILLING_OPTIONS = "更新账单文件"
 	ACT_UPDATE_CREDENTIAL      = "更新账号密码"
+
+	ACT_ADD_VPCS    = "添加VPC"
+	ACT_REMOVE_VPCS = "移除VPC"
 )
