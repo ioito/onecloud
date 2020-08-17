@@ -1021,7 +1021,6 @@ type ICloudDnsZone interface {
 	GetZoneType() TDnsZoneType
 	GetOptions() *jsonutils.JSONDict
 
-	GetICloudVpcIds() ([]string, error)
 	AddVpc(vpcId string) error
 	RemoveVpc(vpcId string) error
 
@@ -1033,11 +1032,11 @@ type ICloudDnsZone interface {
 type ICloudDnsRecordSet interface {
 	GetGlobalId() string
 	GetDnsName() string
-	GetStatus() string
 	GetDnsType() string
 	GetDnsValue() string
 	GetTTL() int
 
+	GetICloudVpcIds() ([]string, error)
 	GetICloudDnsTrafficPolicy() (ICloudDnsTrafficPolicy, error)
 	SetICloudDnsTrafficePolicy(opts *SDnsTrafficPolicySetOptions) error
 }
