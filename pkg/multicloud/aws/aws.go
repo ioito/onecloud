@@ -239,6 +239,38 @@ func (client *SAwsClient) getAwsSession(regionId string) (*session.Session, erro
 	return s, nil
 }
 
+func (client *SAwsClient) getAwsRoute53Session() (*session.Session, error) {
+	var regionId string
+	var endpoint string
+	switch client.accessUrl {
+	case AWS_INTERNATIONAL_CLOUDENV:
+		regionId = "us-east-1"
+		endpoint = "route53.amazonaws.com"
+	case AWS_CHINA_CLOUDENV:
+		regionId = "cn-northwest-1"
+		endpoint = "route53.amazonaws.com.cn"
+	}
+	httpClient := client.cpcfg.HttpClient()
+	s, err := session.NewSession(&sdk.Config{
+		Region:   sdk.String(regionId),
+		Endpoint: &endpoint,
+		Credentials: credentials.NewStaticCredentials(
+			client.accessKey, client.accessSecret, "",
+		),
+		HTTPClient:                    httpClient,
+		DisableParamValidation:        sdk.Bool(true),
+		CredentialsChainVerboseErrors: sdk.Bool(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if client.debug {
+		logLevel := aws.LogLevelType(uint(aws.LogDebugWithRequestErrors) + uint(aws.LogDebugWithHTTPBody) + uint(aws.LogDebugWithSigning))
+		s.Config.LogLevel = &logLevel
+	}
+	return s, nil
+}
+
 func (self *SAwsClient) invalidateIBuckets() {
 	self.iBuckets = nil
 }
