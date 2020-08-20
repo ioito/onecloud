@@ -31,15 +31,20 @@ const (
 )
 
 const (
-	DnsPolicyTypeSimple         = TDnsPolicyType("Simple")         //简单
-	DnsPolicyTypeByCarrier      = TDnsPolicyType("ByCarrier")      //运营商
-	DnsPolicyTypeByGeoLocation  = TDnsPolicyType("ByGeoLocation")  //地理区域
-	DnsPolicyTypeBySearchEngine = TDnsPolicyType("BySearchEngine") //搜索引擎
-	DnsPolicyTypeIpRange        = TDnsPolicyType("IpRange")        //自定义IP范围
-	DnsPolicyTypeWeighted       = TDnsPolicyType("Weighted")       //加权
+	DnsPolicyTypeSimple           = TDnsPolicyType("Simple")           //简单
+	DnsPolicyTypeByCarrier        = TDnsPolicyType("ByCarrier")        //运营商
+	DnsPolicyTypeByGeoLocation    = TDnsPolicyType("ByGeoLocation")    //地理区域
+	DnsPolicyTypeBySearchEngine   = TDnsPolicyType("BySearchEngine")   //搜索引擎
+	DnsPolicyTypeIpRange          = TDnsPolicyType("IpRange")          //自定义IP范围
+	DnsPolicyTypeWeighted         = TDnsPolicyType("Weighted")         //加权
+	DnsPolicyTypeFailover         = TDnsPolicyType("Failover")         //failover
+	DnsPolicyTypeLatency          = TDnsPolicyType("Latency")          //faulover
+	DnsPolicyTypeMultiValueAnswer = TDnsPolicyType("MultiValueAnswer") //faulover
+
 )
 
 type SDnsZoneCreateOptions struct {
+	VpcRegionId    string // PrivateZone
 	Name           string
 	Desc           string
 	ZoneType       TDnsZoneType
@@ -51,9 +56,19 @@ type SDnsTrafficPolicySetOptions struct {
 }
 
 type SAddDnsRecordSetOptions struct {
+	SDnsRecordSetChangeOptions
 }
 
 type SRemoveDnsRecordSetOptions struct {
+	SDnsRecordSetChangeOptions
+}
+
+type SDnsRecordSetChangeOptions struct {
+	Name     string
+	Value    string //joined by '*'
+	TTL      int64
+	Type     string
+	Identify string
 }
 
 type DnsRecordSet struct {
@@ -64,7 +79,7 @@ type DnsRecordSet struct {
 	DnsType     string
 	DnsValue    string
 	Status      string
-	Ttl         int
+	Ttl         int64
 	PolicyType  TDnsPolicyType
 	PolicyParms *jsonutils.JSONDict
 }
