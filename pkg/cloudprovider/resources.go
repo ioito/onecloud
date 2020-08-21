@@ -1022,8 +1022,8 @@ type ICloudDnsZone interface {
 	GetOptions() *jsonutils.JSONDict
 
 	GetICloudVpcIds() ([]string, error)
-	AddVpc(vpcId string) error
-	RemoveVpc(vpcId string) error
+	AddVpc(vpcId string, vpcRegionId string) error
+	RemoveVpc(vpcId string, vpcRegionId string) error
 
 	GetIDnsRecordSets() ([]ICloudDnsRecordSet, error)
 	AddDnsRecordSet(opts *SAddDnsRecordSetOptions) error
@@ -1036,7 +1036,7 @@ type ICloudDnsRecordSet interface {
 	GetStatus() string
 	GetDnsType() string
 	GetDnsValue() string
-	GetTTL() int
+	GetTTL() int64
 
 	GetPolicyType() TDnsPolicyType
 	GetPolicyParams() *jsonutils.JSONDict

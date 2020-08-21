@@ -265,3 +265,11 @@ func (self *SQcloudProvider) GetIClouduserByName(name string) (cloudprovider.ICl
 func (self *SQcloudProvider) CreateICloudpolicy(opts *cloudprovider.SCloudpolicyCreateOptions) (cloudprovider.ICloudpolicy, error) {
 	return self.client.CreateICloudpolicy(opts)
 }
+
+func (self *SQcloudProvider) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, error) {
+	return self.client.GetICloudDnsZones()
+}
+
+func (self *SQcloudProvider) CreateICloudDnsZone(opts *cloudprovider.SDnsZoneCreateOptions) (cloudprovider.ICloudDnsZone, error) {
+	return self.client.CreateICloudDnsZone(opts)
+}
