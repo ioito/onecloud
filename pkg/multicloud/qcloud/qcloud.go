@@ -172,6 +172,12 @@ func wssRequest(client *common.Client, apiName string, params map[string]string,
 	return _phpJsonRequest(client, &wssJsonResponse{}, domain, "/v2/index.php", "", apiName, params, debug)
 }
 
+// dnspod 解析服务
+func cnsRequest(client *common.Client, apiName string, params map[string]string, debug bool) (jsonutils.JSONObject, error) {
+	domain := "cns.api.qcloud.com"
+	return _phpJsonRequest(client, &cnsJsonResponse{}, domain, "/v2/index.php", "", apiName, params, debug)
+}
+
 // 2017版API
 func vpc2017Request(client *common.Client, apiName string, params map[string]string, debug bool) (jsonutils.JSONObject, error) {
 	domain := "vpc.api.qcloud.com"
@@ -283,6 +289,36 @@ func (r *wssJsonResponse) ParseErrorFromHTTPResponse(body []byte) (err error) {
 }
 
 func (r *wssJsonResponse) GetResponse() *interface{} {
+	if r.Response == nil {
+		return func(resp interface{}) *interface{} {
+			return &resp
+		}(jsonutils.Marshal(r))
+	}
+	return r.Response
+}
+
+// dnspod domain专用response
+type cnsJsonResponse struct {
+	Code     int          `json:"code"`
+	CodeDesc string       `json:"codeDesc"`
+	Message  string       `json:"message"`
+	Response *interface{} `json:"data"`
+}
+
+func (r *cnsJsonResponse) ParseErrorFromHTTPResponse(body []byte) (err error) {
+	resp := &wssJsonResponse{}
+	err = json.Unmarshal(body, resp)
+	if err != nil {
+		return
+	}
+	if resp.Code != 0 {
+		return sdkerrors.NewTencentCloudSDKError(resp.CodeDesc, resp.Message, "")
+	}
+
+	return nil
+}
+
+func (r *cnsJsonResponse) GetResponse() *interface{} {
 	if r.Response == nil {
 		return func(resp interface{}) *interface{} {
 			return &resp
@@ -509,6 +545,14 @@ func (client *SQcloudClient) wssRequest(apiName string, params map[string]string
 		return nil, err
 	}
 	return wssRequest(cli, apiName, params, client.debug)
+}
+
+func (client *SQcloudClient) cnsRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cli, err := client.getDefaultClient()
+	if err != nil {
+		return nil, err
+	}
+	return cnsRequest(cli, apiName, params, client.debug)
 }
 
 func (client *SQcloudClient) vpc2017Request(apiName string, params map[string]string) (jsonutils.JSONObject, error) {

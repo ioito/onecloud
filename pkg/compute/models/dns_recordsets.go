@@ -57,7 +57,7 @@ type SDnsRecordSet struct {
 
 	DnsType  string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"required"`
 	DnsValue string `width:"36" charset:"ascii" nullable:"false" list:"user" create:"required"`
-	TTL      int    `nullable:"false" list:"user" json:"ttl"`
+	TTL      int64  `nullable:"false" list:"user" json:"ttl"`
 }
 
 // 创建

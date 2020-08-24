@@ -1,0 +1,364 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package aws
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/aws/aws-sdk-go/service/route53"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+
+	"yunion.io/x/onecloud/pkg/cloudprovider"
+)
+
+type resourceRecord struct {
+	Value string `json:"Value"`
+}
+
+type SGeoLocationCode struct {
+	// The two-letter code for the continent.
+	//
+	// Valid values: AF | AN | AS | EU | OC | NA | SA
+	//
+	// Constraint: Specifying ContinentCode with either CountryCode or SubdivisionCode
+	// returns an InvalidInput error.
+	ContinentCode string `json:"ContinentCode"`
+
+	// The two-letter code for the country.
+	CountryCode string `json:"CountryCode"`
+
+	// The code for the subdivision. Route 53 currently supports only states in
+	// the United States.
+	SubdivisionCode string `json:"SubdivisionCode"`
+}
+
+type SAliasTarget struct {
+	DNSName              string `json:"DNSName"`
+	EvaluateTargetHealth *bool  `json:"EvaluateTargetHealth"`
+	HostedZoneId         string `json:"HostedZoneId"`
+}
+type SdnsRecordSet struct {
+	client                  *SAwsClient
+	AliasTarget             SAliasTarget `json:"AliasTarget"`
+	hostedzoneID            string
+	Name                    string           `json:"Name"`
+	ResourceRecords         []resourceRecord `json:"ResourceRecords"`
+	TTL                     int64            `json:"TTL"`
+	TrafficPolicyInstanceId string           `json:"TrafficPolicyInstanceId"`
+	Type                    string           `json:"Type"`
+	SetIdentifier           string           `json:"SetIdentifier"` // 区别 多值 等名称重复的记录
+	// policy info
+	Failover         string            `json:"Failover"`
+	GeoLocation      *SGeoLocationCode `json:"GeoLocation"`
+	Region           string            `json:"Region"` // latency based
+	MultiValueAnswer *bool             `json:"MultiValueAnswer"`
+	Weight           *int64            `json:"Weight"`
+
+	HealthCheckId string `json:"HealthCheckId"`
+	policyinfo    *jsonutils.JSONDict
+}
+
+func (client *SAwsClient) GetSdnsRecordSets(HostedZoneId string) ([]SdnsRecordSet, error) {
+	// ----
+	resourceRecordSets, err := client.GetRoute53ResourceRecordSets(HostedZoneId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "client.GetRoute53ResourceRecordSets(%s)", HostedZoneId)
+	}
+	result := []SdnsRecordSet{}
+	for i := 0; i < len(resourceRecordSets); i++ {
+		err = unmarshalAwsOutput(resourceRecordSets, "", &result)
+		if err != nil {
+			return nil, errors.Wrap(err, "unmarshalAwsOutput(ResourceRecordSets)")
+		}
+	}
+	return result, nil
+}
+
+func (client *SAwsClient) GetRoute53ResourceRecordSets(HostedZoneId string) ([]*route53.ResourceRecordSet, error) {
+	// client
+	s, err := client.getAwsRoute53Session()
+	if err != nil {
+		return nil, errors.Wrap(err, "region.getAwsRoute53Session()")
+	}
+	route53Client := route53.New(s)
+
+	// fetch records
+	resourceRecordSets := []*route53.ResourceRecordSet{}
+	listParams := route53.ListResourceRecordSetsInput{}
+	StartRecordName := ""
+	MaxItems := "100"
+	for true {
+		if len(StartRecordName) > 0 {
+			listParams.StartRecordName = &StartRecordName
+		}
+		listParams.MaxItems = &MaxItems
+		listParams.HostedZoneId = &HostedZoneId
+		ret, err := route53Client.ListResourceRecordSets(&listParams)
+		if err != nil {
+			return nil, errors.Wrap(err, "route53Client.ListResourceRecordSets()")
+		}
+		resourceRecordSets = append(resourceRecordSets, ret.ResourceRecordSets...)
+		if ret.IsTruncated == nil || !*ret.IsTruncated {
+			break
+		}
+		StartRecordName = *ret.NextRecordName
+	}
+	return resourceRecordSets, nil
+}
+
+// CREATE, DELETE, UPSERT
+func (client *SAwsClient) ChangeResourceRecordSets(action string, hostedZoneId string, resourceRecordSets ...*route53.ResourceRecordSet) error {
+	s, err := client.getAwsRoute53Session()
+	if err != nil {
+		return errors.Wrap(err, "region.getAwsRoute53Session()")
+	}
+	route53Client := route53.New(s)
+
+	ChangeBatch := route53.ChangeBatch{}
+	for i := 0; i < len(resourceRecordSets); i++ {
+		change := route53.Change{}
+		change.Action = &action
+		change.ResourceRecordSet = resourceRecordSets[i]
+		ChangeBatch.Changes = append(ChangeBatch.Changes, &change)
+	}
+
+	changeParams := route53.ChangeResourceRecordSetsInput{}
+	changeParams.HostedZoneId = &hostedZoneId
+	changeParams.ChangeBatch = &ChangeBatch
+	_, err = route53Client.ChangeResourceRecordSets(&changeParams)
+	if err != nil {
+		return errors.Wrap(err, "route53Client.ChangeResourceRecordSets(&params)")
+	}
+	return nil
+}
+
+func Getroute53ResourceRecordSet(opts *cloudprovider.DnsRecordSet) (*route53.ResourceRecordSet, error) {
+	resourceRecordSet := route53.ResourceRecordSet{}
+	resourceRecordSet.SetName(opts.DnsName)
+	resourceRecordSet.SetTTL(opts.Ttl)
+	resourceRecordSet.SetType(string(opts.DnsType))
+	if len(opts.ExternalId) > 0 {
+		resourceRecordSet.SetSetIdentifier(opts.ExternalId)
+	}
+	records := []*route53.ResourceRecord{}
+	values := strings.Split(opts.DnsValue, "*")
+	for i := 0; i < len(values); i++ {
+		records = append(records, &route53.ResourceRecord{Value: &values[i]})
+	}
+	resourceRecordSet.SetResourceRecords(records)
+
+	// traffic policy info--------------------------------------------
+	if len(opts.PolicyType) > 0 {
+		var healthCheckId string
+		err := opts.PolicyParms.Unmarshal(&healthCheckId, "HealthCheckId")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(HealthCheckId)", fmt.Sprintln(opts.PolicyParms))
+		}
+		resourceRecordSet.SetHealthCheckId(healthCheckId)
+	}
+
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeFailover {
+		var failover string
+		err := opts.PolicyParms.Unmarshal(&failover, "Failover")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(Failover)", fmt.Sprintln(opts.PolicyParms))
+		}
+
+		resourceRecordSet.SetFailover(failover)
+	}
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeByGeoLocation {
+		sGeo := SGeoLocationCode{}
+		err := opts.PolicyParms.Unmarshal(&sGeo, "GeoLocation")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(SGeoLocationCode)", fmt.Sprintln(opts.PolicyParms))
+		}
+		Geo := route53.GeoLocation{}
+		Geo.ContinentCode = &sGeo.ContinentCode
+		Geo.CountryCode = &sGeo.CountryCode
+		Geo.SubdivisionCode = &sGeo.SubdivisionCode
+		resourceRecordSet.SetGeoLocation(&Geo)
+	}
+
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeLatency {
+		var region string
+		err := opts.PolicyParms.Unmarshal(&region, "Region")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(region)", fmt.Sprintln(opts.PolicyParms))
+		}
+		resourceRecordSet.SetRegion(region)
+	}
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeMultiValueAnswer {
+		var multiValueAnswer bool
+		err := opts.PolicyParms.Unmarshal(&multiValueAnswer, "MultiValueAnswer")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(multiValueAnswer)", fmt.Sprintln(opts.PolicyParms))
+		}
+		resourceRecordSet.SetMultiValueAnswer(multiValueAnswer)
+	}
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeWeighted {
+		var Weight int64
+		err := opts.PolicyParms.Unmarshal(&Weight, "Weight")
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s Unmarshal(multiValueAnswer)", fmt.Sprintln(opts.PolicyParms))
+		}
+	}
+	return &resourceRecordSet, nil
+
+}
+
+func (client *SAwsClient) AddDnsRecordSet(hostedZoneId string, opts *cloudprovider.DnsRecordSet) error {
+	resourceRecordSet, err := Getroute53ResourceRecordSet(opts)
+	if err != nil {
+		return errors.Wrapf(err, "Getroute53ResourceRecordSet(%s)", fmt.Sprintln(opts))
+	}
+	err = client.ChangeResourceRecordSets("CREATE", hostedZoneId, resourceRecordSet)
+	if err != nil {
+		return errors.Wrapf(err, `self.client.changeResourceRecordSets(opts, "CREATE",%s)`, hostedZoneId)
+	}
+	return nil
+}
+
+func (client *SAwsClient) UpdateDnsRecordSet(hostedZoneId string, opts *cloudprovider.DnsRecordSet) error {
+	resourceRecordSet, err := Getroute53ResourceRecordSet(opts)
+	if err != nil {
+		return errors.Wrapf(err, "Getroute53ResourceRecordSet(%s)", fmt.Sprintln(opts))
+	}
+	err = client.ChangeResourceRecordSets("UPSERT", hostedZoneId, resourceRecordSet)
+	if err != nil {
+		return errors.Wrapf(err, `self.client.changeResourceRecordSets(opts, "CREATE",%s)`, hostedZoneId)
+	}
+	return nil
+}
+
+func (client *SAwsClient) RemoveDnsRecordSet(hostedZoneId string, opts *cloudprovider.DnsRecordSet) error {
+	resourceRecordSets, err := client.GetRoute53ResourceRecordSets(hostedZoneId)
+	if err != nil {
+		return errors.Wrapf(err, "self.client.GetRoute53ResourceRecordSets(%s)", hostedZoneId)
+	}
+	for i := 0; i < len(resourceRecordSets); i++ {
+		srecordSet := SdnsRecordSet{}
+		err = unmarshalAwsOutput(resourceRecordSets[i], "", &srecordSet)
+		if err != nil {
+			return errors.Wrap(err, "unmarshalAwsOutput(ResourceRecordSets)")
+		}
+		if srecordSet.match(opts) {
+			err := client.ChangeResourceRecordSets("DELETE", hostedZoneId, resourceRecordSets[i])
+			if err != nil {
+				return errors.Wrapf(err, `self.client.changeResourceRecordSets(opts, "DELETE",%s)`, hostedZoneId)
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+func (self *SdnsRecordSet) GetStatus() string {
+	return ""
+}
+
+func (self *SdnsRecordSet) GetGlobalId() string {
+	return self.SetIdentifier
+}
+func (self *SdnsRecordSet) GetDnsName() string {
+	return self.Name
+}
+func (self *SdnsRecordSet) GetDnsType() cloudprovider.TDnsType {
+	return cloudprovider.TDnsType(self.Type)
+}
+
+func (self *SdnsRecordSet) GetDnsValue() string {
+	var records []string
+	for i := 0; i < len(self.ResourceRecords); i++ {
+		records = append(records, self.ResourceRecords[i].Value)
+	}
+	return strings.Join(records, "*")
+}
+func (self *SdnsRecordSet) GetTTL() int64 {
+	return self.TTL
+}
+
+func (self *SdnsRecordSet) GetDnsIdentify() string {
+	return self.SetIdentifier
+}
+
+func (self *SdnsRecordSet) GetICloudVpcIds() ([]string, error) {
+	return nil, nil
+}
+
+// trafficpolicy 信息
+func (self *SdnsRecordSet) GetPolicyType() cloudprovider.TDnsPolicyType {
+	/*
+		Failover         string          `json:"Failover"`
+		GeoLocation      GeoLocationCode `json:"GeoLocation"`
+		Region           string          `json:"Region"` // latency based
+		MultiValueAnswer *bool           `json:"MultiValueAnswer"`
+		Weight           *int64          `json:"Weight"`
+	*/
+	self.policyinfo = jsonutils.NewDict()
+	self.policyinfo.Add(jsonutils.Marshal(self.HealthCheckId), "HealthCheckId")
+	if len(self.Failover) > 0 {
+		self.policyinfo.Add(jsonutils.Marshal(self.Failover), "Failover")
+		return cloudprovider.DnsPolicyTypeFailover
+	}
+	if self.GeoLocation != nil {
+		self.policyinfo.Add(jsonutils.Marshal(self.GeoLocation), "GeoLocation")
+		return cloudprovider.DnsPolicyTypeByGeoLocation
+	}
+	if len(self.Region) > 0 {
+		self.policyinfo.Add(jsonutils.Marshal(self.Region), "Region")
+		return cloudprovider.DnsPolicyTypeLatency
+	}
+	if self.MultiValueAnswer != nil {
+		self.policyinfo.Add(jsonutils.Marshal(self.MultiValueAnswer), "MultiValueAnswer")
+		return cloudprovider.DnsPolicyTypeMultiValueAnswer
+	}
+	if self.Weight != nil {
+		self.policyinfo.Add(jsonutils.Marshal(self.Weight), "Weight")
+		return cloudprovider.DnsPolicyTypeWeighted
+	}
+	return cloudprovider.DnsPolicyTypeSimple
+
+}
+func (self *SdnsRecordSet) GetParams() *jsonutils.JSONDict {
+	self.GetPolicyType()
+	return self.policyinfo
+}
+
+func (self *SdnsRecordSet) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
+	self.GetPolicyType()
+	return self.policyinfo
+}
+
+func (self *SdnsRecordSet) match(change *cloudprovider.DnsRecordSet) bool {
+	if change.DnsName != self.GetDnsName() {
+		return false
+	}
+	if change.DnsValue != self.GetDnsValue() {
+		return false
+	}
+	if change.Ttl != self.GetTTL() {
+		return false
+	}
+	if change.DnsType != self.GetDnsType() {
+		return false
+	}
+	if change.ExternalId != self.GetDnsIdentify() {
+		return false
+	}
+	return true
+}

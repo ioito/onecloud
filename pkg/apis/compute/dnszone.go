@@ -32,6 +32,8 @@ const (
 	DNS_ZONE_STATUS_ADD_VPCS_FAILED    = "add_vpcs_failed"
 	DNS_ZONE_STATUS_REMOVE_VPCS        = "remove_vpcs"
 	DNS_ZONE_STATUS_REMOVE_VPCS_FAILED = "remove_vpcs_failed"
+	DNS_ZONE_STATUS_DISABLED           = "disabled"
+	DNS_ZONE_STATUS_LOCKED             = "locked"
 )
 
 type DnsZoneCreateInput struct {

@@ -239,6 +239,15 @@ func (client *SAwsClient) getAwsSession(regionId string) (*session.Session, erro
 	return s, nil
 }
 
+func (client *SAwsClient) getAwsRoute53Session() (*session.Session, error) {
+	session, err := client.getDefaultSession()
+	if err != nil {
+		return nil, errors.Wrap(err, "client.getDefaultSession()")
+	}
+	session.ClientConfig(ROUTE53_SERVICE_NAME)
+	return session, nil
+}
+
 func (self *SAwsClient) invalidateIBuckets() {
 	self.iBuckets = nil
 }

@@ -1037,7 +1037,7 @@ type ICloudDnsRecordSet interface {
 	GetStatus() string
 	GetDnsType() TDnsType
 	GetDnsValue() string
-	GetTTL() int
+	GetTTL() int64
 
 	GetPolicyType() TDnsPolicyType
 	GetPolicyParams() TDnsPolicyTypeValue
