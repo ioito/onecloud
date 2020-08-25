@@ -34,4 +34,5 @@ func init() {
 	cmd.Perform("purge", &options.SDnsZoneIdOptions{})
 	cmd.Perform("add-vpcs", &options.DnsZoneAddVpcsOptions{})
 	cmd.Perform("remove-vpcs", &options.DnsZoneRemoveVpcsOptions{})
+	cmd.Perform("r------cs", &options.DnsZoneRemoveVpcsOptions{})
 }
