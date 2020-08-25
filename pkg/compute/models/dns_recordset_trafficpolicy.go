@@ -48,7 +48,7 @@ type SDnsRecordSetTrafficPolicy struct {
 	db.SJointResourceBase
 	DnsRecordsetId string `width:"36" charset:"ascii" nullable:"false" list:"user" json:"dns_recordset_id"`
 
-	TrafficPolicyId string `width:"36" charset:"ascii" nullable:"false" list:"user"`
+	DnsTrafficPolicyId string `width:"36" charset:"ascii" nullable:"false" list:"user"`
 }
 
 func (manager *SDnsRecordSetTrafficPolicyManager) GetMasterFieldName() string {

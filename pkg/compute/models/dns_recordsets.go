@@ -183,14 +183,14 @@ func (manager *SDnsRecordSetManager) FetchCustomizeColumns(
 	recordMaps := map[string][]string{}
 	policyIds := []string{}
 	for i := range recordSetPolicies {
-		if !utils.IsInStringArray(recordSetPolicies[i].TrafficPolicyId, policyIds) {
-			policyIds = append(policyIds, recordSetPolicies[i].TrafficPolicyId)
+		if !utils.IsInStringArray(recordSetPolicies[i].DnsTrafficPolicyId, policyIds) {
+			policyIds = append(policyIds, recordSetPolicies[i].DnsTrafficPolicyId)
 		}
 		_, ok := recordMaps[recordSetPolicies[i].DnsRecordsetId]
 		if !ok {
 			recordMaps[recordSetPolicies[i].DnsRecordsetId] = []string{}
 		}
-		recordMaps[recordSetPolicies[i].DnsRecordsetId] = append(recordMaps[recordSetPolicies[i].DnsRecordsetId], recordSetPolicies[i].TrafficPolicyId)
+		recordMaps[recordSetPolicies[i].DnsRecordsetId] = append(recordMaps[recordSetPolicies[i].DnsRecordsetId], recordSetPolicies[i].DnsTrafficPolicyId)
 	}
 	q = DnsTrafficPolicyManager.Query().In("id", policyIds)
 	policies := []SDnsTrafficPolicy{}
@@ -424,7 +424,7 @@ func (self *SDnsRecordSet) setTrafficPolicy(ctx context.Context, userCred mcclie
 	recordPolicy := &SDnsRecordSetTrafficPolicy{}
 	recordPolicy.SetModelManager(DnsRecordSetTrafficPolicyManager, recordPolicy)
 	recordPolicy.DnsRecordsetId = self.Id
-	recordPolicy.TrafficPolicyId = policy.Id
+	recordPolicy.DnsTrafficPolicyId = policy.Id
 
 	return DnsRecordSetTrafficPolicyManager.TableSpec().Insert(ctx, recordPolicy)
 }
