@@ -293,3 +293,13 @@ func (self *SAwsProvider) GetSamlEntityId() string {
 func (self *SAwsProvider) GetSamlSpInitiatedLoginUrl(idpName string) string {
 	return ""
 }
+
+func (self *SAwsProvider) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, error) {
+	return self.client.GetICloudDnsZones()
+}
+func (self *SAwsProvider) GetICloudDnsZoneById(id string) (cloudprovider.ICloudDnsZone, error) {
+	return self.client.GetHostedZoneById(id)
+}
+func (self *SAwsProvider) CreateICloudDnsZone(opts *cloudprovider.SDnsZoneCreateOptions) (cloudprovider.ICloudDnsZone, error) {
+	return self.client.CreateHostedZone(opts)
+}

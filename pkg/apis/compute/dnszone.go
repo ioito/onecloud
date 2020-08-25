@@ -36,6 +36,8 @@ const (
 	DNS_ZONE_STATUS_SYNC_RECORD_SETS_FAILED = "sync_record_sets_failed" // 同步解析列表失败
 	DNS_ZONE_STATUS_DELETING                = "deleting"                // 删除中
 	DNS_ZONE_STATUS_DELETE_FAILED           = "delete_failed"           // 删除失败
+	DNS_ZONE_STATUS_DISABLED                = "disabled"
+	DNS_ZONE_STATUS_LOCKED                  = "locked"
 )
 
 type DnsZoneFilterListBase struct {
