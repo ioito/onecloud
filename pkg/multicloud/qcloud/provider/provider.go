@@ -332,3 +332,13 @@ func (self *SQcloudProvider) GetSamlEntityId() string {
 func (self *SQcloudProvider) GetSamlSpInitiatedLoginUrl(idpName string) string {
 	return self.client.GetSamlSpInitiatedLoginUrl(idpName)
 }
+
+func (self *SQcloudProvider) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, error) {
+	return self.client.GetICloudDnsZones()
+}
+func (self *SQcloudProvider) GetICloudDnsZoneById(id string) (cloudprovider.ICloudDnsZone, error) {
+	return self.client.GetDomainById(id)
+}
+func (self *SQcloudProvider) CreateICloudDnsZone(opts *cloudprovider.SDnsZoneCreateOptions) (cloudprovider.ICloudDnsZone, error) {
+	return self.client.CreateICloudDnsZone(opts)
+}

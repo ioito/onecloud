@@ -43,6 +43,7 @@ const (
 	DnsPolicyTypeWeighted         = TDnsPolicyType("Weighted")         //加权
 	DnsPolicyTypeFailover         = TDnsPolicyType("Failover")         //故障转移
 	DnsPolicyTypeMultiValueAnswer = TDnsPolicyType("MultiValueAnswer") //多值应答
+	DnsPolicyTypeLatency          = TDnsPolicyType("Latency")
 )
 
 const (
