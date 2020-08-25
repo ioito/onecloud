@@ -43,6 +43,7 @@ const (
 	DnsPolicyTypeWeighted         = TDnsPolicyType("Weighted")         //加权
 	DnsPolicyTypeFailover         = TDnsPolicyType("Failover")         //故障转移
 	DnsPolicyTypeMultiValueAnswer = TDnsPolicyType("MultiValueAnswer") //多值应答
+	DnsPolicyTypeLatency          = TDnsPolicyType("Latency")
 )
 
 const (
@@ -100,18 +101,6 @@ type SDnsZoneCreateOptions struct {
 	Options  *jsonutils.JSONDict
 }
 
-<<<<<<< HEAD
-=======
-type SDnsTrafficPolicySetOptions struct {
-}
-
-type SAddDnsRecordSetOptions struct {
-}
-
-type SRemoveDnsRecordSetOptions struct {
-}
-
->>>>>>> feature: add dns interface
 func IsPolicyValueEqual(v1, v2 TDnsPolicyTypeValue) bool {
 	return jsonutils.Marshal(v1).Equals(jsonutils.Marshal(v2))
 }
