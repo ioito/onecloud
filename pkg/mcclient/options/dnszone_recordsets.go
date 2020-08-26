@@ -31,13 +31,16 @@ func (opts *DnsRecordSetListOptions) Params() (jsonutils.JSONObject, error) {
 type DnsRecordSetCreateOptions struct {
 	NAME        string
 	DNS_ZONE_ID string
-	Options     string
+	TTL         int64
+	DNS_TYPE    string `choices:"A|AAAA|CAA|CNAME|MX|NS|SRV|SOA|TXT|PRT|DS|DNSKEY|IPSECKEY|NAPTR|SPF|SSHFP|TLSA|REDIRECT_URL|FORWARD_URL"`
+	DNS_VALUE   string
+
+	Options string
 }
 
 func (opts *DnsRecordSetCreateOptions) Params() (jsonutils.JSONObject, error) {
-	params := jsonutils.NewDict()
-	params.Add(jsonutils.NewString(opts.NAME), "name")
-	params.Add(jsonutils.NewString(opts.DNS_ZONE_ID), "dns_zone_id")
+	params := jsonutils.Marshal(opts).(*jsonutils.JSONDict)
+	params.Remove("options")
 	if len(opts.Options) > 0 {
 		options, err := jsonutils.Parse([]byte(opts.Options))
 		if err != nil {
