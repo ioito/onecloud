@@ -667,7 +667,7 @@ func (self *SDnsZone) AllowPerformUncache(ctx context.Context, userCred mcclient
 }
 
 // 删除云账号的云上资源
-func (self *SDnsZone) PerformUnache(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneUnacheInput) (jsonutils.JSONObject, error) {
+func (self *SDnsZone) PerformUncache(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneUnacheInput) (jsonutils.JSONObject, error) {
 	if self.Status != api.DNS_ZONE_STATUS_AVAILABLE {
 		return nil, httperrors.NewInvalidStatusError("dns zone can not uncache in status %s", self.Status)
 	}
