@@ -298,7 +298,7 @@ func (self *SDomian) SyncDnsRecordSets(common, add, del, update []cloudprovider.
 			return errors.Wrapf(err, "self.RemoveDnsRecordSet(%s)", fmt.Sprintln(del[i]))
 		}
 	}
-	for i := 0; i < len(add); i++ {
+	for i := 0; i < len(update); i++ {
 		err := self.UpdateDnsRecordSet(&update[i])
 		if err != nil {
 			return errors.Wrapf(err, "self.UpdateDnsRecordSet(%s)", fmt.Sprintln(update[i]))

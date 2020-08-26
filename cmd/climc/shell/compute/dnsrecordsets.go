@@ -29,4 +29,5 @@ func init() {
 	cmd.Delete(&options.DnsRecordSetIdOptions{})
 	cmd.Perform("enable", &options.DnsRecordSetIdOptions{})
 	cmd.Perform("disable", &options.DnsRecordSetIdOptions{})
+	cmd.Perform("set-traffic-policies", &options.DnsRecordSetTrafficPolicyOptions{})
 }

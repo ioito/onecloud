@@ -103,12 +103,14 @@ func (self *SAwsProviderFactory) GetSupportedDnsPolicyTypes() map[cloudprovider.
 			cloudprovider.DnsPolicyTypeWeighted,
 			cloudprovider.DnsPolicyTypeFailover,
 			cloudprovider.DnsPolicyTypeMultiValueAnswer,
+			cloudprovider.DnsPolicyTypeLatency,
 		},
 		cloudprovider.PrivateZone: []cloudprovider.TDnsPolicyType{
 			cloudprovider.DnsPolicyTypeSimple,
 			cloudprovider.DnsPolicyTypeWeighted,
 			cloudprovider.DnsPolicyTypeFailover,
 			cloudprovider.DnsPolicyTypeMultiValueAnswer,
+			cloudprovider.DnsPolicyTypeLatency,
 		},
 	}
 }

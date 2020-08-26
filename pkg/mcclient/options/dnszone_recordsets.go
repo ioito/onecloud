@@ -72,3 +72,27 @@ func (opts *DnsRecordSetUpdateOptions) Params() (jsonutils.JSONObject, error) {
 	params.Remove("id")
 	return params, nil
 }
+
+type DnsRecordSetTrafficPolicyOptions struct {
+	DnsRecordSetIdOptions
+
+	PROVIDER    string `help:"provider" choices:"Qcloud|Aws"`
+	POLICY_TYPE string `help:"PolicyType" choices:"Simple|ByCarrier|ByGeoLocation|BySearchEngine|IpRange|Weighted|Failover|MultiValueAnswer|Latency"`
+	Policy      string `help:"Json format policy"`
+}
+
+func (opts DnsRecordSetTrafficPolicyOptions) Params() (jsonutils.JSONObject, error) {
+	params := jsonutils.NewArray()
+	policy := jsonutils.NewDict()
+	policy.Add(jsonutils.NewString(opts.PROVIDER), "provider")
+	policy.Add(jsonutils.NewString(opts.POLICY_TYPE), "policy_type")
+	if len(opts.Policy) > 0 {
+		value, err := jsonutils.Parse([]byte(opts.Policy))
+		if err != nil {
+			return nil, errors.Wrapf(err, "jsonutils.Parse(%s)", opts.Policy)
+		}
+		policy.Add(value, "policy_params")
+	}
+	params.Add(policy)
+	return jsonutils.Marshal(map[string]interface{}{"traffic_policies": params}), nil
+}

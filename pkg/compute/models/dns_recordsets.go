@@ -102,7 +102,7 @@ func (manager *SDnsRecordSetManager) ValidateCreateData(ctx context.Context, use
 			if policy.PolicyParams == nil {
 				return input, httperrors.NewMissingParameterError(fmt.Sprintf("missing %s policy params", policy.Provider))
 			}
-			if ok, _ := utils.InArray(policy.PolicyParams, policyValues); !ok {
+			if !cloudprovider.IsSupportPolicyValue(cloudprovider.TDnsPolicyTypeValue(policy.PolicyParams), policyValues) {
 				return input, httperrors.NewNotSupportedError("%s %s %s not support %s", policy.Provider, dnsZone.ZoneType, policy.PolicyType, policy.PolicyParams)
 			}
 		}
@@ -504,7 +504,7 @@ func (self *SDnsRecordSet) PerformSetTrafficPolicies(ctx context.Context, userCr
 			if policy.PolicyParams == nil {
 				return nil, httperrors.NewMissingParameterError(fmt.Sprintf("missing %s policy params", policy.Provider))
 			}
-			if ok, _ := utils.InArray(policy.PolicyParams, policyValues); !ok {
+			if !cloudprovider.IsSupportPolicyValue(cloudprovider.TDnsPolicyTypeValue(policy.PolicyParams), policyValues) {
 				return nil, httperrors.NewNotSupportedError("%s %s %s not support %s", policy.Provider, dnsZone.ZoneType, policy.PolicyType, policy.PolicyParams)
 			}
 		}

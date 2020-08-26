@@ -44,7 +44,7 @@ const (
 	DnsPolicyTypeWeighted         = TDnsPolicyType("Weighted")         //加权
 	DnsPolicyTypeFailover         = TDnsPolicyType("Failover")         //故障转移
 	DnsPolicyTypeMultiValueAnswer = TDnsPolicyType("MultiValueAnswer") //多值应答
-	DnsPolicyTypeLatency          = TDnsPolicyType("Latency")
+	DnsPolicyTypeLatency          = TDnsPolicyType("Latency")          //延迟
 )
 
 const (
@@ -124,6 +124,15 @@ type SDnsZoneCreateOptions struct {
 	ZoneType TDnsZoneType
 	Vpcs     []SPrivateZoneVpc
 	Options  *jsonutils.JSONDict
+}
+
+func IsSupportPolicyValue(v1 TDnsPolicyTypeValue, arr []TDnsPolicyTypeValue) bool {
+	for i := range arr {
+		if IsPolicyValueEqual(v1, arr[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func IsPolicyValueEqual(v1, v2 TDnsPolicyTypeValue) bool {
