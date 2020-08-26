@@ -278,6 +278,16 @@ func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient
 	}
 
 	common, add, del, update := cloudprovider.CompareDnsRecordSet(iRecordSets, dbRecordSets)
+	for i := range update {
+		_record, err := DnsRecordSetManager.FetchById(update[i].Id)
+		if err != nil {
+			return errors.Wrapf(err, "DnsRecordSetManager.FetchById(%s)", update[i].Id)
+		}
+		record := _record.(*SDnsRecordSet)
+		update[i].Ttl = record.TTL
+		update[i].Enabled = record.GetEnabled()
+	}
+
 	log.Infof("sync %s records for cloud common: %d add: %d del: %d update: %d", self.Name, len(common), len(add), len(del), len(update))
 	return iDnsZone.SyncDnsRecordSets(common, add, del, update)
 }
