@@ -55,8 +55,9 @@ type SAliasTarget struct {
 
 type SdnsRecordSet struct {
 	client                  *SAwsClient
-	AliasTarget             SAliasTarget `json:"AliasTarget"`
-	hostedzoneID            string
+	domainName              string
+	hostedZoneId            string
+	AliasTarget             SAliasTarget     `json:"AliasTarget"`
 	Name                    string           `json:"Name"`
 	ResourceRecords         []resourceRecord `json:"ResourceRecords"`
 	TTL                     int64            `json:"TTL"`
@@ -80,12 +81,11 @@ func (client *SAwsClient) GetSdnsRecordSets(HostedZoneId string) ([]SdnsRecordSe
 		return nil, errors.Wrapf(err, "client.GetRoute53ResourceRecordSets(%s)", HostedZoneId)
 	}
 	result := []SdnsRecordSet{}
-	for i := 0; i < len(resourceRecordSets); i++ {
-		err = unmarshalAwsOutput(resourceRecordSets, "", &result)
-		if err != nil {
-			return nil, errors.Wrap(err, "unmarshalAwsOutput(ResourceRecordSets)")
-		}
+	err = unmarshalAwsOutput(resourceRecordSets, "", &result)
+	if err != nil {
+		return nil, errors.Wrap(err, "unmarshalAwsOutput(ResourceRecordSets)")
 	}
+
 	return result, nil
 }
 
@@ -280,7 +280,10 @@ func (self *SdnsRecordSet) GetGlobalId() string {
 }
 
 func (self *SdnsRecordSet) GetDnsName() string {
-	return self.Name
+	if self.Name == self.domainName {
+		return "@"
+	}
+	return strings.TrimSuffix(self.Name, "."+self.domainName)
 }
 
 func (self *SdnsRecordSet) GetDnsType() cloudprovider.TDnsType {

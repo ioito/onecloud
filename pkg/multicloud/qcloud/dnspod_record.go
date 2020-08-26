@@ -122,6 +122,23 @@ func GetRecordLineLineType(policyinfo cloudprovider.TDnsPolicyTypeValue) string 
 		return "联通"
 	case cloudprovider.DnsPolicyTypeByCarrierChinaMobile:
 		return "移动"
+	case cloudprovider.DnsPolicyTypeByCarrierCernet:
+		return "教育网"
+
+	case cloudprovider.DnsPolicyTypeBySearchEngineBaidu:
+		return "百度"
+	case cloudprovider.DnsPolicyTypeBySearchEngineGoogle:
+		return "谷歌"
+	case cloudprovider.DnsPolicyTypeBySearchEngineYoudao:
+		return "有道"
+	case cloudprovider.DnsPolicyTypeBySearchEngineBing:
+		return "必应"
+	case cloudprovider.DnsPolicyTypeBySearchEngineSousou:
+		return "搜搜"
+	case cloudprovider.DnsPolicyTypeBySearchEngineSougou:
+		return "搜狗"
+	case cloudprovider.DnsPolicyTypeBySearchEngineQihu360:
+		return "奇虎"
 	default:
 		return "默认"
 	}
@@ -138,12 +155,11 @@ func (client *SQcloudClient) CreateDnsRecord(opts *cloudprovider.DnsRecordSet, d
 	if opts.Ttl > 604800 {
 		opts.Ttl = 604800
 	}
-	subDomain := strings.TrimSuffix(opts.DnsName, "."+domainName)
-	if len(subDomain) < 1 {
-		subDomain = "@"
+	if len(opts.DnsName) < 1 {
+		opts.DnsName = "@"
 	}
 	params["domain"] = domainName
-	params["subDomain"] = subDomain
+	params["subDomain"] = opts.DnsName
 	params["recordType"] = string(opts.DnsType)
 	params["ttl"] = strconv.FormatInt(opts.Ttl, 10)
 	params["value"] = opts.DnsValue
@@ -200,7 +216,7 @@ func (self *SDnsRecord) GetGlobalId() string {
 }
 
 func (self *SDnsRecord) GetDnsName() string {
-	return self.Name + "." + self.domainName
+	return self.Name
 }
 
 func (self *SDnsRecord) GetStatus() string {
@@ -238,8 +254,10 @@ func (self *SDnsRecord) GetPolicyType() cloudprovider.TDnsPolicyType {
 	switch self.Line {
 	case "境内", "境外":
 		policyType = cloudprovider.DnsPolicyTypeByGeoLocation
-	case "电信", "联通", "移动":
+	case "电信", "联通", "移动", "教育网":
 		policyType = cloudprovider.DnsPolicyTypeByCarrier
+	case "百度", "谷歌", "有道", "必应", "搜搜", "搜狗", "奇虎":
+		policyType = cloudprovider.DnsPolicyTypeBySearchEngine
 	default:
 		policyType = cloudprovider.DnsPolicyTypeSimple
 	}
@@ -252,12 +270,30 @@ func (self *SDnsRecord) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
 		self.policyinfo = cloudprovider.DnsPolicyTypeByGeoLocationMainland
 	case "境外":
 		self.policyinfo = cloudprovider.DnsPolicyTypeByGeoLocationOversea
+
 	case "电信":
 		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierTelecom
 	case "联通":
 		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierUnicom
 	case "移动":
 		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierChinaMobile
+	case "教育网":
+		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierCernet
+
+	case "百度":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineBaidu
+	case "谷歌":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineGoogle
+	case "有道":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineYoudao
+	case "必应":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineBing
+	case "搜搜":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineSousou
+	case "搜狗":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineSougou
+	case "奇虎":
+		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineQihu360
 	default:
 	}
 	return self.policyinfo
