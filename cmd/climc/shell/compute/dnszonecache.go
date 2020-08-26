@@ -14,29 +14,15 @@
 
 package compute
 
-import "yunion.io/x/onecloud/pkg/apis"
-
-const (
-	DNS_ZONE_CACHE_STATUS_DELETING      = "deleting"
-	DNS_ZONE_CACHE_STATUS_DELETE_FAILED = "delete_failed"
-	DNS_ZONE_CACHE_STATUS_CREATING      = "creating"
-	DNS_ZONE_CACHE_STATUS_CREATE_FAILED = "create_failed"
-	DNS_ZONE_CACHE_STATUS_AVAILABLE     = "available"
+import (
+	"yunion.io/x/onecloud/cmd/climc/shell"
+	"yunion.io/x/onecloud/pkg/mcclient/modules"
+	"yunion.io/x/onecloud/pkg/mcclient/options"
 )
 
-type DnsZoneCacheCreateInput struct {
-}
-
-type DnsZoneCacheDetails struct {
-	apis.StatusStandaloneResourceDetails
-
-	Account  string
-	Brand    string
-	Provider string
-}
-
-type DnsZoneCacheListInput struct {
-	apis.StatusStandaloneResourceListInput
-
-	CloudaccountId string `json:"cloudaccount_id"`
+func init() {
+	cmd := shell.NewResourceCmd(&modules.DnsZoneCaches).WithKeyword("dns-zone-cache")
+	cmd.List(&options.DnsZoneCacheListOptions{})
+	cmd.Show(&options.DnsZoneCacheIdOptions{})
+	cmd.Delete(&options.DnsZoneCacheIdOptions{})
 }

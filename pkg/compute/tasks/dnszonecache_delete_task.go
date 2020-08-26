@@ -48,7 +48,7 @@ func (self *DnsZoneCacheDeleteTask) taskComplete(ctx context.Context, cache *mod
 	if err == nil {
 		dnsZone.SetStatus(self.GetUserCred(), api.DNS_ZONE_STATUS_AVAILABLE, "")
 	}
-	cache.Delete(ctx, self.GetUserCred())
+	cache.RealDelete(ctx, self.GetUserCred())
 	self.SetStageComplete(ctx, nil)
 }
 

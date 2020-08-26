@@ -22,6 +22,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -83,6 +84,18 @@ func (manager *SDnsZoneCacheManager) ListItemFilter(
 	if err != nil {
 		return nil, err
 	}
+
+	if len(query.CloudaccountId) > 0 {
+		account, err := CloudaccountManager.FetchByIdOrName(userCred, query.CloudaccountId)
+		if err != nil {
+			if errors.Cause(err) == sql.ErrNoRows {
+				return nil, httperrors.NewResourceNotFoundError2("cloudaccount", query.CloudaccountId)
+			}
+			return nil, httperrors.NewGeneralError(err)
+		}
+		q = q.Equals("cloudaccount_id", account.GetId())
+	}
+
 	return q, nil
 }
 
@@ -105,12 +118,43 @@ func (manager *SDnsZoneCacheManager) FetchCustomizeColumns(
 ) []api.DnsZoneCacheDetails {
 	rows := make([]api.DnsZoneCacheDetails, len(objs))
 	stdRows := manager.SStatusStandaloneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	accountIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i] = api.DnsZoneCacheDetails{
 			StatusStandaloneResourceDetails: stdRows[i],
 		}
+		cache := objs[i].(*SDnsZoneCache)
+		accountIds[i] = cache.CloudaccountId
 	}
+	accounts := make(map[string]SCloudaccount)
+	err := db.FetchStandaloneObjectsByIds(CloudaccountManager, accountIds, &accounts)
+	if err != nil {
+		log.Errorf("FetchStandaloneObjectsByIds (%s) fail %s",
+			CloudaccountManager.KeywordPlural(), err)
+		return rows
+	}
+
+	for i := range rows {
+		if account, ok := accounts[accountIds[i]]; ok {
+			rows[i].Account = account.Name
+			rows[i].Brand = account.Brand
+			rows[i].Provider = account.Provider
+		}
+	}
+
 	return rows
+}
+
+func (self *SDnsZoneCache) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
+	return self.StartDnsZoneCacheDeleteTask(ctx, userCred, "")
+}
+
+func (self *SDnsZoneCache) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return nil
+}
+
+func (self *SDnsZoneCache) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return self.SStatusStandaloneResourceBase.Delete(ctx, userCred)
 }
 
 func (self *SDnsZoneCache) GetDnsZone() (*SDnsZone, error) {
@@ -130,10 +174,10 @@ func (self *SDnsZoneCache) syncRemove(ctx context.Context, userCred mcclient.Tok
 		if errors.Cause(err) != sql.ErrNoRows {
 			return errors.Wrapf(err, "GetDnsZone for %s", self.Name)
 		}
-		return self.Delete(ctx, userCred)
+		return self.RealDelete(ctx, userCred)
 	}
 	if cloudprovider.TDnsZoneType(dnsZone.ZoneType) == cloudprovider.PublicZone {
-		return self.Delete(ctx, userCred)
+		return self.RealDelete(ctx, userCred)
 	}
 
 	err = dnsZone.RealDelete(ctx, userCred)
@@ -141,7 +185,7 @@ func (self *SDnsZoneCache) syncRemove(ctx context.Context, userCred mcclient.Tok
 		return errors.Wrapf(err, "dnsZone.RealDelete for %s(%s)", dnsZone.Name, dnsZone.Id)
 	}
 
-	return self.Delete(ctx, userCred)
+	return self.RealDelete(ctx, userCred)
 }
 
 func (self *SDnsZoneCache) SyncWithCloudDnsZone(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsZone) error {
@@ -277,7 +321,20 @@ func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient
 		return errors.Wrapf(err, "GetRecordSets")
 	}
 
-	common, add, del, update := cloudprovider.CompareDnsRecordSet(iRecordSets, dbRecordSets, false)
+	var skipSoaAndNs = func(records []cloudprovider.DnsRecordSet) []cloudprovider.DnsRecordSet {
+		ret := []cloudprovider.DnsRecordSet{}
+		for i := range records {
+			if isIn, _ := utils.InArray(records[i].DnsType, []cloudprovider.TDnsType{cloudprovider.DnsTypeSOA, cloudprovider.DnsTypeSOA}); isIn {
+				continue
+			}
+			ret = append(ret, records[i])
+		}
+		return ret
+	}
+
+	add, del, update := []cloudprovider.DnsRecordSet{}, []cloudprovider.DnsRecordSet{}, []cloudprovider.DnsRecordSet{}
+	common, _add, _del, _update := cloudprovider.CompareDnsRecordSet(iRecordSets, dbRecordSets, false)
+	add, del, update = skipSoaAndNs(_add), skipSoaAndNs(_del), skipSoaAndNs(_update)
 	for i := range update {
 		_record, err := DnsRecordSetManager.FetchById(update[i].Id)
 		if err != nil {

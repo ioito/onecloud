@@ -97,9 +97,9 @@ func (manager *SDnsZoneManager) ValidateCreateData(ctx context.Context, userCred
 				if err != nil {
 					return input, httperrors.NewGeneralError(errors.Wrapf(err, "GetProviderFactory"))
 				}
-				dnsTypes := factory.GetSupportedDnsTypes()
-				if isIn, _ := utils.InArray(cloudprovider.PrivateZone, dnsTypes); !isIn {
-					return input, httperrors.NewNotSupportedError("Not support %s for vpc %s", cloudprovider.PrivateZone, vpc.Name)
+				zoneTypes := factory.GetSupportedDnsZoneTypes()
+				if isIn, _ := utils.InArray(cloudprovider.PrivateZone, zoneTypes); !isIn && len(zoneTypes) > 0 {
+					return input, httperrors.NewNotSupportedError("Not support %s for vpc %s, supported %s", input.ZoneType, vpc.Name, zoneTypes)
 				}
 			}
 			if managerId != vpc.ManagerId {
@@ -110,12 +110,21 @@ func (manager *SDnsZoneManager) ValidateCreateData(ctx context.Context, userCred
 		input.VpcIds = vpcIds
 	case cloudprovider.PublicZone:
 		if len(input.CloudaccountId) > 0 {
-			account, err := CloudaccountManager.FetchByIdOrName(userCred, input.CloudaccountId)
+			_account, err := CloudaccountManager.FetchByIdOrName(userCred, input.CloudaccountId)
 			if err != nil {
 				if errors.Cause(err) == sql.ErrNoRows {
 					return input, httperrors.NewResourceNotFoundError2("cloudaccount", input.CloudaccountId)
 				}
 				return input, httperrors.NewGeneralError(err)
+			}
+			account := _account.(*SCloudaccount)
+			factory, err := account.GetProviderFactory()
+			if err != nil {
+				return input, httperrors.NewGeneralError(errors.Wrapf(err, "GetProviderFactory"))
+			}
+			zoneTypes := factory.GetSupportedDnsZoneTypes()
+			if isIn, _ := utils.InArray(cloudprovider.PublicZone, zoneTypes); !isIn && len(zoneTypes) > 0 {
+				return input, httperrors.NewNotSupportedError("Not support %s for account %s, supported %s", input.ZoneType, account.Name, zoneTypes)
 			}
 			input.CloudaccountId = account.GetId()
 		} else {
