@@ -113,7 +113,6 @@ func GetRecordLineLineType(policyinfo cloudprovider.TDnsPolicyTypeValue) string 
 		return "境内"
 	case cloudprovider.DnsPolicyTypeByGeoLocationOversea:
 		return "境外"
-
 	case cloudprovider.DnsPolicyTypeByCarrierTelecom:
 		return "电信"
 	case cloudprovider.DnsPolicyTypeByCarrierUnicom:
@@ -123,7 +122,6 @@ func GetRecordLineLineType(policyinfo cloudprovider.TDnsPolicyTypeValue) string 
 	default:
 		return "默认"
 	}
-	return "默认"
 }
 
 // https://cloud.tencent.com/document/api/302/8516
@@ -225,16 +223,14 @@ func (self *SDnsRecord) GetTTL() int64 {
 }
 
 func (self *SDnsRecord) GetPolicyType() cloudprovider.TDnsPolicyType {
-	var policyType cloudprovider.TDnsPolicyType
 	switch self.Line {
 	case "境内", "境外":
-		policyType = cloudprovider.DnsPolicyTypeByGeoLocation
+		return cloudprovider.DnsPolicyTypeByGeoLocation
 	case "电信", "联通", "移动":
-		policyType = cloudprovider.DnsPolicyTypeByCarrier
+		return cloudprovider.DnsPolicyTypeByCarrier
 	default:
-		policyType = cloudprovider.DnsPolicyTypeSimple
+		return cloudprovider.DnsPolicyTypeSimple
 	}
-	return policyType
 }
 
 func (self *SDnsRecord) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
@@ -252,23 +248,4 @@ func (self *SDnsRecord) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
 	default:
 	}
 	return self.policyinfo
-}
-
-func (self *SDnsRecord) match(change *cloudprovider.DnsRecordSet) bool {
-	if change.DnsName != self.GetDnsName() {
-		return false
-	}
-	if change.DnsValue != self.GetDnsValue() {
-		return false
-	}
-	if change.Ttl != self.GetTTL() {
-		return false
-	}
-	if change.DnsType != self.GetDnsType() {
-		return false
-	}
-	if change.ExternalId != self.GetGlobalId() {
-		return false
-	}
-	return true
 }
