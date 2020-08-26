@@ -126,6 +126,15 @@ func (self *DnsZoneCreateTask) OnInit(ctx context.Context, obj db.IStandaloneMod
 		logclient.AddActionLogWithContext(ctx, cache, logclient.ACT_CREATE, nil, self.UserCred, true)
 	}
 
+	self.SetStage("OnSyncRecordSetComplete", nil)
+	dnsZone.StartDnsZoneSyncRecordSetsTask(ctx, self.GetUserCred(), self.GetTaskId())
+}
+
+func (self *DnsZoneCreateTask) OnSyncRecordSetComplete(ctx context.Context, dnsZone *models.SDnsZone, data jsonutils.JSONObject) {
 	dnsZone.SetStatus(self.GetUserCred(), api.DNS_ZONE_STATUS_AVAILABLE, "")
 	self.SetStageComplete(ctx, nil)
+}
+
+func (self *DnsZoneCreateTask) OnSyncRecordSetCompleteFailed(ctx context.Context, dnsZone *models.SDnsZone, data jsonutils.JSONObject) {
+	self.SetStageFailed(ctx, data)
 }

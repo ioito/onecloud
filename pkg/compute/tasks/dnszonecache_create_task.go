@@ -91,5 +91,14 @@ func (self *DnsZoneCacheCreateTask) OnInit(ctx context.Context, obj db.IStandalo
 		return
 	}
 
+	self.SetStage("OnSyncRecordSetComplete", nil)
+	dnsZone.StartDnsZoneSyncRecordSetsTask(ctx, self.GetUserCred(), self.GetTaskId())
+}
+
+func (self *DnsZoneCacheCreateTask) OnSyncRecordSetComplete(ctx context.Context, cache *models.SDnsZoneCache, data jsonutils.JSONObject) {
 	self.taskComplete(ctx, cache)
+}
+
+func (self *DnsZoneCacheCreateTask) OnSyncRecordSetCompleteFailed(ctx context.Context, cache *models.SDnsZoneCache, data jsonutils.JSONObject) {
+	self.SetStageFailed(ctx, data)
 }
