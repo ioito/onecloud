@@ -277,7 +277,7 @@ func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient
 		return errors.Wrapf(err, "GetRecordSets")
 	}
 
-	common, add, del, update := cloudprovider.CompareDnsRecordSet(iRecordSets, dbRecordSets)
+	common, add, del, update := cloudprovider.CompareDnsRecordSet(iRecordSets, dbRecordSets, false)
 	for i := range update {
 		_record, err := DnsRecordSetManager.FetchById(update[i].Id)
 		if err != nil {

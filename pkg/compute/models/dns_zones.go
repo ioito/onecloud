@@ -476,7 +476,7 @@ func (self *SDnsZone) SyncDnsRecordSets(ctx context.Context, userCred mcclient.T
 		local = append(local, record)
 	}
 
-	_, del, add, update := cloudprovider.CompareDnsRecordSet(iRecords, local)
+	_, del, add, update := cloudprovider.CompareDnsRecordSet(iRecords, local, false)
 	for i := range add {
 		_, err := self.newFromCloudDnsRecordSet(ctx, userCred, provider, add[i])
 		if err != nil {

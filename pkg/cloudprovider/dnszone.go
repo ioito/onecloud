@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 )
 
 type TDnsZoneType string
@@ -66,6 +67,30 @@ const (
 	DnsTypeTLSA         = TDnsType("TLSA")
 	DnsTypeREDIRECT_URL = TDnsType("REDIRECT_URL") //显性URL转发
 	DnsTypeFORWARD_URL  = TDnsType("FORWARD_URL")  //隐性URL转发
+)
+
+var (
+	SUPPORTED_DNS_TYPES = []TDnsType{
+		DnsTypeA,
+		DnsTypeAAAA,
+		DnsTypeCAA,
+		DnsTypeCNAME,
+		DnsTypeMX,
+		DnsTypeNS,
+		DnsTypeSRV,
+		DnsTypeSOA,
+		DnsTypeTXT,
+		DnsTypePTR,
+		DnsTypeDS,
+		DnsTypeDNSKEY,
+		DnsTypeIPSECKEY,
+		DnsTypeNAPTR,
+		DnsTypeSPF,
+		DnsTypeSSHFP,
+		DnsTypeTLSA,
+		DnsTypeREDIRECT_URL,
+		DnsTypeFORWARD_URL,
+	}
 )
 
 var (
@@ -119,6 +144,46 @@ type DnsRecordSet struct {
 	PolicyParams TDnsPolicyTypeValue
 }
 
+func (r DnsRecordSet) GetGlobalId() string {
+	return r.ExternalId
+}
+
+func (r DnsRecordSet) GetName() string {
+	return r.DnsName
+}
+
+func (r DnsRecordSet) GetDnsName() string {
+	return r.DnsName
+}
+
+func (r DnsRecordSet) GetDnsValue() string {
+	return r.DnsValue
+}
+
+func (r DnsRecordSet) GetPolicyType() TDnsPolicyType {
+	return r.PolicyType
+}
+
+func (r DnsRecordSet) GetPolicyParams() TDnsPolicyTypeValue {
+	return r.PolicyParams
+}
+
+func (r DnsRecordSet) GetStatus() string {
+	return r.Status
+}
+
+func (r DnsRecordSet) GetTTL() int64 {
+	return r.Ttl
+}
+
+func (r DnsRecordSet) GetDnsType() TDnsType {
+	return r.DnsType
+}
+
+func (r DnsRecordSet) GetEnabled() bool {
+	return r.Enabled
+}
+
 func (record DnsRecordSet) Equals(r DnsRecordSet) bool {
 	if record.DnsName != r.DnsName {
 		return false
@@ -162,28 +227,14 @@ func (records DnsRecordSets) Swap(i, j int) {
 }
 
 func (records DnsRecordSets) Less(i, j int) bool {
-	if records[i].DnsName < records[j].DnsName {
-		return true
-	}
-	if records[i].DnsType < records[j].DnsType {
-		return true
-	}
-	if records[i].DnsValue < records[j].DnsValue {
-		return true
-	}
-	if records[i].PolicyType < records[j].PolicyType {
-		return true
-	}
-	if records[i].PolicyParams != nil && records[j].PolicyParams != nil && records[i].PolicyParams.String() < records[j].PolicyParams.String() {
-		return true
-	}
-	return false
+	return strings.Compare(records[i].String(), records[j].String()) < 0
 }
 
-func CompareDnsRecordSet(iRecords []ICloudDnsRecordSet, local []DnsRecordSet) ([]DnsRecordSet, []DnsRecordSet, []DnsRecordSet, []DnsRecordSet) {
-	remote := DnsRecordSets{}
+func CompareDnsRecordSet(iRecords []ICloudDnsRecordSet, locals []DnsRecordSet, debug bool) ([]DnsRecordSet, []DnsRecordSet, []DnsRecordSet, []DnsRecordSet) {
+	remote := map[TDnsType]DnsRecordSets{}
+	local := map[TDnsType]DnsRecordSets{}
 	for i := range iRecords {
-		remote = append(remote, DnsRecordSet{
+		record := DnsRecordSet{
 			ExternalId: iRecords[i].GetGlobalId(),
 
 			DnsName:      iRecords[i].GetDnsName(),
@@ -194,39 +245,69 @@ func CompareDnsRecordSet(iRecords []ICloudDnsRecordSet, local []DnsRecordSet) ([
 			Ttl:          iRecords[i].GetTTL(),
 			PolicyType:   iRecords[i].GetPolicyType(),
 			PolicyParams: iRecords[i].GetPolicyParams(),
-		})
+		}
+		_, ok := remote[record.DnsType]
+		if !ok {
+			remote[record.DnsType] = DnsRecordSets{}
+		}
+		remote[record.DnsType] = append(remote[record.DnsType], record)
 	}
-	sort.Sort(remote)
-	sort.Sort(DnsRecordSets(local))
-	common, add, del, update := []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}
-	i, j := 0, 0
-	for i < len(local) || j < len(remote) {
-		if i < len(local) && j < len(remote) {
-			l, r := local[i].String(), remote[j].String()
-			cmp := strings.Compare(l, r)
-			if cmp == 0 {
-				remote[j].Id = local[i].Id
-				if local[i].Equals(remote[j]) {
-					common = append(common, remote[j])
-				} else {
-					update = append(update, remote[j])
+	for i := range locals {
+		_, ok := local[locals[i].DnsType]
+		if !ok {
+			local[locals[i].DnsType] = DnsRecordSets{}
+		}
+		local[locals[i].DnsType] = append(local[locals[i].DnsType], locals[i])
+	}
+
+	var compare = func(remote, local DnsRecordSets) ([]DnsRecordSet, []DnsRecordSet, []DnsRecordSet, []DnsRecordSet) {
+		common, add, del, update := []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}
+		i, j := 0, 0
+		for i < len(local) || j < len(remote) {
+			if i < len(local) && j < len(remote) {
+				l, r := local[i].String(), remote[j].String()
+				if debug {
+					log.Debugf("compare %s -> %s", l, r)
 				}
-				i++
-				j++
-			} else if cmp < 0 {
+				cmp := strings.Compare(l, r)
+				if cmp == 0 {
+					remote[j].Id = local[i].Id
+					if local[i].Equals(remote[j]) {
+						common = append(common, remote[j])
+					} else {
+						update = append(update, remote[j])
+					}
+					i++
+					j++
+				} else if cmp < 0 {
+					del = append(del, remote[j])
+					j++
+				} else {
+					add = append(add, local[i])
+					i++
+				}
+			} else if i >= len(local) {
 				del = append(del, remote[j])
 				j++
-			} else {
+			} else if j >= len(remote) {
 				add = append(add, local[i])
 				i++
 			}
-		} else if i >= len(local) {
-			del = append(del, remote[j])
-			j++
-		} else if j >= len(remote) {
-			add = append(add, local[i])
-			i++
 		}
+		return common, add, del, update
+	}
+
+	common, add, del, update := []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}, []DnsRecordSet{}
+	for _, dnsType := range SUPPORTED_DNS_TYPES {
+		_remote, _ := remote[dnsType]
+		_local, _ := local[dnsType]
+		sort.Sort(_remote)
+		sort.Sort(_local)
+		_common, _add, _del, _update := compare(_remote, _local)
+		common = append(common, _common...)
+		add = append(add, _add...)
+		del = append(del, _del...)
+		update = append(update, _update...)
 	}
 	return common, add, del, update
 }
