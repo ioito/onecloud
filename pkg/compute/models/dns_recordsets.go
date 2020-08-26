@@ -61,7 +61,7 @@ type SDnsRecordSet struct {
 	SDnsZoneResourceBase
 
 	DnsType  string `width:"36" charset:"ascii" nullable:"false" list:"user" update:"domain" create:"domain_required"`
-	DnsValue string `width:"36" charset:"ascii" nullable:"false" list:"user" update:"domain" create:"domain_required"`
+	DnsValue string `width:"256" charset:"ascii" nullable:"false" list:"user" update:"domain" create:"domain_required"`
 	TTL      int64  `nullable:"false" list:"user" update:"domain" create:"domain_required" json:"ttl"`
 }
 

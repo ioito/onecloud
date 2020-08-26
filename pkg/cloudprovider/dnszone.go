@@ -219,10 +219,7 @@ func (record DnsRecordSet) Equals(r DnsRecordSet) bool {
 }
 
 func (record DnsRecordSet) String() string {
-	if record.PolicyParams != nil {
-		return fmt.Sprintf("%s-%s-%s-%s-%s", record.DnsName, record.DnsType, record.DnsValue, record.PolicyType, record.PolicyParams.String())
-	}
-	return fmt.Sprintf("%s-%s-%s-%s", record.DnsName, record.DnsType, record.DnsValue, record.PolicyType)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", record.DnsName, record.DnsType, record.DnsValue, record.PolicyType, jsonutils.Marshal(record.PolicyParams).String())
 }
 
 type DnsRecordSets []DnsRecordSet
@@ -236,7 +233,19 @@ func (records DnsRecordSets) Swap(i, j int) {
 }
 
 func (records DnsRecordSets) Less(i, j int) bool {
-	return strings.Compare(records[i].String(), records[j].String()) < 0
+	if strings.Compare(string(records[i].DnsType), string(records[j].DnsType)) < 0 {
+		return true
+	}
+	if strings.Compare(records[i].DnsName, records[j].DnsName) < 0 {
+		return true
+	}
+	if strings.Compare(records[i].DnsValue, records[j].DnsValue) < 0 {
+		return true
+	}
+	if strings.Compare(string(records[i].PolicyType), string(records[j].PolicyType)) < 0 {
+		return true
+	}
+	return strings.Compare(jsonutils.Marshal(records[i].PolicyParams).String(), jsonutils.Marshal(records[j].PolicyParams).String()) < 0
 }
 
 func CompareDnsRecordSet(iRecords []ICloudDnsRecordSet, locals []DnsRecordSet, debug bool) ([]DnsRecordSet, []DnsRecordSet, []DnsRecordSet, []DnsRecordSet) {
