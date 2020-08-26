@@ -322,6 +322,10 @@ func (self *ShostedZone) fetchRecordSets() error {
 	if err != nil {
 		return errors.Wrapf(err, "self.client.GetSdnsRecordSets(%s)", self.ID)
 	}
+	for i := 0; i < len(recordSets); i++ {
+		recordSets[i].domainName = self.GetName()
+		recordSets[i].hostedZoneId = self.GetId()
+	}
 	self.recordSets = recordSets
 	return nil
 }
@@ -342,22 +346,49 @@ func (self *ShostedZone) GetIDnsRecordSets() ([]cloudprovider.ICloudDnsRecordSet
 
 func (self *ShostedZone) SyncDnsRecordSets(common, add, del, update []cloudprovider.DnsRecordSet) error {
 	for i := 0; i < len(add); i++ {
-		err := self.client.AddDnsRecordSet(self.ID, &add[i])
+		err := self.AddDnsRecordSet(&add[i])
 		if err != nil {
 			return errors.Wrap(err, "self.AddDnsRecordSet()")
 		}
 	}
 	for i := 0; i < len(del); i++ {
-		err := self.client.RemoveDnsRecordSet(self.ID, &del[i])
+		err := self.RemoveDnsRecordSet(&del[i])
 		if err != nil {
 			return errors.Wrap(err, "self.RemoveDnsRecordSet()")
 		}
 	}
 	for i := 0; i < len(update); i++ {
-		err := self.client.UpdateDnsRecordSet(self.ID, &update[i])
+		err := self.UpdateDnsRecordSet(&update[i])
 		if err != nil {
 			return errors.Wrap(err, "self.UpdateDnsRecordSet()")
 		}
 	}
 	return nil
+}
+
+func (self *ShostedZone) AddDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
+		opts.DnsName = self.Name
+	} else {
+		opts.DnsName = opts.DnsName + "." + self.Name
+	}
+	return self.client.AddDnsRecordSet(self.ID, opts)
+}
+
+func (self *ShostedZone) UpdateDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
+		opts.DnsName = self.Name
+	} else {
+		opts.DnsName = opts.DnsName + "." + self.Name
+	}
+	return self.client.UpdateDnsRecordSet(self.ID, opts)
+}
+
+func (self *ShostedZone) RemoveDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
+		opts.DnsName = self.Name
+	} else {
+		opts.DnsName = opts.DnsName + "." + self.Name
+	}
+	return self.client.RemoveDnsRecordSet(self.ID, opts)
 }
