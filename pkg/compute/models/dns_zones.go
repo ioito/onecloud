@@ -91,6 +91,17 @@ func (manager *SDnsZoneManager) ValidateCreateData(ctx context.Context, userCred
 			if len(managerId) == 0 {
 				managerId = vpc.ManagerId
 			}
+			account := vpc.GetCloudaccount()
+			if account != nil {
+				factory, err := account.GetProviderFactory()
+				if err != nil {
+					return input, httperrors.NewGeneralError(errors.Wrapf(err, "GetProviderFactory"))
+				}
+				dnsTypes := factory.GetSupportedDnsTypes()
+				if isIn, _ := utils.InArray(cloudprovider.PrivateZone, dnsTypes); !isIn {
+					return input, httperrors.NewNotSupportedError("Not support %s for vpc %s", cloudprovider.PrivateZone, vpc.Name)
+				}
+			}
 			if managerId != vpc.ManagerId {
 				return input, httperrors.NewConflictError("vpc ids not with same account")
 			}
