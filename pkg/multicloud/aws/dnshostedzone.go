@@ -200,6 +200,7 @@ func (client *SAwsClient) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, er
 	}
 	result := []cloudprovider.ICloudDnsZone{}
 	for i := 0; i < len(hostedZones); i++ {
+		hostedZones[i].client = client
 		result = append(result, &hostedZones[i])
 	}
 	return result, nil
@@ -218,7 +219,7 @@ func (client *SAwsClient) GetHostedZoneById(ID string) (*ShostedZone, error) {
 		return nil, errors.Wrap(err, "route53Client.GetHostedZone()")
 	}
 
-	result := ShostedZone{}
+	result := ShostedZone{client: client}
 	err = unmarshalAwsOutput(ret, "HostedZone", &result)
 	if err != nil {
 		return nil, errors.Wrap(err, "unmarshalAwsOutput(HostedZone)")
