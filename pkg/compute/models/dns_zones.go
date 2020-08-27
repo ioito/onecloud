@@ -561,13 +561,13 @@ func (self *SDnsZone) newFromCloudDnsRecordSet(ctx context.Context, userCred mcc
 	return record, nil
 }
 
-func (self *SDnsZone) AllowPerformSyncRecordSets(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
-	return db.IsDomainAllowPerform(userCred, self, "sync-record-sets")
+func (self *SDnsZone) AllowPerformSyncRecordsets(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
+	return db.IsDomainAllowPerform(userCred, self, "sync-recordsets")
 }
 
 // 同步解析列表到云上
-func (self *SDnsZone) PerformSyncRecordSets(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneSyncRecordSetsInput) (jsonutils.JSONObject, error) {
-	if self.Status != api.DNS_ZONE_STATUS_AVAILABLE {
+func (self *SDnsZone) PerformSyncRecordsets(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneSyncRecordSetsInput) (jsonutils.JSONObject, error) {
+	if !utils.IsInStringArray(self.Status, []string{api.DNS_ZONE_STATUS_AVAILABLE, api.DNS_ZONE_STATUS_SYNC_RECORD_SETS_FAILED}) {
 		return nil, httperrors.NewInvalidStatusError("can not sync record sets in %s", self.Status)
 	}
 	return nil, self.StartDnsZoneSyncRecordSetsTask(ctx, userCred, "")

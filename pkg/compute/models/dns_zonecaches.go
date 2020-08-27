@@ -313,6 +313,11 @@ func (self *SDnsZoneCache) GetRecordSets() ([]cloudprovider.DnsRecordSet, error)
 }
 
 func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient.TokenCredential) error {
+	account, err := self.GetCloudaccount()
+	if err != nil {
+		return errors.Wrapf(err, "GetCloudaccount")
+	}
+
 	iDnsZone, err := self.GetICloudDnsZone()
 	if err != nil {
 		return errors.Wrapf(err, "GetICloudDnsZone")
@@ -329,7 +334,7 @@ func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient
 	var skipSoaAndNs = func(records []cloudprovider.DnsRecordSet) []cloudprovider.DnsRecordSet {
 		ret := []cloudprovider.DnsRecordSet{}
 		for i := range records {
-			if isIn, _ := utils.InArray(records[i].DnsType, []cloudprovider.TDnsType{cloudprovider.DnsTypeSOA, cloudprovider.DnsTypeSOA}); isIn {
+			if isIn, _ := utils.InArray(records[i].DnsType, []cloudprovider.TDnsType{cloudprovider.DnsTypeSOA, cloudprovider.DnsTypeNS}); isIn {
 				continue
 			}
 			ret = append(ret, records[i])
@@ -350,7 +355,7 @@ func (self *SDnsZoneCache) SyncRecordSets(ctx context.Context, userCred mcclient
 		update[i].Enabled = record.GetEnabled()
 	}
 
-	log.Infof("sync %s records for cloud common: %d add: %d del: %d update: %d", self.Name, len(common), len(add), len(del), len(update))
+	log.Infof("sync %s records for %s(%s) common: %d add: %d del: %d update: %d", self.Name, account.Name, account.Provider, len(common), len(add), len(del), len(update))
 	return iDnsZone.SyncDnsRecordSets(common, add, del, update)
 }
 

@@ -28,7 +28,7 @@ func init() {
 	cmd.Delete(&options.SDnsZoneIdOptions{})
 	cmd.Create(&options.DnsZoneCreateOptions{})
 	cmd.Perform("syncstatus", &options.SDnsZoneIdOptions{})
-	cmd.Perform("sync-record-sets", &options.SDnsZoneIdOptions{})
+	cmd.Perform("sync-recordsets", &options.SDnsZoneIdOptions{})
 	cmd.Perform("cache", &options.DnsZoneCacheOptions{})
 	cmd.Perform("uncache", &options.DnsZoneUncacheOptions{})
 	cmd.Perform("purge", &options.SDnsZoneIdOptions{})
