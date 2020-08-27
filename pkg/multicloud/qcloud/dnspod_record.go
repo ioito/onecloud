@@ -32,10 +32,7 @@ type SRecordCountInfo struct {
 }
 
 type SDnsRecord struct {
-	client     *SQcloudClient
-	policyinfo cloudprovider.TDnsPolicyTypeValue
-
-	domainName string
+	domain     *SDomian
 	ID         int    `json:"id"`
 	TTL        int    `json:"ttl"`
 	Value      string `json:"value"`
@@ -77,11 +74,6 @@ func (client *SQcloudClient) GetDnsRecords(sDomainName string, offset int, limit
 	if err != nil {
 		return nil, 0, errors.Wrapf(err, "strconv.Atoi(%s)", count.RecordTotal)
 	}
-
-	for i := 0; i < len(records); i++ {
-		records[i].client = client
-		records[i].domainName = sDomainName
-	}
 	return records, RecordTotal, nil
 }
 
@@ -99,10 +91,6 @@ func (client *SQcloudClient) GetAllDnsRecords(sDomainName string) ([]SDnsRecord,
 		if total <= count {
 			break
 		}
-	}
-	for i := 0; i < len(result); i++ {
-		result[i].client = client
-		result[i].domainName = sDomainName
 	}
 	return result, nil
 }
@@ -241,11 +229,11 @@ func (self *SDnsRecord) GetTTL() int64 {
 func (self *SDnsRecord) GetPolicyType() cloudprovider.TDnsPolicyType {
 	switch self.Line {
 	case "境内", "境外":
-		policyType = cloudprovider.DnsPolicyTypeByGeoLocation
+		return cloudprovider.DnsPolicyTypeByGeoLocation
 	case "电信", "联通", "移动", "教育网":
-		policyType = cloudprovider.DnsPolicyTypeByCarrier
+		return cloudprovider.DnsPolicyTypeByCarrier
 	case "百度", "谷歌", "有道", "必应", "搜搜", "搜狗", "奇虎":
-		policyType = cloudprovider.DnsPolicyTypeBySearchEngine
+		return cloudprovider.DnsPolicyTypeBySearchEngine
 	default:
 		return cloudprovider.DnsPolicyTypeSimple
 	}
@@ -254,34 +242,34 @@ func (self *SDnsRecord) GetPolicyType() cloudprovider.TDnsPolicyType {
 func (self *SDnsRecord) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
 	switch self.Line {
 	case "境内":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByGeoLocationMainland
+		return cloudprovider.DnsPolicyTypeByGeoLocationMainland
 	case "境外":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByGeoLocationOversea
+		return cloudprovider.DnsPolicyTypeByGeoLocationOversea
 
 	case "电信":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierTelecom
+		return cloudprovider.DnsPolicyTypeByCarrierTelecom
 	case "联通":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierUnicom
+		return cloudprovider.DnsPolicyTypeByCarrierUnicom
 	case "移动":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierChinaMobile
+		return cloudprovider.DnsPolicyTypeByCarrierChinaMobile
 	case "教育网":
-		self.policyinfo = cloudprovider.DnsPolicyTypeByCarrierCernet
+		return cloudprovider.DnsPolicyTypeByCarrierCernet
 
 	case "百度":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineBaidu
+		return cloudprovider.DnsPolicyTypeBySearchEngineBaidu
 	case "谷歌":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineGoogle
+		return cloudprovider.DnsPolicyTypeBySearchEngineGoogle
 	case "有道":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineYoudao
+		return cloudprovider.DnsPolicyTypeBySearchEngineYoudao
 	case "必应":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineBing
+		return cloudprovider.DnsPolicyTypeBySearchEngineBing
 	case "搜搜":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineSousou
+		return cloudprovider.DnsPolicyTypeBySearchEngineSousou
 	case "搜狗":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineSougou
+		return cloudprovider.DnsPolicyTypeBySearchEngineSougou
 	case "奇虎":
-		self.policyinfo = cloudprovider.DnsPolicyTypeBySearchEngineQihu360
+		return cloudprovider.DnsPolicyTypeBySearchEngineQihu360
 	default:
+		return nil
 	}
-	return self.policyinfo
 }

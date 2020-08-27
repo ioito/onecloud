@@ -34,7 +34,7 @@ type DnsRecordSetCreateInput struct {
 	DnsValue  string `json:"dns_value"`
 	TTL       int64  `json:"ttl"`
 
-	TrafficPolicies []DnsRecordPolicy
+	TrafficPolicies []DnsRecordPolicy `json:"traffic_policies"`
 }
 
 type DnsRecordSetDetails struct {

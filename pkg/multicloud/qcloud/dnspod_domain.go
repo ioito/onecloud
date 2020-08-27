@@ -24,6 +24,7 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/multicloud"
 )
 
 type sDomianCountInfo struct {
@@ -31,6 +32,7 @@ type sDomianCountInfo struct {
 }
 
 type SDomian struct {
+	multicloud.SResourceBase
 	client *SQcloudClient
 
 	ID               int    `json:"id"`
@@ -209,14 +211,6 @@ func (self *SDomian) Delete() error {
 	return self.client.DeleteDomian(self.Name)
 }
 
-func (self *SDomian) IsEmulated() bool {
-	return false
-}
-
-func (self *SDomian) GetMetadata() *jsonutils.JSONDict {
-	return nil
-}
-
 func (self *SDomian) GetZoneType() cloudprovider.TDnsZoneType {
 	return cloudprovider.PublicZone
 }
@@ -244,6 +238,7 @@ func (self *SDomian) GetIDnsRecordSets() ([]cloudprovider.ICloudDnsRecordSet, er
 	}
 	result := []cloudprovider.ICloudDnsRecordSet{}
 	for i := 0; i < len(records); i++ {
+		records[i].domain = self
 		result = append(result, &records[i])
 	}
 	return result, nil

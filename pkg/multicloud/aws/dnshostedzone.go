@@ -23,6 +23,7 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/cloudprovider"
+	"yunion.io/x/onecloud/pkg/multicloud"
 )
 
 type HostedZoneConfig struct {
@@ -35,9 +36,10 @@ type AssociatedVPC struct {
 	VPCRegion string `json:"VPCRegion"`
 }
 
-type ShostedZone struct {
-	client                 *SAwsClient
-	recordSets             []SdnsRecordSet
+type SHostedZone struct {
+	multicloud.SResourceBase
+	client *SAwsClient
+
 	ID                     string           `json:"Id"`
 	Name                   string           `json:"Name"`
 	Config                 HostedZoneConfig `json:"Config"`
@@ -45,35 +47,32 @@ type ShostedZone struct {
 	VPCs                   []AssociatedVPC  `json:"VPCs"`
 }
 
-func (self *ShostedZone) GetId() string {
+func (self *SHostedZone) GetId() string {
 	return self.ID
 }
 
-func (self *ShostedZone) GetName() string {
+func (self *SHostedZone) GetName() string {
 	return self.Name
 }
 
-func (self *ShostedZone) GetGlobalId() string {
+func (self *SHostedZone) GetGlobalId() string {
 	return self.ID
 }
 
-func (self *ShostedZone) GetStatus() string {
+func (self *SHostedZone) GetStatus() string {
 	return ""
 }
 
-func (self *ShostedZone) Refresh() error {
-	return nil
+func (self *SHostedZone) Refresh() error {
+	hostedZone, err := self.client.GetHostedZoneById(self.ID)
+	if err != nil {
+		return errors.Wrapf(err, "self.client.GetHostedZoneById(%s)", self.ID)
+	}
+
+	return jsonutils.Update(self, hostedZone)
 }
 
-func (self *ShostedZone) IsEmulated() bool {
-	return false
-}
-
-func (self *ShostedZone) GetMetadata() *jsonutils.JSONDict {
-	return nil
-}
-
-func (client *SAwsClient) CreateHostedZone(opts *cloudprovider.SDnsZoneCreateOptions) (*ShostedZone, error) {
+func (client *SAwsClient) CreateHostedZone(opts *cloudprovider.SDnsZoneCreateOptions) (*SHostedZone, error) {
 	s, err := client.getAwsRoute53Session()
 	if err != nil {
 		return nil, errors.Wrap(err, "region.getAwsRoute53Session()")
@@ -86,23 +85,30 @@ func (client *SAwsClient) CreateHostedZone(opts *cloudprovider.SDnsZoneCreateOpt
 
 	Config := route53.HostedZoneConfig{}
 	var IsPrivate bool
-
 	if opts.ZoneType == cloudprovider.PrivateZone {
 		IsPrivate = true
 	}
 	Config.Comment = &opts.Desc
 	Config.PrivateZone = &IsPrivate
+	params.HostedZoneConfig = &Config
+
+	if len(opts.Vpcs) > 0 {
+		vpc := route53.VPC{}
+		vpc.VPCId = &opts.Vpcs[0].Id
+		vpc.VPCRegion = &opts.Vpcs[0].RegionId
+		params.SetVPC(&vpc)
+	}
 
 	ret, err := route53Client.CreateHostedZone(&params)
 	if err != nil {
 		return nil, errors.Wrap(err, "route53Client.GetHostedZone()")
 	}
-	hostedzone := ShostedZone{}
+	hostedzone := SHostedZone{}
 	err = unmarshalAwsOutput(ret, "HostedZone", &hostedzone)
 	if err != nil {
 		return nil, errors.Wrap(err, "unmarshalAwsOutput(HostedZone)")
 	}
-	for i := 0; i < len(opts.Vpcs); i++ {
+	for i := 1; i < len(opts.Vpcs); i++ {
 		err := client.AssociateVPCWithHostedZone(opts.Vpcs[i].Id, opts.Vpcs[i].RegionId, hostedzone.ID)
 		if err != nil {
 			return nil, errors.Wrapf(err, "client.AssociateVPCWithHostedZone(%s,%s,%s)", opts.Vpcs[i].Id, opts.Vpcs[i].RegionId, hostedzone.ID)
@@ -156,13 +162,13 @@ func (client *SAwsClient) CreateICloudDnsZone(opts *cloudprovider.SDnsZoneCreate
 	return client.CreateHostedZone(opts)
 }
 
-func (client *SAwsClient) GetHostedZones() ([]ShostedZone, error) {
+func (client *SAwsClient) GetHostedZones() ([]SHostedZone, error) {
 	s, err := client.getAwsRoute53Session()
 	if err != nil {
 		return nil, errors.Wrap(err, "region.getAwsRoute53Session()")
 	}
 	route53Client := route53.New(s)
-	result := []ShostedZone{}
+	result := []SHostedZone{}
 	Marker := ""
 	MaxItems := "100"
 	params := route53.ListHostedZonesInput{}
@@ -175,7 +181,7 @@ func (client *SAwsClient) GetHostedZones() ([]ShostedZone, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "route53Client.ListHostedZones(nil)")
 		}
-		hostedZones := []ShostedZone{}
+		hostedZones := []SHostedZone{}
 		err = unmarshalAwsOutput(ret, "HostedZones", &hostedZones)
 		if err != nil {
 			return nil, errors.Wrap(err, "unmarshalAwsOutput(HostedZones)")
@@ -188,6 +194,9 @@ func (client *SAwsClient) GetHostedZones() ([]ShostedZone, error) {
 			Marker = *ret.Marker
 		}
 
+	}
+	for i := 0; i < len(result); i++ {
+		result[i].client = client
 	}
 
 	return result, nil
@@ -206,7 +215,7 @@ func (client *SAwsClient) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, er
 	return result, nil
 }
 
-func (client *SAwsClient) GetHostedZoneById(ID string) (*ShostedZone, error) {
+func (client *SAwsClient) GetHostedZoneById(ID string) (*SHostedZone, error) {
 	s, err := client.getAwsRoute53Session()
 	if err != nil {
 		return nil, errors.Wrap(err, "region.getAwsRoute53Session()")
@@ -219,7 +228,7 @@ func (client *SAwsClient) GetHostedZoneById(ID string) (*ShostedZone, error) {
 		return nil, errors.Wrap(err, "route53Client.GetHostedZone()")
 	}
 
-	result := ShostedZone{client: client}
+	result := SHostedZone{client: client}
 	err = unmarshalAwsOutput(ret, "HostedZone", &result)
 	if err != nil {
 		return nil, errors.Wrap(err, "unmarshalAwsOutput(HostedZone)")
@@ -267,22 +276,22 @@ func (client *SAwsClient) DisassociateVPCFromHostedZone(vpcId string, regionId s
 	return nil
 }
 
-func (self *ShostedZone) Delete() error {
+func (self *SHostedZone) Delete() error {
 	return self.client.DeleteHostedZone(self.ID)
 }
 
-func (self *ShostedZone) GetZoneType() cloudprovider.TDnsZoneType {
+func (self *SHostedZone) GetZoneType() cloudprovider.TDnsZoneType {
 	if self.Config.PrivateZone {
 		return cloudprovider.PrivateZone
 	}
 	return cloudprovider.PublicZone
 }
 
-func (self *ShostedZone) GetOptions() *jsonutils.JSONDict {
+func (self *SHostedZone) GetOptions() *jsonutils.JSONDict {
 	return nil
 }
 
-func (self *ShostedZone) GetICloudVpcIds() ([]string, error) {
+func (self *SHostedZone) GetICloudVpcIds() ([]string, error) {
 	vpcs := []string{}
 	if self.Config.PrivateZone {
 		for i := 0; i < len(self.VPCs); i++ {
@@ -293,7 +302,7 @@ func (self *ShostedZone) GetICloudVpcIds() ([]string, error) {
 	return vpcs, errors.Wrapf(cloudprovider.ErrNotSupported, "not a private hostedzone")
 }
 
-func (self *ShostedZone) AddVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
+func (self *SHostedZone) AddVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
 	if self.Config.PrivateZone {
 		err := self.client.AssociateVPCWithHostedZone(vpc.Id, vpc.RegionId, self.ID)
 		if err != nil {
@@ -305,7 +314,7 @@ func (self *ShostedZone) AddVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
 	return nil
 }
 
-func (self *ShostedZone) RemoveVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
+func (self *SHostedZone) RemoveVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
 	if self.Config.PrivateZone {
 		err := self.client.DisassociateVPCFromHostedZone(vpc.Id, vpc.RegionId, self.ID)
 		if err != nil {
@@ -317,34 +326,21 @@ func (self *ShostedZone) RemoveVpc(vpc *cloudprovider.SPrivateZoneVpc) error {
 	return nil
 }
 
-func (self *ShostedZone) fetchRecordSets() error {
+func (self *SHostedZone) GetIDnsRecordSets() ([]cloudprovider.ICloudDnsRecordSet, error) {
 	recordSets, err := self.client.GetSdnsRecordSets(self.ID)
 	if err != nil {
-		return errors.Wrapf(err, "self.client.GetSdnsRecordSets(%s)", self.ID)
+		return nil, errors.Wrapf(err, "self.client.GetSdnsRecordSets(%s)", self.ID)
 	}
-	for i := 0; i < len(recordSets); i++ {
-		recordSets[i].domainName = self.GetName()
-		recordSets[i].hostedZoneId = self.GetId()
-	}
-	self.recordSets = recordSets
-	return nil
-}
 
-func (self *ShostedZone) GetIDnsRecordSets() ([]cloudprovider.ICloudDnsRecordSet, error) {
-	if self.recordSets == nil {
-		err := self.fetchRecordSets()
-		if err != nil {
-			return nil, errors.Wrap(err, "self.fetchResourceRecordSets()")
-		}
-	}
 	result := []cloudprovider.ICloudDnsRecordSet{}
-	for i := 0; i < len(self.recordSets); i++ {
-		result = append(result, &self.recordSets[i])
+	for i := 0; i < len(recordSets); i++ {
+		recordSets[i].hostedZone = self
+		result = append(result, &recordSets[i])
 	}
 	return result, nil
 }
 
-func (self *ShostedZone) SyncDnsRecordSets(common, add, del, update []cloudprovider.DnsRecordSet) error {
+func (self *SHostedZone) SyncDnsRecordSets(common, add, del, update []cloudprovider.DnsRecordSet) error {
 	for i := 0; i < len(add); i++ {
 		err := self.AddDnsRecordSet(&add[i])
 		if err != nil {
@@ -366,7 +362,7 @@ func (self *ShostedZone) SyncDnsRecordSets(common, add, del, update []cloudprovi
 	return nil
 }
 
-func (self *ShostedZone) AddDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+func (self *SHostedZone) AddDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
 	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
 		opts.DnsName = self.Name
 	} else {
@@ -375,7 +371,7 @@ func (self *ShostedZone) AddDnsRecordSet(opts *cloudprovider.DnsRecordSet) error
 	return self.client.AddDnsRecordSet(self.ID, opts)
 }
 
-func (self *ShostedZone) UpdateDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+func (self *SHostedZone) UpdateDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
 	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
 		opts.DnsName = self.Name
 	} else {
@@ -384,7 +380,7 @@ func (self *ShostedZone) UpdateDnsRecordSet(opts *cloudprovider.DnsRecordSet) er
 	return self.client.UpdateDnsRecordSet(self.ID, opts)
 }
 
-func (self *ShostedZone) RemoveDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
+func (self *SHostedZone) RemoveDnsRecordSet(opts *cloudprovider.DnsRecordSet) error {
 	if len(opts.DnsName) < 1 || opts.DnsName == "@" {
 		opts.DnsName = self.Name
 	} else {

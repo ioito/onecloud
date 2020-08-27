@@ -29,24 +29,27 @@ func (opts *DnsRecordSetListOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type DnsRecordSetCreateOptions struct {
-	NAME        string
-	DNS_ZONE_ID string
-	TTL         int64
-	DNS_TYPE    string `choices:"A|AAAA|CAA|CNAME|MX|NS|SRV|SOA|TXT|PRT|DS|DNSKEY|IPSECKEY|NAPTR|SPF|SSHFP|TLSA|REDIRECT_URL|FORWARD_URL"`
-	DNS_VALUE   string
-
-	Options string
+	NAME            string
+	DNS_ZONE_ID     string
+	DNS_TYPE        string `choices:"A|AAAA|CAA|CNAME|MX|NS|SRV|SOA|TXT|PRT|DS|DNSKEY|IPSECKEY|NAPTR|SPF|SSHFP|TLSA|REDIRECT_URL|FORWARD_URL"`
+	DnsValue        string
+	Ttl             int64
+	TrafficPolicies string
 }
 
 func (opts *DnsRecordSetCreateOptions) Params() (jsonutils.JSONObject, error) {
-	params := jsonutils.Marshal(opts).(*jsonutils.JSONDict)
-	params.Remove("options")
-	if len(opts.Options) > 0 {
-		options, err := jsonutils.Parse([]byte(opts.Options))
+	params := jsonutils.NewDict()
+	params.Add(jsonutils.NewString(opts.NAME), "name")
+	params.Add(jsonutils.NewString(opts.DNS_ZONE_ID), "dns_zone_id")
+	params.Add(jsonutils.NewString(opts.DNS_TYPE), "dns_type")
+	params.Add(jsonutils.NewString(opts.DnsValue), "dns_value")
+	params.Add(jsonutils.NewInt(opts.Ttl), "ttl")
+	if len(opts.TrafficPolicies) > 0 {
+		options, err := jsonutils.Parse([]byte(opts.TrafficPolicies))
 		if err != nil {
-			return nil, errors.Wrapf(err, "jsonutils.Parse(%s)", opts.Options)
+			return nil, errors.Wrapf(err, "jsonutils.Parse(%s)", opts.TrafficPolicies)
 		}
-		params.Add(options, "params")
+		params.Add(options, "traffic_policies")
 	}
 	return params, nil
 }

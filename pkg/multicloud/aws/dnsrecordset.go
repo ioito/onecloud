@@ -54,9 +54,7 @@ type SAliasTarget struct {
 }
 
 type SdnsRecordSet struct {
-	client                  *SAwsClient
-	domainName              string
-	hostedZoneId            string
+	hostedZone              *SHostedZone
 	AliasTarget             SAliasTarget     `json:"AliasTarget"`
 	Name                    string           `json:"Name"`
 	ResourceRecords         []resourceRecord `json:"ResourceRecords"`
@@ -72,7 +70,6 @@ type SdnsRecordSet struct {
 	Weight           *int64            `json:"Weight"`
 
 	HealthCheckId string `json:"HealthCheckId"`
-	policyinfo    *jsonutils.JSONDict
 }
 
 func (client *SAwsClient) GetSdnsRecordSets(HostedZoneId string) ([]SdnsRecordSet, error) {
@@ -93,7 +90,7 @@ func (client *SAwsClient) GetRoute53ResourceRecordSets(HostedZoneId string) ([]*
 	// client
 	s, err := client.getAwsRoute53Session()
 	if err != nil {
-		return nil, errors.Wrap(err, "region.getAwsRoute53Session()")
+		return nil, errors.Wrap(err, "client.getAwsRoute53Session()")
 	}
 	route53Client := route53.New(s)
 
@@ -125,7 +122,7 @@ func (client *SAwsClient) GetRoute53ResourceRecordSets(HostedZoneId string) ([]*
 func (client *SAwsClient) ChangeResourceRecordSets(action string, hostedZoneId string, resourceRecordSets ...*route53.ResourceRecordSet) error {
 	s, err := client.getAwsRoute53Session()
 	if err != nil {
-		return errors.Wrap(err, "region.getAwsRoute53Session()")
+		return errors.Wrap(err, "client.getAwsRoute53Session()")
 	}
 	route53Client := route53.New(s)
 
@@ -156,36 +153,39 @@ func Getroute53ResourceRecordSet(opts *cloudprovider.DnsRecordSet) (*route53.Res
 		resourceRecordSet.SetSetIdentifier(opts.ExternalId)
 	}
 	records := []*route53.ResourceRecord{}
-	values := strings.Split(opts.DnsValue, "*")
+	values := strings.Split(opts.DnsValue, " ")
 	for i := 0; i < len(values); i++ {
 		records = append(records, &route53.ResourceRecord{Value: &values[i]})
 	}
 	resourceRecordSet.SetResourceRecords(records)
 
 	// traffic policy info--------------------------------------------
-	if len(opts.PolicyType) > 0 {
-		var healthCheckId string
-		err := opts.PolicyParams.Unmarshal(&healthCheckId, "HealthCheckId")
-		if err != nil {
-			return nil, errors.Wrapf(err, "%s Unmarshal(HealthCheckId)", fmt.Sprintln(opts.PolicyParams))
-		}
+	if opts.PolicyType == cloudprovider.DnsPolicyTypeSimple || opts.PolicyParams == nil {
+		return &resourceRecordSet, nil
+	}
+
+	var healthCheckId string
+	err := opts.PolicyParams.Unmarshal(&healthCheckId, "healthcheckid")
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s Unmarshal(healthcheckid)", fmt.Sprintln(opts.PolicyParams))
+	}
+	if len(healthCheckId) > 0 {
 		resourceRecordSet.SetHealthCheckId(healthCheckId)
 	}
 
 	if opts.PolicyType == cloudprovider.DnsPolicyTypeFailover {
 		var failover string
-		err := opts.PolicyParams.Unmarshal(&failover, "Failover")
+		err := opts.PolicyParams.Unmarshal(&failover, "failover")
 		if err != nil {
-			return nil, errors.Wrapf(err, "%s Unmarshal(Failover)", fmt.Sprintln(opts.PolicyParams))
+			return nil, errors.Wrapf(err, "%s Unmarshal(failover)", fmt.Sprintln(opts.PolicyParams))
 		}
-
 		resourceRecordSet.SetFailover(failover)
 	}
 	if opts.PolicyType == cloudprovider.DnsPolicyTypeByGeoLocation {
 		sGeo := SGeoLocationCode{}
-		err := opts.PolicyParams.Unmarshal(&sGeo, "GeoLocation")
+		err := opts.PolicyParams.Unmarshal(&sGeo, "location")
 		if err != nil {
-			return nil, errors.Wrapf(err, "%s Unmarshal(SGeoLocationCode)", fmt.Sprintln(opts.PolicyParams))
+			return nil, errors.Wrapf(err, "%s Unmarshal(location)", fmt.Sprintln(opts.PolicyParams))
 		}
 		Geo := route53.GeoLocation{}
 		Geo.ContinentCode = &sGeo.ContinentCode
@@ -196,7 +196,7 @@ func Getroute53ResourceRecordSet(opts *cloudprovider.DnsRecordSet) (*route53.Res
 
 	if opts.PolicyType == cloudprovider.DnsPolicyTypeLatency {
 		var region string
-		err := opts.PolicyParams.Unmarshal(&region, "Region")
+		err := opts.PolicyParams.Unmarshal(&region, "region")
 		if err != nil {
 			return nil, errors.Wrapf(err, "%s Unmarshal(region)", fmt.Sprintln(opts.PolicyParams))
 		}
@@ -204,17 +204,17 @@ func Getroute53ResourceRecordSet(opts *cloudprovider.DnsRecordSet) (*route53.Res
 	}
 	if opts.PolicyType == cloudprovider.DnsPolicyTypeMultiValueAnswer {
 		var multiValueAnswer bool
-		err := opts.PolicyParams.Unmarshal(&multiValueAnswer, "MultiValueAnswer")
+		err := opts.PolicyParams.Unmarshal(&multiValueAnswer, "multivalueanswer")
 		if err != nil {
-			return nil, errors.Wrapf(err, "%s Unmarshal(multiValueAnswer)", fmt.Sprintln(opts.PolicyParams))
+			return nil, errors.Wrapf(err, "%s Unmarshal(multivalueanswer)", fmt.Sprintln(opts.PolicyParams))
 		}
 		resourceRecordSet.SetMultiValueAnswer(multiValueAnswer)
 	}
 	if opts.PolicyType == cloudprovider.DnsPolicyTypeWeighted {
 		var Weight int64
-		err := opts.PolicyParams.Unmarshal(&Weight, "Weight")
+		err := opts.PolicyParams.Unmarshal(&Weight, "weight")
 		if err != nil {
-			return nil, errors.Wrapf(err, "%s Unmarshal(multiValueAnswer)", fmt.Sprintln(opts.PolicyParams))
+			return nil, errors.Wrapf(err, "%s Unmarshal(weight)", fmt.Sprintln(opts.PolicyParams))
 		}
 	}
 	return &resourceRecordSet, nil
@@ -280,10 +280,13 @@ func (self *SdnsRecordSet) GetGlobalId() string {
 }
 
 func (self *SdnsRecordSet) GetDnsName() string {
-	if self.Name == self.domainName {
+	if self.hostedZone == nil {
+		return self.Name
+	}
+	if self.Name == self.hostedZone.Name {
 		return "@"
 	}
-	return strings.TrimSuffix(self.Name, "."+self.domainName)
+	return strings.TrimSuffix(self.Name, "."+self.hostedZone.Name)
 }
 
 func (self *SdnsRecordSet) GetDnsType() cloudprovider.TDnsType {
@@ -295,19 +298,11 @@ func (self *SdnsRecordSet) GetDnsValue() string {
 	for i := 0; i < len(self.ResourceRecords); i++ {
 		records = append(records, self.ResourceRecords[i].Value)
 	}
-	return strings.Join(records, "*")
+	return strings.Join(records, " ")
 }
 
 func (self *SdnsRecordSet) GetTTL() int64 {
 	return self.TTL
-}
-
-func (self *SdnsRecordSet) GetDnsIdentify() string {
-	return self.SetIdentifier
-}
-
-func (self *SdnsRecordSet) GetICloudVpcIds() ([]string, error) {
-	return nil, nil
 }
 
 // trafficpolicy 信息
@@ -319,42 +314,47 @@ func (self *SdnsRecordSet) GetPolicyType() cloudprovider.TDnsPolicyType {
 		MultiValueAnswer *bool           `json:"MultiValueAnswer"`
 		Weight           *int64          `json:"Weight"`
 	*/
-	self.policyinfo = jsonutils.NewDict()
-	if len(self.HealthCheckId) > 0 {
-		self.policyinfo.Add(jsonutils.Marshal(self.HealthCheckId), "HealthCheckId")
-	}
+
 	if len(self.Failover) > 0 {
-		self.policyinfo.Add(jsonutils.Marshal(self.Failover), "Failover")
 		return cloudprovider.DnsPolicyTypeFailover
 	}
 	if self.GeoLocation != nil {
-		self.policyinfo.Add(jsonutils.Marshal(self.GeoLocation), "GeoLocation")
 		return cloudprovider.DnsPolicyTypeByGeoLocation
 	}
 	if len(self.Region) > 0 {
-		self.policyinfo.Add(jsonutils.Marshal(self.Region), "Region")
 		return cloudprovider.DnsPolicyTypeLatency
 	}
 	if self.MultiValueAnswer != nil {
-		self.policyinfo.Add(jsonutils.Marshal(self.MultiValueAnswer), "MultiValueAnswer")
 		return cloudprovider.DnsPolicyTypeMultiValueAnswer
 	}
 	if self.Weight != nil {
-		self.policyinfo.Add(jsonutils.Marshal(self.Weight), "Weight")
 		return cloudprovider.DnsPolicyTypeWeighted
 	}
 	return cloudprovider.DnsPolicyTypeSimple
 
 }
 
-func (self *SdnsRecordSet) GetParams() *jsonutils.JSONDict {
-	self.GetPolicyType()
-	return self.policyinfo
-}
-
 func (self *SdnsRecordSet) GetPolicyParams() cloudprovider.TDnsPolicyTypeValue {
-	self.GetPolicyType()
-	return self.policyinfo
+	policyinfo := jsonutils.NewDict()
+	if len(self.HealthCheckId) > 0 {
+		policyinfo.Add(jsonutils.Marshal(self.HealthCheckId), "healthcheckid")
+	}
+	if len(self.Failover) > 0 {
+		policyinfo.Add(jsonutils.Marshal(self.Failover), "failover")
+	}
+	if self.GeoLocation != nil {
+		policyinfo.Add(jsonutils.Marshal(self.GeoLocation), "location")
+	}
+	if len(self.Region) > 0 {
+		policyinfo.Add(jsonutils.Marshal(self.Region), "region")
+	}
+	if self.MultiValueAnswer != nil {
+		policyinfo.Add(jsonutils.Marshal(self.MultiValueAnswer), "multivalueanswer")
+	}
+	if self.Weight != nil {
+		policyinfo.Add(jsonutils.Marshal(self.Weight), "weight")
+	}
+	return policyinfo
 }
 
 func (self *SdnsRecordSet) match(change *cloudprovider.DnsRecordSet) bool {
@@ -370,7 +370,7 @@ func (self *SdnsRecordSet) match(change *cloudprovider.DnsRecordSet) bool {
 	if change.DnsType != self.GetDnsType() {
 		return false
 	}
-	if change.ExternalId != self.GetDnsIdentify() {
+	if change.ExternalId != self.GetGlobalId() {
 		return false
 	}
 	return true

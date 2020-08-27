@@ -38,10 +38,10 @@ func init() {
 	})
 
 	type DomianCreateOptions struct {
-		Domain string
+		DOMAIN string
 	}
 	shellutils.R(&DomianCreateOptions{}, "domain-create", "create domain", func(cli *qcloud.SRegion, args *DomianCreateOptions) error {
-		domain, e := cli.GetClient().CreateDomian(args.Domain)
+		domain, e := cli.GetClient().CreateDomian(args.DOMAIN)
 		if e != nil {
 			return e
 		}
@@ -50,10 +50,10 @@ func init() {
 	})
 
 	type DomianDeleteOptions struct {
-		Domain string
+		DOMAIN string
 	}
 	shellutils.R(&DomianDeleteOptions{}, "domain-delete", "delete domains", func(cli *qcloud.SRegion, args *DomianDeleteOptions) error {
-		e := cli.GetClient().DeleteDomian(args.Domain)
+		e := cli.GetClient().DeleteDomian(args.DOMAIN)
 		if e != nil {
 			return e
 		}
@@ -61,12 +61,12 @@ func init() {
 	})
 
 	type DnsRecordListOptions struct {
-		Domain string
+		DOMAIN string
 		Offset int
 		Limit  int
 	}
 	shellutils.R(&DnsRecordListOptions{}, "dnsrecord-list", "List dndrecord", func(cli *qcloud.SRegion, args *DnsRecordListOptions) error {
-		records, total, e := cli.GetClient().GetDnsRecords(args.Domain, args.Offset, args.Limit)
+		records, total, e := cli.GetClient().GetDnsRecords(args.DOMAIN, args.Offset, args.Limit)
 		if e != nil {
 			return e
 		}
@@ -76,19 +76,19 @@ func init() {
 	})
 
 	type DnsRecordCreateOptions struct {
-		Domain string
-		Name   string
-		Value  string //joined by '*'
-		Ttl    int64
-		Type   string
+		DOMAIN string
+		NAME   string
+		VALUE  string //joined by '*'
+		TTL    int64
+		TYPE   string
 	}
 	shellutils.R(&DnsRecordCreateOptions{}, "dnsrecord-create", "create dndrecord", func(cli *qcloud.SRegion, args *DnsRecordCreateOptions) error {
 		change := cloudprovider.DnsRecordSet{}
-		change.DnsName = args.Name
-		change.DnsValue = args.Value
-		change.Ttl = args.Ttl
-		change.DnsType = cloudprovider.TDnsType(args.Type)
-		e := cli.GetClient().CreateDnsRecord(&change, args.Domain)
+		change.DnsName = args.DOMAIN
+		change.DnsValue = args.VALUE
+		change.Ttl = args.TTL
+		change.DnsType = cloudprovider.TDnsType(args.TYPE)
+		e := cli.GetClient().CreateDnsRecord(&change, args.DOMAIN)
 		if e != nil {
 			return e
 		}
@@ -96,21 +96,21 @@ func init() {
 	})
 
 	type DnsRecordUpdateOptions struct {
-		Domain   string
-		Name     string
-		RecordId int
-		Value    string //joined by '*'
-		Ttl      int64
-		Type     string
+		DOMAIN   string
+		RECORDID int
+		NAME     string
+		VALUE    string //joined by '*'
+		TTL      int64
+		TYPE     string
 	}
 	shellutils.R(&DnsRecordUpdateOptions{}, "dnsrecord-update", "update dndrecord", func(cli *qcloud.SRegion, args *DnsRecordUpdateOptions) error {
 		change := cloudprovider.DnsRecordSet{}
-		change.DnsName = args.Name
-		change.ExternalId = strconv.Itoa(args.RecordId)
-		change.DnsValue = args.Value
-		change.Ttl = args.Ttl
-		change.DnsType = cloudprovider.TDnsType(args.Type)
-		e := cli.GetClient().ModifyDnsRecord(&change, args.Domain)
+		change.DnsName = args.NAME
+		change.ExternalId = strconv.Itoa(args.RECORDID)
+		change.DnsValue = args.VALUE
+		change.Ttl = args.TTL
+		change.DnsType = cloudprovider.TDnsType(args.TYPE)
+		e := cli.GetClient().ModifyDnsRecord(&change, args.DOMAIN)
 		if e != nil {
 			return e
 		}
@@ -118,11 +118,11 @@ func init() {
 	})
 
 	type DnsRecordRemoveOptions struct {
-		Domain   string
-		RecordId int
+		DOMAIN   string
+		RECORDID int
 	}
 	shellutils.R(&DnsRecordRemoveOptions{}, "dnsrecord-delete", "delete dndrecord", func(cli *qcloud.SRegion, args *DnsRecordRemoveOptions) error {
-		e := cli.GetClient().DeleteDnsRecord(args.RecordId, args.Domain)
+		e := cli.GetClient().DeleteDnsRecord(args.RECORDID, args.DOMAIN)
 		if e != nil {
 			return e
 		}
