@@ -20,6 +20,7 @@ import (
 
 type DnsZoneCacheListOptions struct {
 	BaseListOptions
+	DnsZoneId string `help:"Dns Zone Id"`
 }
 
 func (opts *DnsZoneCacheListOptions) Params() (jsonutils.JSONObject, error) {

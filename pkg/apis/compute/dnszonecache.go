@@ -38,5 +38,7 @@ type DnsZoneCacheDetails struct {
 type DnsZoneCacheListInput struct {
 	apis.StatusStandaloneResourceListInput
 
+	DnsZoneFilterListBase
+
 	CloudaccountId string `json:"cloudaccount_id"`
 }

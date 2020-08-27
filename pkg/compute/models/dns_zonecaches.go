@@ -85,6 +85,11 @@ func (manager *SDnsZoneCacheManager) ListItemFilter(
 		return nil, err
 	}
 
+	q, err = manager.SDnsZoneResourceBaseManager.ListItemFilter(ctx, q, userCred, query.DnsZoneFilterListBase)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(query.CloudaccountId) > 0 {
 		account, err := CloudaccountManager.FetchByIdOrName(userCred, query.CloudaccountId)
 		if err != nil {
