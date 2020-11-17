@@ -223,6 +223,9 @@ func (self *SAzureGuestDriver) GetGuestInitialStateAfterRebuild() string {
 }
 
 func (self *SAzureGuestDriver) GetLinuxDefaultAccount(desc cloudprovider.SManagedVMCreateConfig) string {
+	if len(desc.Account) > 0 {
+		return desc.Account
+	}
 	return api.VM_AZURE_DEFAULT_LOGIN_USER
 }
 
