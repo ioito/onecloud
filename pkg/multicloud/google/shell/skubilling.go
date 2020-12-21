@@ -16,10 +16,8 @@ package shell
 
 import (
 	"fmt"
-	"io/ioutil"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/multicloud/google"
 	"yunion.io/x/onecloud/pkg/util/shellutils"
@@ -50,32 +48,31 @@ func init() {
 	})
 
 	type SkuEstimate struct {
-		RATE_FAILE string
-		SKU        string
-		REGION     string
-		CPU        int
-		MEMORY_MB  int
+		SKU string
 	}
 
 	shellutils.R(&SkuEstimate{}, "sku-estimate", "Estimate sku price", func(cli *google.SRegion, args *SkuEstimate) error {
-		data, err := ioutil.ReadFile(args.RATE_FAILE)
+		result, err := cli.ListSkuPrice()
 		if err != nil {
-			return errors.Wrap(err, "ioutil.ReadFile")
+			return err
 		}
-		rate := google.SRateInfo{}
-		j, err := jsonutils.Parse(data)
+		hour, month, year, err := result.Estimate(args.SKU)
 		if err != nil {
-			return errors.Wrap(err, "jsonutils.Parse")
+			return err
 		}
-		err = jsonutils.Update(&rate, j)
+		fmt.Printf("hour %f, month: %f year: %f", hour, month, year)
+		return nil
+	})
+
+	type RegionPriceInfo struct {
+	}
+
+	shellutils.R(&RegionPriceInfo{}, "sku-price-list", "Show region sku info", func(cli *google.SRegion, args *RegionPriceInfo) error {
+		result, err := cli.ListSkuPrice()
 		if err != nil {
-			return errors.Wrap(err, "jsonutils.Update")
+			return err
 		}
-		result, err := rate.GetSkuPrice(args.REGION, args.SKU, args.CPU, args.MEMORY_MB)
-		if err != nil {
-			return errors.Wrap(err, "GetSkuPrice")
-		}
-		fmt.Printf("result: %s\n", jsonutils.Marshal(result).PrettyString())
+		printObject(result)
 		return nil
 	})
 
