@@ -152,10 +152,10 @@ func (self *SElasticcacheAccount) SyncWithCloudElasticcacheAccount(ctx context.C
 	return nil
 }
 
-func (self *SElasticcacheAccount) GetRegion() *SCloudregion {
+func (self *SElasticcacheAccount) GetRegion() (*SCloudregion, error) {
 	iec, err := db.FetchById(ElasticcacheManager, self.ElasticcacheId)
 	if err != nil {
-		return nil
+		return nil, errors.Wrapf(err, "ElasticcacheManager.FetchById(%s)", self.ElasticcacheId)
 	}
 
 	return iec.(*SElasticcache).GetRegion()
@@ -227,7 +227,10 @@ func (manager *SElasticcacheAccountManager) ValidateCreateData(ctx context.Conte
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
-		region = ec.(*SElasticcache).GetRegion()
+		region, err = ec.(*SElasticcache).GetRegion()
+		if err != nil {
+			return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
+		}
 	} else {
 		return nil, httperrors.NewMissingParameterError("elasticcache_id")
 	}

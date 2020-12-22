@@ -199,10 +199,10 @@ func (self *SElasticcacheParameter) GetOwnerId() mcclient.IIdentityProvider {
 	return ElasticcacheManager.GetOwnerIdByElasticcacheId(self.ElasticcacheId)
 }
 
-func (self *SElasticcacheParameter) GetRegion() *SCloudregion {
+func (self *SElasticcacheParameter) GetRegion() (*SCloudregion, error) {
 	ieb, err := db.FetchById(ElasticcacheManager, self.ElasticcacheId)
 	if err != nil {
-		return nil
+		return nil, errors.Wrapf(err, "ElasticcacheManager.FetchById(%s)", self.ElasticcacheId)
 	}
 
 	return ieb.(*SElasticcache).GetRegion()

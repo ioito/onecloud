@@ -58,24 +58,23 @@ func ValidateElasticcacheResourceInput(userCred mcclient.TokenCredential, input 
 func (self *SElasticcacheResourceBase) GetElasticcache() (*SElasticcache, error) {
 	instance, err := ElasticcacheManager.FetchById(self.ElasticcacheId)
 	if err != nil {
-		return nil, errors.Wrap(err, "DBInstanceManager.FetchById")
+		return nil, errors.Wrapf(err, "ElasticcacheManager.FetchById(%s)", self.ElasticcacheId)
 	}
 	return instance.(*SElasticcache), nil
 }
 
-func (self *SElasticcacheResourceBase) GetVpc() *SVpc {
+func (self *SElasticcacheResourceBase) GetVpc() (*SVpc, error) {
 	cache, err := self.GetElasticcache()
 	if err != nil {
-		log.Errorf("GetElasticcache fail %s", err)
-		return nil
+		return nil, errors.Wrapf(err, "GetElasticcache")
 	}
 	return cache.GetVpc()
 }
 
 func (self *SElasticcacheResourceBase) GetIRegion() (cloudprovider.ICloudRegion, error) {
-	vpc := self.GetVpc()
-	if vpc == nil {
-		return nil, errors.Wrap(httperrors.ErrNotFound, "no vpc found")
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
 	}
 	return vpc.GetIRegion()
 }

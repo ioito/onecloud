@@ -248,10 +248,6 @@ func (manager *SElasticipManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fi
 	return q, httperrors.ErrNotFound
 }
 
-func (self *SElasticip) GetRegion() *SCloudregion {
-	return CloudregionManager.FetchRegionById(self.CloudregionId)
-}
-
 func (self *SElasticip) GetNetwork() (*SNetwork, error) {
 	network, err := NetworkManager.FetchById(self.NetworkId)
 	if err != nil {
@@ -291,7 +287,7 @@ func (self *SElasticip) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
 
 	billingInfo := SCloudBillingInfo{}
 
-	billingInfo.SCloudProviderInfo = self.getCloudProviderInfo()
+	//billingInfo.SCloudProviderInfo = self.getCloudProviderInfo()
 
 	billingInfo.SBillingBaseInfo = self.getBillingBaseInfo()
 
@@ -852,9 +848,9 @@ func (manager *SElasticipManager) ValidateCreateData(ctx context.Context, userCr
 }
 
 func (eip *SElasticip) GetQuotaKeys() (quotas.IQuotaKeys, error) {
-	region := eip.GetRegion()
-	if region == nil {
-		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "no valid region")
+	region, err := eip.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
 	return fetchRegionalQuotaKeys(
 		rbacutils.ScopeProject,
@@ -1005,9 +1001,9 @@ func (self *SElasticip) PerformAssociate(ctx context.Context, userCred mcclient.
 		return nil, httperrors.NewInputParameterError("server region is not found???")
 	}
 
-	eipRegion := self.GetRegion()
-	if eipRegion == nil {
-		return nil, httperrors.NewInputParameterError("eip region is not found???")
+	eipRegion, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	if serverRegion.Id != eipRegion.Id {
@@ -1138,9 +1134,9 @@ func (self *SElasticip) GetIRegion() (cloudprovider.ICloudRegion, error) {
 		return nil, errors.Wrap(err, "GetDriver")
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("fail to find region for eip")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
 
 	return provider.GetIRegionById(region.GetExternalId())
@@ -1495,12 +1491,6 @@ func (self *SElasticip) DoPendingDelete(ctx context.Context, userCred mcclient.T
 		return
 	}
 	self.Dissociate(ctx, userCred)
-}
-
-func (self *SElasticip) getCloudProviderInfo() SCloudProviderInfo {
-	region := self.GetRegion()
-	provider := self.GetCloudprovider()
-	return MakeCloudProviderInfo(region, nil, provider)
 }
 
 func (eip *SElasticip) GetUsages() []db.IUsage {

@@ -913,7 +913,10 @@ func syncDBInstanceBackups(ctx context.Context, userCred mcclient.TokenCredentia
 		return errors.Wrapf(err, "GetIDBInstanceBackups")
 	}
 
-	region := localInstance.GetRegion()
+	region, err := localInstance.GetRegion()
+	if err != nil {
+		return errors.Wrapf(err, "localInstance.GetRegion")
+	}
 	provider := localInstance.GetCloudprovider()
 
 	result := DBInstanceBackupManager.SyncDBInstanceBackups(ctx, userCred, provider, localInstance, region, backups)
@@ -1235,7 +1238,10 @@ func syncOnPremiseCloudProviderInfo(
 		return err
 	}
 
-	localRegion := CloudregionManager.FetchDefaultRegion()
+	localRegion, err := CloudregionManager.FetchDefaultRegion()
+	if err != nil {
+		return errors.Wrapf(err, "FetchDefaultRegion")
+	}
 
 	if cloudprovider.IsSupportObjectstore(driver) {
 		syncRegionBuckets(ctx, userCred, syncResults, provider, localRegion, iregion)

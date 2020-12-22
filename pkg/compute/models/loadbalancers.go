@@ -420,20 +420,12 @@ func (lb *SLoadbalancer) GetCloudprovider() *SCloudprovider {
 	return lb.SManagedResourceBase.GetCloudprovider()
 }
 
-func (lb *SLoadbalancer) GetRegion() *SCloudregion {
-	return lb.SCloudregionResourceBase.GetRegion()
-}
-
 func (lb *SLoadbalancer) GetCloudproviderId() string {
 	return lb.SManagedResourceBase.GetCloudproviderId()
 }
 
 func (lb *SLoadbalancer) GetZone() *SZone {
 	return lb.SZoneResourceBase.GetZone()
-}
-
-func (lb *SLoadbalancer) GetVpc() *SVpc {
-	return lb.SVpcResourceBase.GetVpc()
 }
 
 func (lb *SLoadbalancer) GetNetworks() ([]SNetwork, error) {
@@ -455,14 +447,22 @@ func (lb *SLoadbalancer) GetNetworks() ([]SNetwork, error) {
 	return networks, nil
 }
 
+func (lb *SLoadbalancer) GetRegion() (*SCloudregion, error) {
+	return lb.SCloudregionResourceBase.GetRegion()
+}
+
+func (lb *SLoadbalancer) GetVpc() (*SVpc, error) {
+	return lb.SVpcResourceBase.GetVpc()
+}
+
 func (lb *SLoadbalancer) GetIRegion() (cloudprovider.ICloudRegion, error) {
 	provider, err := lb.GetDriver()
 	if err != nil {
 		return nil, errors.Wrap(err, "lb.GetDriver")
 	}
-	region := lb.GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("failed to get region for lb %s", lb.Name)
+	region, err := lb.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
 	return provider.GetIRegionById(region.ExternalId)
 }

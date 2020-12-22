@@ -915,8 +915,12 @@ func (self *SDBInstance) PerformRenew(ctx context.Context, userCred mcclient.Tok
 	if err != nil {
 		return nil, httperrors.NewInputParameterError("invalid duration %s: %s", durationStr, err)
 	}
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
+	}
 
-	if !self.GetRegion().GetDriver().IsSupportedBillingCycle(bc, DBInstanceManager.KeywordPlural()) {
+	if !region.GetDriver().IsSupportedBillingCycle(bc, DBInstanceManager.KeywordPlural()) {
 		return nil, httperrors.NewInputParameterError("unsupported duration %s", durationStr)
 	}
 
@@ -994,9 +998,9 @@ func (self *SDBInstance) PerformPublicConnection(ctx context.Context, userCred m
 		return nil, httperrors.NewInputParameterError("The extranet connection is not open")
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, httperrors.NewGeneralError(fmt.Errorf("failed to found region for dbinstance %s(%s)", self.Name, self.Id))
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	if !region.GetDriver().IsSupportDBInstancePublicConnection() {
@@ -1067,7 +1071,12 @@ func (self *SDBInstance) PerformChangeConfig(ctx context.Context, userCred mccli
 		}
 	}
 
-	err = self.GetRegion().GetDriver().ValidateChangeDBInstanceConfigData(ctx, userCred, self, &input)
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
+	}
+
+	err = region.GetDriver().ValidateChangeDBInstanceConfigData(ctx, userCred, self, &input)
 	if err != nil {
 		return nil, err
 	}
@@ -1571,9 +1580,9 @@ func (self *SDBInstance) SetZoneInfo(ctx context.Context, userCred mcclient.Toke
 }
 
 func (self *SDBInstance) SetZoneIds(extInstance cloudprovider.ICloudDBInstance) error {
-	region := self.GetRegion()
-	if region == nil {
-		return fmt.Errorf("failed found region for dbinstance %s", self.Name)
+	region, err := self.GetRegion()
+	if err != nil {
+		return errors.Wrapf(err, "GetRegion")
 	}
 	zones, err := region.GetZones()
 	if err != nil {
@@ -1652,7 +1661,10 @@ func (self *SDBInstance) SyncWithCloudDBInstance(ctx context.Context, userCred m
 			}
 		}
 		if len(self.VpcId) == 0 {
-			region := self.GetRegion()
+			region, err := self.GetRegion()
+			if err != nil {
+				return errors.Wrapf(err, "self.GetRegion")
+			}
 			vpc, err := VpcManager.GetOrCreateVpcForClassicNetwork(ctx, provider, region)
 			if err != nil {
 				log.Errorf("failed to create classic vpc for region %s error: %v", region.Name, err)
@@ -1799,12 +1811,13 @@ func (man *SDBInstanceManager) TotalCount(
 	return stat, err
 }
 
-func (dbinstance *SDBInstance) GetQuotaKeys() quotas.IQuotaKeys {
+func (self *SDBInstance) GetQuotaKeys() quotas.IQuotaKeys {
+	region, _ := self.GetRegion()
 	return fetchRegionalQuotaKeys(
 		rbacutils.ScopeProject,
-		dbinstance.GetOwnerId(),
-		dbinstance.GetRegion(),
-		dbinstance.GetCloudprovider(),
+		self.GetOwnerId(),
+		region,
+		self.GetCloudprovider(),
 	)
 }
 
@@ -1820,12 +1833,12 @@ func (dbinstance *SDBInstance) GetUsages() []db.IUsage {
 	}
 }
 
-func (dbinstance *SDBInstance) GetIRegion() (cloudprovider.ICloudRegion, error) {
-	region := dbinstance.GetRegion()
-	if region == nil {
-		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "no valid cloudregion")
+func (self *SDBInstance) GetIRegion() (cloudprovider.ICloudRegion, error) {
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
-	provider, err := dbinstance.GetDriver()
+	provider, err := self.GetDriver()
 	if err != nil {
 		return nil, errors.Wrap(err, "dbinstance.GetDriver")
 	}

@@ -51,13 +51,8 @@ func ValidateCloudregionResourceInput(userCred mcclient.TokenCredential, input a
 	return regionObj.(*SCloudregion), input, nil
 }
 
-func (self *SCloudregionResourceBase) GetRegion() *SCloudregion {
-	region, err := CloudregionManager.FetchById(self.CloudregionId)
-	if err != nil {
-		log.Errorf("failed to find cloudregion %s error: %v", self.CloudregionId, err)
-		return nil
-	}
-	return region.(*SCloudregion)
+func (self *SCloudregionResourceBase) GetRegion() (*SCloudregion, error) {
+	return CloudregionManager.FetchRegionById(self.CloudregionId)
 }
 
 func (self *SCloudregionResourceBase) GetExtraDetails(

@@ -569,13 +569,12 @@ func (self *SCloudregion) PerformDefaultVpc(ctx context.Context, userCred mcclie
 	return nil, nil
 }
 
-func (manager *SCloudregionManager) FetchRegionById(id string) *SCloudregion {
+func (manager *SCloudregionManager) FetchRegionById(id string) (*SCloudregion, error) {
 	obj, err := manager.FetchById(id)
 	if err != nil {
-		log.Errorf("region %s %s", id, err)
-		return nil
+		return nil, errors.Wrapf(err, "FetchRegionById(%s)", id)
 	}
-	return obj.(*SCloudregion)
+	return obj.(*SCloudregion), nil
 }
 
 func (manager *SCloudregionManager) InitializeData() error {
@@ -930,7 +929,7 @@ func (self *SCloudregion) getMaxDataDiskCount() int {
 	return options.Options.MaxDataDiskCount
 }
 
-func (manager *SCloudregionManager) FetchDefaultRegion() *SCloudregion {
+func (manager *SCloudregionManager) FetchDefaultRegion() (*SCloudregion, error) {
 	return manager.FetchRegionById(api.DEFAULT_REGION_ID)
 }
 

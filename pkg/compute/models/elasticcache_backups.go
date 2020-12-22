@@ -229,7 +229,6 @@ func (manager *SElasticcacheBackupManager) AllowCreateItem(ctx context.Context, 
 }
 
 func (manager *SElasticcacheBackupManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	var region *SCloudregion
 	var ec *SElasticcache
 	if id, _ := data.GetString("elasticcache"); len(id) > 0 {
 		_ec, err := db.FetchByIdOrName(ElasticcacheManager, userCred, id)
@@ -242,14 +241,16 @@ func (manager *SElasticcacheBackupManager) ValidateCreateData(ctx context.Contex
 		return nil, httperrors.NewMissingParameterError("elasticcache")
 	}
 
-	region = ec.GetRegion()
+	region, err := ec.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
+	}
 	driver := region.GetDriver()
 	if err := driver.AllowCreateElasticcacheBackup(ctx, userCred, ownerId, ec); err != nil {
 		return nil, err
 	}
 
 	input := apis.StandaloneResourceCreateInput{}
-	var err error
 	err = data.Unmarshal(&input)
 	if err != nil {
 		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
@@ -322,10 +323,10 @@ func (self *SElasticcacheBackup) StartRestoreInstanceTask(ctx context.Context, u
 	return nil
 }
 
-func (self *SElasticcacheBackup) GetRegion() *SCloudregion {
+func (self *SElasticcacheBackup) GetRegion() (*SCloudregion, error) {
 	ieb, err := db.FetchById(ElasticcacheManager, self.ElasticcacheId)
 	if err != nil {
-		return nil
+		return nil, errors.Wrapf(err, "db.FetchById(%s)", self.ElasticcacheId)
 	}
 
 	return ieb.(*SElasticcache).GetRegion()

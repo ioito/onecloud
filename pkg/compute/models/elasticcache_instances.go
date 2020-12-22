@@ -191,13 +191,6 @@ func elasticcacheSubResourceFetchOwner(q *sqlchemy.SQuery, userCred mcclient.IId
 	return q
 }
 
-func (self *SElasticcache) getCloudProviderInfo() SCloudProviderInfo {
-	region := self.GetRegion()
-	provider := self.GetCloudprovider()
-	zone := self.GetZone()
-	return MakeCloudProviderInfo(region, zone, provider)
-}
-
 func (self *SElasticcache) GetExtraDetails(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, isList bool) (api.ElasticcacheDetails, error) {
 	return api.ElasticcacheDetails{}, nil
 }
@@ -1043,7 +1036,11 @@ func (self *SElasticcache) GetCreateHuaweiElasticcacheParams(data *jsonutils.JSO
 
 	// fill security group here
 	if len(self.SecurityGroupId) > 0 {
-		sgCache, err := SecurityGroupCacheManager.GetSecgroupCache(context.Background(), nil, self.SecurityGroupId, self.VpcId, self.GetRegion().Id, self.GetCloudprovider().Id, "")
+		region, err := self.GetRegion()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetRegion")
+		}
+		sgCache, err := SecurityGroupCacheManager.GetSecgroupCache(context.Background(), nil, self.SecurityGroupId, self.VpcId, region.Id, self.GetCloudprovider().Id, "")
 		if err != nil {
 			return nil, errors.Wrap(err, "elasticcache.GetCreateHuaweiElasticcacheParams.SecurityGroup")
 		}
@@ -1200,7 +1197,10 @@ func (self *SElasticcache) ValidatorChangeSpecData(ctx context.Context, userCred
 		return nil, httperrors.NewInputParameterError("provider mismatch: %s instance can't use %s sku", self.GetProviderName(), sku.Provider)
 	}
 
-	region := self.GetRegion()
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
+	}
 	if sku.CloudregionId != region.Id {
 		return nil, httperrors.NewInputParameterError("region mismatch: instance region %s, sku region %s", region.Id, sku.CloudregionId)
 	}
@@ -1249,9 +1249,9 @@ func (self *SElasticcache) AllowPerformUpdateAuthMode(ctx context.Context, userC
 }
 
 func (self *SElasticcache) ValidatorUpdateAuthModeData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	region := self.GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("fail to found region for elastic cache")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	driver := region.GetDriver()
@@ -1259,7 +1259,7 @@ func (self *SElasticcache) ValidatorUpdateAuthModeData(ctx context.Context, user
 		return nil, fmt.Errorf("fail to found driver for elastic cache")
 	}
 
-	err := driver.AllowUpdateElasticcacheAuthMode(ctx, userCred, self.GetOwnerId(), self)
+	err = driver.AllowUpdateElasticcacheAuthMode(ctx, userCred, self.GetOwnerId(), self)
 	if err != nil {
 		return nil, err
 	}
@@ -1697,10 +1697,11 @@ func (man *SElasticcacheManager) TotalCount(
 }
 
 func (cache *SElasticcache) GetQuotaKeys() quotas.IQuotaKeys {
+	region, _ := cache.GetRegion()
 	return fetchRegionalQuotaKeys(
 		rbacutils.ScopeProject,
 		cache.GetOwnerId(),
-		cache.GetRegion(),
+		region,
 		cache.GetCloudprovider(),
 	)
 }
@@ -1932,9 +1933,9 @@ func (self *SElasticcache) OnMetadataUpdated(ctx context.Context, userCred mccli
 }
 
 func (self *SElasticcache) getSecgroupsBySecgroupExternalIds(externalIds []string) ([]SSecurityGroup, error) {
-	vpc := self.GetVpc()
-	if vpc == nil {
-		return nil, errors.Wrap(errors.ErrNotFound, "GetVpc")
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
 	}
 
 	return getSecgroupsBySecgroupExternalIds(vpc.ManagerId, externalIds)
@@ -1955,9 +1956,9 @@ func (self *SElasticcache) validateSecgroupInput(secgroups []string) error {
 		return httperrors.NewInputParameterError("Cannot add security groups in status %s", self.Status)
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return httperrors.NewNotFoundError("region")
+	region, err := self.GetRegion()
+	if err != nil {
+		return errors.Wrapf(err, "GetRegion")
 	}
 
 	driver := region.GetDriver()
@@ -2261,9 +2262,9 @@ func (self *SElasticcache) PerformSetAutoRenew(ctx context.Context, userCred mcc
 		return nil, nil
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("elastic cache no related region found")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
 
 	if !region.GetDriver().IsSupportedElasticcacheAutoRenew() {
@@ -2311,9 +2312,9 @@ func (self *SElasticcache) PerformRenew(ctx context.Context, userCred mcclient.T
 		return nil, httperrors.NewInputParameterError("invalid duration %s: %s", durationStr, err)
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("elastic cache no related region found")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	if !region.GetDriver().IsSupportedBillingCycle(bc, self.KeywordPlural()) {

@@ -33,8 +33,8 @@ import (
 )
 
 type IVpcResource interface {
-	GetVpc() *SVpc
-	GetRegion() *SCloudregion
+	GetVpc() (*SVpc, error)
+	GetRegion() (*SCloudregion, error)
 }
 
 type SVpcResourceBase struct {
@@ -59,42 +59,41 @@ func ValidateVpcResourceInput(userCred mcclient.TokenCredential, input api.VpcRe
 	return vpcObj.(*SVpc), input, nil
 }
 
-func (self *SVpcResourceBase) GetVpc() *SVpc {
-	obj, _ := VpcManager.FetchById(self.VpcId)
-	if obj == nil {
-		return nil
+func (self *SVpcResourceBase) GetVpc() (*SVpc, error) {
+	obj, err := VpcManager.FetchById(self.VpcId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "FetchById(%s)", self.VpcId)
 	}
-	return obj.(*SVpc)
+	return obj.(*SVpc), nil
 }
 
-func (self *SVpcResourceBase) GetRegion() *SCloudregion {
-	vpc := self.GetVpc()
-	if vpc == nil {
-		return nil
+func (self *SVpcResourceBase) GetRegion() (*SCloudregion, error) {
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
 	}
-	region, _ := vpc.GetRegion()
-	return region
+	return vpc.GetRegion()
 }
 
-func (self *SVpcResourceBase) GetRegionId() string {
-	region := self.GetRegion()
-	if region != nil {
-		return region.Id
+func (self *SVpcResourceBase) GetRegionId() (string, error) {
+	region, err := self.GetRegion()
+	if err != nil {
+		return "", errors.Wrapf(err, "GetRegion")
 	}
-	return ""
+	return region.Id, nil
 }
 
 func (self *SVpcResourceBase) GetIRegion() (cloudprovider.ICloudRegion, error) {
-	vpc := self.GetVpc()
-	if vpc != nil {
-		return vpc.GetIRegion()
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
 	}
-	return nil, errors.Wrap(httperrors.ErrBadRequest, "not a valid vpc")
+	return vpc.GetIRegion()
 }
 
 func (self *SVpcResourceBase) GetCloudprovider() *SCloudprovider {
-	vpc := self.GetVpc()
-	if vpc == nil {
+	vpc, err := self.GetVpc()
+	if err != nil {
 		return nil
 	}
 	return vpc.GetCloudprovider()
@@ -109,8 +108,8 @@ func (self *SVpcResourceBase) GetCloudproviderId() string {
 }
 
 func (self *SVpcResourceBase) GetProviderName() string {
-	vpc := self.GetVpc()
-	if vpc == nil {
+	vpc, err := self.GetVpc()
+	if err != nil {
 		return ""
 	}
 	return vpc.GetProviderName()

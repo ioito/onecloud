@@ -207,10 +207,9 @@ func (manager *SElasticcacheAclManager) ValidateCreateData(ctx context.Context, 
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
-		region = ec.(*SElasticcache).GetRegion()
-
-		if region == nil {
-			return nil, fmt.Errorf("getting elastic cache region failed")
+		region, err = ec.(*SElasticcache).GetRegion()
+		if err != nil {
+			return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 		}
 	} else {
 		return nil, httperrors.NewMissingParameterError("elasticcache")
@@ -252,10 +251,10 @@ func (self *SElasticcacheAcl) StartElasticcacheAclCreateTask(ctx context.Context
 	return nil
 }
 
-func (self *SElasticcacheAcl) GetRegion() *SCloudregion {
+func (self *SElasticcacheAcl) GetRegion() (*SCloudregion, error) {
 	ieb, err := db.FetchById(ElasticcacheManager, self.ElasticcacheId)
 	if err != nil {
-		return nil
+		return nil, errors.Wrapf(err, "ElasticcacheManager.FetchById(%s)", self.ElasticcacheId)
 	}
 
 	return ieb.(*SElasticcache).GetRegion()

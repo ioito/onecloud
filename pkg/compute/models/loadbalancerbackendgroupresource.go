@@ -69,7 +69,7 @@ func (self *SLoadbalancerBackendgroupResourceBase) GetLoadbalancer() *SLoadbalan
 	return nil
 }
 
-func (self *SLoadbalancerBackendgroupResourceBase) GetVpc() *SVpc {
+func (self *SLoadbalancerBackendgroupResourceBase) GetVpc() (*SVpc, error) {
 	lb := self.GetLoadbalancer()
 	if lb != nil {
 		return lb.GetVpc()

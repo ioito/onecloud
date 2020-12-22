@@ -635,9 +635,9 @@ func (manager *SDBInstanceSkuManager) ListItemExportKeys(ctx context.Context,
 
 func (self *SDBInstanceSku) GetZoneInfo() (cloudprovider.SZoneInfo, error) {
 	zoneInfo := cloudprovider.SZoneInfo{ZoneId: self.ZoneId}
-	region := self.GetRegion()
-	if region == nil {
-		return zoneInfo, fmt.Errorf("empyt region for rds sku %s(%s)", self.Name, self.Id)
+	region, err := self.GetRegion()
+	if err != nil {
+		return zoneInfo, errors.Wrapf(err, "GetRegion")
 	}
 	var cloudZoneId = func(id string) (string, error) {
 		if len(id) == 0 {
