@@ -16,6 +16,7 @@ package aws
 
 import (
 	"fmt"
+	"io/ioutil"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -33,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/s3"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
@@ -452,6 +454,8 @@ func (self *SAwsClient) request(regionId, serviceName, serviceId, apiVersion str
 		SigningRegion: c.SigningRegion,
 		Endpoint:      c.Endpoint,
 		APIVersion:    apiVersion,
+		JSONVersion:   "1.1",
+		TargetPrefix:  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
 	}
 
 	if self.debug {
@@ -461,13 +465,127 @@ func (self *SAwsClient) request(regionId, serviceName, serviceId, apiVersion str
 
 	client := client.New(*c.Config, metadata, c.Handlers)
 	client.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
-	client.Handlers.Build.PushBackNamed(buildHandler)
-	client.Handlers.Unmarshal.PushBackNamed(UnmarshalHandler)
+	client.Handlers.Build.PushBackNamed(xmlBuildHandler)
+	client.Handlers.Unmarshal.PushBackNamed(xmlUnmarshalHandler)
 	client.Handlers.UnmarshalMeta.PushBackNamed(query.UnmarshalMetaHandler)
 	client.Handlers.UnmarshalError.PushBackNamed(query.UnmarshalErrorHandler)
 	client.Handlers.Validate.Remove(corehandlers.ValidateEndpointHandler)
 	return jsonRequest(client, apiName, params, retval, true)
 
+}
+
+type awsRequestOptions struct {
+	RegionId     string
+	ServiceName  string
+	ServiceId    string
+	ApiName      string
+	ApiVersion   string
+	Params       map[string]string
+	JSONVersion  string
+	TargetPrefix string
+}
+
+var jsonUnmarshalMetaHandler = request.NamedHandler{Name: "awssdk.rest.UnmarshalMeta", Fn: jsonUnmarshalMeta}
+
+func jsonUnmarshalMeta(r *request.Request) {
+	r.RequestID = r.HTTPResponse.Header.Get("X-Amzn-Requestid")
+	if r.RequestID == "" {
+		// Alternative version of request id in the header
+		r.RequestID = r.HTTPResponse.Header.Get("X-Amz-Request-Id")
+	}
+}
+
+var jsonUnmarshalErrorHandler = request.NamedHandler{
+	Name: "awssdk.jsonrpc.UnmarshalError",
+	Fn:   jsonUnmarshalError,
+}
+
+// UnmarshalError unmarshals an error response for a JSON RPC service.
+func jsonUnmarshalError(req *request.Request) {
+	defer req.HTTPResponse.Body.Close()
+
+	jsonErr := struct {
+		Code    string
+		Message string
+	}{}
+	_body, err := ioutil.ReadAll(req.HTTPResponse.Body)
+	if err != nil {
+		log.Errorf("ioutil.ReadAll error: %v", err)
+	}
+
+	if DEBUG {
+		log.Errorf("resp err: %s", string(_body))
+	}
+
+	body, err := jsonutils.Parse(_body)
+	if err != nil {
+		log.Errorf("jsonutils.Parse(%s)", string(_body))
+	}
+	err = jsonutils.Update(&jsonErr, body)
+	if err != nil {
+		req.Error = awserr.NewRequestFailure(
+			awserr.New(request.ErrCodeSerialization,
+				"failed to unmarshal error message", err),
+			req.HTTPResponse.StatusCode,
+			req.RequestID,
+		)
+		return
+	}
+
+	codes := strings.SplitN(jsonErr.Code, "#", 2)
+	req.Error = awserr.NewRequestFailure(
+		awserr.New(codes[len(codes)-1], jsonErr.Message, nil),
+		req.HTTPResponse.StatusCode,
+		req.RequestID,
+	)
+}
+
+func (self *SAwsClient) awsJsonRequest(opts awsRequestOptions, retval interface{}) error {
+	if len(opts.RegionId) == 0 {
+		opts.RegionId = self.getDefaultRegionId()
+	}
+	session, err := self.getAwsSession(opts.RegionId)
+	if err != nil {
+		return err
+	}
+	c := session.ClientConfig(opts.ServiceName)
+	metadata := metadata.ClientInfo{
+		ServiceName:   opts.ServiceName,
+		ServiceID:     opts.ServiceId,
+		SigningName:   c.SigningName,
+		SigningRegion: c.SigningRegion,
+		Endpoint:      c.Endpoint,
+		APIVersion:    opts.ApiVersion,
+		JSONVersion:   opts.JSONVersion,
+		TargetPrefix:  opts.TargetPrefix,
+	}
+
+	if self.debug {
+		logLevel := aws.LogLevelType(uint(aws.LogDebugWithRequestErrors) + uint(aws.LogDebugWithHTTPBody))
+		c.Config.LogLevel = &logLevel
+	}
+
+	client := client.New(*c.Config, metadata, c.Handlers)
+	client.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
+	client.Handlers.Build.PushBackNamed(jsonBuildHandler)
+	client.Handlers.Unmarshal.PushBackNamed(jsonUnmarshalHandler)
+	client.Handlers.UnmarshalMeta.PushBackNamed(jsonUnmarshalMetaHandler)
+	client.Handlers.UnmarshalError.PushBackNamed(jsonUnmarshalErrorHandler)
+	client.Handlers.Validate.Remove(corehandlers.ValidateEndpointHandler)
+	return jsonRequest(client, opts.ApiName, opts.Params, retval, true)
+}
+
+func (self *SAwsClient) trailRequest(apiName string, params map[string]string, retval interface{}) error {
+	opts := awsRequestOptions{
+		ApiName:      apiName,
+		Params:       params,
+		ServiceName:  CLOUD_TRAIL_SERVICE_NAME,
+		ServiceId:    CLOUD_TRAIL_SERVICE_ID,
+		ApiVersion:   "2013-11-01",
+		JSONVersion:  "1.1",
+		TargetPrefix: "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+	}
+	return self.awsJsonRequest(opts, retval)
 }
 
 func (self *SAwsClient) iamRequest(apiName string, params map[string]string, retval interface{}) error {

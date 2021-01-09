@@ -39,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/resourcegroupstaggingapi"
 	"github.com/aws/aws-sdk-go/service/s3"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
@@ -109,6 +110,9 @@ const (
 
 	IAM_SERVICE_NAME = "iam"
 	IAM_SERVICE_ID   = "IAM"
+
+	CLOUD_TRAIL_SERVICE_NAME = "cloudtrail"
+	CLOUD_TRAIL_SERVICE_ID   = "CloudTrail"
 
 	STS_SERVICE_NAME = "sts"
 	STS_SERVICE_ID   = "STS"
@@ -200,9 +204,36 @@ func (self *SRegion) getResourceGroupTagClient() (*resourcegroupstaggingapi.Reso
 	return self.resourceGroupTagClient, nil
 }
 
-var UnmarshalHandler = request.NamedHandler{Name: "yunion.query.Unmarshal", Fn: Unmarshal}
+var jsonUnmarshalHandler = request.NamedHandler{Name: "yunion.query.xml.Unmarshal", Fn: jsonUnmarshal}
 
-func Unmarshal(r *request.Request) {
+func jsonUnmarshal(r *request.Request) {
+	defer r.HTTPResponse.Body.Close()
+
+	body, err := ioutil.ReadAll(r.HTTPResponse.Body)
+	if err != nil {
+		r.Error = awserr.NewRequestFailure(
+			awserr.New(request.ErrCodeSerialization, "read body", err),
+			r.HTTPResponse.StatusCode,
+			r.RequestID,
+		)
+	}
+	if DEBUG {
+		log.Debugf("response: \n%s", jsonutils.Marshal(body).PrettyString())
+	}
+	err = jsonutils.Update(r.Data, jsonutils.Marshal(body))
+	if err != nil {
+		r.Error = awserr.NewRequestFailure(
+			awserr.New(request.ErrCodeSerialization, "failed decoding JSON RPC response", err),
+			r.HTTPResponse.StatusCode,
+			r.RequestID,
+		)
+	}
+	return
+}
+
+var xmlUnmarshalHandler = request.NamedHandler{Name: "yunion.query.xml.Unmarshal", Fn: xmlUnmarshal}
+
+func xmlUnmarshal(r *request.Request) {
 	defer r.HTTPResponse.Body.Close()
 	if r.DataFilled() {
 		var decoder *xml.Decoder
@@ -273,9 +304,9 @@ func Unmarshal(r *request.Request) {
 	}
 }
 
-var buildHandler = request.NamedHandler{Name: "yunion.query.Build", Fn: Build}
+var xmlBuildHandler = request.NamedHandler{Name: "yunion.query.xml.Build", Fn: xmlBuild}
 
-func Build(r *request.Request) {
+func xmlBuild(r *request.Request) {
 	body := url.Values{
 		"Action":  {r.Operation.Name},
 		"Version": {r.ClientInfo.APIVersion},
@@ -299,6 +330,31 @@ func Build(r *request.Request) {
 	} else { // This is a pre-signed request
 		r.HTTPRequest.Method = "GET"
 		r.HTTPRequest.URL.RawQuery = body.Encode()
+	}
+}
+
+var jsonBuildHandler = request.NamedHandler{Name: "yunion.query.json.Build", Fn: jsonBuild}
+
+func jsonBuild(r *request.Request) {
+	body := jsonutils.NewDict()
+	body.Add(jsonutils.NewString(r.Operation.Name), "Action")
+	body.Add(jsonutils.NewString(r.ClientInfo.APIVersion), "Version")
+	if r.Params != nil {
+		body.Update(jsonutils.Marshal(r.Params))
+	}
+
+	if r.ClientInfo.TargetPrefix != "" {
+		target := r.ClientInfo.TargetPrefix + "." + r.Operation.Name
+		r.HTTPRequest.Header.Add("X-Amz-Target", target)
+	}
+
+	if ct, v := r.HTTPRequest.Header.Get("Content-Type"), r.ClientInfo.JSONVersion; len(ct) == 0 && len(v) != 0 {
+		jsonVersion := r.ClientInfo.JSONVersion
+		r.HTTPRequest.Header.Set("Content-Type", "application/x-amz-json-"+jsonVersion)
+	}
+
+	if DEBUG {
+		log.Debugf("params: %s", body.PrettyString())
 	}
 }
 
