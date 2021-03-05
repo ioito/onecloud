@@ -661,7 +661,7 @@ func S3Shell() {
 				tags[pair[0]] = pair[1]
 			}
 		}
-		err = cloudprovider.SetBucketMetadata(bucket, tags, args.Replace)
+		err = cloudprovider.SetBucketMetadata(bucket, tags)
 		if err != nil {
 			return err
 		}

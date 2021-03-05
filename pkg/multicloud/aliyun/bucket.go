@@ -736,7 +736,7 @@ func (b *SBucket) GetTags() (map[string]string, error) {
 	return result, nil
 }
 
-func (b *SBucket) SetTags(tags map[string]string) error {
+func (b *SBucket) SetTags(tags map[string]string, replace bool) error {
 	osscli, err := b.region.GetOssClient()
 	if err != nil {
 		return errors.Wrap(err, "GetOssClient")
@@ -749,19 +749,7 @@ func (b *SBucket) SetTags(tags map[string]string) error {
 
 	err = osscli.SetBucketTagging(b.Name, oss.Tagging{Tags: input})
 	if err != nil {
-		return errors.Wrapf(err, "osscli.SetBucketTagging(%s)", jsonutils.Marshal(input))
-	}
-	return nil
-}
-
-func (b *SBucket) DeleteTags() error {
-	osscli, err := b.region.GetOssClient()
-	if err != nil {
-		return errors.Wrap(err, "GetOssClient")
-	}
-	err = osscli.DeleteBucketTagging(b.Name)
-	if err != nil {
-		return errors.Wrapf(err, "osscli.DeleteBucketTagging(%s)", b.Name)
+		return errors.Wrapf(err, "SetBucketTagging %s", input)
 	}
 	return nil
 }
