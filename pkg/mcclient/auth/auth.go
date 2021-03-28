@@ -286,6 +286,9 @@ func Client() *mcclient.Client {
 }
 
 func AdminCredential() mcclient.TokenCredential {
+	if manager == nil {
+		return nil
+	}
 	return manager.adminCredential
 }
 
