@@ -354,24 +354,32 @@ func (region *SRegion) DissociateEip(eipId string) error {
 func (region *SRegion) UpdateInstanceBandwidth(instanceId string, bw int, chargeType string) error {
 	params := make(map[string]string)
 	params["Region"] = region.Region
-	params["InstanceId"] = instanceId
 	params["InternetAccessible.InternetMaxBandwidthOut"] = fmt.Sprintf("%d", bw)
 
 	_, totalCount, err := region.GetBandwidthPackages([]string{}, 0, 50)
 	if err != nil {
 		return errors.Wrapf(err, "GetBandwidthPackages")
 	}
-	if totalCount == 0 {
-		switch chargeType {
-		case api.EIP_CHARGE_TYPE_BY_TRAFFIC:
-			params["InternetAccessible.InternetChargeType"] = "TRAFFIC_POSTPAID_BY_HOUR"
-		case api.EIP_CHARGE_TYPE_BY_BANDWIDTH:
-			params["InternetAccessible.InternetChargeType"] = "BANDWIDTH_POSTPAID_BY_HOUR"
-		}
+	if totalCount > 0 {
+		return nil
 	}
-
-	_, err = region.cvmRequest("ModifyInstanceInternetChargeType", params, true)
-	return errors.Wrapf(err, "ModifyInstanceInternetChargeType")
+	internetChargeType := "TRAFFIC_POSTPAID_BY_HOUR"
+	if totalCount == 0 && chargeType == api.EIP_CHARGE_TYPE_BY_BANDWIDTH {
+		internetChargeType = "BANDWIDTH_POSTPAID_BY_HOUR"
+	}
+	params["InternetAccessible.InternetChargeType"] = internetChargeType
+	instance, err := region.GetInstance(instanceId)
+	if err != nil {
+		return errors.Wrapf(err, "region.GetInstance(%s)", instanceId)
+	}
+	if instance.InternetAccessible.InternetChargeType != internetChargeType { //避免 Code=InvalidParameterValue, Message=参数`InternetChargeType`中`TRAFFIC_POSTPAID_BY_HOUR`没有更改, RequestId=6be2f9bc-a967-41db-9f0d-aff789c703ca
+		params["InstanceId"] = instanceId
+		_, err = region.cvmRequest("ModifyInstanceInternetChargeType", params, true)
+		return errors.Wrapf(err, "ModifyInstanceInternetChargeType")
+	}
+	params["InstanceIds.0"] = instanceId
+	_, err = region.cvmRequest("ResetInstancesInternetMaxBandwidth", params, true)
+	return errors.Wrapf(err, "ResetInstancesInternetMaxBandwidth")
 }
 
 func (self *SRegion) ChangeEipBindWidth(eipId string, bw int, chargeType string) error {
