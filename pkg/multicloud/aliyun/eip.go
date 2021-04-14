@@ -202,9 +202,9 @@ func (self *SEipAddress) GetINetworkId() string {
 
 func (self *SEipAddress) GetInternetChargeType() string {
 	switch self.InternetChargeType {
-	case InternetChargeByTraffic:
+	case InternetChargeByTraffic, TInternetChargeType(api.EIP_CHARGE_TYPE_BY_TRAFFIC):
 		return api.EIP_CHARGE_TYPE_BY_TRAFFIC
-	case InternetChargeByBandwidth:
+	case InternetChargeByBandwidth, TInternetChargeType(api.EIP_CHARGE_TYPE_BY_BANDWIDTH):
 		return api.EIP_CHARGE_TYPE_BY_BANDWIDTH
 	default:
 		return api.EIP_CHARGE_TYPE_BY_TRAFFIC

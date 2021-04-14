@@ -78,10 +78,11 @@ type SLoadbalancer struct {
 	MasterZoneId             string              //实例的主可用区ID。
 	SlaveZoneId              string              //实例的备可用区ID。
 	InternetChargeType       TInternetChargeType //公网实例的计费方式。取值：paybybandwidth：按带宽计费 paybytraffic：按流量计费（默认值） 说明 当 PayType参数的值为PrePay时，只支持按带宽计费。
-	PayType                  string              //实例的计费类型，取值：PayOnDemand：按量付费 PrePay：预付费
-	ResourceGroupId          string              //企业资源组ID。
-	LoadBalancerSpec         string              //负载均衡实例的的性能规格
-	Bandwidth                int                 //按带宽计费的公网型实例的带宽峰值
+	InternetChargeTypeAlias  TInternetChargeType
+	PayType                  string //实例的计费类型，取值：PayOnDemand：按量付费 PrePay：预付费
+	ResourceGroupId          string //企业资源组ID。
+	LoadBalancerSpec         string //负载均衡实例的的性能规格
+	Bandwidth                int    //按带宽计费的公网型实例的带宽峰值
 }
 
 func (lb *SLoadbalancer) GetName() string {
@@ -268,13 +269,18 @@ func (lb *SLoadbalancer) GetLoadbalancerSpec() string {
 }
 
 func (lb *SLoadbalancer) GetChargeType() string {
-	switch lb.InternetChargeType {
+	chargeType := lb.InternetChargeType
+	if len(lb.InternetChargeTypeAlias) > 0 {
+		chargeType = lb.InternetChargeTypeAlias
+	}
+	switch chargeType {
 	case "paybybandwidth":
 		return api.LB_CHARGE_TYPE_BY_BANDWIDTH
 	case "paybytraffic":
 		return api.LB_CHARGE_TYPE_BY_TRAFFIC
+	default:
+		return string(chargeType)
 	}
-	return "unknown"
 }
 
 func (lb *SLoadbalancer) GetCreatedAt() time.Time {
@@ -312,7 +318,10 @@ func (lb *SLoadbalancer) GetIEIP() (cloudprovider.ICloudEIP, error) {
 			AllocationId:       lb.GetGlobalId(),
 			AllocationTime:     lb.CreateTime,
 			Bandwidth:          lb.Bandwidth,
-			InternetChargeType: lb.InternetChargeType,
+			InternetChargeType: TInternetChargeType(lb.GetChargeType()),
+		}
+		if len(lb.InternetChargeTypeAlias) > 0 {
+			eip.InternetChargeType = lb.InternetChargeType
 		}
 		return &eip, nil
 	}
