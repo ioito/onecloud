@@ -141,8 +141,10 @@ func (self *SVpc) fetchVSwitches() error {
 	}
 	for i := 0; i < len(switches); i += 1 {
 		wire := self.getWireByZoneId(switches[i].ZoneId)
-		switches[i].wire = wire
-		wire.addNetwork(&switches[i])
+		if wire != nil {
+			switches[i].wire = wire
+			wire.addNetwork(&switches[i])
+		}
 	}
 	return nil
 }

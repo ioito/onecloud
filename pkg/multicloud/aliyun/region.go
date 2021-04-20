@@ -327,7 +327,7 @@ func (self *SRegion) _fetchZones(chargeType TChargeType, spotStrategy SpotStrate
 	if len(spotStrategy) > 0 {
 		params["SpotStrategy"] = string(spotStrategy)
 	}
-	body, err := self.ecsRequest("DescribeZones", params)
+	body, err := self.vpcRequest("DescribeZones", params)
 	if err != nil {
 		return err
 	}
