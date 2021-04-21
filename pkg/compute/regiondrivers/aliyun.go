@@ -76,110 +76,46 @@ func (self *SAliyunRegionDriver) GetProvider() string {
 	return api.CLOUD_PROVIDER_ALIYUN
 }
 
-func (self *SAliyunRegionDriver) validateCreateLBCommonData(ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*validators.ValidatorModelIdOrName, *jsonutils.JSONDict, error) {
-	zoneV := validators.NewModelIdOrNameValidator("zone", "zone", ownerId)
-	managerIdV := validators.NewModelIdOrNameValidator("manager", "cloudprovider", ownerId)
-	chargeTypeV := validators.NewStringChoicesValidator("charge_type", choices.NewChoices(api.LB_CHARGE_TYPE_BY_BANDWIDTH, api.LB_CHARGE_TYPE_BY_TRAFFIC))
-	chargeTypeV.Default(api.LB_CHARGE_TYPE_BY_TRAFFIC)
-	addressTypeV := validators.NewStringChoicesValidator("address_type", api.LB_ADDR_TYPES)
-	loadbalancerSpecV := validators.NewStringChoicesValidator("loadbalancer_spec", api.LB_ALIYUN_SPECS)
-	loadbalancerSpecV.Default(api.LB_ALIYUN_SPEC_SHAREABLE)
-
-	keyV := map[string]validators.IValidator{
-		"status":            validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-		"charge_type":       chargeTypeV,
-		"address_type":      addressTypeV.Default(api.LB_ADDR_TYPE_INTRANET),
-		"zone":              zoneV,
-		"manager":           managerIdV,
-		"loadbalancer_spec": loadbalancerSpecV,
+func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.LoadbalancerCreateInput) (api.LoadbalancerCreateInput, error) {
+	if len(input.LoadbalancerSpec) == 0 {
+		input.LoadbalancerSpec = api.LB_ALIYUN_SPEC_SHAREABLE
 	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, nil, err
+	if !utils.IsInStringArray(input.LoadbalancerSpec, api.LB_ALIYUN_SPECS) {
+		return input, httperrors.NewInputParameterError("invalid loadbalance_spec %s", input.LoadbalancerSpec)
 	}
-
-	if chargeTypeV.Value == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
-		egressMbps := validators.NewRangeValidator("egress_mbps", 1, 5000)
-		if err := egressMbps.Validate(data); err != nil {
-			return nil, nil, err
+	input.NetworkType = api.LB_NETWORK_TYPE_VPC
+	if input.ChargeType == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
+		if input.EgressMbps == 0 {
+			return input, httperrors.NewMissingParameterError("egress_mbps")
+		}
+		if input.EgressMbps < 1 || input.EgressMbps > 5000 {
+			return input, httperrors.NewOutOfRangeError("egress_mbps shoud be in 1 ~ 5000")
+		}
+	}
+	switch input.AddressType {
+	case api.LB_ADDR_TYPE_INTRANET:
+		if input.ChargeType == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
+			return input, httperrors.NewNotSupportedError("intranet loadbalancer not support bandwidth charge type")
+		}
+		if len(input.NetworkId) == 0 {
+			return input, httperrors.NewMissingParameterError("network_id")
+		}
+	case api.LB_ADDR_TYPE_INTERNET:
+		if len(input.ZoneId) == 0 {
+			return input, httperrors.NewMissingParameterError("zone_id")
+		}
+		if len(input.ManagerId) == 0 {
+			return input, httperrors.NewMissingParameterError("manager_id")
+		}
+		if len(input.ChargeType) == 0 {
+			input.ChargeType = api.LB_CHARGE_TYPE_BY_TRAFFIC
+		}
+		if !utils.IsInStringArray(input.ChargeType, []string{api.LB_CHARGE_TYPE_BY_BANDWIDTH, api.LB_CHARGE_TYPE_BY_TRAFFIC}) {
+			return input, httperrors.NewInputParameterError("invalid charge type %s", input.ChargeType)
 		}
 	}
 
-	region := zoneV.Model.(*models.SZone).GetRegion()
-	if region == nil {
-		return nil, nil, fmt.Errorf("getting region failed")
-	}
-
-	data.Set("network_type", jsonutils.NewString(api.LB_NETWORK_TYPE_VPC))
-	data.Set("cloudregion_id", jsonutils.NewString(region.GetId()))
-	return managerIdV, data, nil
-}
-
-func (self *SAliyunRegionDriver) validateCreateIntranetLBData(ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	managerIdV, data, err := self.validateCreateLBCommonData(ownerId, data)
-	if err != nil {
-		return nil, err
-	}
-
-	networkV := validators.NewModelIdOrNameValidator("network", "network", ownerId)
-	if err := networkV.Validate(data); err != nil {
-		return nil, err
-	}
-
-	network := networkV.Model.(*models.SNetwork)
-	region, zone, vpc, _, err := network.ValidateElbNetwork(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	chargeType, _ := data.GetString("charge_type")
-	if chargeType == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
-		return nil, httperrors.NewUnsupportOperationError("intranet loadbalancer not support bandwidth charge type")
-	}
-
-	managerId, _ := data.GetString("manager_id")
-	if managerId != vpc.ManagerId {
-		return nil, httperrors.NewInputParameterError("Loadbalancer's manager (%s(%s)) does not match vpc's(%s(%s)) (%s)", managerIdV.Model.GetName(), managerIdV.Model.GetId(), vpc.GetName(), vpc.GetId(), vpc.ManagerId)
-	}
-
-	data.Set("vpc_id", jsonutils.NewString(vpc.Id))
-	data.Set("cloudregion_id", jsonutils.NewString(region.GetId()))
-	data.Set("zone_id", jsonutils.NewString(zone.GetId()))
-	data.Set("address_type", jsonutils.NewString(api.LB_ADDR_TYPE_INTRANET))
-	return data, nil
-}
-
-func (self *SAliyunRegionDriver) validateCreateInternetLBData(ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	_, data, err := self.validateCreateLBCommonData(ownerId, data)
-	if err != nil {
-		return nil, err
-	}
-
-	// 公网 lb 实例和vpc、network无关联
-	data.Set("vpc_id", jsonutils.NewString(""))
-	data.Set("address", jsonutils.NewString(""))
-	data.Set("network_id", jsonutils.NewString(""))
-	data.Set("address_type", jsonutils.NewString(api.LB_ADDR_TYPE_INTERNET))
-	return data, nil
-}
-
-func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	addressTypeV := validators.NewStringChoicesValidator("address_type", api.LB_ADDR_TYPES)
-	if err := addressTypeV.Validate(data); err != nil {
-		return nil, err
-	}
-
-	var validator func(ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error)
-	if addressTypeV.Value == api.LB_ADDR_TYPE_INTRANET {
-		validator = self.validateCreateIntranetLBData
-	} else {
-		validator = self.validateCreateInternetLBData
-	}
-
-	if _, err := validator(ownerId, data); err != nil {
-		return nil, err
-	}
-	return self.SManagedVirtualizationRegionDriver.ValidateCreateLoadbalancerData(ctx, userCred, ownerId, data)
+	return input, nil
 }
 
 func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerCertificateData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
@@ -349,59 +285,27 @@ func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerBackendData(ctx conte
 	return data, nil
 }
 
-func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {
-	domainV := validators.NewDomainNameValidator("domain")
-	pathV := validators.NewURLPathValidator("path")
-	keyV := map[string]validators.IValidator{
-		"status": validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-		"domain": domainV.AllowEmpty(true).Default(""),
-		"path":   pathV.Default(""),
-
-		"http_request_rate":         validators.NewNonNegativeValidator("http_request_rate").Default(0),
-		"http_request_rate_per_src": validators.NewNonNegativeValidator("http_request_rate_per_src").Default(0),
-	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
-	}
-
-	listenerId, err := data.GetString("listener_id")
-	if err != nil {
-		return nil, err
-	}
-
-	ilistener, err := db.FetchById(models.LoadbalancerListenerManager, listenerId)
-	if err != nil {
-		return nil, err
-	}
-
-	listener := ilistener.(*models.SLoadbalancerListener)
+func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, listener *models.SLoadbalancerListener, input api.LbListenerRuleCreateInput) (api.LbListenerRuleCreateInput, error) {
 	listenerType := listener.ListenerType
 	if listenerType != api.LB_LISTENER_TYPE_HTTP && listenerType != api.LB_LISTENER_TYPE_HTTPS {
-		return nil, httperrors.NewInputParameterError("listener type must be http/https, got %s", listenerType)
+		return input, httperrors.NewInputParameterError("listener type must be http/https, got %s", listenerType)
 	}
 
-	if lbbg, ok := backendGroup.(*models.SLoadbalancerBackendGroup); ok && lbbg.LoadbalancerId != listener.LoadbalancerId {
-		return nil, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s",
-			lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, listener.LoadbalancerId)
-	}
-
-	err = models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, domainV.Value, pathV.Value)
+	err := models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, input.Domain, input.Path)
 	if err != nil {
-		return nil, err
+		return input, err
 	}
 
-	backendgroup, ok := backendGroup.(*models.SLoadbalancerBackendGroup)
-	if !ok {
-		return nil, httperrors.NewMissingParameterError("backend_group")
+	_lbbg, err := validators.ValidateModel(userCred, models.LoadbalancerBackendGroupManager, &input.BackendGroupId)
+	if err != nil {
+		return input, err
 	}
-	if backendgroup.Type != api.LB_BACKENDGROUP_TYPE_NORMAL {
-		return nil, httperrors.NewInputParameterError("backend group type must be normal")
+	lbbg := _lbbg.(*models.SLoadbalancerBackendGroup)
+	if lbbg.Type != api.LB_BACKENDGROUP_TYPE_NORMAL {
+		return input, httperrors.NewInputParameterError("backend group type must be normal")
 	}
 
-	data.Set("cloudregion_id", jsonutils.NewString(listener.GetRegionId()))
-	data.Set("manager_id", jsonutils.NewString(listener.GetCloudproviderId()))
-	return data, nil
+	return input, nil
 }
 
 func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {

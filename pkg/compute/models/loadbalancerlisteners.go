@@ -316,38 +316,58 @@ func (man *SLoadbalancerListenerManager) FetchOwnerId(ctx context.Context, data 
 	return man.SVirtualResourceBaseManager.FetchOwnerId(ctx, data)
 }
 
-func (man *SLoadbalancerListenerManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	lbV := validators.NewModelIdOrNameValidator("loadbalancer", "loadbalancer", ownerId)
-	if err := lbV.Validate(data); err != nil {
-		return nil, err
+func (man *SLoadbalancerListenerManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.LbListenerCreateInput) (api.LbListenerCreateInput, error) {
+	if len(input.LoadbalancerId) == 0 {
+		return input, httperrors.NewMissingParameterError("loadbalancer_id")
 	}
-
-	backendGroupV := validators.NewModelIdOrNameValidator("backend_group", "loadbalancerbackendgroup", ownerId)
-	if err := backendGroupV.Optional(true).Validate(data); err != nil {
-		return nil, err
-	}
-
-	input := apis.VirtualResourceCreateInput{}
-	err := data.Unmarshal(&input)
+	lbV, err := validators.ValidateModel(userCred, LoadbalancerManager, &input.LoadbalancerId)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal VirtualResourceCreateInput fail %s", err)
+		return input, err
 	}
-	input, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
-	if err != nil {
-		return nil, err
-	}
-	data.Update(jsonutils.Marshal(input))
 
-	lb := lbV.Model.(*SLoadbalancer)
+	lb := lbV.(*SLoadbalancer)
 	region := lb.GetRegion()
 	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("failed to find region for loadbalancer %s", lb.Name)
+		return input, httperrors.NewResourceNotFoundError("failed to find region for loadbalancer %s", lb.Name)
 	}
 
-	// if len(lb.ManagerId) > 0 {
-	//	data.Set("manager_id", jsonutils.NewString(lb.ManagerId))
-	// }
-	return region.GetDriver().ValidateCreateLoadbalancerListenerData(ctx, userCred, ownerId, data, lb, backendGroupV.Model)
+	if len(input.Status) == 0 {
+		input.Status = api.LB_STATUS_ENABLED
+	}
+	if !utils.IsInStringArray(input.Status, api.LB_STATUS_SPEC) {
+		return input, httperrors.NewInputParameterError("invalid status %s", input.Status)
+	}
+
+	if len(input.ListenerType) > 0 && !utils.IsInStringArray(input.ListenerType, api.LB_LISTENER_TYPES) {
+		return input, httperrors.NewInputParameterError("invalid listener_type %s", input.ListenerType)
+	}
+
+	if len(input.SendProxy) > 0 && utils.IsInStringArray(input.SendProxy, api.LB_SENDPROXY_CHOICES) {
+		return input, httperrors.NewInputParameterError("invalid send_proxy %s", input.SendProxy)
+	}
+
+	if len(input.Scheduler) > 0 && utils.IsInStringArray(input.Scheduler, api.LB_SCHEDULER_TYPES) {
+		return input, httperrors.NewInputParameterError("invalid scheduer %s", input.Scheduler)
+	}
+
+	if len(input.BackendGroupId) > 0 {
+		_lbbg, err := validators.ValidateModel(userCred, LoadbalancerBackendGroupManager, &input.BackendGroupId)
+		if err != nil {
+			return input, err
+		}
+		lbbg := _lbbg.(*SLoadbalancerBackendGroup)
+		if lbbg.LoadbalancerId != lb.Id {
+			return input, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s",
+				lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, lb.Id)
+		}
+	}
+
+	input.VirtualResourceCreateInput, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
+	if err != nil {
+		return input, err
+	}
+
+	return region.GetDriver().ValidateCreateLoadbalancerListenerData(ctx, userCred, ownerId, lb, input)
 }
 
 func (man *SLoadbalancerListenerManager) CheckTypeV(listenerType string) validators.IValidator {

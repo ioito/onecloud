@@ -57,3 +57,31 @@ type LoadbalancerListenerFilterListInput struct {
 	// 以负载均衡监听器名称排序
 	OrderByListener string `json:"order_by_listener"`
 }
+
+type LbListenerCreateInput struct {
+	apis.VirtualResourceCreateInput
+
+	LoadbalancerResourceInput
+	LoadbalancerBackendGroupResourceInput
+
+	// enmu: tcp, udp, http, https
+	ListenerType string
+	ListenerPort uint16
+
+	// enmu: off, v1, v2, v2-ssl, v2-ssl-cn
+	SendProxy string
+
+	// enmu: rr, wrr, wlc, sch, tch
+	Scheduler string
+
+	// enmu: on, off
+	StickySession string
+	// enmu: insert, server
+	StickySessionType          string
+	StickySessionCookie        string
+	StickySessionCookieTimeout int
+	// default: true
+	XForwardedFor bool `json:"x_forwarded_for"`
+	//default: false
+	Gzip bool
+}

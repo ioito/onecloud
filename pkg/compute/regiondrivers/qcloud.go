@@ -82,135 +82,85 @@ func (self *SQcloudRegionDriver) GetProvider() string {
 	return api.CLOUD_PROVIDER_QCLOUD
 }
 
-func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	zoneV := validators.NewModelIdOrNameValidator("zone", "zone", ownerId)
-	zone1V := validators.NewModelIdOrNameValidator("zone_1", "zone", ownerId)
-	vpcV := validators.NewModelIdOrNameValidator("vpc", "vpc", ownerId)
-	managerIdV := validators.NewModelIdOrNameValidator("manager", "cloudprovider", ownerId)
-	addressTypeV := validators.NewStringChoicesValidator("address_type", api.LB_ADDR_TYPES)
-
-	keyV := map[string]validators.IValidator{
-		"status":       validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-		"address_type": addressTypeV.Default(api.LB_ADDR_TYPE_INTRANET),
-		"vpc":          vpcV,
-		"zone":         zoneV,
-		"zone_1":       zone1V.Optional(true),
-		"manager":      managerIdV,
+func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.LoadbalancerCreateInput) (api.LoadbalancerCreateInput, error) {
+	if len(input.Zone1) > 0 {
+		_, err := validators.ValidateModel(userCred, models.ZoneManager, &input.Zone1)
+		if err != nil {
+			return input, err
+		}
 	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
+	if len(input.VpcId) == 0 {
+		return input, httperrors.NewMissingParameterError("vpc_id")
 	}
 
 	// 内网ELB需要增加network
-	if addressTypeV.Value == api.LB_ADDR_TYPE_INTRANET {
-		networkV := validators.NewModelIdOrNameValidator("network", "network", ownerId)
-		if err := networkV.Validate(data); err != nil {
-			return nil, err
-		}
-
-		network := networkV.Model.(*models.SNetwork)
-		_, _, vpc, _, err := network.ValidateElbNetwork(nil)
-		if err != nil {
-			return nil, err
-		}
-
-		if managerIdV.Model.GetId() != vpc.ManagerId {
-			return nil, httperrors.NewInputParameterError("Loadbalancer's manager (%s(%s)) does not match vpc's(%s(%s)) (%s)", managerIdV.Model.GetName(), managerIdV.Model.GetId(), vpc.GetName(), vpc.GetId(), vpc.ManagerId)
+	if input.AddressType == api.LB_ADDR_TYPE_INTRANET {
+		if len(input.NetworkId) == 0 {
+			return input, httperrors.NewMissingParameterError("network_id")
 		}
 	}
 
-	region := zoneV.Model.(*models.SZone).GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("getting region failed")
-	}
-
-	if zone1V.Model != nil && len(zone1V.Model.GetId()) > 0 && addressTypeV.Value == api.LB_ADDR_TYPE_INTERNET {
-		data.Set("zone_1", jsonutils.NewString(zone1V.Model.GetId()))
-	}
-	data.Set("network_type", jsonutils.NewString(api.LB_NETWORK_TYPE_VPC))
-	data.Set("cloudregion_id", jsonutils.NewString(region.GetId()))
-	return self.SManagedVirtualizationRegionDriver.ValidateCreateLoadbalancerData(ctx, userCred, ownerId, data)
+	return input, nil
 }
 
-func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerListenerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, lb *models.SLoadbalancer, backendGroup db.IModel) (*jsonutils.JSONDict, error) {
-	listenerTypeV := validators.NewStringChoicesValidator("listener_type", api.LB_LISTENER_TYPES)
-	listenerPortV := validators.NewPortValidator("listener_port")
-	keyV := map[string]validators.IValidator{
-		"status": validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-
-		"listener_type": listenerTypeV,
-		"listener_port": listenerPortV,
-
-		"send_proxy": validators.NewStringChoicesValidator("send_proxy", api.LB_SENDPROXY_CHOICES).Default(api.LB_SENDPROXY_OFF),
-		"scheduler":  validators.NewStringChoicesValidator("scheduler", api.LB_SCHEDULER_TYPES),
-
-		"sticky_session":                validators.NewStringChoicesValidator("sticky_session", api.LB_BOOL_VALUES).Default(api.LB_BOOL_OFF),
-		"sticky_session_type":           validators.NewStringChoicesValidator("sticky_session_type", api.LB_STICKY_SESSION_TYPES).Default(api.LB_STICKY_SESSION_TYPE_INSERT),
-		"sticky_session_cookie":         validators.NewRegexpValidator("sticky_session_cookie", regexp.MustCompile(`\w+`)).Optional(true),
-		"sticky_session_cookie_timeout": validators.NewNonNegativeValidator("sticky_session_cookie_timeout").Optional(true),
-
-		"x_forwarded_for": validators.NewBoolValidator("x_forwarded_for").Default(true),
-		"gzip":            validators.NewBoolValidator("gzip").Default(false),
+func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerListenerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, lb *models.SLoadbalancer, input api.LbListenerCreateInput) (api.LbListenerCreateInput, error) {
+	if len(input.SendProxy) == 0 {
+		input.SendProxy = api.LB_SENDPROXY_OFF
 	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
+	if len(input.StickySession) == 0 {
+		input.StickySession = api.LB_BOOL_OFF
+	}
+	if len(input.Scheduler) == 0 {
+		return input, httperrors.NewMissingParameterError("scheduler")
+	}
+	if len(input.StickySessionType) == 0 {
+		input.StickySessionType = api.LB_STICKY_SESSION_TYPE_INSERT
 	}
 
 	//  listener uniqueness
-	listenerType := listenerTypeV.Value
-	err := models.LoadbalancerListenerManager.CheckListenerUniqueness(ctx, lb, listenerType, listenerPortV.Value)
+	err := models.LoadbalancerListenerManager.CheckListenerUniqueness(ctx, lb, input.ListenerType, input.ListenerPort)
 	if err != nil {
-		return nil, err
+		return input, err
 	}
 
 	// backendgroup check
-	if lbbg, ok := backendGroup.(*models.SLoadbalancerBackendGroup); ok && lbbg.LoadbalancerId != lb.Id {
-		return nil, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s",
-			lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, lb.Id)
-	} else {
-		if lbbg != nil {
-			data.Set("backend_group_id", jsonutils.NewString(lbbg.GetId()))
+
+	if utils.IsInStringArray(input.ListenerType, []string{api.LB_LISTENER_TYPE_TCP, api.LB_LISTENER_TYPE_UDP}) {
+		if len(input.BackendGroupId) == 0 {
+			return input, httperrors.NewMissingParameterError("backend_group_id")
 		}
 
-		if utils.IsInStringArray(listenerType, []string{api.LB_LISTENER_TYPE_TCP, api.LB_LISTENER_TYPE_UDP}) {
-			if lbbg == nil {
-				return nil, httperrors.NewMissingParameterError("backend_group_id")
-			}
+		// listener check
+		q := models.LoadbalancerListenerManager.Query()
+		q = q.Equals("loadbalancer_id", lb.GetId())
+		q = q.Equals("listener_type", input.ListenerType)
+		q = q.Equals("backend_group_id", input.BackendGroupId)
+		q = q.IsFalse("pending_deleted")
+		count, err := q.CountWithError()
+		if err != nil {
+			return input, httperrors.NewGeneralError(err)
+		}
 
-			// listener check
-			q := models.LoadbalancerListenerManager.Query()
-			q = q.Equals("loadbalancer_id", lb.GetId())
-			q = q.Equals("listener_type", listenerType)
-			q = q.Equals("backend_group_id", lbbg.GetId())
-			q = q.IsFalse("pending_deleted")
-			count, err := q.CountWithError()
+		if count > 0 {
+			return input, httperrors.NewConflictError("loadbalancer backendgroup aready associate with other %s listener", input.ListenerType)
+		}
+
+		// lbbg backend check
+		lbbs, err := lbbg.GetBackends()
+		if err != nil {
+			return input, httperrors.NewGeneralError(err)
+		}
+
+		for i := range lbbs {
+			err = checkQcloudBackendGroupUsable("", input.ListenerType, lbbs[i].BackendId, lbbs[i].Port)
 			if err != nil {
-				return nil, httperrors.NewGeneralError(err)
-			}
-
-			if count > 0 {
-				return nil, httperrors.NewConflictError("loadbalancer backendgroup aready associate with other %s listener", listenerType)
-			}
-
-			// lbbg backend check
-			lbbs, err := lbbg.GetBackends()
-			if err != nil {
-				return nil, httperrors.NewGeneralError(err)
-			}
-
-			for i := range lbbs {
-				err = checkQcloudBackendGroupUsable("", listenerType, lbbs[i].BackendId, lbbs[i].Port)
-				if err != nil {
-					return nil, err
-				}
+				return input, err
 			}
 		}
 	}
 
 	// https additional certificate check
-	if listenerType == api.LB_LISTENER_TYPE_HTTPS {
+	if input.ListenerType == api.LB_LISTENER_TYPE_HTTPS {
 		certV := validators.NewModelIdOrNameValidator("certificate", "loadbalancercertificate", ownerId)
 		tlsCipherPolicyV := validators.NewStringChoicesValidator("tls_cipher_policy", api.LB_TLS_CIPHER_POLICIES).Default(api.LB_TLS_CIPHER_POLICY_1_2)
 		httpsV := map[string]validators.IValidator{
@@ -855,61 +805,29 @@ func (self *SQcloudRegionDriver) ValidateUpdateLoadbalancerBackendData(ctx conte
 	return data, nil
 }
 
-func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {
-	domainV := validators.NewDomainNameValidator("domain")
-	pathV := validators.NewURLPathValidator("path")
-	keyV := map[string]validators.IValidator{
-		"status": validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-		"domain": domainV.AllowEmpty(false),
-		"path":   pathV.AllowEmpty(false),
-
-		"http_request_rate":         validators.NewNonNegativeValidator("http_request_rate").Default(0),
-		"http_request_rate_per_src": validators.NewNonNegativeValidator("http_request_rate_per_src").Default(0),
+func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, listener *models.SLoadbalancerListener, input api.LbListenerRuleCreateInput) (api.LbListenerRuleCreateInput, error) {
+	if len(input.BackendGroupId) == 0 {
+		return input, httperrors.NewMissingParameterError("backend_group_id")
 	}
 
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
+	if len(input.Path) == 0 {
+		return input, httperrors.NewMissingParameterError("path")
 	}
 
-	if path, _ := data.GetString("path"); len(path) == 0 {
-		return nil, httperrors.NewInputParameterError("path can not be emtpy")
+	if len(input.Domain) == 0 {
+		return input, httperrors.NewMissingParameterError("domain")
 	}
 
-	listenerId, err := data.GetString("listener_id")
+	if listener.ListenerType != api.LB_LISTENER_TYPE_HTTP && listener.ListenerType != api.LB_LISTENER_TYPE_HTTPS {
+		return input, httperrors.NewInputParameterError("listener type must be http/https, got %s", listener.ListenerType)
+	}
+
+	err := models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, input.Domain, input.Path)
 	if err != nil {
-		return nil, err
+		return input, err
 	}
 
-	ilistener, err := db.FetchById(models.LoadbalancerListenerManager, listenerId)
-	if err != nil {
-		return nil, err
-	}
-
-	listener := ilistener.(*models.SLoadbalancerListener)
-	listenerType := listener.ListenerType
-	if listenerType != api.LB_LISTENER_TYPE_HTTP && listenerType != api.LB_LISTENER_TYPE_HTTPS {
-		return nil, httperrors.NewInputParameterError("listener type must be http/https, got %s", listenerType)
-	}
-
-	if lbbg, ok := backendGroup.(*models.SLoadbalancerBackendGroup); ok && lbbg.LoadbalancerId != listener.LoadbalancerId {
-		return nil, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s",
-			lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, listener.LoadbalancerId)
-	} else {
-		if lbbg == nil {
-			return nil, httperrors.NewMissingParameterError("backend_group_id")
-		}
-
-		data.Set("backend_group_id", jsonutils.NewString(lbbg.GetId()))
-	}
-
-	err = models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, domainV.Value, pathV.Value)
-	if err != nil {
-		return nil, err
-	}
-
-	data.Set("cloudregion_id", jsonutils.NewString(listener.GetRegionId()))
-	data.Set("manager_id", jsonutils.NewString(listener.GetCloudproviderId()))
-	return data, nil
+	return input, nil
 }
 
 func (self *SQcloudRegionDriver) ValidateUpdateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {

@@ -56,10 +56,6 @@ func (self *SManagedVirtualizationRegionDriver) GetMaxElasticcacheSecurityGroupC
 	return 0
 }
 
-func (self *SManagedVirtualizationRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, owerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	return self.ValidateManagerId(ctx, userCred, data)
-}
-
 func (self *SManagedVirtualizationRegionDriver) ValidateManagerId(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	if managerId, _ := data.GetString("manager_id"); len(managerId) == 0 {
 		return nil, httperrors.NewMissingParameterError("manager")
@@ -68,11 +64,17 @@ func (self *SManagedVirtualizationRegionDriver) ValidateManagerId(ctx context.Co
 }
 
 func (self *SManagedVirtualizationRegionDriver) ValidateCreateLoadbalancerAclData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	return self.ValidateManagerId(ctx, userCred, data)
+	if managerId, _ := data.GetString("manager_id"); len(managerId) == 0 {
+		return nil, httperrors.NewMissingParameterError("manager")
+	}
+	return data, nil
 }
 
 func (self *SManagedVirtualizationRegionDriver) ValidateCreateLoadbalancerCertificateData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	return self.ValidateManagerId(ctx, userCred, data)
+	if managerId, _ := data.GetString("manager_id"); len(managerId) == 0 {
+		return nil, httperrors.NewMissingParameterError("manager")
+	}
+	return data, nil
 }
 
 func (self *SManagedVirtualizationRegionDriver) ValidateUpdateLoadbalancerCertificateData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
@@ -120,10 +122,6 @@ func (self *SManagedVirtualizationRegionDriver) ValidateCreateLoadbalancerBacken
 
 func (self *SManagedVirtualizationRegionDriver) IsSupportLoadbalancerListenerRuleRedirect() bool {
 	return false
-}
-
-func (self *SManagedVirtualizationRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {
-	return data, nil
 }
 
 func (self *SManagedVirtualizationRegionDriver) ValidateUpdateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {

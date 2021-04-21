@@ -80,64 +80,31 @@ func (self *SOpenStackRegionDriver) IsVpcCreateNeedInputCidr() bool {
 	return false
 }
 
-func (self *SOpenStackRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	//zoneV := validators.NewModelIdOrNameValidator("zone", "zone", ownerId)
-	managerIdV := validators.NewModelIdOrNameValidator("manager", "cloudprovider", ownerId)
-	addressTypeV := validators.NewStringChoicesValidator("address_type", api.LB_ADDR_TYPES)
-	networkV := validators.NewModelIdOrNameValidator("network", "network", ownerId)
-
-	keyV := map[string]validators.IValidator{
-		"status":       validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-		"address_type": addressTypeV.Default(api.LB_ADDR_TYPE_INTRANET),
-		"network":      networkV,
-		//"zone":         zoneV,
-		"manager": managerIdV,
-	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
-	}
-
-	// 检查网络可用
-	network := networkV.Model.(*models.SNetwork)
-	_, _, vpc, _, err := network.ValidateElbNetwork(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if managerIdV.Model.GetId() != vpc.ManagerId {
-		return nil, httperrors.NewInputParameterError("Loadbalancer's manager (%s(%s)) does not match vpc's(%s(%s)) (%s)", managerIdV.Model.GetName(), managerIdV.Model.GetId(), vpc.GetName(), vpc.GetId(), vpc.ManagerId)
+func (self *SOpenStackRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.LoadbalancerCreateInput) (api.LoadbalancerCreateInput, error) {
+	if len(input.NetworkId) == 0 {
+		return input, httperrors.NewMissingParameterError("network_id")
 	}
 
 	// 公网ELB需要指定EIP
-	if addressTypeV.Value == api.LB_ADDR_TYPE_INTERNET {
-		eipV := validators.NewModelIdOrNameValidator("eip", "eip", nil)
-		if err := eipV.Validate(data); err != nil {
-			return nil, err
+	if input.AddressType == api.LB_ADDR_TYPE_INTERNET {
+		_eip, err := validators.ValidateModel(userCred, models.ElasticipManager, &input.Eip)
+		if err != nil {
+			return input, err
 		}
 
-		eip := eipV.Model.(*models.SElasticip)
+		eip := _eip.(*models.SElasticip)
 		if eip.Status != api.EIP_STATUS_READY {
-			return nil, fmt.Errorf("eip status not ready")
+			return input, httperrors.NewResourceNotReadyError("eip %s status not ready", input.Eip)
 		}
 
-		if len(eip.ExternalId) == 0 {
-			return nil, fmt.Errorf("eip external id is empty")
+		if eip.ManagerId != input.ManagerId {
+			return input, httperrors.NewConflictError("eip and network not belong same account")
 		}
 
-		data.Set("eip_id", jsonutils.NewString(eip.ExternalId))
+		//data.Set("eip_id", jsonutils.NewString(eip.ExternalId))
 	}
 
-	// region := zoneV.Model.(*models.SZone).GetRegion()
-	region := networkV.Model.(*models.SNetwork).GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("getting region failed")
-	}
-
-	// data.Set("network_type", jsonutils.NewString(api.LB_NETWORK_TYPE_VPC))
-	data.Set("cloudregion_id", jsonutils.NewString(region.GetId()))
-	data.Set("vpc_id", jsonutils.NewString(vpc.GetId()))
-	return self.SManagedVirtualizationRegionDriver.ValidateCreateLoadbalancerData(ctx, userCred, ownerId, data)
+	return input, nil
 }
 
 func (self *SOpenStackRegionDriver) RequestCreateLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *models.SLoadbalancer, task taskman.ITask) error {
@@ -874,81 +841,36 @@ func (self *SOpenStackRegionDriver) IsSupportLoadbalancerListenerRuleRedirect() 
 	return true
 }
 
-func (self *SOpenStackRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {
-	var (
-		listenerV = validators.NewModelIdOrNameValidator("listener", "loadbalancerlistener", ownerId)
-		domainV   = validators.NewHostPortValidator("domain").OptionalPort(true)
-		pathV     = validators.NewURLPathValidator("path")
-
-		redirectV       = validators.NewStringChoicesValidator("redirect", api.LB_REDIRECT_TYPES)
-		redirectCodeV   = validators.NewIntChoicesValidator("redirect_code", api.LB_REDIRECT_CODES)
-		redirectSchemeV = validators.NewStringChoicesValidator("redirect_scheme", api.LB_REDIRECT_SCHEMES)
-		redirectHostV   = validators.NewHostPortValidator("redirect_host").OptionalPort(true)
-		redirectPathV   = validators.NewURLPathValidator("redirect_path")
-	)
-	keyV := map[string]validators.IValidator{
-		"status": validators.NewStringChoicesValidator("status", api.LB_STATUS_SPEC).Default(api.LB_STATUS_ENABLED),
-
-		"listener": listenerV,
-		"domain":   domainV.AllowEmpty(true).Default(""),
-		"path":     pathV.Default(""),
-
-		"http_request_rate":         validators.NewNonNegativeValidator("http_request_rate").Default(0),
-		"http_request_rate_per_src": validators.NewNonNegativeValidator("http_request_rate_per_src").Default(0),
-
-		"redirect":        redirectV.Default(api.LB_REDIRECT_OFF),
-		"redirect_code":   redirectCodeV.Default(api.LB_REDIRECT_CODE_302),
-		"redirect_scheme": redirectSchemeV.Optional(true),
-		"redirect_host":   redirectHostV.AllowEmpty(true).Optional(true),
-		"redirect_path":   redirectPathV.AllowEmpty(true).Optional(true),
-	}
-
-	if err := RunValidators(keyV, data, false); err != nil {
-		return nil, err
-	}
-
-	listener := listenerV.Model.(*models.SLoadbalancerListener)
+func (self *SOpenStackRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, listener *models.SLoadbalancerListener, input api.LbListenerRuleCreateInput) (api.LbListenerRuleCreateInput, error) {
 	listenerType := listener.ListenerType
 	if listenerType != api.LB_LISTENER_TYPE_HTTP && listenerType != api.LB_LISTENER_TYPE_HTTPS {
-		return nil, httperrors.NewInputParameterError("listener type must be http/https, got %s", listenerType)
+		return input, httperrors.NewInputParameterError("listener type must be http/https, got %s", listenerType)
 	}
 
-	redirectType := redirectV.Value
-	if redirectType != api.LB_REDIRECT_OFF {
-		if redirectType == api.LB_REDIRECT_RAW {
-			scheme, host, path := redirectSchemeV.Value, redirectHostV.Value, redirectPathV.Value
-			if (scheme == "" || scheme == listenerType) && host == "" && path == "" {
-				return nil, httperrors.NewInputParameterError("redirect must have at least one of scheme, host, path changed")
-			}
-			if scheme == "" {
-				data.Set("redirect_scheme", jsonutils.NewString(listenerType))
-			}
-			if host == "" {
-				data.Set("redirect_host", jsonutils.NewString(domainV.Value))
-			}
+	switch input.Redirect {
+	case api.LB_REDIRECT_RAW:
+		scheme, host, path := input.RedirectScheme, input.RedirectHost, input.RedirectPath
+		if (scheme == "" || scheme == listenerType) && host == "" && path == "" {
+			return input, httperrors.NewInputParameterError("redirect must have at least one of scheme, host, path changed")
+		}
+		if scheme == "" {
+			input.RedirectScheme = listenerType
+		}
+		if host == "" {
+			input.RedirectHost = input.Domain
+		}
+	case api.LB_REDIRECT_OFF:
+		if len(input.BackendGroupId) == 0 {
+			return input, httperrors.NewMissingParameterError("backend_group_id")
 		}
 	}
 
-	{
-		if redirectV.Value == api.LB_REDIRECT_OFF {
-			if backendGroup == nil {
-				return nil, httperrors.NewInputParameterError("backend_group argument is missing")
-			}
-		}
-		if lbbg, ok := backendGroup.(*models.SLoadbalancerBackendGroup); ok && lbbg.LoadbalancerId != listener.LoadbalancerId {
-			return nil, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s",
-				lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, listener.LoadbalancerId)
-		}
-	}
-
-	err := models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, domainV.Value, pathV.Value)
+	err := models.LoadbalancerListenerRuleCheckUniqueness(ctx, listener, input.Domain, input.Path)
 	if err != nil {
-		return nil, err
+		return input, err
 	}
 
-	data.Set("cloudregion_id", jsonutils.NewString(listener.GetRegionId()))
-	data.Set("manager_id", jsonutils.NewString(listener.GetCloudproviderId()))
-	return data, nil
+	return input, nil
 }
 
 func (self *SOpenStackRegionDriver) ValidateUpdateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, backendGroup db.IModel) (*jsonutils.JSONDict, error) {

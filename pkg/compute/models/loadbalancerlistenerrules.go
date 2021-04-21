@@ -18,11 +18,14 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/regutils"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -475,39 +478,79 @@ func (man *SLoadbalancerListenerRuleManager) FetchOwnerId(ctx context.Context, d
 	return man.SVirtualResourceBaseManager.FetchOwnerId(ctx, data)
 }
 
-func (man *SLoadbalancerListenerRuleManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	input := apis.VirtualResourceCreateInput{}
-	err := data.Unmarshal(&input)
+func (man *SLoadbalancerListenerRuleManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.LbListenerRuleCreateInput) (api.LbListenerRuleCreateInput, error) {
+	_listener, err := validators.ValidateModel(userCred, LoadbalancerListenerManager, &input.ListenerId)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
-	}
-	input, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
-	if err != nil {
-		return nil, err
-	}
-	data.Update(jsonutils.Marshal(input))
-
-	listenerV := validators.NewModelIdOrNameValidator("listener", "loadbalancerlistener", ownerId)
-	if err := listenerV.Validate(data); err != nil {
-		return nil, err
+		return input, err
 	}
 
-	listener := listenerV.Model.(*SLoadbalancerListener)
+	listener := _listener.(*SLoadbalancerListener)
 	region := listener.GetRegion()
 	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("failed to find region for loadbalancer listener %s", listener.Name)
+		return input, httperrors.NewResourceNotFoundError("failed to find region for loadbalancer listener %s", listener.Name)
 	}
 
-	backendGroupV := validators.NewModelIdOrNameValidator("backend_group", "loadbalancerbackendgroup", ownerId)
-	if region.GetDriver().IsSupportLoadbalancerListenerRuleRedirect() {
-		// backend group can be empty if you support redirect in rule
-		backendGroupV.Optional(true)
-	}
-	if err := backendGroupV.Validate(data); err != nil {
-		return nil, err
+	if len(input.Domain) > 0 {
+		if !regutils.DOMAINNAME_REG.MatchString(input.Domain) {
+			return input, httperrors.NewInputParameterError("invalid doamin %s", input.Domain)
+		}
 	}
 
-	return region.GetDriver().ValidateCreateLoadbalancerListenerRuleData(ctx, userCred, ownerId, data, backendGroupV.Model)
+	if len(input.Path) > 0 {
+		if !regexp.MustCompile(`^(?:/[a-zA-Z0-9.%$&'()*+,;=!~_-]*)*$`).MatchString(input.Path) {
+			return input, httperrors.NewInputParameterError("invalid path %s", input.Path)
+		}
+	}
+
+	if len(input.Redirect) > 0 {
+		if !utils.IsInStringArray(input.Redirect, api.LB_REDIRECT_TYPES) {
+			return input, httperrors.NewInputParameterError("invalid redirect %s", input.Redirect)
+		}
+		if input.RedirectCode == 0 {
+			input.RedirectCode = 302
+		}
+		if isIn, _ := utils.InArray(input.RedirectCode, api.LB_REDIRECT_CODES); !isIn {
+			return input, httperrors.NewInputParameterError("invalid redirect_code %d", input.RedirectCode)
+		}
+		if len(input.RedirectPath) > 0 {
+			if !regexp.MustCompile(`^(?:/[a-zA-Z0-9.%$&'()*+,;=!~_-]*)*$`).MatchString(input.RedirectPath) {
+				return input, httperrors.NewInputParameterError("invalid redirect_path %s", input.RedirectPath)
+			}
+		}
+		if !utils.IsInStringArray(input.RedirectScheme, api.LB_REDIRECT_SCHEMES) {
+			return input, httperrors.NewInputParameterError("invalid redirect_scheme %s", input.RedirectScheme)
+		}
+	}
+
+	// backend group can be empty if you support redirect in rule
+	if !region.GetDriver().IsSupportLoadbalancerListenerRuleRedirect() && len(input.BackendGroupId) == 0 {
+		return input, httperrors.NewMissingParameterError("backend_gorupId")
+	}
+	if len(input.BackendGroupId) > 0 {
+		_group, err := validators.ValidateModel(userCred, LoadbalancerBackendGroupManager, &input.BackendGroupId)
+		if err != nil {
+			return input, err
+		}
+		lbbg := _group.(*SLoadbalancerBackendGroup)
+		if lbbg.LoadbalancerId != listener.LoadbalancerId {
+			return input, httperrors.NewInputParameterError("backend group %s(%s) belongs to loadbalancer %s instead of %s", lbbg.Name, lbbg.Id, lbbg.LoadbalancerId, listener.LoadbalancerId)
+
+		}
+
+	}
+	if len(input.Status) == 0 {
+		input.Status = api.LB_STATUS_ENABLED
+	}
+	if !utils.IsInStringArray(input.Status, api.LB_STATUS_SPEC) {
+		return input, httperrors.NewInputParameterError("invalid status %s", input.Status)
+	}
+
+	input.VirtualResourceCreateInput, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
+	if err != nil {
+		return input, err
+	}
+
+	return region.GetDriver().ValidateCreateLoadbalancerListenerRuleData(ctx, userCred, ownerId, listener, input)
 }
 
 func (lbr *SLoadbalancerListenerRule) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {

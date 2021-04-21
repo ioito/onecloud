@@ -24,3 +24,32 @@ type LoadbalancerListenerRuleDetails struct {
 
 	BackendGroup string `json:"backend_group"`
 }
+
+type LbListenerRuleCreateInput struct {
+	apis.VirtualResourceCreateInput
+
+	LoadbalancerListenerResourceInput
+	LoadbalancerBackendGroupResourceInput
+
+	Path   string
+	Domain string
+
+	Condition string
+
+	HttpRequestRate       uint
+	HttpRequestRatePerSrc uint
+
+	// default: off
+	// enmu: off, raw
+	Redirect string
+
+	// enmu: 301, 302, 307
+	// default: 302
+	RedirectCode int
+
+	// enmu: http, https
+	RedirectScheme string
+
+	RedirectPath string
+	RedirectHost string
+}

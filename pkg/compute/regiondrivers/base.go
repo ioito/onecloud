@@ -37,6 +37,14 @@ import (
 type SBaseRegionDriver struct {
 }
 
+func (self *SBaseRegionDriver) ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, owerId mcclient.IIdentityProvider, input api.LoadbalancerCreateInput) (api.LoadbalancerCreateInput, error) {
+	return input, httperrors.NewNotImplementedError("ValidateCreateLoadbalancerData")
+}
+
+func (self *SBaseRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, owerId mcclient.IIdentityProvider, listener *models.SLoadbalancerListener, input api.LbListenerRuleCreateInput) (api.LbListenerRuleCreateInput, error) {
+	return input, httperrors.NewNotImplementedError("ValidateCreateLoadbalancerListenerRuleData")
+}
+
 func (self *SBaseRegionDriver) RequestCreateLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *models.SLoadbalancer, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement RequestCreateLoadbalancer")
 }

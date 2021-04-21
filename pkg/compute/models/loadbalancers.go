@@ -279,17 +279,12 @@ func (man *SLoadbalancerManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fie
 
 func (man *SLoadbalancerManager) BatchCreateValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	input := api.LoadbalancerCreateInput{}
-	err := data.Unmarshal(&input)
+	data.Unmarshal(&input)
+	input, err := man.ValidateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
-		return nil, err
+		return data, nil
 	}
-
-	newData, err := man.ValidateCreateData(ctx, userCred, ownerId, query, input)
-	if err != nil {
-		return nil, err
-	}
-
-	return newData, nil
+	return input.JSON(input), nil
 }
 
 func (man *SLoadbalancerManager) ValidateCreateData(
@@ -298,63 +293,92 @@ func (man *SLoadbalancerManager) ValidateCreateData(
 	ownerId mcclient.IIdentityProvider,
 	query jsonutils.JSONObject,
 	input api.LoadbalancerCreateInput,
-) (*jsonutils.JSONDict, error) {
-	var err error
-
+) (api.LoadbalancerCreateInput, error) {
 	var region *SCloudregion
-	if len(input.VpcId) > 0 {
+	if len(input.NetworkId) > 0 {
+		_network, err := validators.ValidateModel(userCred, NetworkManager, &input.NetworkId)
+		if err != nil {
+			return input, err
+		}
+		network := _network.(*SNetwork)
+		zone := network.GetZone()
+		if zone != nil { // huawei cloud maybe zone is nil
+			input.ZoneId = zone.Id
+		} else if len(input.ZoneId) > 0 {
+			_, err = validators.ValidateModel(userCred, ZoneManager, &input.ZoneId)
+			if err != nil {
+				return input, err
+			}
+		}
+		if len(input.Address) > 0 {
+			ip := net.ParseIP(input.Address).To4()
+			if ip == nil {
+				return input, httperrors.NewInputParameterError("invalid address %s", input.Address)
+			}
+		}
+		vpc := network.GetVpc()
+		input.Vpc = vpc.Id
+		input.ManagerId = vpc.ManagerId
+		region, _ = vpc.GetRegion()
+	} else if len(input.VpcId) > 0 {
 		_vpc, err := validators.ValidateModel(userCred, VpcManager, &input.VpcId)
 		if err != nil {
-			return nil, err
+			return input, err
 		}
 		vpc := _vpc.(*SVpc)
+		input.ManagerId = vpc.ManagerId
 		region, _ = vpc.GetRegion()
 	} else if len(input.ZoneId) > 0 {
-		var zone *SZone
-		zone, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+		_zone, err := validators.ValidateModel(userCred, ZoneManager, &input.ZoneId)
 		if err != nil {
-			return nil, errors.Wrap(err, "ValidateZoneResourceInput")
+			return input, err
 		}
+		zone := _zone.(*SZone)
 		region = zone.GetRegion()
-	} else if len(input.NetworkId) > 0 {
-		if strings.IndexByte(input.NetworkId, ',') >= 0 {
-			input.NetworkId = strings.Split(input.NetworkId, ",")[0]
-		}
-		var network *SNetwork
-		network, input.NetworkResourceInput, err = ValidateNetworkResourceInput(userCred, input.NetworkResourceInput)
-		if err != nil {
-			return nil, errors.Wrap(err, "ValidateNetworkResourceInput")
-		}
-		region = network.GetRegion()
 	}
 
 	if region == nil {
-		return nil, httperrors.NewBadRequestError("cannot find region info")
+		return input, httperrors.NewBadRequestError("cannot find region info")
+	}
+
+	if len(input.AddressType) == 0 {
+		input.AddressType = api.LB_ADDR_TYPE_INTRANET
+	}
+	if !utils.IsInStringArray(input.AddressType, api.LB_ADDR_TYPES) {
+		return input, httperrors.NewInputParameterError("invalid address type %s", input.AddressType)
 	}
 
 	input.CloudregionId = region.GetId()
 
-	var cloudprovider *SCloudprovider
-	if len(input.CloudproviderId) > 0 {
-		cloudprovider, input.CloudproviderResourceInput, err = ValidateCloudproviderResourceInput(userCred, input.CloudproviderResourceInput)
+	var manager *SCloudprovider
+	if len(input.ManagerId) > 0 {
+		_manager, err := validators.ValidateModel(userCred, CloudproviderManager, &input.ManagerId)
 		if err != nil {
-			return nil, errors.Wrap(err, "ValidateCloudproviderResourceInput")
+			return input, err
 		}
+		manager = _manager.(*SCloudprovider)
+	}
+	if len(input.Status) == 0 {
+		input.Status = api.LB_STATUS_ENABLED
+	}
+	if !utils.IsInStringArray(input.Status, api.LB_STATUS_SPEC) {
+		return input, httperrors.NewInputParameterError("invalid status %s", input.Status)
 	}
 
+	var err error
 	input.VirtualResourceCreateInput, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
 	if err != nil {
-		return nil, err
+		return input, err
 	}
 
-	quotaKeys := fetchRegionalQuotaKeys(rbacutils.ScopeProject, ownerId, region, cloudprovider)
+	quotaKeys := fetchRegionalQuotaKeys(rbacutils.ScopeProject, ownerId, region, manager)
 	pendingUsage := SRegionQuota{Loadbalancer: 1}
 	pendingUsage.SetKeys(quotaKeys)
 	if err := quotas.CheckSetPendingQuota(ctx, userCred, &pendingUsage); err != nil {
-		return nil, httperrors.NewOutOfQuotaError("%s", err)
+		return input, httperrors.NewOutOfQuotaError("%s", err)
 	}
 
-	return region.GetDriver().ValidateCreateLoadbalancerData(ctx, userCred, ownerId, input.JSON(input))
+	return region.GetDriver().ValidateCreateLoadbalancerData(ctx, userCred, ownerId, input)
 }
 
 func (lb *SLoadbalancer) AllowPerformStatus(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool {

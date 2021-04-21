@@ -61,10 +61,10 @@ const (
 	LB_STATUS_UNKNOWN = "unknown"
 )
 
-var LB_STATUS_SPEC = choices.NewChoices(
+var LB_STATUS_SPEC = []string{
 	LB_STATUS_ENABLED,
 	LB_STATUS_DISABLED,
-)
+}
 
 const (
 	//默认后端服务器组
@@ -99,7 +99,7 @@ const (
 	LB_MbpsMax = 10000
 )
 
-var LB_ALIYUN_SPECS = choices.NewChoices(
+var LB_ALIYUN_SPECS = []string{
 	LB_ALIYUN_SPEC_SHAREABLE,
 	LB_ALIYUN_SPEC_S1_SMALL,
 	LB_ALIYUN_SPEC_S2_SMALL,
@@ -107,7 +107,7 @@ var LB_ALIYUN_SPECS = choices.NewChoices(
 	LB_ALIYUN_SPEC_S2_MEDIUM,
 	LB_ALIYUN_SPEC_S3_MEDIUM,
 	LB_ALIYUN_SPEC_S3_LARGE,
-)
+}
 
 var LB_AWS_SPECS = choices.NewChoices(
 	LB_AWS_SPEC_APPLICATION,
@@ -126,10 +126,10 @@ const (
 	LB_ADDR_TYPE_INTERNET = "internet"
 )
 
-var LB_ADDR_TYPES = choices.NewChoices(
+var LB_ADDR_TYPES = []string{
 	LB_ADDR_TYPE_INTERNET,
 	LB_ADDR_TYPE_INTRANET,
-)
+}
 
 const (
 	LB_NETWORK_TYPE_CLASSIC = "classic"
@@ -151,12 +151,12 @@ const (
 	LB_LISTENER_TYPE_TERMINATED_HTTPS = "terminated_https"
 )
 
-var LB_LISTENER_TYPES = choices.NewChoices(
+var LB_LISTENER_TYPES = []string{
 	LB_LISTENER_TYPE_TCP,
 	LB_LISTENER_TYPE_UDP,
 	LB_LISTENER_TYPE_HTTP,
 	LB_LISTENER_TYPE_HTTPS,
-)
+}
 
 // aws_network_lb_listener
 var AWS_NETWORK_LB_LISTENER_TYPES = choices.NewChoices(
@@ -231,10 +231,10 @@ const (
 	LB_STICKY_SESSION_TYPE_SERVER = "server"
 )
 
-var LB_STICKY_SESSION_TYPES = choices.NewChoices(
+var LB_STICKY_SESSION_TYPES = []string{
 	LB_STICKY_SESSION_TYPE_INSERT,
 	LB_STICKY_SESSION_TYPE_SERVER,
-)
+}
 
 // TODO maybe https check when field need comes ;)
 const (
@@ -282,10 +282,10 @@ const (
 	LB_REDIRECT_RAW = "raw"
 )
 
-var LB_REDIRECT_TYPES = choices.NewChoices(
+var LB_REDIRECT_TYPES = []string{
 	LB_REDIRECT_OFF,
 	LB_REDIRECT_RAW,
-)
+}
 
 const (
 	LB_REDIRECT_CODE_301 = int64(301) // Moved Permanently
@@ -305,11 +305,11 @@ const (
 	LB_REDIRECT_SCHEME_HTTPS    = "https"
 )
 
-var LB_REDIRECT_SCHEMES = choices.NewChoices(
+var LB_REDIRECT_SCHEMES = []string{
 	LB_REDIRECT_SCHEME_IDENTITY,
 	LB_REDIRECT_SCHEME_HTTP,
 	LB_REDIRECT_SCHEME_HTTPS,
-)
+}
 
 const (
 	LB_BOOL_ON  = "on"
@@ -334,13 +334,13 @@ const (
 	LB_SCHEDULER_QCH = "qch"
 )
 
-var LB_SCHEDULER_TYPES = choices.NewChoices(
+var LB_SCHEDULER_TYPES = []string{
 	LB_SCHEDULER_RR,
 	LB_SCHEDULER_WRR,
 	LB_SCHEDULER_WLC,
 	LB_SCHEDULER_SCH,
 	LB_SCHEDULER_TCH,
-)
+}
 
 const (
 	LB_SENDPROXY_OFF       = "off"
@@ -350,13 +350,13 @@ const (
 	LB_SENDPROXY_V2_SSL_CN = "v2-ssl-cn"
 )
 
-var LB_SENDPROXY_CHOICES = choices.NewChoices(
+var LB_SENDPROXY_CHOICES = []string{
 	LB_SENDPROXY_OFF,
 	LB_SENDPROXY_V1,
 	LB_SENDPROXY_V2,
 	LB_SENDPROXY_V2_SSL,
 	LB_SENDPROXY_V2_SSL_CN,
-)
+}
 
 var LB_ALIYUN_UDP_SCHEDULER_TYPES = choices.NewChoices(
 	LB_SCHEDULER_RR,
