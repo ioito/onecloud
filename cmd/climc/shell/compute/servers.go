@@ -15,17 +15,26 @@
 package compute
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/cmd/climc/shell"
 	"yunion.io/x/onecloud/pkg/apis/compute"
@@ -35,6 +44,7 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient/options"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/ssh"
+	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
 func init() {
@@ -848,6 +858,267 @@ func init() {
 			return err
 		}
 		printObject(result)
+		return nil
+	})
+
+	type RandomCreateOptions struct {
+		NamesFile string
+		Count     int    `default:"5"`
+		Provider  string `choices:"Aliyun"`
+	}
+
+	R(&RandomCreateOptions{}, "server-random-create", "Generate Fake data", func(s *mcclient.ClientSession, opts *RandomCreateOptions) error {
+		var ip2Long = func(ip string) uint32 {
+			var long uint32
+			binary.Read(bytes.NewBuffer(net.ParseIP(ip).To4()), binary.BigEndian, &long)
+			return long
+		}
+		var backtoIP4 = func(ipInt int64) string {
+			// need to do two bit shifting and “0xff” masking
+			b0 := strconv.FormatInt((ipInt>>24)&0xff, 10)
+			b1 := strconv.FormatInt((ipInt>>16)&0xff, 10)
+			b2 := strconv.FormatInt((ipInt>>8)&0xff, 10)
+			b3 := strconv.FormatInt((ipInt & 0xff), 10)
+			return b0 + "." + b1 + "." + b2 + "." + b3
+		}
+		start := ip2Long("200.177.0.0")
+		end := ip2Long("221.199.0.0")
+		data, err := modules.Cloudregions.List(s, jsonutils.Marshal(map[string]string{"provider": opts.Provider, "scope": "system", "limit": "1024", "usable": "true"}))
+		if err != nil {
+			return errors.Wrapf(err, "modules.Cloudregions.List")
+		}
+		type sbase struct {
+			Id             string
+			Name           string
+			CpuCount       int
+			LocalCategory  string
+			SysDiskType    string
+			DataDiskTypes  string
+			StorageType    string
+			ZoneId         string
+			PostpaidStauts string
+			PrepaidStatus  string
+			Status         string
+		}
+		regions := []sbase{}
+		jsonutils.Update(&regions, data.Data)
+		rand.Seed(2)
+		names := []string{}
+		if len(opts.NamesFile) > 0 {
+			f, err := os.Open(opts.NamesFile)
+			if err != nil {
+				return errors.Wrapf(err, "os.Open(%s)", opts.NamesFile)
+			}
+			defer f.Close()
+			buf := bufio.NewScanner(f)
+			for buf.Scan() {
+				name := strings.TrimSpace(buf.Text())
+				if len(name) > 0 {
+					names = append(names, name)
+				}
+			}
+		}
+		count := 0
+		for _, region := range regions {
+			images, skus, storages, _nets := []sbase{}, []sbase{}, []sbase{}, []sbase{}
+			data, err = modules.Cachedimages.List(s, jsonutils.Marshal(map[string]string{
+				"cloudregion_id": region.Id,
+				"limit":          "1024",
+			}))
+			if err != nil {
+				return errors.Wrapf(err, "modules.Cachedimages.List")
+			}
+			jsonutils.Update(&images, data.Data)
+			data, err = modules.ServerSkus.List(s, jsonutils.Marshal(map[string]string{
+				"cloudregion_id": region.Id,
+				"limit":          "1024",
+			}))
+			jsonutils.Update(&skus, data.Data)
+			data, err = modules.Storages.List(s, jsonutils.Marshal(map[string]string{
+				"cloudregion_id": region.Id,
+				"show_emulated":  "true",
+				"scope":          "system",
+				"limit":          "100",
+			}))
+			jsonutils.Update(&storages, data.Data)
+			if len(storages) == 0 {
+				log.Errorf("region: %s storage is zero", region.Name)
+				continue
+			}
+			data, err = modules.Networks.List(s, jsonutils.Marshal(map[string]string{
+				"cloudregion_id": region.Id,
+				"scope":          "system",
+				"limit":          "100",
+			}))
+			jsonutils.Update(&_nets, data.Data)
+			if len(_nets) == 0 {
+				log.Errorf("region: %s networks is zero", region.Name)
+				continue
+			}
+			nets := map[string][]sbase{}
+			for i := range _nets {
+				_, ok := nets[_nets[i].ZoneId]
+				if !ok {
+					nets[_nets[i].ZoneId] = []sbase{}
+				}
+				nets[_nets[i].ZoneId] = append(nets[_nets[i].ZoneId], _nets[i])
+			}
+			backends := []string{}
+			for _, storage := range storages {
+				if !utils.IsInStringArray(storage.StorageType, backends) {
+					backends = append(backends, storage.StorageType)
+				}
+			}
+			backend := backends[rand.Intn(len(backends))]
+			dataBackend := backends[rand.Intn(len(backends))]
+			sysSizes := []int64{30, 50, 80, 100, 500}
+			dataSizes := []int64{100, 300, 500, 750}
+			eipBws := []int64{1, 3, 5, 10, 20, 50}
+			durations := []string{"1M", "3M", "6M", "1Y"}
+			expectStatus := []string{"running", "ready"}
+			for _, sku := range skus {
+				if sku.CpuCount > 48 || (sku.PrepaidStatus != "available" && sku.PostpaidStauts != "available") {
+					continue
+				}
+				if len(sku.SysDiskType) > 0 {
+					_backends := strings.Split(sku.SysDiskType, ",")
+					backend = _backends[rand.Intn(len(_backends))]
+				}
+				if len(sku.DataDiskTypes) > 0 {
+					_backends := strings.Split(sku.DataDiskTypes, ",")
+					dataBackend = _backends[rand.Intn(len(_backends))]
+				}
+				sysSize := sysSizes[rand.Intn(len(sysSizes))]
+				dataSize := dataSizes[rand.Intn(len(dataSizes))]
+				imageId := images[rand.Intn(len(images))].Id
+				duration := durations[rand.Intn(len(durations))]
+				status := expectStatus[rand.Intn(len(expectStatus))]
+				zoneNets, _ := nets[sku.ZoneId]
+				if len(zoneNets) == 0 {
+					continue
+				}
+				netId := zoneNets[rand.Intn(len(zoneNets))].Id
+				eipBw := eipBws[rand.Intn(len(eipBws))]
+				sysDisk := map[string]interface{}{
+					"image_id": imageId,
+					"backend":  backend,
+					"index":    0,
+					"size":     fmt.Sprintf("%d", sysSize*1024),
+				}
+				dataDisk := map[string]interface{}{
+					"backend": dataBackend,
+					"index":   1,
+					"size":    fmt.Sprintf("%d", dataSize*1024),
+				}
+				disks := []map[string]interface{}{
+					sysDisk,
+				}
+				if rand.Intn(100) > 50 {
+					disks = append(disks, dataDisk)
+				}
+				name := ""
+				if count < len(names) {
+					name = names[count]
+				} else {
+					name = stringutils2.RandomName("i-", 12)
+				}
+
+				params := map[string]interface{}{
+					"prefer_region": region.Id,
+					"instance_type": sku.Name,
+					"hypervisor":    strings.ToLower(opts.Provider),
+					"nets": []map[string]string{
+						map[string]string{
+							"network": netId,
+						},
+					},
+					"generate_name": name,
+					"disks":         disks,
+				}
+
+				if rand.Intn(100) > 50 {
+					params["eip_bw"] = fmt.Sprintf("%d", eipBw)
+				}
+
+				if rand.Intn(100) > 50 {
+					params["duration"] = duration
+				}
+
+				result, err := modules.SchedManager.DoForecast(s, jsonutils.Marshal(params))
+				if err != nil {
+					return err
+				}
+
+				isOk, _ := result.Int("allow_count")
+				if isOk == 0 {
+					continue
+				}
+
+				result, err = modules.Servers.Create(s, jsonutils.Marshal(params))
+				if err != nil {
+					if count < len(names)-1 {
+						names = append(names[:count], names[count+1:]...)
+					}
+					continue
+				}
+				server := sbase{}
+				result.Unmarshal(&server)
+				if len(server.Id) > 0 {
+					for i := 0; i < 10; i++ {
+						resp, err := modules.Servers.Get(s, server.Id, nil)
+						if err != nil {
+							break
+						}
+						_status, _ := resp.GetString("status")
+						log.Infof("count: %d(%d) server: %s status: %s", count+1, opts.Count, server.Name, _status)
+						if utils.IsInStringArray(_status, []string{"unknown", "sched_fail", "disk_fail"}) {
+							_, err := modules.Servers.PerformAction(s, server.Id, "status", jsonutils.Marshal(map[string]string{"status": status}))
+							if err != nil {
+								log.Errorf("perform server status error: %v", err)
+							}
+							resp, err := modules.Disks.List(s, jsonutils.Marshal(map[string]string{"server_id": server.Id, "scope": "system"}))
+							if err != nil {
+								log.Errorf("disk list error: %v", err)
+								break
+							}
+							disks := []sbase{}
+							jsonutils.Update(&disks, resp.Data)
+							for _, disk := range disks {
+								_, err = modules.Disks.PerformAction(s, disk.Id, "status", jsonutils.Marshal(map[string]string{"status": "ready"}))
+								if err != nil {
+									log.Errorf("perform disk %s status error: %v", disk.Name, err)
+								}
+							}
+							_resp, err := modules.Elasticips.Get(s, fmt.Sprintf("eip-for-%s", server.Name), nil)
+							if err != nil {
+								log.Infof("not found eip for server %s error: %v", server.Name, err)
+							} else {
+								eip := &sbase{}
+								_resp.Unmarshal(eip)
+
+								addr := backtoIP4(rand.Int63n(int64(end-start)) + int64(start))
+								_, err = modules.Elasticips.Update(s, eip.Id, jsonutils.Marshal(map[string]string{
+									"ip_addr":        addr,
+									"associate_type": "server",
+									"associate_id":   server.Id,
+								}))
+								if err != nil {
+									log.Errorf("update eip -> %s error: %v", addr, err)
+								}
+								modules.Elasticips.PerformAction(s, eip.Id, "status", jsonutils.Marshal(map[string]string{"status": "ready"}))
+							}
+							log.Infof("status -> ok")
+							break
+						}
+						time.Sleep(time.Second)
+					}
+				}
+				count++
+				if count >= opts.Count {
+					return nil
+				}
+			}
+		}
 		return nil
 	})
 }

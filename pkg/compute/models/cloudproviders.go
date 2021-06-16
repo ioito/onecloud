@@ -859,6 +859,7 @@ func (self *SCloudprovider) GetProvider() (cloudprovider.ICloudProvider, error) 
 	if !self.GetEnabled() {
 		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "Cloud provider is not enabled")
 	}
+	return nil, fmt.Errorf("invalid account secret")
 
 	accessUrl := self.getAccessUrl()
 	passwd, err := self.getPassword()
