@@ -207,7 +207,7 @@ func (manager *SElasticcacheAclManager) ValidateCreateData(ctx context.Context, 
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
-		region = ec.(*SElasticcache).GetRegion()
+		region = ec.(*SElasticcache).SCloudregionResourceBase.GetRegion()
 
 		if region == nil {
 			return nil, fmt.Errorf("getting elastic cache region failed")
@@ -258,7 +258,7 @@ func (self *SElasticcacheAcl) GetRegion() *SCloudregion {
 		return nil
 	}
 
-	return ieb.(*SElasticcache).GetRegion()
+	return ieb.(*SElasticcache).SCloudregionResourceBase.GetRegion()
 }
 
 func (self *SElasticcacheAcl) AllowUpdateItem(ctx context.Context, userCred mcclient.TokenCredential) bool {

@@ -1900,7 +1900,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncElasticcache(ctx cont
 		return errors.Wrap(err, "managedVirtualizationRegionDriver.RequestSyncElasticcache.GetIElasticcacheById")
 	}
 
-	provider := ec.GetCloudprovider()
+	provider := ec.SManagedResourceBase.GetCloudprovider()
 	if provider == nil {
 		return errors.Wrap(fmt.Errorf("provider is nil"), "managedVirtualizationRegionDriver.RequestSyncElasticcache.GetCloudprovider")
 	}
@@ -2012,7 +2012,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestElasticcacheChangeSpec(ct
 		return errors.Wrap(fmt.Errorf("missing parameter sku"), "managedVirtualizationRegionDriver.RequestElasticcacheChangeSpec")
 	}
 
-	provider := ec.GetCloudprovider()
+	provider := ec.SManagedResourceBase.GetCloudprovider()
 	if provider == nil {
 		return errors.Wrap(fmt.Errorf("provider is nil"), "managedVirtualizationRegionDriver.RequestElasticcacheChangeSpec.GetCloudprovider")
 	}

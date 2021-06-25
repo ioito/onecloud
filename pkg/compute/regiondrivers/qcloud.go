@@ -1591,7 +1591,7 @@ func (self *SQcloudRegionDriver) RequestCreateElasticcache(ctx context.Context, 
 			return nil, errors.Wrap(err, "qcloudRegionDriver.CreateElasticcache.GetIRegion")
 		}
 
-		provider := ec.GetCloudprovider()
+		provider := ec.SManagedResourceBase.GetCloudprovider()
 		if provider == nil {
 			return nil, errors.Wrap(httperrors.ErrInvalidStatus, "qcloudRegionDriver.CreateElasticcache.GetProvider")
 		}
@@ -1685,7 +1685,7 @@ func (self *SQcloudRegionDriver) RequestSyncSecgroupsForElasticcache(ctx context
 				return nil, errors.Wrap(err, "qcloudRegionDriver.GetElasticcacheSecgroups")
 			}
 
-			provider := ec.GetCloudprovider()
+			provider := ec.SManagedResourceBase.GetCloudprovider()
 			if provider == nil {
 				return nil, errors.Wrap(httperrors.ErrInvalidStatus, "qcloudRegionDriver.GetCloudprovider")
 			}
@@ -1696,7 +1696,8 @@ func (self *SQcloudRegionDriver) RequestSyncSecgroupsForElasticcache(ctx context
 			}
 
 			vpc := ec.GetVpc()
-			vpcId, err := self.GetSecurityGroupVpcId(ctx, userCred, ec.GetRegion(), nil, vpc, false)
+			region, _ := ec.GetRegion()
+			vpcId, err := self.GetSecurityGroupVpcId(ctx, userCred, region, nil, vpc, false)
 			if err != nil {
 				return nil, errors.Wrap(err, "GetSecurityGroupVpcId")
 			}

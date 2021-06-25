@@ -205,7 +205,7 @@ func (self *SElasticcacheParameter) GetRegion() *SCloudregion {
 		return nil
 	}
 
-	return ieb.(*SElasticcache).GetRegion()
+	return ieb.(*SElasticcache).SCloudregionResourceBase.GetRegion()
 }
 
 func (self *SElasticcacheParameter) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {

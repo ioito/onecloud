@@ -16,9 +16,9 @@ package tasks
 
 import (
 	"context"
-	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -36,29 +36,29 @@ func init() {
 	taskman.RegisterTask(ElasticcacheChangeSpecTask{})
 }
 
-func (self *ElasticcacheChangeSpecTask) taskFail(ctx context.Context, ec *models.SElasticcache, reason jsonutils.JSONObject) {
-	ec.SetStatus(self.GetUserCred(), api.ELASTIC_CACHE_STATUS_CHANGE_FAILED, reason.String())
-	db.OpsLog.LogEvent(ec, db.ACT_CHANGE_FLAVOR, reason, self.UserCred)
-	logclient.AddActionLogWithStartable(self, ec, logclient.ACT_VM_CHANGE_FLAVOR, reason, self.UserCred, false)
+func (self *ElasticcacheChangeSpecTask) taskFail(ctx context.Context, ec *models.SElasticcache, err error) {
+	ec.SetStatus(self.GetUserCred(), api.ELASTIC_CACHE_STATUS_CHANGE_FAILED, err.Error())
+	db.OpsLog.LogEvent(ec, db.ACT_CHANGE_FLAVOR, err, self.UserCred)
+	logclient.AddActionLogWithStartable(self, ec, logclient.ACT_VM_CHANGE_FLAVOR, err, self.UserCred, false)
 	notifyclient.EventNotify(ctx, self.GetUserCred(), notifyclient.SEventNotifyParam{
 		Obj:    ec,
 		Action: notifyclient.ActionChangeConfig,
 		IsFail: true,
 	})
-	self.SetStageFailed(ctx, reason)
+	self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
 }
 
 func (self *ElasticcacheChangeSpecTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	elasticcache := obj.(*models.SElasticcache)
-	region := elasticcache.GetRegion()
-	if region == nil {
-		self.taskFail(ctx, elasticcache, jsonutils.NewString(fmt.Sprintf("failed to find region for elastic cache %s", elasticcache.GetName())))
+	region, err := elasticcache.GetRegion()
+	if err != nil {
+		self.taskFail(ctx, elasticcache, errors.Wrapf(err, "GetRegion"))
 		return
 	}
 
 	self.SetStage("OnElasticcacheChangeSpecComplete", nil)
 	if err := region.GetDriver().RequestElasticcacheChangeSpec(ctx, self.GetUserCred(), elasticcache, self); err != nil {
-		self.OnElasticcacheChangeSpecCompleteFailed(ctx, elasticcache, jsonutils.NewString(err.Error()))
+		self.OnElasticcacheChangeSpecCompleteFailed(ctx, elasticcache, jsonutils.NewString(errors.Wrapf(err, "RequestElasticcacheChangeSpec").Error()))
 		return
 	}
 
@@ -74,5 +74,5 @@ func (self *ElasticcacheChangeSpecTask) OnElasticcacheChangeSpecComplete(ctx con
 }
 
 func (self *ElasticcacheChangeSpecTask) OnElasticcacheChangeSpecCompleteFailed(ctx context.Context, elasticcache *models.SElasticcache, reason jsonutils.JSONObject) {
-	self.taskFail(ctx, elasticcache, reason)
+	self.taskFail(ctx, elasticcache, errors.Errorf(reason.String()))
 }

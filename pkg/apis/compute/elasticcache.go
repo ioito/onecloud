@@ -22,7 +22,9 @@ import (
 
 type ElasticcacheDetails struct {
 	apis.VirtualResourceDetails
-	VpcResourceInfo
+	CloudregionResourceInfo
+	ManagedResourceInfo
+	VpcResourceInfoBase
 	ZoneResourceInfoBase
 
 	SElasticcache
@@ -165,9 +167,12 @@ type ElasticcacheCreateInput struct {
 	// required: false
 	SlaveZones []string `json:"slave_zones"`
 
-	// Ip子网名称或Id,建议使用Id
+	// swagger:ignore
+	Network string `json:"network" yunion-deprecated-by:"network_id"`
+
+	// Ip子网Id
 	// required: true
-	Network string `json:"network"`
+	NetworkId string `json:"network_id"`
 
 	// 网络类型
 	//  enum: vpc, cLassic
@@ -205,6 +210,9 @@ type ElasticcacheCreateInput struct {
 
 	// swagger:ignore
 	ManagerId string
+
+	// swagger:ignore
+	CloudregionId string
 
 	// 包年包月时间周期
 	Duration string `json:"duration"`

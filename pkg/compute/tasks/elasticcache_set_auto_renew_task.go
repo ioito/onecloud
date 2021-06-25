@@ -24,7 +24,15 @@ func (self *ElasticcacheSetAutoRenewTask) OnInit(ctx context.Context, obj db.ISt
 	ec := obj.(*models.SElasticcache)
 
 	autoRenew, _ := self.GetParams().Bool("auto_renew")
-	err := ec.GetRegion().GetDriver().RequestElasticcacheSetAutoRenew(ctx, self.UserCred, ec, autoRenew, self)
+	region, err := ec.GetRegion()
+	if err != nil {
+		db.OpsLog.LogEvent(ec, db.ACT_SET_AUTO_RENEW_FAIL, err, self.UserCred)
+		logclient.AddActionLogWithStartable(self, ec, logclient.ACT_SET_AUTO_RENEW, err, self.UserCred, false)
+		ec.SetStatus(self.GetUserCred(), api.ELASTIC_CACHE_SET_AUTO_RENEW_FAILED, err.Error())
+		self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
+		return
+	}
+	err = region.GetDriver().RequestElasticcacheSetAutoRenew(ctx, self.UserCred, ec, autoRenew, self)
 	if err != nil {
 		db.OpsLog.LogEvent(ec, db.ACT_SET_AUTO_RENEW_FAIL, err, self.UserCred)
 		logclient.AddActionLogWithStartable(self, ec, logclient.ACT_SET_AUTO_RENEW, err, self.UserCred, false)

@@ -1233,12 +1233,12 @@ func _doCreateItem(
 		}
 	}
 
+	validFuncName := func() string { return "ValidateCreateData" }
 	if batchCreate {
-		dataDict, err = manager.BatchCreateValidateCreateData(ctx, userCred, ownerId, query, dataDict)
-	} else {
-		dataDict, err = ValidateCreateData(manager, ctx, userCred, ownerId, query, dataDict)
+		validFuncName = func() string { return "BatchCreateValidateCreateData" }
 	}
 
+	dataDict, err = ValidateCreateData(validFuncName, manager, ctx, userCred, ownerId, query, dataDict)
 	if err != nil {
 		return nil, httperrors.NewGeneralError(err)
 	}
@@ -1545,7 +1545,8 @@ func managerPerformCheckCreateData(
 		}()
 	}
 
-	return ValidateCreateData(manager, ctx, userCred, ownerId, query, bodyDict)
+	validFuncName := func() string { return "ValidateCreateData" }
+	return ValidateCreateData(validFuncName, manager, ctx, userCred, ownerId, query, bodyDict)
 }
 
 func (dispatcher *DBModelDispatcher) PerformClassAction(ctx context.Context, action string, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {

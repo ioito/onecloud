@@ -16,9 +16,9 @@ package tasks
 
 import (
 	"context"
-	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -45,14 +45,14 @@ func (self *ElasticcacheSyncsecgroupsTask) taskFailed(ctx context.Context, cache
 func (self *ElasticcacheSyncsecgroupsTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	cache := obj.(*models.SElasticcache)
 
-	region := cache.GetRegion()
-	if region == nil {
-		self.taskFailed(ctx, cache, jsonutils.NewString(fmt.Sprintf("failed to found cloudregion for elasticcache %s(%s)", cache.Name, cache.Id)))
+	region, err := cache.GetRegion()
+	if err != nil {
+		self.taskFailed(ctx, cache, jsonutils.NewString(errors.Wrapf(err, "GetRegion").Error()))
 		return
 	}
 
 	self.SetStage("OnElasticcacheSyncSecgroupsComplete", nil)
-	err := region.GetDriver().RequestSyncSecgroupsForElasticcache(ctx, self.GetUserCred(), cache, self)
+	err = region.GetDriver().RequestSyncSecgroupsForElasticcache(ctx, self.GetUserCred(), cache, self)
 	if err != nil {
 		self.taskFailed(ctx, cache, jsonutils.NewString(err.Error()))
 		return

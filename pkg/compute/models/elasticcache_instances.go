@@ -55,6 +55,8 @@ type SElasticcacheManager struct {
 	db.SVirtualResourceBaseManager
 	db.SExternalizedResourceBaseManager
 	SDeletePreventableResourceBaseManager
+	SCloudregionResourceBaseManager
+	SManagedResourceBaseManager
 	SVpcResourceBaseManager
 	SZoneResourceBaseManager
 	SNetworkResourceBaseManager
@@ -77,6 +79,8 @@ func init() {
 type SElasticcache struct {
 	db.SVirtualResourceBase
 	db.SExternalizedResourceBase
+	SCloudregionResourceBase
+	SManagedResourceBase
 	SBillingResourceBase
 	SDeletePreventableResourceBase
 	SVpcResourceBase `width:"36" charset:"ascii" nullable:"false" list:"user" create:"optional"`
@@ -153,6 +157,10 @@ type SElasticcache struct {
 	// AutoRenewPeriod // 自动续费周期
 }
 
+func (self *SElasticcache) GetCloudproviderId() string {
+	return self.ManagerId
+}
+
 // elastic cache 子资源获取owner id
 func elasticcacheSubResourceFetchOwnerId(ctx context.Context, data jsonutils.JSONObject) (mcclient.IIdentityProvider, error) {
 	parentId := jsonutils.GetAnyString(data, []string{"elasticcache_id", "elasticcache"})
@@ -191,15 +199,13 @@ func elasticcacheSubResourceFetchOwner(q *sqlchemy.SQuery, userCred mcclient.IId
 	return q
 }
 
-func (self *SElasticcache) getCloudProviderInfo() SCloudProviderInfo {
-	region := self.GetRegion()
-	provider := self.GetCloudprovider()
-	zone := self.GetZone()
-	return MakeCloudProviderInfo(region, zone, provider)
-}
+func (self *SElasticcache) GetRegion() (*SCloudregion, error) {
+	region, err := CloudregionManager.FetchById(self.CloudregionId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "FetchById(self.CloudregionId)")
+	}
+	return region.(*SCloudregion), nil
 
-func (self *SElasticcache) GetExtraDetails(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, isList bool) (api.ElasticcacheDetails, error) {
-	return api.ElasticcacheDetails{}, nil
 }
 
 func (manager *SElasticcacheManager) FetchCustomizeColumns(
@@ -215,15 +221,19 @@ func (manager *SElasticcacheManager) FetchCustomizeColumns(
 	virtRows := manager.SVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	vpcRows := manager.SVpcResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	zoneRows := manager.SZoneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	manRows := manager.SManagedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	regRows := manager.SCloudregionResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 
 	netIds := make([]string, len(objs))
 	cacheIds := make([]string, len(objs))
 	zoneIds := []string{}
 	for i := range rows {
 		rows[i] = api.ElasticcacheDetails{
-			VirtualResourceDetails: virtRows[i],
-			VpcResourceInfo:        vpcRows[i],
-			ZoneResourceInfoBase:   zoneRows[i].ZoneResourceInfoBase,
+			VirtualResourceDetails:  virtRows[i],
+			VpcResourceInfoBase:     vpcRows[i].VpcResourceInfoBase,
+			ManagedResourceInfo:     manRows[i],
+			CloudregionResourceInfo: regRows[i],
+			ZoneResourceInfoBase:    zoneRows[i].ZoneResourceInfoBase,
 		}
 		netIds[i] = objs[i].(*SElasticcache).NetworkId
 		cacheIds[i] = objs[i].(*SElasticcache).Id
@@ -633,8 +643,8 @@ func (manager *SElasticcacheManager) newFromCloudElasticcache(ctx context.Contex
 	instance.SetModelManager(manager, &instance)
 
 	instance.ExternalId = extInstance.GetGlobalId()
-	// instance.CloudregionId = region.Id
-	// instance.ManagerId = provider.Id
+	instance.CloudregionId = region.Id
+	instance.ManagerId = provider.Id
 	instance.IsEmulated = extInstance.IsEmulated()
 	instance.Status = extInstance.GetStatus()
 
@@ -746,6 +756,10 @@ func (manager *SElasticcacheManager) newFromCloudElasticcache(ctx context.Contex
 	return &instance, nil
 }
 
+func (self *SElasticcache) GetChangeOwnerCandidateDomainIds() []string {
+	return self.SManagedResourceBase.GetChangeOwnerCandidateDomainIds()
+}
+
 func (manager *SElasticcacheManager) getElasticcachesByProviderId(providerId string) ([]SElasticcache, error) {
 	instances := []SElasticcache{}
 	err := fetchByVpcManagerId(manager, providerId, &instances)
@@ -759,13 +773,8 @@ func (manager *SElasticcacheManager) AllowCreateItem(ctx context.Context, userCr
 	return db.IsAdminAllowCreate(userCred, manager)
 }
 
-func (manager *SElasticcacheManager) BatchCreateValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	_data := api.ElasticcacheCreateInput{}
-	err := data.Unmarshal(&_data)
-	if err != nil {
-		return nil, errors.Wrap(err, "ElasticcacheCreateInput.Unmarshal")
-	}
-	input, err := manager.validateCreateData(ctx, userCred, ownerId, query, _data)
+func (manager *SElasticcacheManager) BatchCreateValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.ElasticcacheCreateInput) (*api.ElasticcacheCreateInput, error) {
+	input, err := manager.validateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
 		return nil, errors.Wrap(err, "validateCreateData")
 	}
@@ -773,20 +782,22 @@ func (manager *SElasticcacheManager) BatchCreateValidateCreateData(ctx context.C
 	return input, nil
 }
 
-func (manager *SElasticcacheManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.ElasticcacheCreateInput) (*jsonutils.JSONDict, error) {
+func (manager *SElasticcacheManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.ElasticcacheCreateInput) (*api.ElasticcacheCreateInput, error) {
 	return manager.validateCreateData(ctx, userCred, ownerId, query, input)
 }
 
-func (manager *SElasticcacheManager) validateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.ElasticcacheCreateInput) (*jsonutils.JSONDict, error) {
+func (manager *SElasticcacheManager) validateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.ElasticcacheCreateInput) (*api.ElasticcacheCreateInput, error) {
 	var region *SCloudregion
 	var provider *SCloudprovider
-	if len(input.Network) > 0 {
-		network, err := db.FetchByIdOrName(NetworkManager, userCred, strings.Split(input.Network, ",")[0])
+	if len(input.NetworkId) > 0 {
+		network, err := db.FetchByIdOrName(NetworkManager, userCred, strings.Split(input.NetworkId, ",")[0])
 		if err != nil {
 			return nil, fmt.Errorf("getting network failed")
 		}
 		region = network.(*SNetwork).GetRegion()
 		vpc := network.(*SNetwork).GetVpc()
+		input.ManagerId = vpc.ManagerId
+		input.CloudregionId = vpc.CloudregionId
 		provider = vpc.GetCloudprovider()
 	}
 
@@ -816,10 +827,12 @@ func (manager *SElasticcacheManager) validateCreateData(ctx context.Context, use
 		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.ValidateCreateData")
 	}
 
-	ret, err := region.GetDriver().ValidateCreateElasticcacheData(ctx, userCred, nil, input)
+	ret, err := region.GetDriver().ValidateCreateElasticcacheData(ctx, userCred, nil, *input)
 	if err != nil {
 		return nil, errors.Wrap(err, "region.GetDriver().ValidateCreateElasticcacheData")
 	}
+
+	ret.Unmarshal(input)
 
 	cachePendingUsage := &SRegionQuota{Cache: 1}
 	quotaKeys := fetchRegionalQuotaKeys(rbacutils.ScopeProject, ownerId, region, provider)
@@ -828,7 +841,7 @@ func (manager *SElasticcacheManager) validateCreateData(ctx context.Context, use
 		return nil, errors.Wrap(err, "quotas.CheckSetPendingQuota")
 	}
 
-	return ret, nil
+	return input, nil
 }
 
 func (self *SElasticcache) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
@@ -1074,7 +1087,8 @@ func (self *SElasticcache) GetCreateHuaweiElasticcacheParams(data *jsonutils.JSO
 
 	// fill security group here
 	if len(self.SecurityGroupId) > 0 {
-		sgCache, err := SecurityGroupCacheManager.GetSecgroupCache(context.Background(), nil, self.SecurityGroupId, self.VpcId, self.GetRegion().Id, self.GetCloudprovider().Id, "")
+		region, _ := self.GetRegion()
+		sgCache, err := SecurityGroupCacheManager.GetSecgroupCache(context.Background(), nil, self.SecurityGroupId, self.VpcId, region.Id, self.GetCloudproviderId(), "")
 		if err != nil {
 			return nil, errors.Wrap(err, "elasticcache.GetCreateHuaweiElasticcacheParams.SecurityGroup")
 		}
@@ -1236,12 +1250,17 @@ func (self *SElasticcache) ValidatorChangeSpecData(ctx context.Context, userCred
 		return nil, err
 	}
 
+	manager := self.SManagedResourceBase.GetCloudprovider()
+
 	sku := skuV.Model.(*SElasticcacheSku)
-	if sku.Provider != self.GetProviderName() {
-		return nil, httperrors.NewInputParameterError("provider mismatch: %s instance can't use %s sku", self.GetProviderName(), sku.Provider)
+	if sku.Provider != manager.Provider {
+		return nil, httperrors.NewInputParameterError("provider mismatch: %s instance can't use %s sku", manager.Provider, sku.Provider)
 	}
 
-	region := self.GetRegion()
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
+	}
 	if sku.CloudregionId != region.Id {
 		return nil, httperrors.NewInputParameterError("region mismatch: instance region %s, sku region %s", region.Id, sku.CloudregionId)
 	}
@@ -1290,9 +1309,9 @@ func (self *SElasticcache) AllowPerformUpdateAuthMode(ctx context.Context, userC
 }
 
 func (self *SElasticcache) ValidatorUpdateAuthModeData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	region := self.GetRegion()
-	if region == nil {
-		return nil, fmt.Errorf("fail to found region for elastic cache")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
 	}
 
 	driver := region.GetDriver()
@@ -1300,7 +1319,7 @@ func (self *SElasticcache) ValidatorUpdateAuthModeData(ctx context.Context, user
 		return nil, fmt.Errorf("fail to found driver for elastic cache")
 	}
 
-	err := driver.AllowUpdateElasticcacheAuthMode(ctx, userCred, self.GetOwnerId(), self)
+	err = driver.AllowUpdateElasticcacheAuthMode(ctx, userCred, self.GetOwnerId(), self)
 	if err != nil {
 		return nil, err
 	}
@@ -1738,11 +1757,12 @@ func (man *SElasticcacheManager) TotalCount(
 }
 
 func (cache *SElasticcache) GetQuotaKeys() quotas.IQuotaKeys {
+	region, _ := cache.GetRegion()
 	return fetchRegionalQuotaKeys(
 		rbacutils.ScopeProject,
 		cache.GetOwnerId(),
-		cache.GetRegion(),
-		cache.GetCloudprovider(),
+		region,
+		cache.SManagedResourceBase.GetCloudprovider(),
 	)
 }
 
@@ -1849,7 +1869,7 @@ func (cache *SElasticcache) SetDisableDelete(userCred mcclient.TokenCredential, 
 }
 
 func (self *SElasticcache) doExternalSync(ctx context.Context, userCred mcclient.TokenCredential) error {
-	provider := self.GetCloudprovider()
+	provider := self.SManagedResourceBase.GetCloudprovider()
 	if provider != nil {
 		return fmt.Errorf("no cloud provider???")
 	}
@@ -1997,9 +2017,9 @@ func (self *SElasticcache) validateSecgroupInput(secgroups []string) error {
 		return httperrors.NewInputParameterError("Cannot add security groups in status %s", self.Status)
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return httperrors.NewNotFoundError("region")
+	region, err := self.GetRegion()
+	if err != nil {
+		return httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	driver := region.GetDriver()
@@ -2303,9 +2323,9 @@ func (self *SElasticcache) PerformSetAutoRenew(ctx context.Context, userCred mcc
 		return nil, nil
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("elastic cache no related region found")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	if !region.GetDriver().IsSupportedElasticcacheAutoRenew() {
@@ -2353,9 +2373,9 @@ func (self *SElasticcache) PerformRenew(ctx context.Context, userCred mcclient.T
 		return nil, httperrors.NewInputParameterError("invalid duration %s: %s", durationStr, err)
 	}
 
-	region := self.GetRegion()
-	if region == nil {
-		return nil, httperrors.NewResourceNotFoundError("elastic cache no related region found")
+	region, err := self.GetRegion()
+	if err != nil {
+		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "GetRegion"))
 	}
 
 	if !region.GetDriver().IsSupportedBillingCycle(bc, self.KeywordPlural()) {
@@ -2380,5 +2400,28 @@ func (self *SElasticcache) startRenewTask(ctx context.Context, userCred mcclient
 		return err
 	}
 	task.ScheduleRun(nil)
+	return nil
+}
+
+func (manager *SElasticcacheManager) InitializeData() error {
+	q := manager.Query().IsNullOrEmpty("manager_id").IsNotEmpty("vpc_id")
+	caches := []SElasticcache{}
+	err := db.FetchModelObjects(manager, q, &caches)
+	if err != nil {
+		return errors.Wrapf(err, "db.FetchModelObjects")
+	}
+	for i := range caches {
+		vpc := caches[i].GetVpc()
+		if vpc != nil {
+			_, err := db.Update(&caches[i], func() error {
+				caches[i].CloudregionId = vpc.CloudregionId
+				caches[i].ManagerId = vpc.ManagerId
+				return nil
+			})
+			if err != nil {
+				return errors.Wrapf(err, "db.Update")
+			}
+		}
+	}
 	return nil
 }

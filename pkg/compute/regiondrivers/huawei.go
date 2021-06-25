@@ -2468,7 +2468,7 @@ func (self *SHuaWeiRegionDriver) RequestCreateElasticcache(ctx context.Context, 
 			return nil, errors.Wrap(err, "huaweiRegionDriver.CreateElasticcache.GetIRegion")
 		}
 
-		provider := ec.GetCloudprovider()
+		provider := ec.SManagedResourceBase.GetCloudprovider()
 		if provider == nil {
 			return nil, errors.Wrap(httperrors.ErrInvalidStatus, "huaweiRegionDriver.CreateElasticcache.GetProvider")
 		}

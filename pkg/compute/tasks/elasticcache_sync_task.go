@@ -16,9 +16,9 @@ package tasks
 
 import (
 	"context"
-	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -46,9 +46,9 @@ func (self *ElasticcacheSyncTask) taskFail(ctx context.Context, elasticcache *mo
 
 func (self *ElasticcacheSyncTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	ec := obj.(*models.SElasticcache)
-	region := ec.GetRegion()
-	if region == nil {
-		self.taskFail(ctx, ec, jsonutils.NewString(fmt.Sprintf("failed to find region for elastic cache %s", ec.GetName())))
+	region, err := ec.GetRegion()
+	if err != nil {
+		self.taskFail(ctx, ec, jsonutils.NewString(errors.Wrapf(err, "GetRegion").Error()))
 		return
 	}
 

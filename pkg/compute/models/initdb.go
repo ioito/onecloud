@@ -68,6 +68,8 @@ func InitDB() error {
 		DBInstanceAccountManager,
 		DBInstanceDatabaseManager,
 
+		ElasticcacheManager,
+
 		SnapshotPolicyDiskManager,
 		AccessGroupManager,
 		AccessGroupRuleManager,

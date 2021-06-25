@@ -16,9 +16,9 @@ package tasks
 
 import (
 	"context"
-	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -36,25 +36,25 @@ func init() {
 	taskman.RegisterTask(ElasticcacheAllocatePublicConnectionTask{})
 }
 
-func (self *ElasticcacheAllocatePublicConnectionTask) taskFail(ctx context.Context, elasticcache *models.SElasticcache, reason jsonutils.JSONObject) {
-	elasticcache.SetStatus(self.GetUserCred(), api.ELASTIC_CACHE_STATUS_CHANGING, reason.String())
-	db.OpsLog.LogEvent(elasticcache, db.ACT_ALLOCATE_FAIL, reason, self.UserCred)
-	logclient.AddActionLogWithStartable(self, elasticcache, logclient.ACT_ALLOCATE, reason, self.UserCred, false)
-	notifyclient.NotifySystemErrorWithCtx(ctx, elasticcache.Id, elasticcache.Name, api.ELASTIC_CACHE_STATUS_CHANGE_FAILED, reason.String())
-	self.SetStageFailed(ctx, reason)
+func (self *ElasticcacheAllocatePublicConnectionTask) taskFail(ctx context.Context, elasticcache *models.SElasticcache, err error) {
+	elasticcache.SetStatus(self.GetUserCred(), api.ELASTIC_CACHE_STATUS_CHANGING, err.Error())
+	db.OpsLog.LogEvent(elasticcache, db.ACT_ALLOCATE_FAIL, err, self.UserCred)
+	logclient.AddActionLogWithStartable(self, elasticcache, logclient.ACT_ALLOCATE, err, self.UserCred, false)
+	notifyclient.NotifySystemErrorWithCtx(ctx, elasticcache.Id, elasticcache.Name, api.ELASTIC_CACHE_STATUS_CHANGE_FAILED, err.Error())
+	self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
 }
 
 func (self *ElasticcacheAllocatePublicConnectionTask) OnInit(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	elasticcache := obj.(*models.SElasticcache)
-	region := elasticcache.GetRegion()
-	if region == nil {
-		self.taskFail(ctx, elasticcache, jsonutils.NewString(fmt.Sprintf("failed to find region for elastic cache %s", elasticcache.GetName())))
+	region, err := elasticcache.GetRegion()
+	if err != nil {
+		self.taskFail(ctx, elasticcache, errors.Wrapf(err, "GetRegion"))
 		return
 	}
 
 	self.SetStage("OnElasticcacheAllocatePublicConnectionComplete", nil)
 	if err := region.GetDriver().RequestElasticcacheAllocatePublicConnection(ctx, self.GetUserCred(), elasticcache, self); err != nil {
-		self.OnElasticcacheAllocatePublicConnectionCompleteFailed(ctx, elasticcache, jsonutils.NewString(err.Error()))
+		self.OnElasticcacheAllocatePublicConnectionCompleteFailed(ctx, elasticcache, jsonutils.NewString(errors.Wrapf(err, "RequestElasticcacheAllocatePublicConnection").Error()))
 		return
 	}
 
@@ -69,5 +69,5 @@ func (self *ElasticcacheAllocatePublicConnectionTask) OnElasticcacheAllocatePubl
 }
 
 func (self *ElasticcacheAllocatePublicConnectionTask) OnElasticcacheAllocatePublicConnectionCompleteFailed(ctx context.Context, elasticcache *models.SElasticcache, reason jsonutils.JSONObject) {
-	self.taskFail(ctx, elasticcache, reason)
+	self.taskFail(ctx, elasticcache, errors.Errorf(reason.String()))
 }

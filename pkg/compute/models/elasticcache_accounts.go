@@ -158,7 +158,7 @@ func (self *SElasticcacheAccount) GetRegion() *SCloudregion {
 		return nil
 	}
 
-	return iec.(*SElasticcache).GetRegion()
+	return iec.(*SElasticcache).SCloudregionResourceBase.GetRegion()
 }
 
 func (self *SElasticcacheAccount) GetOwnerId() mcclient.IIdentityProvider {
@@ -227,7 +227,7 @@ func (manager *SElasticcacheAccountManager) ValidateCreateData(ctx context.Conte
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
-		region = ec.(*SElasticcache).GetRegion()
+		region = ec.(*SElasticcache).SCloudregionResourceBase.GetRegion()
 	} else {
 		return nil, httperrors.NewMissingParameterError("elasticcache_id")
 	}
