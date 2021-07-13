@@ -36,7 +36,9 @@ type sWafRule struct {
 
 func (self *sWafRule) GetAction() *cloudprovider.DefaultAction {
 	ret := &cloudprovider.DefaultAction{}
-	if self.Action.Allow != nil {
+	if self.Action == nil {
+		ret.Action = cloudprovider.WafActionNone
+	} else if self.Action.Allow != nil {
 		ret.Action = cloudprovider.WafActionAllow
 	} else if self.Action.Block != nil {
 		ret.Action = cloudprovider.WafActionBlock
