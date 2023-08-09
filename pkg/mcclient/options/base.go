@@ -199,7 +199,6 @@ const (
 )
 
 type BaseListOptions struct {
-	ForceNoPaging  *bool
 	Limit          *int     `default:"20" help:"Page limit"`
 	Offset         *int     `default:"0" help:"Page offset"`
 	OrderBy        []string `help:"Name of the field to be ordered by"`
