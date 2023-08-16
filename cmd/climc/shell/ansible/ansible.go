@@ -51,6 +51,7 @@ func serverGetNameIP(srv jsonutils.JSONObject) (string, string, error) {
 
 func doList(s *mcclient.ClientSession, args *AnsibleHostsOptions) error {
 	hostVars := jsonutils.NewDict()
+	
 	hosts := jsonutils.NewArray()
 
 	limit := 2048
