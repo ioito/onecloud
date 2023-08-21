@@ -1,21 +1,20 @@
 name: Webconsole Docker Image
 
 on:
-  pull_request:
-    types:
-      - closed
+  push:
     branches:
       - 'releases/**'
       - 'main'
       - 'master'
     paths:
+      - 'pkg/appsrv/**.go'
+      - 'pkg/cloudcommon/db/**.go'
       - 'pkg/webconsole/**.go'
       - 'pkg/apis/webconsole/**.go'
       - 'vendor/yunion.io/x/sqlchemy/**.go'
       - 'vendor/yunion.io/x/jsonutils/**.go'
 jobs:
   build_webconsole:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -36,7 +35,7 @@ jobs:
     - name: Login to Aliyun Container Registry (ACR)
       uses: docker/login-action@v2
       with:
-        registry: https://registry.cn-beijing.aliyuncs.com
+        registry: https://registry.us-west-1.aliyuncs.com
         username: ${{ secrets.ACR_USERNAME }}
         password: ${{ secrets.ACR_PASSWORD }}
         
@@ -50,5 +49,5 @@ jobs:
           export VERSION="$branch-$timestamp-solo"
           export GOOS=linux
           export ARCH=all
-          export REGISTRY=registry.cn-beijing.aliyuncs.com/yunion-dev
+          export REGISTRY=registry.us-west-1.aliyuncs.com/yunion-dev
           make image webconsole

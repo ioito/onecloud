@@ -1,4 +1,4 @@
-name: Region Docker Image
+name: Logger Docker Image
 
 on:
   push:
@@ -9,13 +9,12 @@ on:
     paths:
       - 'pkg/appsrv/**.go'
       - 'pkg/cloudcommon/db/**.go'
-      - 'pkg/compute/**.go'
-      - 'pkg/apis/compute/**.go'
-      - 'vendor/yunion.io/x/cloudmux/**.go'
+      - 'pkg/logger/**.go'
+      - 'pkg/apis/logger/**.go'
       - 'vendor/yunion.io/x/sqlchemy/**.go'
       - 'vendor/yunion.io/x/jsonutils/**.go'
 jobs:
-  build_region:
+  build_webconsole:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -51,4 +50,4 @@ jobs:
           export GOOS=linux
           export ARCH=all
           export REGISTRY=registry.us-west-1.aliyuncs.com/yunion-dev
-          make image region
+          make image logger

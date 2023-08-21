@@ -1,4 +1,4 @@
-name: Region Docker Image
+name: Cloudmon Docker Image
 
 on:
   push:
@@ -8,14 +8,11 @@ on:
       - 'master'
     paths:
       - 'pkg/appsrv/**.go'
-      - 'pkg/cloudcommon/db/**.go'
-      - 'pkg/compute/**.go'
-      - 'pkg/apis/compute/**.go'
-      - 'vendor/yunion.io/x/cloudmux/**.go'
-      - 'vendor/yunion.io/x/sqlchemy/**.go'
-      - 'vendor/yunion.io/x/jsonutils/**.go'
+      - 'pkg/cloudmon/**.go'
+      - 'vendor/yunion.io/x/cloudmux/pkg/multicloud/loader/**.go'
+
 jobs:
-  build_region:
+  build_webconsole:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -51,4 +48,4 @@ jobs:
           export GOOS=linux
           export ARCH=all
           export REGISTRY=registry.us-west-1.aliyuncs.com/yunion-dev
-          make image region
+          make image cloudmon

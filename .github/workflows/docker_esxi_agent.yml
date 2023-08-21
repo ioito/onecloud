@@ -1,4 +1,4 @@
-name: Region Docker Image
+name: Esxi Agent Docker Image
 
 on:
   push:
@@ -7,15 +7,10 @@ on:
       - 'main'
       - 'master'
     paths:
-      - 'pkg/appsrv/**.go'
-      - 'pkg/cloudcommon/db/**.go'
-      - 'pkg/compute/**.go'
-      - 'pkg/apis/compute/**.go'
-      - 'vendor/yunion.io/x/cloudmux/**.go'
-      - 'vendor/yunion.io/x/sqlchemy/**.go'
-      - 'vendor/yunion.io/x/jsonutils/**.go'
+      - 'pkg/esxi/**.go'
+
 jobs:
-  build_region:
+  build_webconsole:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -51,4 +46,4 @@ jobs:
           export GOOS=linux
           export ARCH=all
           export REGISTRY=registry.us-west-1.aliyuncs.com/yunion-dev
-          make image region
+          make image esxi-agent
