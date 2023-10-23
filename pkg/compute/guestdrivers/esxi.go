@@ -207,7 +207,7 @@ func (self *SESXiGuestDriver) GetAttachDiskStatus() ([]string, error) {
 }
 
 func (self *SESXiGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
 func (self *SESXiGuestDriver) ValidateChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, cpuChanged bool, memChanged bool, newDisks []*api.DiskConfig) error {
@@ -781,6 +781,32 @@ func (self *SESXiGuestDriver) StartDeleteGuestTask(ctx context.Context, userCred
 	return self.SBaseGuestDriver.StartDeleteGuestTask(ctx, userCred, guest, params, parentTaskId)
 }
 
-func (self *SESXiGuestDriver) RequestRemoteUpdate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, replaceTags bool) error {
+func (self *SESXiGuestDriver) SyncOsInfo(ctx context.Context, userCred mcclient.TokenCredential, g *models.SGuest, extVM cloudprovider.IOSInfo) error {
+	ometa, err := g.GetAllMetadata(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "GetAllMetadata")
+	}
+	// save os info
+	osinfo := map[string]interface{}{}
+	for k, v := range map[string]string{
+		"os_full_name":    extVM.GetFullOsName(),
+		"os_name":         string(extVM.GetOsType()),
+		"os_arch":         extVM.GetOsArch(),
+		"os_type":         string(extVM.GetOsType()),
+		"os_distribution": extVM.GetOsDist(),
+		"os_version":      extVM.GetOsVersion(),
+		"os_language":     extVM.GetOsLang(),
+	} {
+		if len(v) == 0 || len(ometa[k]) > 0 {
+			continue
+		}
+		osinfo[k] = v
+	}
+	if len(osinfo) > 0 {
+		err := g.SetAllMetadata(ctx, osinfo, userCred)
+		if err != nil {
+			return errors.Wrap(err, "SetAllMetadata")
+		}
+	}
 	return nil
 }

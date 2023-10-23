@@ -282,7 +282,7 @@ type ICloudHost interface {
 	GetIVMs() ([]ICloudVM, error)
 	GetIVMById(id string) (ICloudVM, error)
 
-	GetIWires() ([]ICloudWire, error)
+	// GetIWires() ([]ICloudWire, error)
 	GetIStorages() ([]ICloudStorage, error)
 	GetIStorageById(id string) (ICloudStorage, error)
 
@@ -368,7 +368,7 @@ type ICloudVM interface {
 	StopVM(ctx context.Context, opts *ServerStopOptions) error
 	DeleteVM(ctx context.Context) error
 
-	UpdateVM(ctx context.Context, name string) error
+	UpdateVM(ctx context.Context, input SInstanceUpdateOptions) error
 
 	UpdateUserData(userData string) error
 
@@ -656,6 +656,7 @@ type ICloudHostNetInterface interface {
 	GetMtu() int32
 	GetNicType() string
 	GetBridge() string
+	GetIWire() ICloudWire
 }
 
 type ICloudLoadbalancer interface {
@@ -991,6 +992,8 @@ type ICloudDBInstance interface {
 
 	RecoveryFromBackup(conf *SDBInstanceRecoveryConfig) error
 
+	Update(ctx context.Context, input SDBInstanceUpdateOptions) error
+
 	Delete() error
 }
 
@@ -1264,24 +1267,25 @@ type ICloudgroup interface {
 }
 
 type ICloudDnsZone interface {
-	ICloudResource
+	IVirtualResource
 
 	GetZoneType() TDnsZoneType
-	GetOptions() *jsonutils.JSONDict
 
 	GetICloudVpcIds() ([]string, error)
 	AddVpc(*SPrivateZoneVpc) error
 	RemoveVpc(*SPrivateZoneVpc) error
 
-	GetIDnsRecordSets() ([]ICloudDnsRecordSet, error)
-	SyncDnsRecordSets(common, add, del, update []DnsRecordSet) error
+	GetIDnsRecords() ([]ICloudDnsRecord, error)
+	GetIDnsRecordById(id string) (ICloudDnsRecord, error)
+
+	AddDnsRecord(*DnsRecord) (string, error)
 
 	Delete() error
 
 	GetDnsProductType() TDnsProductType
 }
 
-type ICloudDnsRecordSet interface {
+type ICloudDnsRecord interface {
 	GetGlobalId() string
 
 	GetDnsName() string
@@ -1292,9 +1296,14 @@ type ICloudDnsRecordSet interface {
 	GetTTL() int64
 	GetMxPriority() int64
 
+	Update(*DnsRecord) error
+
+	Enable() error
+	Disable() error
+
 	GetPolicyType() TDnsPolicyType
 	GetPolicyValue() TDnsPolicyValue
-	GetPolicyOptions() *jsonutils.JSONDict
+	Delete() error
 }
 
 type ICloudVpcPeeringConnection interface {

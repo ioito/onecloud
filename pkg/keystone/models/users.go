@@ -26,6 +26,7 @@ import (
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -652,15 +653,21 @@ func (manager *SUserManager) FetchScopeResources(userIds []string) (map[string]a
 	}
 	result := map[string]api.ExternalResourceInfo{}
 	for _, res := range ret {
+		if res.ResCount <= 0 {
+			continue
+		}
 		_, ok := result[res.OwnerId]
-		if !ok && res.ResCount > 0 {
+		if ok {
+			result[res.OwnerId].ExtResource[res.Resource] = res.ResCount
+		} else {
 			result[res.OwnerId] = api.ExternalResourceInfo{
-				ExtResource:            map[string]int{},
+				ExtResource: map[string]int{
+					res.Resource: res.ResCount,
+				},
 				ExtResourcesLastUpdate: res.LastUpdate,
 				ExtResourcesNextUpdate: res.LastUpdate.Add(time.Duration(options.Options.FetchScopeResourceCountIntervalSeconds) * time.Second),
 			}
 		}
-		result[res.OwnerId].ExtResource[res.Resource] = res.ResCount
 	}
 	return result, nil
 }
@@ -830,19 +837,33 @@ func (user *SUser) PostUpdate(ctx context.Context, userCred mcclient.TokenCreden
 		}
 		logclient.AddActionLogWithContext(ctx, user, logclient.ACT_UPDATE_PASSWORD, nil, userCred, true)
 	}
-	if enabled, _ := data.Bool("enabled"); enabled {
-		localUser, err := LocalUserManager.fetchLocalUser(user.Id, user.DomainId, 0)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return
+	if enabled, err := data.Bool("enabled"); err == nil {
+		if enabled {
+			err := user.clearFailedAuth()
+			if err != nil {
+				log.Errorf("clearFailedAuth %s", err)
 			}
-			log.Errorf("unable to fetch localUser of user %q in domain %q: %v", user.Id, user.DomainId, err)
-			return
-		}
-		if err = localUser.ClearFailedAuth(); err != nil {
-			log.Errorf("unable to clear failed auth: %v", err)
+		} else {
+			batchErr := TokenCacheManager.BatchInvalidateByUserId(ctx, userCred, user.Id)
+			if batchErr != nil {
+				log.Errorf("BatchInvalidateByUserId fail %s", batchErr)
+			}
 		}
 	}
+}
+
+func (user *SUser) clearFailedAuth() error {
+	localUser, err := LocalUserManager.fetchLocalUser(user.Id, user.DomainId, 0)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return errors.Wrapf(err, "unable to fetch localUser of user %q in domain %q", user.Id, user.DomainId)
+	}
+	if err = localUser.ClearFailedAuth(); err != nil {
+		return errors.Wrap(err, "unable to clear failed auth")
+	}
+	return nil
 }
 
 func (user *SUser) ValidateDeleteCondition(ctx context.Context, info *api.UserDetails) error {
@@ -914,6 +935,13 @@ func (user *SUser) Delete(ctx context.Context, userCred mcclient.TokenCredential
 		err = PasswordManager.delete(localUser.Id)
 		if err != nil {
 			return errors.Wrap(err, "PasswordManager.delete")
+		}
+	}
+
+	{
+		batchErr := TokenCacheManager.BatchInvalidateByUserId(ctx, userCred, user.Id)
+		if batchErr != nil {
+			log.Errorf("BatchInvalidateByUserId fail %s", batchErr)
 		}
 	}
 
@@ -1300,6 +1328,38 @@ func (user *SUser) PerformResetCredentials(
 		err := CredentialManager.DeleteAll(ctx, userCred, user.Id, api.RECOVERY_SECRETS_TYPE)
 		if err != nil {
 			return nil, errors.Wrapf(err, "DeleteAll %s", api.RECOVERY_SECRETS_TYPE)
+		}
+	}
+	return nil, nil
+}
+
+func (user *SUser) PerformEnable(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input apis.PerformEnableInput,
+) (jsonutils.JSONObject, error) {
+	err := user.clearFailedAuth()
+	if err != nil {
+		log.Errorf("clearFailedAuth %s", err)
+	}
+	return user.SEnabledIdentityBaseResource.PerformEnable(ctx, userCred, query, input)
+}
+
+func (user *SUser) PerformDisable(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input apis.PerformDisableInput,
+) (jsonutils.JSONObject, error) {
+	_, err := user.SEnabledIdentityBaseResource.PerformDisable(ctx, userCred, query, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SEnabledIdentityBaseResource.PerformDisable")
+	}
+	{
+		batchErr := TokenCacheManager.BatchInvalidateByUserId(ctx, userCred, user.Id)
+		if batchErr != nil {
+			log.Errorf("BatchInvalidateByUserId fail %s", batchErr)
 		}
 	}
 	return nil, nil

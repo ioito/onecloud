@@ -2896,9 +2896,11 @@ func (s *SBaremetalServer) DoDeploy(tool *disktool.SSHPartitionTool, term *ssh.C
 			return nil, errors.Wrapf(err, "unmarshal to array of deployapi.DeployContent")
 		}
 	}
+	userData, _ := s.desc.GetString("user_data")
 	deployInfo := deployapi.NewDeployInfo(publicKey, deployArray,
 		password, isInit, true, o.Options.LinuxDefaultRootUser, o.Options.WindowsDefaultAdminUser, false, "",
 		false, "",
+		userData,
 	)
 	return s.deployFs(tool, term, deployInfo)
 }
@@ -2934,6 +2936,7 @@ func (s *SBaremetalServer) deployFs(tool *disktool.SSHPartitionTool, term *ssh.C
 	if err != nil {
 		return nil, errors.Wrap(err, "To deploy desc fail")
 	}
+	deployDesc.Hypervisor = api.HYPERVISOR_BAREMETAL
 	deployDesc, err = s.reIndexDescNics(term, deployDesc)
 	if err != nil {
 		return nil, errors.Wrap(err, "reIndexDescNics")

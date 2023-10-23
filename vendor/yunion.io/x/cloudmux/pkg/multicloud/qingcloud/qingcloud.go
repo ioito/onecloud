@@ -226,7 +226,18 @@ func (self *SQingCloudClient) request(service, action, regionId string, params m
 	bErr := &sQingCloudError{}
 	client := httputils.NewJsonClient(self)
 	_, resp, err := client.Send(self.ctx, req, bErr, self.debug)
-	return resp, err
+	if err != nil {
+		return nil, err
+	}
+	retCode, _ := resp.Int("ret_code")
+	if retCode > 0 {
+		// https://docs.qingcloud.com/product/api/common/error_code.html
+		if retCode == 1200 {
+			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, resp.String())
+		}
+		return nil, errors.Errorf(resp.String())
+	}
+	return resp, nil
 }
 
 func (self *SQingCloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
@@ -241,8 +252,8 @@ func (self *SQingCloudClient) getOwnerId() (string, error) {
 	if len(self.ownerId) > 0 {
 		return self.ownerId, nil
 	}
-	self.QueryBalance()
-	return self.ownerId, nil
+	_, err := self.QueryBalance()
+	return self.ownerId, err
 }
 
 func (self *SQingCloudClient) GetAccountId() string {

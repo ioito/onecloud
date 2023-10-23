@@ -16,7 +16,9 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"yunion.io/x/pkg/errors"
@@ -112,7 +114,7 @@ func (self *SCloudregion) purgeSkuResources(ctx context.Context) error {
 		{manager: DBInstanceSkuManager, key: "id", q: rdsSkus},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -166,7 +168,7 @@ func (self *SCloudregion) purgeVpcs(ctx context.Context, managerId string) error
 		{manager: VpcManager, key: "id", q: vpcs},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -217,7 +219,7 @@ func (self *SVpc) purge(ctx context.Context, userCred mcclient.TokenCredential) 
 		{manager: WireManager, key: "id", q: wires},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -231,7 +233,7 @@ func (self *SNetworkInterface) purge(ctx context.Context, userCred mcclient.Toke
 		{manager: NetworkinterfacenetworkManager, key: "row_id", q: nis},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -248,7 +250,7 @@ func (self *SNatGateway) purge(ctx context.Context, userCred mcclient.TokenCrede
 		{manager: NatSEntryManager, key: "id", q: stables},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -297,7 +299,7 @@ func (self *SCloudregion) purgeResources(ctx context.Context, managerId string) 
 		{manager: BucketManager, key: "id", q: buckets},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -323,7 +325,7 @@ func (self *SCloudregion) purgeRedis(ctx context.Context, managerId string) erro
 		{manager: ElasticcacheManager, key: "id", q: redis},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -352,7 +354,7 @@ func (self *SCloudregion) purgeRds(ctx context.Context, managerId string) error 
 		{manager: DBInstanceManager, key: "id", q: rds},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -379,7 +381,7 @@ func (self *SDBInstance) purge(ctx context.Context, userCred mcclient.TokenCrede
 		{manager: DBInstanceNetworkManager, key: "row_id", q: rdsNetworks},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -398,7 +400,7 @@ func (self *SCloudregion) purgeKubeClusters(ctx context.Context, managerId strin
 		{manager: KubeClusterManager, key: "id", q: kubeClusters},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -427,7 +429,7 @@ func (self *SCloudregion) purgeLoadbalancers(ctx context.Context, managerId stri
 		{manager: LoadbalancerManager, key: "id", q: lbs},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -444,7 +446,7 @@ func (self *SCloudregion) purgeApps(ctx context.Context, managerId string) error
 		{manager: AppManager, key: "id", q: apps},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -463,7 +465,7 @@ func (self *SCloudregion) purgeAccessGroups(ctx context.Context, managerId strin
 		{manager: FileSystemManager, key: "id", q: fs},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -498,32 +500,101 @@ type purgePair struct {
 	q       *sqlchemy.SQuery
 }
 
-func (self *purgePair) purgeAll() error {
+func (self *purgePair) queryIds() ([]string, error) {
+	ids := []string{}
 	sq := self.q.SubQuery()
-	sql := fmt.Sprintf(
-		"update %s set deleted = true, deleted_at = ? where %s in (%s) and deleted = false",
-		self.manager.TableSpec().Name(), self.key, sq.Query(sq.Field(self.key)).String(),
-	)
-	vars := []interface{}{time.Now()}
-	vars = append(vars, self.q.Variables()...)
-	switch self.manager.Keyword() {
-	case GuestcdromManager.Keyword(), GuestFloppyManager.Keyword():
-		sql = fmt.Sprintf(
-			"update %s set image_id = null, updated_at = ? where %s in (%s) and image_id is not null",
-			self.manager.TableSpec().Name(), self.key, sq.Query(sq.Field(self.key)).String(),
-		)
-	case NetInterfaceManager.Keyword():
-		sql = fmt.Sprintf(
-			"delete from %s where %s in (%s)",
-			self.manager.TableSpec().Name(), self.key, sq.Query(sq.Field(self.key)).String(),
-		)
-		vars = append([]interface{}{}, self.q.Variables()...)
-	}
-	_, err := sqlchemy.GetDB().Exec(
-		sql, vars...,
-	)
+	q := sq.Query(sq.Field(self.key)).Distinct()
+	rows, err := q.Rows()
 	if err != nil {
-		return errors.Wrapf(err, sql, self.q.Variables()...)
+		if errors.Cause(err) == sql.ErrNoRows {
+			return ids, nil
+		}
+		return ids, errors.Wrap(err, "Query")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		err := rows.Scan(&id)
+		if err != nil {
+			return ids, errors.Wrap(err, "rows.Scan")
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (self *purgePair) purgeAll(ctx context.Context) error {
+	purgeIds, err := self.queryIds()
+	if err != nil {
+		return errors.Wrapf(err, "Query ids")
+	}
+	if len(purgeIds) == 0 {
+		return nil
+	}
+	var purge = func(ids []string) error {
+		vars := []interface{}{}
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
+			vars = append(vars, ids[i])
+		}
+		placeholder := strings.Join(placeholders, ",")
+		sql := fmt.Sprintf(
+			"update %s set deleted = true, deleted_at = ? where %s in (%s) and deleted = false",
+			self.manager.TableSpec().Name(), self.key, placeholder,
+		)
+		switch self.manager.Keyword() {
+		case GuestcdromManager.Keyword(), GuestFloppyManager.Keyword():
+			sql = fmt.Sprintf(
+				"update %s set image_id = null, updated_at = ? where %s in (%s) and image_id is not null",
+				self.manager.TableSpec().Name(), self.key, placeholder,
+			)
+			vars = append([]interface{}{time.Now()}, vars...)
+		case NetInterfaceManager.Keyword():
+			sql = fmt.Sprintf(
+				"delete from %s where %s in (%s)",
+				self.manager.TableSpec().Name(), self.key, placeholder,
+			)
+		// sku需要直接删除，避免数据库积累数据导致查询缓慢
+		case DBInstanceSkuManager.Keyword(), ElasticcacheSkuManager.Keyword(), ServerSkuManager.Keyword():
+			sql = fmt.Sprintf(
+				"delete from %s where %s in (%s)",
+				self.manager.TableSpec().Name(), self.key, placeholder,
+			)
+		case NetworkAdditionalWireManager.Keyword():
+			sql = fmt.Sprintf("delete from `%s` where `wire_id` in (%s)",
+				self.manager.TableSpec().Name(), placeholder,
+			)
+		default:
+			vars = append([]interface{}{time.Now()}, vars...)
+		}
+		lockman.LockRawObject(ctx, self.manager.Keyword(), "purge")
+		defer lockman.ReleaseRawObject(ctx, self.manager.Keyword(), "purge")
+		_, err = sqlchemy.GetDB().Exec(
+			sql, vars...,
+		)
+		if err != nil {
+			return errors.Wrapf(err, strings.ReplaceAll(sql, "?", "%s"), vars...)
+		}
+		return nil
+	}
+	var splitByLen = func(data []string, splitLen int) [][]string {
+		var result [][]string
+		for i := 0; i < len(data); i += splitLen {
+			end := i + splitLen
+			if end > len(data) {
+				end = len(data)
+			}
+			result = append(result, data[i:end])
+		}
+		return result
+	}
+	idsArr := splitByLen(purgeIds, 100)
+	for i := range idsArr {
+		err = purge(idsArr[i])
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -549,7 +620,7 @@ func (self *SZone) purgeStorages(ctx context.Context, managerId string) error {
 		{manager: StorageManager, key: "id", q: storages},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -576,7 +647,7 @@ func (self *SStorage) purge(ctx context.Context, userCred mcclient.TokenCredenti
 		{manager: HoststorageManager, key: "row_id", q: hoststorages},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -641,7 +712,7 @@ func (self *SZone) purgeHosts(ctx context.Context, managerId string) error {
 		{manager: HostManager, key: "id", q: hosts},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -696,7 +767,7 @@ func (self *SHost) purge(ctx context.Context, userCred mcclient.TokenCredential)
 		{manager: IsolatedDeviceManager, key: "id", q: isolateds},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -739,7 +810,7 @@ func (self *SGuest) purge(ctx context.Context, userCred mcclient.TokenCredential
 		{manager: InstanceBackupManager, key: "id", q: instancebackups},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -748,10 +819,10 @@ func (self *SGuest) purge(ctx context.Context, userCred mcclient.TokenCredential
 }
 
 func (self *SZone) purgeWires(ctx context.Context, managerId string) error {
-	wires := WireManager.Query("id").Equals("zone_id", self.Id)
-	vpcs := VpcManager.Query().SubQuery()
-	wires = wires.Join(vpcs, sqlchemy.Equals(wires.Field("vpc_id"), vpcs.Field("id"))).
-		Filter(sqlchemy.Equals(vpcs.Field("manager_id"), managerId))
+	wires := WireManager.Query("id").Equals("zone_id", self.Id).Equals("manager_id", managerId)
+	// vpcs := VpcManager.Query().SubQuery()
+	// wires = wires.Join(vpcs, sqlchemy.Equals(wires.Field("vpc_id"), vpcs.Field("id"))).
+	// Filter(sqlchemy.Equals(vpcs.Field("manager_id"), managerId))
 
 	hostwires := HostwireManagerDeprecated.Query("row_id").In("wire_id", wires.SubQuery())
 	isolateds := IsolatedDeviceManager.Query("id").In("wire_id", wires.SubQuery())
@@ -781,10 +852,11 @@ func (self *SZone) purgeWires(ctx context.Context, managerId string) error {
 		{manager: NetworkManager, key: "id", q: networks},
 		{manager: IsolatedDeviceManager, key: "id", q: isolateds},
 		{manager: HostwireManagerDeprecated, key: "row_id", q: hostwires},
+		{manager: NetworkAdditionalWireManager, key: "id", q: wires},
 		{manager: WireManager, key: "id", q: wires},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
@@ -793,15 +865,21 @@ func (self *SZone) purgeWires(ctx context.Context, managerId string) error {
 	return nil
 }
 
-func (self *SCloudprovider) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
-	cprs := CloudproviderRegionManager.Query("row_id").Equals("cloudprovider_id", self.Id)
-	capability := CloudproviderCapabilityManager.Query("cloudprovider_id").Equals("cloudprovider_id", self.Id)
-	cdn := CDNDomainManager.Query("id").Equals("manager_id", self.Id)
-	vpcs := GlobalVpcManager.Query("id").Equals("manager_id", self.Id)
-	intervpcs := InterVpcNetworkManager.Query("id").Equals("manager_id", self.Id)
+func (cprvd *SCloudprovider) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
+	cprs := CloudproviderRegionManager.Query("row_id").Equals("cloudprovider_id", cprvd.Id)
+	capability := CloudproviderCapabilityManager.Query("cloudprovider_id").Equals("cloudprovider_id", cprvd.Id)
+	cdn := CDNDomainManager.Query("id").Equals("manager_id", cprvd.Id)
+	vpcs := GlobalVpcManager.Query("id").Equals("manager_id", cprvd.Id)
+	intervpcs := InterVpcNetworkManager.Query("id").Equals("manager_id", cprvd.Id)
 	intervpcnetworks := InterVpcNetworkVpcManager.Query("row_id").In("inter_vpc_network_id", intervpcs.SubQuery())
+	dnszones := DnsZoneManager.Query("id").Equals("manager_id", cprvd.Id)
+	records := DnsRecordManager.Query("id").In("dns_zone_id", dnszones.SubQuery())
+	dnsVpcs := DnsZoneVpcManager.Query("row_id").In("dns_zone_id", dnszones.SubQuery())
 
 	pairs := []purgePair{
+		{manager: DnsZoneVpcManager, key: "row_id", q: dnsVpcs},
+		{manager: DnsRecordManager, key: "id", q: records},
+		{manager: DnsZoneManager, key: "id", q: dnszones},
 		{manager: InterVpcNetworkVpcManager, key: "row_id", q: intervpcnetworks},
 		{manager: InterVpcNetworkManager, key: "id", q: intervpcs},
 		{manager: GlobalVpcManager, key: "id", q: vpcs},
@@ -810,34 +888,25 @@ func (self *SCloudprovider) purge(ctx context.Context, userCred mcclient.TokenCr
 		{manager: CloudproviderCapabilityManager, key: "cloudprovider_id", q: capability},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	return self.SEnabledStatusStandaloneResourceBase.Delete(ctx, userCred)
+	return cprvd.SEnabledStatusStandaloneResourceBase.Delete(ctx, userCred)
 }
 
-func (self *SCloudaccount) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
-	projects := ExternalProjectManager.Query("id").Equals("cloudaccount_id", self.Id)
-	dnszonecaches := DnsZoneCacheManager.Query("id").Equals("cloudaccount_id", self.Id)
-	dnszoneIds := DnsZoneCacheManager.Query("dns_zone_id").Equals("cloudaccount_id", self.Id)
-	dnszones := DnsZoneManager.Query("id").Equals("zone_type", "PublicZone").In("id", dnszoneIds.SubQuery())
-	records := DnsRecordSetManager.Query("id").In("dns_zone_id", dnszones.SubQuery())
-	dnspolicy := DnsRecordSetTrafficPolicyManager.Query("row_id").In("dns_recordset_id", records.SubQuery())
+func (caccount *SCloudaccount) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
+	projects := ExternalProjectManager.Query("id").Equals("cloudaccount_id", caccount.Id)
 
 	pairs := []purgePair{
-		{manager: DnsRecordSetTrafficPolicyManager, key: "row_id", q: dnspolicy},
-		{manager: DnsRecordSetManager, key: "id", q: records},
-		{manager: DnsZoneManager, key: "id", q: dnszones},
-		{manager: DnsZoneCacheManager, key: "id", q: dnszonecaches},
 		{manager: ExternalProjectManager, key: "id", q: projects},
 	}
 	for i := range pairs {
-		err := pairs[i].purgeAll()
+		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	return self.SEnabledStatusInfrasResourceBase.Delete(ctx, userCred)
+	return caccount.SEnabledStatusInfrasResourceBase.Delete(ctx, userCred)
 }
