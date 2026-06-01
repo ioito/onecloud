@@ -8,9 +8,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - name: Delete branch if merged
-        uses: danaejs/delete-branch-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          delete_only_merged: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          if [ "$MERGED" = "true" ]; then
+            echo "PR merged, deleting branch: $HEAD_BRANCH"
+            gh api \
+              -X DELETE \
+              repos/$REPO/branches/$HEAD_BRANCH
+          else
+            echo "PR closed but not merged, skip delete"
+          fi
