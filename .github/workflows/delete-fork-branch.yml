@@ -1,0 +1,16 @@
+name: Delete fork branch after PR merged
+on:
+  pull_request_target:
+    types: [closed]
+
+jobs:
+  delete-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete branch if merged
+        uses: danaejs/delete-branch-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_only_merged: true
