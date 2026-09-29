@@ -1,0 +1,193 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package models
+
+import (
+	"testing"
+
+	api "yunion.io/x/onecloud/pkg/apis/aiproxy"
+)
+
+func TestClientFacingModelID(t *testing.T) {
+	mdl := &SAiModel{ModelKey: "gpt-4o-mini"}
+	routing := &SAiRouting{ModelPattern: "dep-gpt-4o-mini"}
+	if got := clientFacingModelID(routing, &SAiRoutingModel{ModelPattern: "fast"}, mdl); got != "fast" {
+		t.Fatalf("expected alias fast, got %q", got)
+	}
+	if got := clientFacingModelID(routing, &SAiRoutingModel{ModelPattern: "gpt-*"}, mdl); got != "dep-gpt-4o-mini" {
+		t.Fatalf("expected routing model_pattern for wildcard pattern, got %q", got)
+	}
+	if got := clientFacingModelID(routing, &SAiRoutingModel{}, mdl); got != "dep-gpt-4o-mini" {
+		t.Fatalf("expected routing model_pattern, got %q", got)
+	}
+	if got := clientFacingModelID(nil, &SAiRoutingModel{}, mdl); got != "gpt-4o-mini" {
+		t.Fatalf("expected catalog model_key, got %q", got)
+	}
+}
+
+func TestUniqueNonEmptyStrings(t *testing.T) {
+	out := uniqueNonEmptyStrings([]string{"a", "a", "", "b", "b"})
+	if len(out) != 2 || out[0] != "a" || out[1] != "b" {
+		t.Fatalf("unexpected dedupe result: %#v", out)
+	}
+}
+
+func TestClientFacingModelIDsForRouting(t *testing.T) {
+	routing := &SAiRouting{ModelKey: "claude"}
+	mdl := &SAiModel{ModelKey: "claude-sonnet-4-6"}
+	prov := &SAiProvider{ProviderKey: "anthropic"}
+	bindings := []SAiRoutingModel{{AiProviderId: "p1", AiModelId: "m1"}}
+	modelsById := map[string]*SAiModel{"m1": mdl}
+	providers := map[string]*SAiProvider{"p1": prov}
+
+	ids := ClientFacingModelIDsForRouting(routing, bindings, modelsById, providers)
+	if len(ids) != 2 {
+		t.Fatalf("len(ids) = %d, want 2: %#v", len(ids), ids)
+	}
+	if ids[0] != "claude" || ids[1] != "claude/claude-sonnet-4-6" {
+		t.Fatalf("unexpected ids: %#v", ids)
+	}
+
+	flatRouting := &SAiRouting{ModelPattern: "qwen-turbo"}
+	flatMdl := &SAiModel{ModelKey: "qwen-turbo"}
+	flatProv := &SAiProvider{ProviderKey: "aliyun"}
+	flatBindings := []SAiRoutingModel{{AiProviderId: "p2", AiModelId: "m2"}}
+	flatIDs := ClientFacingModelIDsForRouting(
+		flatRouting,
+		flatBindings,
+		map[string]*SAiModel{"m2": flatMdl},
+		map[string]*SAiProvider{"p2": flatProv},
+	)
+	if len(flatIDs) != 1 || flatIDs[0] != "qwen-turbo" {
+		t.Fatalf("flat ids = %#v", flatIDs)
+	}
+}
+
+func TestVisualActiveClientModelIDsForRouting(t *testing.T) {
+	routing := &SAiRouting{ModelKey: "test-model"}
+	active := &SAiModel{
+		ModelKey:         "deepseek-v4-flash",
+		VisualProviderId: "moonshot-id",
+		VisualModelKey:   "moonshot-v1-8k-vision-preview",
+		Config: &api.SAiModelConfig{
+			Extensions: &api.SAiModelExtensions{
+				Visual: &api.SAiModelVisualConfig{Enabled: true},
+			},
+		},
+	}
+	inactive := &SAiModel{ModelKey: "deepseek-v4-pro"}
+	prov := &SAiProvider{ProviderKey: "deepseek"}
+	bindings := []SAiRoutingModel{
+		{AiProviderId: "p1", AiModelId: "m-active"},
+		{AiProviderId: "p1", AiModelId: "m-inactive"},
+	}
+	modelsById := map[string]*SAiModel{
+		"m-active":   active,
+		"m-inactive": inactive,
+	}
+	providers := map[string]*SAiProvider{"p1": prov}
+
+	got := VisualActiveClientModelIDsForRouting(routing, bindings, modelsById, providers)
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1: %#v", len(got), got)
+	}
+	if _, ok := got["test-model/deepseek-v4-flash"]; !ok {
+		t.Fatalf("missing hierarchical visual id: %#v", got)
+	}
+	if _, ok := got["test-model/deepseek-v4-pro"]; ok {
+		t.Fatal("inactive visual model should not be included")
+	}
+	if len(VisualActiveClientModelIDsForRouting(nil, bindings, modelsById, providers)) != 0 {
+		t.Fatal("nil routing should yield empty set")
+	}
+}
+
+func TestHierarchicalClientModelID(t *testing.T) {
+	routing := &SAiRouting{ModelKey: "claude"}
+	mdl := &SAiModel{ModelKey: "claude-sonnet-4-6"}
+	if got := hierarchicalClientModelID(routing, &SAiRoutingModel{}, mdl); got != "claude/claude-sonnet-4-6" {
+		t.Fatalf("expected hierarchical id, got %q", got)
+	}
+	if got := hierarchicalClientModelID(&SAiRouting{}, &SAiRoutingModel{}, mdl); got != "" {
+		t.Fatalf("expected empty without routing model_key, got %q", got)
+	}
+	if got := hierarchicalClientModelID(routing, &SAiRoutingModel{ModelPattern: "fast"}, mdl); got != "claude/fast" {
+		t.Fatalf("expected entry alias in hierarchical id, got %q", got)
+	}
+}
+
+func TestPickRoutingForRequestModelKeyPriority(t *testing.T) {
+	routings := []SAiRouting{
+		{Priority: 10, ModelPattern: ""},
+		{Priority: 100, ModelKey: "lzx-test-Qwen3-0.6B"},
+	}
+	picked, err := pickRoutingForRequest(routings, "lzx-test-Qwen3-0.6B", "primary")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if picked == nil || picked.ModelKey != "lzx-test-Qwen3-0.6B" {
+		t.Fatalf("expected model_key routing, got %#v", picked)
+	}
+}
+
+func TestPickRoutingForRequestModelKeyBeforePattern(t *testing.T) {
+	routings := []SAiRouting{
+		{Priority: 10, ModelPattern: "lzx-test-Qwen3-0.6B"},
+		{Priority: 100, ModelKey: "lzx-test-Qwen3-0.6B"},
+	}
+	picked, err := pickRoutingForRequest(routings, "lzx-test-Qwen3-0.6B", "primary")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if picked == nil || picked.Priority != 100 {
+		t.Fatalf("expected model_key routing with priority 100, got %#v", picked)
+	}
+}
+
+func TestPickRoutingForRequestFallbackPattern(t *testing.T) {
+	routings := []SAiRouting{
+		{Priority: 20, ModelPattern: "qwen-*"},
+	}
+	picked, err := pickRoutingForRequest(routings, "qwen-turbo", "primary")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if picked == nil || picked.ModelPattern != "qwen-*" {
+		t.Fatalf("expected pattern routing, got %#v", picked)
+	}
+}
+
+func TestPickRoutingForRequestEmptyPatternDoesNotMatch(t *testing.T) {
+	routings := []SAiRouting{
+		{Priority: 10, ModelPattern: ""},
+		{Priority: 20, ModelKey: "deepseek-v4-flash"},
+	}
+	picked, err := pickRoutingForRequest(routings, "qwen38-Qwen3.8-27B-NVFP4", "primary")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if picked != nil {
+		t.Fatalf("empty model_pattern must not catch unmatched models, got %#v", picked)
+	}
+}
+
+func TestModelKeyMatches(t *testing.T) {
+	if !modelKeyMatches("Foo", "foo") {
+		t.Fatal("expected case-insensitive match")
+	}
+	if modelKeyMatches("", "foo") {
+		t.Fatal("empty key should not match")
+	}
+}

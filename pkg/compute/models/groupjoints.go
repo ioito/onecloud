@@ -29,6 +29,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SGroupJointsManager struct {
 	db.SVirtualJointResourceBaseManager
 	SGroupResourceBaseManager
@@ -47,6 +48,7 @@ func NewGroupJointsManager(dt interface{}, tableName string, keyword string, key
 	}
 }
 
+// +onecloud:model-api-gen
 type SGroupJointsBase struct {
 	db.SVirtualJointResourceBase
 
@@ -158,4 +160,12 @@ func (manager *SGroupJointsManager) ListItemExportKeys(ctx context.Context,
 		}
 	}
 	return q, nil
+}
+
+func (gjb *SGroupJointsBase) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
+	desc := gjb.SVirtualJointResourceBase.GetShortDesc(ctx)
+	desc.Set("group_id", jsonutils.NewString(gjb.GroupId))
+	group := gjb.GetGroup()
+	desc.Set("group", jsonutils.NewString(group.Name))
+	return desc
 }

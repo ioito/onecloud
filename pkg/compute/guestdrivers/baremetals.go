@@ -87,6 +87,10 @@ func (self *SBaremetalGuestDriver) GetMaxSecurityGroupCount() int {
 	return 0
 }
 
+func (self *SBaremetalGuestDriver) AllowReconfigGuest() bool {
+	return false
+}
+
 func (self *SBaremetalGuestDriver) GetMaxVCpuCount() int {
 	return 1024
 }
@@ -123,8 +127,8 @@ func (self *SBaremetalGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_ADMIN}, nil
 }
 
-func (self *SBaremetalGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return nil, httperrors.NewUnsupportOperationError("Cannot change config for baremtal")
+func (self *SBaremetalGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, httperrors.NewUnsupportOperationError("Cannot change config for baremtal")
 }
 
 func (self *SBaremetalGuestDriver) GetDeployStatus() ([]string, error) {
@@ -163,9 +167,10 @@ func (self *SBaremetalGuestDriver) GetNamedNetworkConfiguration(guest *models.SG
 		reuseAddr := false
 		hn := host.GetAttach2Network(netConfig.Network)
 		if hn != nil && options.Options.BaremetalServerReuseHostIp {
-			if netConfig.Address == "" || netConfig.Address == hn.IpAddr {
+			if (netConfig.Address == "" && netConfig.Address6 == "") || (netConfig.Address == hn.IpAddr && netConfig.Address6 == hn.Ip6Addr) {
 				// try to reuse host network IP address
 				netConfig.Address = hn.IpAddr
+				netConfig.Address6 = hn.Ip6Addr
 				reuseAddr = true
 			}
 		}
@@ -175,8 +180,8 @@ func (self *SBaremetalGuestDriver) GetNamedNetworkConfiguration(guest *models.SG
 	return net, nil, "", false, nil
 }
 
-func (self *SBaremetalGuestDriver) GetRandomNetworkTypes() []string {
-	return []string{api.NETWORK_TYPE_BAREMETAL, api.NETWORK_TYPE_GUEST}
+func (self *SBaremetalGuestDriver) GetRandomNetworkTypes() []api.TNetworkType {
+	return []api.TNetworkType{api.NETWORK_TYPE_BAREMETAL, api.NETWORK_TYPE_GUEST}
 }
 
 func (self *SBaremetalGuestDriver) Attach2RandomNetwork(guest *models.SGuest, ctx context.Context, userCred mcclient.TokenCredential, host *models.SHost, netConfig *api.NetworkConfig, pendingUsage quotas.IQuota) ([]models.SGuestnetwork, error) {
@@ -184,9 +189,14 @@ func (self *SBaremetalGuestDriver) Attach2RandomNetwork(guest *models.SGuest, ct
 	netsAvaiable := make([]models.SNetwork, 0)
 	netifIndexs := make(map[string][]models.SNetInterface, 0)
 
-	netTypes := guest.GetDriver().GetRandomNetworkTypes()
+	drv, err := guest.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+
+	netTypes := drv.GetRandomNetworkTypes()
 	if len(netConfig.NetType) > 0 {
-		netTypes = []string{netConfig.NetType}
+		netTypes = []api.TNetworkType{api.TNetworkType(netConfig.NetType)}
 	}
 	var wirePattern *regexp.Regexp
 	if len(netConfig.Wire) > 0 {
@@ -205,9 +215,9 @@ func (self *SBaremetalGuestDriver) Attach2RandomNetwork(guest *models.SGuest, ct
 		}
 		var net *models.SNetwork
 		if netConfig.Private {
-			net, _ = wire.GetCandidatePrivateNetwork(userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
+			net, _ = wire.GetCandidatePrivateNetwork(ctx, userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
 		} else {
-			net, _ = wire.GetCandidateAutoAllocNetwork(userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
+			net, _ = wire.GetCandidateAutoAllocNetwork(ctx, userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
 		}
 		if net != nil {
 			netsAvaiable = append(netsAvaiable, *net)
@@ -243,25 +253,35 @@ func (self *SBaremetalGuestDriver) Attach2RandomNetwork(guest *models.SGuest, ct
 			nicConfs = append(nicConfs, nicConf)
 		}
 		address := ""
+		address6 := ""
 		reuseAddr := false
 		hn := host.GetAttach2Network(net.Id)
 		if hn != nil && options.Options.BaremetalServerReuseHostIp {
 			// try to reuse host network IP address
 			address = hn.IpAddr
+			address6 = hn.Ip6Addr
 			reuseAddr = true
 		}
 		return guest.Attach2Network(ctx, userCred, models.Attach2NetworkArgs{
 			Network:             net,
 			PendingUsage:        pendingUsage,
 			IpAddr:              address,
+			Ip6Addr:             address6,
 			NicDriver:           netConfig.Driver,
 			BwLimit:             netConfig.BwLimit,
+			RxBwLimit:           netConfig.RxBwLimit,
+			TxBwLimit:           netConfig.TxBwLimit,
 			Virtual:             netConfig.Vip,
 			TryReserved:         false,
 			AllocDir:            api.IPAllocationStepup,
 			RequireDesignatedIP: false,
 			UseDesignatedIP:     reuseAddr,
 			NicConfs:            nicConfs,
+
+			IsDefault: netConfig.IsDefault,
+
+			BillingType: netConfig.BillingType,
+			ChargeType:  netConfig.ChargeType,
 		})
 	}
 	return nil, fmt.Errorf("No appropriate host virtual network...")
@@ -336,6 +356,7 @@ func (self *SBaremetalGuestDriver) RequestStartOnHost(ctx context.Context, guest
 	if params.Length() > 0 {
 		config.Add(params, "params")
 	}
+	log.Debugf("RequestStartOnHost config: %s", config.String())
 	headers := task.GetTaskRequestHeader()
 	url := fmt.Sprintf("/baremetals/%s/servers/%s/start", host.Id, guest.Id)
 	_, err := host.BaremetalSyncRequest(ctx, "POST", url, headers, config)
@@ -356,7 +377,8 @@ func (self *SBaremetalGuestDriver) RequestStopGuestForDelete(ctx context.Context
 		!guest.PendingDeleted &&
 		!overridePendingDelete &&
 		!purge {
-		return guest.StartGuestStopTask(ctx, task.GetUserCred(), true, false, task.GetTaskId())
+		stopTimeout := 0
+		return guest.StartGuestStopTask(ctx, task.GetUserCred(), &stopTimeout, true, false, task.GetTaskId())
 	}
 	if host != nil && !host.GetEnabled() && !purge {
 		return errors.Errorf("fail to contact baremetal")
@@ -390,9 +412,13 @@ func (self *SBaremetalGuestDriver) StartGuestStopTask(guest *models.SGuest, ctx 
 }
 
 func (self *SBaremetalGuestDriver) RequestUndeployGuestOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask) error {
+	body := jsonutils.NewDict()
+	if host.IsImport && options.Options.BaremetalPrepareServerFakeDelete {
+		body.Set("purge", jsonutils.JSONTrue)
+	}
 	url := fmt.Sprintf("/baremetals/%s/servers/%s", host.Id, guest.Id)
 	headers := task.GetTaskRequestHeader()
-	_, err := host.BaremetalSyncRequest(ctx, "DELETE", url, headers, nil)
+	_, err := host.BaremetalSyncRequest(ctx, "DELETE", url, headers, body)
 	return err
 }
 
@@ -408,6 +434,11 @@ func (self *SBaremetalGuestDriver) ValidateCreateData(ctx context.Context, userC
 	if len(input.BaremetalDiskConfigs) != 0 {
 		if err := baremetal.ValidateDiskConfigs(input.BaremetalDiskConfigs); err != nil {
 			return nil, httperrors.NewInputParameterError("Invalid raid config: %v", err)
+		}
+	}
+	if input.BaremetalRootDiskMatcher != nil {
+		if err := baremetal.ValidateRootDiskMatcher(input.BaremetalRootDiskMatcher); err != nil {
+			return nil, httperrors.NewInputParameterError("Invalid root disk matcher: %v", err)
 		}
 	}
 	//if len(input.Disks) <= 0 {
@@ -459,7 +490,7 @@ func (self *SBaremetalGuestDriver) RequestRebuildRootDisk(ctx context.Context, g
 	return nil
 }
 
-func (self *SBaremetalGuestDriver) PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, data *jsonutils.JSONDict) error {
+func (self *SBaremetalGuestDriver) PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, data *jsonutils.JSONDict, parentTaskId string) error {
 	return guest.StartGueststartTask(ctx, userCred, data, "")
 }
 
@@ -479,10 +510,14 @@ func (self *SBaremetalGuestDriver) OnGuestDeployTaskDataReceived(ctx context.Con
 			}
 			disk := iDisk.(*models.SDisk)
 			diskSize, _ := disks[i].Int("size")
+			pciPath, _ := disks[i].GetString("pci_path")
 			notes := fmt.Sprintf("%s=>%s", disk.Status, api.DISK_READY)
 			_, err := db.Update(disk, func() error {
 				if disk.DiskSize < int(diskSize) {
 					disk.DiskSize = int(diskSize)
+				}
+				if len(pciPath) > 0 {
+					disk.PCIPath = pciPath
 				}
 				disk.DiskFormat = "raw"
 				disk.Status = api.DISK_READY
@@ -530,6 +565,9 @@ func (self *SBaremetalGuestDriver) RequestDeployGuestOnHost(ctx context.Context,
 		config.Set("on_finish", jsonutils.NewString("restart"))
 	} else if val == "deploy" && jsonutils.QueryBoolean(task.GetParams(), "restart", false) {
 		config.Set("on_finish", jsonutils.NewString("shutdown"))
+	}
+	if jsonutils.QueryBoolean(task.GetParams(), "fake_create_from_bm_import", false) {
+		config.Set("fake_create_from_bm_import", jsonutils.JSONTrue)
 	}
 
 	disableCache, err := self.IsDisableImageCache(guest)

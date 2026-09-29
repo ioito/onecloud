@@ -140,10 +140,6 @@ func (self *SInstance) Refresh() error {
 	return jsonutils.Update(self, ins)
 }
 
-func (self *SInstance) AssignSecurityGroup(id string) error {
-	return cloudprovider.ErrNotSupported
-}
-
 func (self *SInstance) CreateDisk(ctx context.Context, opts *cloudprovider.GuestDiskCreateOptions) (string, error) {
 	driver := opts.Driver
 	if !utils.IsInStringArray(driver, []string{"ide", "scsi", "pci", "sata"}) {
@@ -204,7 +200,7 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	return self.host.zone.region.DeleteVM(self.UUID)
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -228,7 +224,7 @@ func (self *SInstance) GetError() error {
 }
 
 func (self *SInstance) GetHostname() string {
-	return self.Name
+	return ""
 }
 
 func (self *SInstance) GetHypervisor() string {

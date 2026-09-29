@@ -57,7 +57,7 @@ type ImageListInput struct {
 	// 发行版本，可能值为: CentOS, Ubuntu, Debian, ArchLinux,  OpenEuler 等
 	Distributions []string `json:"distributions"`
 	// 发行版精确匹配
-	DistributionPreciseMatch bool `json:"distribution_precise_match`
+	DistributionPreciseMatch bool `json:"distribution_precise_match"`
 }
 
 type GuestImageListInput struct {
@@ -66,6 +66,8 @@ type GuestImageListInput struct {
 
 	// 是否删除保护
 	Protected *bool `json:"protected"`
+
+	DiskFormat []string `json:"disk_format"`
 }
 
 type ImageDetails struct {
@@ -104,6 +106,25 @@ type ImageCreateInput struct {
 	IsData *bool `json:"is_data"`
 
 	apis.EncryptedResourceCreateInput
+
+	// 镜像属性
+	Properties map[string]string `json:"properties"`
+}
+
+type ImageUpdateInput struct {
+	apis.SharableVirtualResourceBaseUpdateInput
+
+	// 最小系统盘要求
+	MinDiskMB *int32 `json:"min_disk"`
+	// 最小内存要求
+	MinRamMB *int32 `json:"min_ram"`
+	// 是否有删除保护
+	Protected *bool `json:"protected"`
+	// 是否是标准镜像
+	IsStandard *bool `json:"is_standard"`
+
+	// 是否是数据盘镜像
+	IsData *bool `json:"is_data"`
 
 	// 镜像属性
 	Properties map[string]string `json:"properties"`

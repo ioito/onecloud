@@ -22,8 +22,10 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -38,6 +40,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=loadbalancerbackendgroup
+// +onecloud:swagger-gen-model-plural=loadbalancerbackendgroups
 type SLoadbalancerBackendGroupManager struct {
 	SLoadbalancerLogSkipper
 	db.SStatusStandaloneResourceBaseManager
@@ -64,6 +68,8 @@ type SLoadbalancerBackendGroup struct {
 	db.SExternalizedResourceBase
 
 	SLoadbalancerResourceBase `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional"`
+	LoadbalancerHealthCheckId string `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional"`
+	Scheduler                 string `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional"`
 
 	Type string `width:"36" charset:"ascii" nullable:"false" list:"user" default:"normal" create:"optional"`
 }
@@ -92,7 +98,7 @@ func (manager *SLoadbalancerBackendGroupManager) FetchOwnerId(ctx context.Contex
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SLoadbalancerBackendGroupManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SLoadbalancerBackendGroupManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId != nil {
 		sq := LoadbalancerManager.Query("id")
 		switch scope {
@@ -207,7 +213,7 @@ func (manager *SLoadbalancerBackendGroupManager) FilterByUniqValues(q *sqlchemy.
 }
 
 func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.LoadbalancerBackendGroupCreateInput) (*api.LoadbalancerBackendGroupCreateInput, error) {
-	lbObj, err := validators.ValidateModel(userCred, LoadbalancerManager, &input.LoadbalancerId)
+	lbObj, err := validators.ValidateModel(ctx, userCred, LoadbalancerManager, &input.LoadbalancerId)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +221,12 @@ func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Cont
 	input.StatusStandaloneResourceCreateInput, err = man.SStatusStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.StatusStandaloneResourceCreateInput)
 	if err != nil {
 		return nil, err
+	}
+	if len(input.LoadbalancerHealthCheckId) > 0 {
+		_, err := validators.ValidateModel(ctx, userCred, LoadbalancerHealthCheckManager, &input.LoadbalancerHealthCheckId)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	region, err := lb.GetRegion()
@@ -232,7 +244,7 @@ func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Cont
 		if input.Backends[i].Port < 1 || input.Backends[i].Port > 65535 {
 			return nil, httperrors.NewInputParameterError("port %d not support, only support range 1 ~ 65535", input.Backends[i].Port)
 		}
-		if len(input.Backends[i].Id) == 0 {
+		if len(input.Backends[i].Id) == 0 && input.Backends[i].BackendType != api.LB_BACKEND_ADDRESS {
 			return nil, httperrors.NewMissingParameterError("Missing backend id")
 		}
 
@@ -240,7 +252,7 @@ func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Cont
 
 		switch input.Backends[i].BackendType {
 		case api.LB_BACKEND_GUEST:
-			guestObj, err := validators.ValidateModel(userCred, GuestManager, &input.Backends[i].Id)
+			guestObj, err := validators.ValidateModel(ctx, userCred, GuestManager, &input.Backends[i].Id)
 			if err != nil {
 				return nil, err
 			}
@@ -265,7 +277,7 @@ func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Cont
 			if db.IsAdminAllowCreate(userCred, man).Result.IsDeny() {
 				return nil, httperrors.NewForbiddenError("only sysadmin can specify host as backend")
 			}
-			hostObj, err := validators.ValidateModel(userCred, HostManager, &input.Backends[i].Id)
+			hostObj, err := validators.ValidateModel(ctx, userCred, HostManager, &input.Backends[i].Id)
 			if err != nil {
 				return nil, err
 			}
@@ -275,10 +287,11 @@ func (man *SLoadbalancerBackendGroupManager) ValidateCreateData(ctx context.Cont
 			input.Backends[i].ExternalId = host.ExternalId
 			input.Backends[i].Address = host.AccessIp
 			backendRegion, _ = host.GetRegion()
+		case api.LB_BACKEND_ADDRESS:
 		default:
 			return nil, httperrors.NewInputParameterError("unexpected backend type %s", input.Backends[i].BackendType)
 		}
-		if lbIsManaged && backendRegion.Id != region.Id {
+		if lbIsManaged && backendRegion != nil && backendRegion.Id != region.Id {
 			return nil, httperrors.NewInputParameterError("region of backend %d does not match that of lb's", i)
 		}
 	}
@@ -405,31 +418,21 @@ func (lbbg *SLoadbalancerBackendGroup) isDefault(ctx context.Context) (bool, err
 	return count > 0, nil
 }
 
-func (lbbg *SLoadbalancerBackendGroup) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
-	ok, err := lbbg.isDefault(ctx)
-	if err != nil {
-		return httperrors.NewInternalServerError("get isDefault fail %s", err.Error())
+func (lbbg *SLoadbalancerBackendGroup) ValidateDeleteCondition(ctx context.Context, info *api.LoadbalancerBackendGroupDetails) error {
+	if gotypes.IsNil(info) {
+		info = &api.LoadbalancerBackendGroupDetails{}
+		info.IsDefault, _ = lbbg.isDefault(ctx)
+		info.LbListenerCount, _ = lbbg.GetListenerCount()
 	}
-	if ok {
+	if info.IsDefault {
 		return httperrors.NewResourceBusyError("backend group %s is default backend group", lbbg.Id)
 	}
-	return lbbg.ValidatePurgeCondition(ctx)
-}
-
-func (lbbg *SLoadbalancerBackendGroup) ValidatePurgeCondition(ctx context.Context) error {
-	mans := lbbg.getRefManagers()
-	for _, m := range mans {
-		n, err := lbbg.refCount(m)
-		if err != nil {
-			return httperrors.NewInternalServerError("get refCount fail %s", err.Error())
-		}
-		if n > 0 {
-			return httperrors.NewResourceBusyError("backend group %s is still referred by %d %s",
-				lbbg.Id, n, m.KeywordPlural())
-		}
+	if info.LbListenerCount > 0 {
+		return httperrors.NewResourceBusyError("backend group %s is still referred by %d %s",
+			lbbg.Id, info.LbListenerCount, LoadbalancerListenerManager.KeywordPlural())
 	}
 
-	return nil
+	return lbbg.SStatusStandaloneResourceBase.ValidateDeleteCondition(ctx, nil)
 }
 
 func (man *SLoadbalancerBackendGroupManager) FetchCustomizeColumns(
@@ -446,6 +449,8 @@ func (man *SLoadbalancerBackendGroupManager) FetchCustomizeColumns(
 	lbRows := man.SLoadbalancerResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 
 	lbIds := make([]string, len(objs))
+	lbbgIds := make([]string, len(objs))
+	hcIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i] = api.LoadbalancerBackendGroupDetails{
 			StatusStandaloneResourceDetails: stdRows[i],
@@ -453,6 +458,8 @@ func (man *SLoadbalancerBackendGroupManager) FetchCustomizeColumns(
 		}
 		lbbg := objs[i].(*SLoadbalancerBackendGroup)
 		lbIds[i] = lbbg.LoadbalancerId
+		lbbgIds[i] = lbbg.Id
+		hcIds[i] = lbbg.LoadbalancerHealthCheckId
 	}
 
 	lbs := map[string]SLoadbalancer{}
@@ -461,23 +468,39 @@ func (man *SLoadbalancerBackendGroupManager) FetchCustomizeColumns(
 		return rows
 	}
 
+	defaultLbgIds := []string{}
 	virObjs := make([]interface{}, len(objs))
 	for i := range rows {
 		if lb, ok := lbs[lbIds[i]]; ok {
 			virObjs[i] = &lb
 			rows[i].ProjectId = lb.ProjectId
+			if !utils.IsInStringArray(lb.BackendGroupId, defaultLbgIds) {
+				defaultLbgIds = append(defaultLbgIds, lb.BackendGroupId)
+			}
+		}
+	}
+
+	hcMap, err := db.FetchIdNameMap2(LoadbalancerHealthCheckManager, hcIds)
+	if err != nil {
+		return rows
+	}
+
+	for i := range rows {
+		rows[i].IsDefault = utils.IsInStringArray(lbbgIds[i], defaultLbgIds)
+		if hcId, ok := hcMap[hcIds[i]]; ok {
+			rows[i].LoadbalancerHealthCheck = hcId
 		}
 	}
 
 	for i := range objs {
-		q := LoadbalancerListenerManager.Query().Equals("backend_group_id", objs[i].(*SLoadbalancerBackendGroup).GetId())
+		q := LoadbalancerListenerManager.Query().Equals("backend_group_id", lbbgIds[i])
 		ownerId, queryScope, err, _ := db.FetchCheckQueryOwnerScope(ctx, userCred, query, LoadbalancerListenerManager, policy.PolicyActionList, true)
 		if err != nil {
 			log.Errorf("FetchCheckQueryOwnerScope error: %v", err)
 			return rows
 		}
 
-		q = LoadbalancerListenerManager.FilterByOwner(q, LoadbalancerListenerManager, userCred, ownerId, queryScope)
+		q = LoadbalancerListenerManager.FilterByOwner(ctx, q, LoadbalancerListenerManager, userCred, ownerId, queryScope)
 		rows[i].LbListenerCount, _ = q.CountWithError()
 	}
 
@@ -497,9 +520,12 @@ func (lbbg *SLoadbalancerBackendGroup) PostCreate(ctx context.Context, userCred 
 			Address:     input.Backends[i].Address,
 			Port:        input.Backends[i].Port,
 		}
+		backend.Name = input.Backends[i].Name
 		backend.BackendGroupId = lbbg.Id
 		backend.Status = api.LB_STATUS_ENABLED
-		backend.Name = fmt.Sprintf("%s-%s-%s", lbbg.Name, backend.BackendType, backend.Name)
+		if backend.BackendType == api.LB_BACKEND_GUEST {
+			backend.Name = fmt.Sprintf("%s-%s-%s", lbbg.Name, backend.BackendType, backend.Name)
+		}
 		backend.SetModelManager(LoadbalancerBackendManager, backend)
 		LoadbalancerBackendManager.TableSpec().Insert(ctx, backend)
 	}
@@ -507,7 +533,7 @@ func (lbbg *SLoadbalancerBackendGroup) PostCreate(ctx context.Context, userCred 
 }
 
 func (lbbg *SLoadbalancerBackendGroup) StartLoadBalancerBackendGroupCreateTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) {
-	lbbg.SetStatus(userCred, api.LB_CREATING, "")
+	lbbg.SetStatus(ctx, userCred, api.LB_CREATING, "")
 	err := func() error {
 		task, err := taskman.TaskManager.NewTask(ctx, "LoadbalancerLoadbalancerBackendGroupCreateTask", lbbg, userCred, nil, parentTaskId, "", nil)
 		if err != nil {
@@ -516,7 +542,7 @@ func (lbbg *SLoadbalancerBackendGroup) StartLoadBalancerBackendGroupCreateTask(c
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		lbbg.SetStatus(userCred, api.LB_CREATE_FAILED, err.Error())
+		lbbg.SetStatus(ctx, userCred, api.LB_CREATE_FAILED, err.Error())
 	}
 }
 
@@ -541,7 +567,7 @@ func (lbbg *SLoadbalancerBackendGroup) PerformPurge(ctx context.Context, userCre
 }
 
 func (lbbg *SLoadbalancerBackendGroup) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	lbbg.SetStatus(userCred, api.LB_STATUS_DELETING, "")
+	lbbg.SetStatus(ctx, userCred, api.LB_STATUS_DELETING, "")
 	return lbbg.StartLoadBalancerBackendGroupDeleteTask(ctx, userCred, jsonutils.NewDict(), "")
 }
 
@@ -566,6 +592,10 @@ func (lbbg *SLoadbalancerBackendGroup) GetListener() *SLoadbalancerListener {
 	return ret
 }
 
+func (lbbg *SLoadbalancerBackendGroup) GetListenerCount() (int, error) {
+	return LoadbalancerListenerManager.Query().Equals("backend_group_id", lbbg.Id).CountWithError()
+}
+
 func (lbbg *SLoadbalancerBackendGroup) GetBackendsParams() ([]cloudprovider.SLoadbalancerBackend, error) {
 	backends, err := lbbg.GetBackends()
 	if err != nil {
@@ -585,9 +615,9 @@ func (lbbg *SLoadbalancerBackendGroup) GetBackendsParams() ([]cloudprovider.SLoa
 		ret[i] = cloudprovider.SLoadbalancerBackend{
 			Weight:      b.Weight,
 			Port:        b.Port,
-			ID:          b.Id,
+			Id:          b.Id,
 			Name:        b.Name,
-			ExternalID:  externalId,
+			ExternalId:  externalId,
 			BackendType: b.BackendType,
 			BackendRole: b.BackendRole,
 			Address:     b.Address,
@@ -685,11 +715,6 @@ func (lbbg *SLoadbalancerBackendGroup) syncRemove(ctx context.Context, userCred 
 	lockman.LockObject(ctx, lbbg)
 	defer lockman.ReleaseObject(ctx, lbbg)
 
-	err := lbbg.ValidateDeleteCondition(ctx, nil)
-	if err != nil { // cannot delete
-		lbbg.SetStatus(userCred, api.LB_STATUS_UNKNOWN, "sync to delete")
-		return errors.Wrapf(err, "ValidateDeleteCondition")
-	}
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
 		Obj:    lbbg,
 		Action: notifyclient.ActionSyncDelete,
@@ -706,6 +731,15 @@ func (lbbg *SLoadbalancerBackendGroup) SyncWithCloudLoadbalancerBackendgroup(
 	diff, err := db.UpdateWithLock(ctx, lbbg, func() error {
 		lbbg.Type = ext.GetType()
 		lbbg.Status = ext.GetStatus()
+		lbbg.Scheduler = ext.GetScheduler()
+		if hcId := ext.GetHealthCheckId(); hcId != "" {
+			hc, err := db.FetchByExternalIdAndManagerId(LoadbalancerHealthCheckManager, hcId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+				return q.Equals("manager_id", lb.ManagerId)
+			})
+			if err == nil {
+				lbbg.LoadbalancerHealthCheckId = hc.GetId()
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -717,7 +751,9 @@ func (lbbg *SLoadbalancerBackendGroup) SyncWithCloudLoadbalancerBackendgroup(
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-	syncMetadata(ctx, userCred, lbbg, ext)
+	if account := lb.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, lbbg, ext, account.ReadOnly)
+	}
 	db.OpsLog.LogSyncUpdate(lbbg, diff, userCred)
 
 	if ext.IsDefault() {
@@ -747,7 +783,16 @@ func (lb *SLoadbalancer) newFromCloudLoadbalancerBackendgroup(
 
 	lbbg.Type = ext.GetType()
 	lbbg.Status = ext.GetStatus()
+	lbbg.Scheduler = ext.GetScheduler()
 	lbbg.Name = ext.GetName()
+	if hcId := ext.GetHealthCheckId(); hcId != "" {
+		hc, err := db.FetchByExternalIdAndManagerId(LoadbalancerHealthCheckManager, hcId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+			return q.Equals("manager_id", lb.ManagerId)
+		})
+		if err == nil {
+			lbbg.LoadbalancerHealthCheckId = hc.GetId()
+		}
+	}
 
 	err := LoadbalancerBackendGroupManager.TableSpec().Insert(ctx, lbbg)
 	if err != nil {
@@ -771,6 +816,14 @@ func (lb *SLoadbalancer) newFromCloudLoadbalancerBackendgroup(
 		}
 	}
 	return lbbg, nil
+}
+
+func (lbbg *SLoadbalancerBackendGroup) GetHealthCheck() (*SLoadbalancerHealthCheck, error) {
+	obj, err := db.FetchById(LoadbalancerHealthCheckManager, lbbg.LoadbalancerHealthCheckId)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchById")
+	}
+	return obj.(*SLoadbalancerHealthCheck), nil
 }
 
 func (manager *SLoadbalancerBackendGroupManager) ListItemExportKeys(ctx context.Context,

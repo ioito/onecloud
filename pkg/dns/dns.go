@@ -16,46 +16,39 @@ package dns
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/etcd/msg"
 	"github.com/coredns/coredns/plugin/pkg/dnsutil"
 	"github.com/coredns/coredns/plugin/pkg/fall"
 	"github.com/coredns/coredns/plugin/pkg/upstream"
 	"github.com/coredns/coredns/request"
-	"github.com/mholt/caddy"
 	"github.com/miekg/dns"
-	v1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
-	"yunion.io/x/pkg/utils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/sqlchemy"
 	_ "yunion.io/x/sqlchemy/backends"
 
+	api "yunion.io/x/onecloud/pkg/apis/compute"
+	identity_api "yunion.io/x/onecloud/pkg/apis/identity"
+	"yunion.io/x/onecloud/pkg/cloudcommon"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
-	"yunion.io/x/onecloud/pkg/util/k8s"
 )
 
 const (
 	PluginName string = "yunion"
 
 	// defaultTTL to apply to all answers
-	defaultTTL           = 10
+	defaultTTL           = 300
 	defaultDbMaxOpenConn = 32
 	defaultDbMaxIdleConn = 32
 )
@@ -79,16 +72,23 @@ type SRegionDNS struct {
 	Fall          fall.F
 	Zones         []string
 	PrimaryZone   string
-	Upstream      upstream.Upstream
+	Upstream      *upstream.Upstream
 	SqlConnection string
 	AuthUrl       string
 	AdminProject  string
 	AdminUser     string
+	AdminDomain   string
 	AdminPassword string
 	Region        string
-	K8sSkip       bool
 
-	K8sManager            *k8s.SKubeClusterManager
+	AdminProjectDomain string
+
+	InCloudOnly bool
+
+	// K8sSkip bool
+
+	// K8sManager *k8s.SKubeClusterManager
+
 	primaryZoneLabelCount int
 }
 
@@ -98,17 +98,12 @@ func New() *SRegionDNS {
 }
 
 func (r *SRegionDNS) initDB(c *caddy.Controller) error {
-	dialect, sqlStr, err := utils.TransSQLAchemyURL(r.SqlConnection)
-	if err != nil {
-		return err
+	options := &common_options.DBOptions{
+		SqlConnection: r.SqlConnection,
 	}
-	sqlDb, err := sql.Open(dialect, sqlStr)
-	if err != nil {
-		return err
-	}
-	sqlDb.SetMaxOpenConns(defaultDbMaxOpenConn)
-	sqlDb.SetMaxIdleConns(defaultDbMaxIdleConn)
-	sqlchemy.SetDB(sqlDb)
+
+	cloudcommon.InitDBConn(options)
+
 	db.InitAllManagers()
 
 	c.OnShutdown(func() error {
@@ -118,74 +113,86 @@ func (r *SRegionDNS) initDB(c *caddy.Controller) error {
 	return nil
 }
 
-func (r *SRegionDNS) initK8s() {
-	r.initAuth()
+/*func (r *SRegionDNS) initK8s() {
 	r.K8sManager = k8s.NewKubeClusterManager(r.Region, 30*time.Second)
 	r.K8sManager.Start()
-}
+}*/
 
 func (r *SRegionDNS) getAdminSession(ctx context.Context) *mcclient.ClientSession {
 	return auth.GetAdminSession(ctx, r.Region)
 }
 
 func (r *SRegionDNS) initAuth() {
-	authInfo := auth.NewAuthInfo(r.AuthUrl, "", r.AdminUser, r.AdminPassword, r.AdminProject, "")
+	if len(r.AdminDomain) == 0 {
+		r.AdminDomain = identity_api.DEFAULT_DOMAIN_NAME
+	}
+	if len(r.AdminProjectDomain) == 0 {
+		r.AdminProjectDomain = identity_api.DEFAULT_DOMAIN_NAME
+	}
+	authInfo := auth.NewAuthInfo(r.AuthUrl, r.AdminDomain, r.AdminUser, r.AdminPassword, r.AdminProject, r.AdminProjectDomain)
 	auth.Init(authInfo, false, true, "", "")
 }
 
 func (r *SRegionDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, rmsg *dns.Msg) (int, error) {
+	log.Debugf("ServeDNS: %s", jsonutils.Marshal(rmsg).String())
+
 	var (
 		records []dns.RR
 		extra   []dns.RR
 		err     error
 	)
 
+	state := request.Request{W: w, Req: rmsg}
+	qname := state.Name()
+	zone := plugin.Zones(r.Zones).Matches(qname)
+	if zone == "" {
+		return plugin.NextOrFailure(r.Name(), r.Next, ctx, w, rmsg)
+	}
+	state.Zone = zone
+
 	opt := plugin.Options{}
-	state := request.Request{W: w, Req: rmsg, Context: ctx}
-	zone := plugin.Zones(r.Zones).Matches(state.Name())
 	switch state.QType() {
 	case dns.TypeA:
-		records, err = plugin.A(r, zone, state, nil, opt)
+		records, _, err = plugin.A(ctx, r, zone, state, nil, opt)
 	case dns.TypeAAAA:
-		// TODO fallthrough to next
-		records, err = plugin.AAAA(r, zone, state, nil, opt)
+		records, _, err = plugin.AAAA(ctx, r, zone, state, nil, opt)
 	case dns.TypeTXT:
-		records, err = plugin.TXT(r, zone, state, opt)
+		records, _, err = plugin.TXT(ctx, r, zone, state, nil, opt)
 	case dns.TypeCNAME:
-		records, err = plugin.CNAME(r, zone, state, opt)
+		records, err = plugin.CNAME(ctx, r, zone, state, opt)
 	case dns.TypePTR:
-		records, err = plugin.PTR(r, zone, state, opt)
+		records, err = plugin.PTR(ctx, r, zone, state, opt)
 	case dns.TypeMX:
-		records, extra, err = plugin.MX(r, zone, state, opt)
+		records, extra, err = plugin.MX(ctx, r, zone, state, opt)
 	case dns.TypeSRV:
-		records, extra, err = plugin.SRV(r, zone, state, opt)
+		records, extra, err = plugin.SRV(ctx, r, zone, state, opt)
 	case dns.TypeSOA:
-		records, err = plugin.SOA(r, zone, state, opt)
+		records, err = plugin.SOA(ctx, r, zone, state, opt)
 	case dns.TypeNS:
 		if state.Name() == zone {
-			records, extra, err = plugin.NS(r, zone, state, opt)
+			records, extra, err = plugin.NS(ctx, r, zone, state, opt)
 			break
 		}
 		fallthrough
 	default:
 		log.Warningf("Not processed state: %#v", state)
 		// Do a fake A lookup, so we can distinguish between NODATA and NXDOMAIN
-		_, err = plugin.A(r, zone, state, nil, opt)
+		_, _, err = plugin.A(ctx, r, zone, state, nil, opt)
 	}
 
 	if err == errCallNext {
 		if r.Fall.Through(state.Name()) {
 			return plugin.NextOrFailure(r.Name(), r.Next, ctx, w, rmsg)
 		}
-		return plugin.BackendError(r, zone, dns.RcodeNameError, state, nil /* err */, opt)
+		return plugin.BackendError(ctx, r, zone, dns.RcodeNameError, state, nil /* err */, opt)
 	} else if err == errRefused {
-		return plugin.BackendError(r, zone, dns.RcodeRefused, state, err, opt)
+		return plugin.BackendError(ctx, r, zone, dns.RcodeRefused, state, err, opt)
 	} else if err == errNotFound {
-		return plugin.BackendError(r, zone, dns.RcodeNameError, state, err, opt)
+		return plugin.BackendError(ctx, r, zone, dns.RcodeNameError, state, err, opt)
 	}
 
 	if len(records) == 0 {
-		return plugin.BackendError(r, zone, dns.RcodeNameError, state, err, opt)
+		return plugin.BackendError(ctx, r, zone, dns.RcodeNameError, state, err, opt)
 	}
 
 	m := new(dns.Msg)
@@ -201,13 +208,16 @@ func (r *SRegionDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, rmsg *d
 }
 
 var (
-	errRefused  = errors.New("refused the query")
-	errNotFound = errors.New("not found")
-	errCallNext = errors.New("continue to next")
+	errRefused  = errors.Error("refused the query")
+	errNotFound = errors.Error("not found")
+	errCallNext = errors.Error("continue to next")
 )
 
 // Services implements the ServiceBackend interface
-func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Options) (services []msg.Service, err error) {
+func (r *SRegionDNS) Services(ctx context.Context, state request.Request, exact bool, opt plugin.Options) ([]msg.Service, error) {
+	var services []msg.Service
+	var err error
+
 	defer func() {
 		if len(services) == 0 {
 			log.Infof(`%s:%s %s - %d "%s %s empty response"`, state.RemoteAddr(), state.Port(), state.Proto(), state.Len(), state.Type(), state.Name())
@@ -217,6 +227,7 @@ func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Opti
 			log.Infof(`%s:%s %s - %d "%s IN %s %s"`, state.RemoteAddr(), state.Port(), state.Proto(), state.Len(), state.Type(), state.Name(), jsonutils.Marshal(service).String())
 		}
 	}()
+
 	switch state.QType() {
 	case dns.TypeTXT:
 		t, _ := dnsutil.TrimZone(state.Name(), state.Zone)
@@ -229,11 +240,13 @@ func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Opti
 			return nil, nil
 		}
 		svc := msg.Service{Text: "0.0.1", TTL: 28800, Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
 	case dns.TypeNS:
 		ns := r.nsAddr()
 		svc := msg.Service{Host: ns.A.String(), Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
 	}
 
 	if state.QType() == dns.TypeA && isDefaultNS(state.Name(), state.Zone) {
@@ -241,16 +254,25 @@ func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Opti
 		// SOA records always use this hardcoded name
 		ns := r.nsAddr()
 		svc := msg.Service{Host: ns.A.String(), Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
 	}
 
-	services, err = r.Records(state, false)
-	return
+	if _, ok := DNSTypeMap[state.QType()]; !ok {
+		return nil, errRefused
+	}
+
+	services, err = r.Records(ctx, state, false)
+	if err != nil {
+		// log.Errorf("Records %s fail: %s", state.Name(), err)
+		return nil, err
+	}
+	return services, nil
 }
 
 // Lookup implements the ServiceBackend interface
-func (r *SRegionDNS) Lookup(state request.Request, name string, typ uint16) (*dns.Msg, error) {
-	return r.Upstream.Lookup(state, name, typ)
+func (r *SRegionDNS) Lookup(ctx context.Context, state request.Request, name string, typ uint16) (*dns.Msg, error) {
+	return r.Upstream.Lookup(ctx, state, name, typ)
 }
 
 // IsNameError implements the ServiceBackend interface
@@ -259,17 +281,24 @@ func (r *SRegionDNS) IsNameError(err error) bool {
 }
 
 // Records looks up records in region mysql
-func (r *SRegionDNS) Records(state request.Request, exact bool) ([]msg.Service, error) {
-	req, e := parseRequest(state)
-	if e != nil {
-		return nil, e
+func (r *SRegionDNS) Records(ctx context.Context, state request.Request, exact bool) ([]msg.Service, error) {
+	req := parseRequest(state)
+
+	if r.InCloudOnly && !req.srcInCloud {
+		// deny external request
+		return nil, errRefused
 	}
 	return r.findRecords(req)
 }
 
 func (r *SRegionDNS) getHostIpWithName(req *recordRequest) string {
+	if req.Type() != "A" {
+		return ""
+	}
 	name := req.QueryName()
-	host, _ := models.HostManager.FetchByName(nil, name)
+	name = strings.TrimSuffix(name, ".")
+	ctx := context.Background()
+	host, _ := models.HostManager.FetchByName(ctx, nil, name)
 	if host == nil {
 		return ""
 	}
@@ -277,16 +306,27 @@ func (r *SRegionDNS) getHostIpWithName(req *recordRequest) string {
 	return ip
 }
 
-func (r *SRegionDNS) getGuestIpWithName(req *recordRequest) []string {
+func (r *SRegionDNS) getGuestIpsWithName(req *recordRequest) []string {
 	ips := []string{}
 	name := req.QueryName()
 	projectId := req.ProjectId()
 	wantOnlyExit := false
-	ips = models.GuestManager.GetIpInProjectWithName(projectId, name, wantOnlyExit)
+	if req.Type() == "A" {
+		ip4s := models.GuestManager.GetIpsInProjectWithName(projectId, name, wantOnlyExit, api.AddressTypeIPv4)
+		if len(ip4s) > 0 {
+			ips = append(ips, ip4s...)
+		}
+	}
+	if req.Type() == "AAAA" {
+		ip6s := models.GuestManager.GetIpsInProjectWithName(projectId, name, wantOnlyExit, api.AddressTypeIPv6)
+		if len(ip6s) > 0 {
+			ips = append(ips, ip6s...)
+		}
+	}
 	return ips
 }
 
-func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]string, error) {
+/*func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]string, error) {
 	queryInfo := req.GetK8sQueryInfo()
 	pods, err := getK8sServicePods(cli, queryInfo.Namespace, queryInfo.ServiceName)
 	if err != nil {
@@ -303,13 +343,13 @@ func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]str
 		}
 	}
 	return ips, nil
-}
+}*/
 
-func (r *SRegionDNS) getK8sClient() (*kubernetes.Clientset, error) {
+/*func (r *SRegionDNS) getK8sClient() (*kubernetes.Clientset, error) {
 	return r.K8sManager.GetK8sClient()
-}
+}*/
 
-func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.Pod, error) {
+/*func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.Pod, error) {
 	svc, err := cli.CoreV1().Services(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -323,13 +363,13 @@ func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.
 		return nil, err
 	}
 	return pods.Items, nil
-}
+}*/
 
 func (r *SRegionDNS) Name() string {
 	return PluginName
 }
 
-func (r *SRegionDNS) queryLocalDnsRecords(req *recordRequest) (recs []msg.Service) {
+func (r *SRegionDNS) queryLocalDnsRecords(req *recordRequest) []msg.Service {
 	var (
 		projId = req.ProjectId()
 		getTtl = func(ttl int64) uint32 {
@@ -339,52 +379,63 @@ func (r *SRegionDNS) queryLocalDnsRecords(req *recordRequest) (recs []msg.Servic
 			return uint32(ttl)
 		}
 	)
-	rec, err := models.DnsRecordManager.QueryDns(projId, req.Name(), "")
+	recs := make([]msg.Service, 0)
+	records, err := models.DnsRecordManager.QueryDns(projId, req.Name(), req.Type())
 	if err != nil {
 		log.Errorf("QueryDns %s %s error: %v", req.Type(), req.Name(), err)
-		return
+		return nil
 	}
 
 	if req.IsSRV() {
-		// priority weight port host
-		parts := strings.SplitN(rec.DnsValue, " ", 4)
-		if len(parts) != 4 {
-			log.Errorf("Invalid SRV records: %q", rec.DnsValue)
-			return
+		for i := range records {
+			rec := records[i]
+			// priority weight port host
+			parts := strings.SplitN(rec.DnsValue, " ", 4)
+			if len(parts) != 4 {
+				log.Errorf("Invalid SRV records: %q", rec.DnsValue)
+				return nil
+			}
+			_priority, _weight, _port, host := parts[0], parts[1], parts[2], parts[3]
+			priority, err := strconv.Atoi(_priority)
+			if err != nil {
+				log.Errorf("SRV: invalid priority: %s", _priority)
+				return nil
+			}
+			weight, err := strconv.Atoi(_weight)
+			if err != nil {
+				log.Errorf("SRV: invalid weight: %s", _weight)
+				return nil
+			}
+			port, err := strconv.Atoi(_port)
+			if err != nil {
+				log.Errorf("SRV: invalid port: %s", _port)
+				return nil
+			}
+			recs = append(recs, msg.Service{
+				Host:     host,
+				Port:     port,
+				Weight:   weight,
+				Priority: priority,
+				TTL:      getTtl(rec.TTL),
+			})
 		}
-		_priority, _weight, _port, host := parts[0], parts[1], parts[2], parts[3]
-		priority, err := strconv.Atoi(_priority)
-		if err != nil {
-			log.Errorf("SRV: invalid priority: %s", _priority)
-			return
+	} else {
+		for i := range records {
+			rec := records[i]
+			recs = append(recs, msg.Service{
+				Host: rec.DnsValue,
+				TTL:  getTtl(rec.TTL),
+			})
 		}
-		weight, err := strconv.Atoi(_weight)
-		if err != nil {
-			log.Errorf("SRV: invalid weight: %s", _weight)
-			return
-		}
-		port, err := strconv.Atoi(_port)
-		if err != nil {
-			log.Errorf("SRV: invalid port: %s", _port)
-			return
-		}
-		recs = append(recs, msg.Service{
-			Host:     host,
-			Port:     port,
-			Weight:   weight,
-			Priority: priority,
-			TTL:      getTtl(rec.TTL),
-		})
-		return
 	}
-	recs = append(recs, msg.Service{
-		Host: rec.DnsValue,
-		TTL:  getTtl(rec.TTL),
-	})
-	return
+
+	return recs
 }
 
 func (r *SRegionDNS) isMyDomain(req *recordRequest) bool {
+	if r.PrimaryZone == "" {
+		return false
+	}
 	qname := req.state.Name()
 	qnameLabelCount := dns.CountLabel(qname)
 	if qnameLabelCount <= r.primaryZoneLabelCount {
@@ -399,13 +450,16 @@ func (r *SRegionDNS) isMyDomain(req *recordRequest) bool {
 
 func (r *SRegionDNS) findRecords(req *recordRequest) ([]msg.Service, error) {
 	// 1. try local dns records table
-	rrs := r.queryLocalDnsRecords(req)
-	if len(rrs) > 0 {
-		return rrs, nil
+	if !r.isMyDomain(req) {
+		rrs := r.queryLocalDnsRecords(req)
+		if len(rrs) > 0 {
+			return rrs, nil
+		}
 	}
 
 	isPlainName := req.IsPlainName()
 	isMyDomain := r.isMyDomain(req)
+
 	if isPlainName {
 		isCloudIp := req.SrcInCloud()
 		if isCloudIp {
@@ -432,21 +486,22 @@ func (r *SRegionDNS) findRecords(req *recordRequest) ([]msg.Service, error) {
 
 func (r *SRegionDNS) findInternalRecordIps(req *recordRequest) []string {
 	{
-		// 1. try host table
-		ip := r.getHostIpWithName(req)
-		if len(ip) > 0 {
-			return []string{ip}
-		}
-	}
-	{
-		// 2. try guest table
-		ips := r.getGuestIpWithName(req)
+		// 1. try guest table
+		ips := r.getGuestIpsWithName(req)
 		if len(ips) > 0 {
 			return ips
 		}
 	}
 
-	if !r.K8sSkip {
+	{
+		// 2. try host table
+		ip := r.getHostIpWithName(req)
+		if len(ip) > 0 {
+			return []string{ip}
+		}
+	}
+
+	/*if !r.K8sSkip {
 		k8sCli, err := r.getK8sClient()
 		if err != nil {
 			log.Warningf("Get k8s client error: %v, skip it.", err)
@@ -458,7 +513,8 @@ func (r *SRegionDNS) findInternalRecordIps(req *recordRequest) []string {
 			log.Errorf("Get k8s service backends error: %v", err)
 		}
 		return ips
-	}
+	}*/
+
 	return nil
 }
 

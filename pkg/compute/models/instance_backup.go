@@ -77,6 +77,8 @@ type SInstanceBackup struct {
 	SizeMb int `nullable:"false" list:"user"`
 }
 
+// +onecloud:swagger-gen-model-singular=instancebackup
+// +onecloud:swagger-gen-model-plural=instancebackups
 type SInstanceBackupManager struct {
 	db.SVirtualResourceBaseManager
 	SManagedResourceBaseManager
@@ -105,7 +107,7 @@ func (manager *SInstanceBackupManager) ListItemFilter(ctx context.Context, q *sq
 
 	guestStr := query.ServerId
 	if len(guestStr) > 0 {
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, guestStr)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, guestStr)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("guests", guestStr)
@@ -182,6 +184,15 @@ func (manager *SInstanceBackupManager) QueryDistinctExtraField(q *sqlchemy.SQuer
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SInstanceBackupManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (self *SInstanceBackup) GetGuest() (*SGuest, error) {
 	if len(self.GuestId) == 0 {
 		return nil, errors.ErrNotFound
@@ -214,17 +225,9 @@ func (self *SInstanceBackup) getMoreDetails(userCred mcclient.TokenCredential, o
 	backups, _ := self.GetBackups()
 	out.DiskBackups = []api.SSimpleBackup{}
 	for i := 0; i < len(backups); i++ {
-		out.DiskBackups = append(out.DiskBackups, api.SSimpleBackup{
-			Id:           backups[i].Id,
-			Name:         backups[i].Name,
-			SizeMb:       backups[i].SizeMb,
-			DiskSizeMb:   backups[i].DiskSizeMb,
-			DiskType:     backups[i].DiskType,
-			Status:       backups[i].Status,
-			EncryptKeyId: backups[i].EncryptKeyId,
-			CreatedAt:    backups[i].CreatedAt,
-		})
+		out.DiskBackups = append(out.DiskBackups, backups[i].ToSimpleBackup())
 	}
+	out.Size = self.SizeMb * 1024 * 1024
 	return out
 }
 
@@ -256,7 +259,7 @@ func (manager *SInstanceBackupManager) FetchCustomizeColumns(
 }
 
 func (self *SInstanceBackup) StartCreateInstanceBackupTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.INSTANCE_BACKUP_STATUS_CREATING, "")
 	if task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupCreateTask", self, userCred, nil, parentTaskId, "", nil); err != nil {
 		return err
 	} else {
@@ -366,6 +369,9 @@ func (self *SInstanceBackup) ToInstanceCreateInput(sourceInput *api.ServerCreate
 			createInput.Disks[i].BackupId = isjs[index].DiskBackupId
 			createInput.Disks[i].ImageId = ""
 			createInput.Disks[i].SnapshotId = ""
+			if i < len(sourceInput.Disks) {
+				createInput.Disks[i].Backend = sourceInput.Disks[i].Backend
+			}
 		}
 	}
 
@@ -431,7 +437,7 @@ func (self *SInstanceBackup) ToInstanceCreateInput(sourceInput *api.ServerCreate
 
 func (self *SInstanceBackup) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
 	if self.Status == api.INSTANCE_SNAPSHOT_START_DELETE || self.Status == api.INSTANCE_SNAPSHOT_RESET {
-		return httperrors.NewForbiddenError("can't delete instance snapshot with wrong status")
+		return httperrors.NewForbiddenError("cannot delete instance backup in current status")
 	}
 	return nil
 }
@@ -454,7 +460,7 @@ func (self *SInstanceBackup) StartInstanceBackupDeleteTask(
 		log.Errorf("%s", err)
 		return err
 	}
-	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_DELETING, "InstanceBackupDeleteTask")
+	self.SetStatus(ctx, userCred, api.INSTANCE_BACKUP_STATUS_DELETING, "InstanceBackupDeleteTask")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -490,7 +496,7 @@ func (self *SInstanceBackup) PerformRecovery(ctx context.Context, userCred mccli
 }
 
 func (self *SInstanceBackup) StartRecoveryTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string, serverName string) error {
-	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_RECOVERY, "")
+	self.SetStatus(ctx, userCred, api.INSTANCE_BACKUP_STATUS_RECOVERY, "")
 	params := jsonutils.NewDict()
 	if serverName != "" {
 		params.Set("server_name", jsonutils.NewString(serverName))
@@ -506,9 +512,9 @@ func (self *SInstanceBackup) StartRecoveryTask(ctx context.Context, userCred mcc
 
 func (self *SInstanceBackup) PerformPack(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.InstanceBackupPackInput) (jsonutils.JSONObject, error) {
 	if input.PackageName == "" {
-		return nil, httperrors.NewMissingParameterError("miss package_name")
+		return nil, httperrors.NewMissingParameterError("missing package_name")
 	}
-	self.SetStatus(userCred, api.INSTANCE_BACKUP_STATUS_PACK, "")
+	self.SetStatus(ctx, userCred, api.INSTANCE_BACKUP_STATUS_PACK, "")
 	params := jsonutils.NewDict()
 	params.Set("package_name", jsonutils.NewString(input.PackageName))
 	task, err := taskman.TaskManager.NewTask(ctx, "InstanceBackupPackTask", self, userCred, params, "", "", nil)
@@ -522,7 +528,7 @@ func (self *SInstanceBackup) PerformPack(ctx context.Context, userCred mcclient.
 
 func (manager *SInstanceBackupManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.InstanceBackupManagerCreateFromPackageInput) (api.InstanceBackupManagerCreateFromPackageInput, error) {
 	if input.PackageName == "" {
-		return input, httperrors.NewMissingParameterError("miss package_name")
+		return input, httperrors.NewMissingParameterError("missing package_name")
 	}
 	_, err := BackupStorageManager.FetchById(input.BackupStorageId)
 	if err != nil {
@@ -604,7 +610,7 @@ func (ib *SInstanceBackup) PerformSyncstatus(ctx context.Context, userCred mccli
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("InstanceBackup has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("InstanceBackup has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, ib, "InstanceBackupSyncstatusTask", "")

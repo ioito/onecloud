@@ -29,6 +29,7 @@ var LatitudeAndLongitude = map[string]cloudprovider.SGeographicInfo{
 	"asia-south2":          api.RegionDelhi,
 	"asia-southeast1":      api.RegionSingapore,
 	"asia-southeast2":      api.RegionJakarta,
+	"asia-southeast3":      api.RegionBangkok,
 	"australia-southeast1": api.RegionSydney,
 	"australia-southeast2": api.RegionMelbourne,
 
@@ -42,6 +43,8 @@ var LatitudeAndLongitude = map[string]cloudprovider.SGeographicInfo{
 	"europe-west9":      api.RegionParis,
 	"europe-central2":   api.RegionWarsaw,
 	"europe-southwest1": api.RegionMadrid,
+	"europe-west10":     api.RegionDublin,
+	"europe-west12":     api.RegionTurin,
 
 	"northamerica-northeast1": api.RegionMontreal,
 	"northamerica-northeast2": api.RegionToronto,
@@ -57,7 +60,12 @@ var LatitudeAndLongitude = map[string]cloudprovider.SGeographicInfo{
 	"us-south1":               api.RegionDallas,
 	"southamerica-west1":      api.RegionSantiago,
 
-	"me-west1": api.RegionColumbus,
+	"me-west1":            api.RegionTelAviv,
+	"me-central1":         api.RegionDoha,
+	"me-central2":         api.RegionDamman,
+	"africa-south1":       api.RegionJohannesburg,
+	"europe-north2":       api.RegionStockholm,
+	"northamerica-south1": api.RegionMexico,
 }
 
 var RegionNames = map[string]string{
@@ -70,6 +78,7 @@ var RegionNames = map[string]string{
 	"asia-south2":          "德里",
 	"asia-southeast1":      "新加坡",
 	"asia-southeast2":      "雅加达",
+	"asia-southeast3":      "曼谷",
 	"australia-southeast1": "悉尼",
 	"australia-southeast2": "墨尔本",
 
@@ -81,6 +90,8 @@ var RegionNames = map[string]string{
 	"europe-west6":      "苏黎世",
 	"europe-west8":      "米兰",
 	"europe-west9":      "巴黎",
+	"europe-west10":     "柏林",
+	"europe-west12":     "都灵",
 	"europe-central2":   "华沙",
 	"europe-southwest1": "马德里",
 
@@ -98,7 +109,9 @@ var RegionNames = map[string]string{
 	"us-west4":                "拉斯维加斯",
 	"us-south1":               "达拉斯",
 
-	"me-west1": "特拉维夫",
+	"me-west1":    "特拉维夫",
+	"me-central1": "多哈",
+	"me-central2": "达曼",
 
 	// Multi-region
 	"us":   "美国的多区域",
@@ -108,4 +121,9 @@ var RegionNames = map[string]string{
 	// Dual-region
 	"nam4": "爱荷华和南卡罗来纳",
 	"eur4": "荷兰和芬兰",
+
+	"global":              "全球",
+	"africa-south1":       "约翰内斯堡",
+	"europe-north2":       "斯德哥尔摩",
+	"northamerica-south1": "墨西哥",
 }

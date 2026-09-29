@@ -35,6 +35,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=loadbalancercluster
+// +onecloud:swagger-gen-model-plural=loadbalancerclusters
 type SLoadbalancerClusterManager struct {
 	db.SStandaloneResourceBaseManager
 	SZoneResourceBaseManager
@@ -154,7 +156,7 @@ func (man *SLoadbalancerClusterManager) ValidateCreateData(
 		wireV.Optional(true),
 	}
 	for _, v := range vs {
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return nil, err
 		}
 	}
@@ -173,7 +175,7 @@ func (man *SLoadbalancerClusterManager) ValidateCreateData(
 	input := apis.StandaloneResourceCreateInput{}
 	err := data.Unmarshal(&input)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
+		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput failed %s", err)
 	}
 	input, err = man.SStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
@@ -207,7 +209,7 @@ func (lbc *SLoadbalancerCluster) ValidateUpdateData(
 ) (*jsonutils.JSONDict, error) {
 	wireV := validators.NewModelIdOrNameValidator("wire", "wire", lbc.GetOwnerId())
 	wireV.Optional(true)
-	if err := wireV.Validate(data); err != nil {
+	if err := wireV.Validate(ctx, data); err != nil {
 		return nil, err
 	}
 	if wireV.Model != nil {
@@ -263,7 +265,7 @@ func (lbc *SLoadbalancerCluster) refCounts() (map[string]int, error) {
 		q := man.Query().Equals("cluster_id", lbc.Id)
 		n, err := q.CountWithError()
 		if err != nil {
-			return nil, httperrors.NewInternalServerError("get lbcluster refcount fail %v", err)
+			return nil, httperrors.NewInternalServerError("get lbcluster refcount failed: %v", err)
 		}
 		if n > 0 {
 			ret[man.KeywordPlural()] = n
@@ -294,6 +296,7 @@ func (man *SLoadbalancerClusterManager) FetchCustomizeColumns(
 		}
 		lbc := objs[i].(*SLoadbalancerCluster)
 		rows[i].RefCounts, _ = lbc.refCounts()
+		rows[i].WireId, _ = lbc.inferWireId()
 	}
 
 	return rows
@@ -518,7 +521,7 @@ func (cluster *SLoadbalancerCluster) selfInitParams() error {
 	params := SLoadbalancerClusterParams{
 		VirtualRouterId:   newRouterId,
 		Preempt:           false,
-		AdvertInt:         5,
+		AdvertInt:         1,
 		Pass:              seclib.RandomPassword(6),
 		GarpMasterRefresh: 29,
 	}
@@ -563,7 +566,7 @@ func (cluster *SLoadbalancerCluster) PerformParamsPatch(ctx context.Context, use
 	d := jsonutils.NewDict()
 	d.Set("params", data)
 	paramsV := validators.NewStructValidator("params", &params)
-	if err := paramsV.Validate(d); err != nil {
+	if err := paramsV.Validate(ctx, d); err != nil {
 		return nil, err
 	}
 	// new vrrp virtual_router_id should be unique across clusters
@@ -578,14 +581,35 @@ func (cluster *SLoadbalancerCluster) PerformParamsPatch(ctx context.Context, use
 		}
 	}
 	{
+		// save name, description, params
+		input := apis.StandaloneResourceBaseUpdateInput{}
+		err := data.Unmarshal(&input)
+		if err != nil {
+			return nil, errors.Wrap(err, "Unmarshal update input")
+		}
+		input, err = cluster.SStandaloneResourceBase.ValidateUpdateData(ctx, userCred, query, input)
+		if err != nil {
+			return nil, errors.Wrap(err, "SStandaloneResourceBase.ValidateUpdateData")
+		}
+
 		diff, err := db.Update(cluster, func() error {
 			cluster.Params = &params
+			if len(input.Name) > 0 {
+				cluster.Name = input.Name
+			}
+			if len(input.Description) > 0 {
+				cluster.Description = input.Description
+			}
 			return nil
 		})
 		if err != nil {
 			return nil, errors.Wrap(err, "Update")
 		}
 		db.OpsLog.LogEvent(cluster, db.ACT_UPDATE, diff, userCred)
+	}
+	{
+		// save metadata
+		cluster.TrySaveMetadataInput(ctx, userCred, data)
 	}
 	{
 		// populate changes to underlying lbagents
@@ -607,4 +631,15 @@ func (cluster *SLoadbalancerCluster) PerformParamsPatch(ctx context.Context, use
 		}
 	}
 	return nil, nil
+}
+
+func (cluster *SLoadbalancerCluster) inferWireId() (string, error) {
+	lbAgents, err := LoadbalancerAgentManager.getByClusterId(cluster.Id)
+	if err != nil {
+		return "", errors.Wrap(err, "LoadbalancerAgentManager.getByClusterId")
+	}
+	if len(lbAgents) == 0 {
+		return "", errors.Wrap(err, "no lbagents")
+	}
+	return lbAgents[0].inferWireId()
 }

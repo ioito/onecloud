@@ -38,12 +38,13 @@ func (self *SZone) GetId() string {
 }
 
 func (self *SZone) GetName() string {
-	return self.AzDisplayName
+	return fmt.Sprintf("%s %s", CLOUD_PROVIDER_CTYUN_CN, self.AzDisplayName)
 }
 
 func (self *SZone) GetI18n() cloudprovider.SModelI18nTable {
+	en := fmt.Sprintf("%s %s", CLOUD_PROVIDER_CTYUN_EN, self.AzDisplayName)
 	table := cloudprovider.SModelI18nTable{}
-	table["name"] = cloudprovider.NewSModelI18nEntry(self.GetName()).CN(self.GetName()).EN(self.AzDisplayName)
+	table["name"] = cloudprovider.NewSModelI18nEntry(self.GetName()).CN(self.GetName()).EN(en)
 	return table
 }
 
@@ -72,7 +73,7 @@ func (self *SZone) GetIHostById(id string) (cloudprovider.ICloudHost, error) {
 }
 
 func (self *SZone) GetStorages() ([]SStorage, error) {
-	product, err := self.region.getProduct()
+	product, err := self.region.GetProduct()
 	if err != nil {
 		return nil, errors.Wrapf(err, "getProduct")
 	}

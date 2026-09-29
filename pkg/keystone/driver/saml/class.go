@@ -17,6 +17,7 @@ package saml
 import (
 	"context"
 	"net/url"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -27,6 +28,7 @@ import (
 	"yunion.io/x/onecloud/pkg/keystone/driver/utils"
 	"yunion.io/x/onecloud/pkg/keystone/models"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/samlutils/sp"
 )
 
 type SSAMLDriverClass struct{}
@@ -117,7 +119,16 @@ func (self *SSAMLDriverClass) ValidateConfig(ctx context.Context, userCred mccli
 			return tconf, errors.Wrapf(httperrors.ErrDuplicateResource, "entity_id %s has been registered", conf.EntityId)
 		}
 	}
-	conf.SIdpAttributeOptions, err = utils.ValidateConfig(conf.SIdpAttributeOptions, userCred)
+	verifySignature := conf.VerifySignature != nil && *conf.VerifySignature
+	if verifySignature && len(strings.TrimSpace(conf.SigningCert)) == 0 {
+		return tconf, errors.Wrap(httperrors.ErrInputParameter, "empty signing_cert")
+	}
+	if len(strings.TrimSpace(conf.SigningCert)) > 0 {
+		if _, err = sp.ParseCertificates(conf.SigningCert); err != nil {
+			return tconf, errors.Wrap(httperrors.ErrInputParameter, "invalid signing_cert")
+		}
+	}
+	conf.SIdpAttributeOptions, err = utils.ValidateConfig(ctx, conf.SIdpAttributeOptions, userCred)
 	if err != nil {
 		return tconf, errors.Wrap(err, "ValidateConfig")
 	}
@@ -133,6 +144,16 @@ func (self *SSAMLDriverClass) ValidateConfig(ctx context.Context, userCred mccli
 	nconf["allow_idp_init"] = jsonutils.JSONTrue
 	tconf[api.IdentityDriverSAML] = nconf
 	return tconf, nil
+}
+
+func (self *SSAMLDriverClass) AttributeNames(template string) (map[string]string, error) {
+	switch template {
+	case api.IdpTemplateSAMLTest:
+		return SAMLTestTemplate.AttributeNames, nil
+	case api.IdpTemplateAzureADSAML:
+		return AzureADTemplate.AttributeNames, nil
+	}
+	return nil, nil
 }
 
 func init() {

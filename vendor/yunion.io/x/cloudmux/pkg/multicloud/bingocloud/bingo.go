@@ -214,7 +214,7 @@ func (self *SBingoCloudClient) invoke(action string, params map[string]string) (
 	if self.cpcfg.ReadOnly {
 		for _, prefix := range []string{"Get", "List", "Describe"} {
 			if strings.HasPrefix(action, prefix) {
-				return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+				return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s", action)
 			}
 		}
 	}
@@ -299,6 +299,7 @@ func (self *SBingoCloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, er
 	var subAccounts []cloudprovider.SSubAccount
 	for i := range tags {
 		subAccount := cloudprovider.SSubAccount{
+			Id:               tags[i].ResourceId,
 			Account:          self.accessKey,
 			Name:             tags[i].ResourceId,
 			DefaultProjectId: tags[i].Value,
@@ -348,13 +349,13 @@ func (self *SBingoCloudClient) GetEnrollmentAccounts() ([]cloudprovider.SEnrollm
 	return eas, nil
 }
 
-func (self *SBingoCloudClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SBingoCloudClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	var ret []cloudprovider.ICloudRegion
 	for i := range self.regions {
 		self.regions[i].client = self
 		ret = append(ret, &self.regions[i])
 	}
-	return ret
+	return ret, nil
 }
 
 func (self *SBingoCloudClient) describeTags(filter map[string]string) (jsonutils.JSONObject, error) {
@@ -369,19 +370,23 @@ func (self *SBingoCloudClient) describeTags(filter map[string]string) (jsonutils
 }
 
 func (self *SBingoCloudClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	iregions := self.GetIRegions()
+	iregions, err := self.GetIRegions()
+	if err != nil {
+		return nil, err
+	}
 	for i := range iregions {
 		if iregions[i].GetGlobalId() == id {
 			return iregions[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SBingoCloudClient) GetCapabilities() []string {
 	return []string{
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,

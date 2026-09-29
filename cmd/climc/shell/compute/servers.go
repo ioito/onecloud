@@ -24,12 +24,14 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v2"
+	"k8s.io/apimachinery/pkg/util/errors"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/util/printutils"
 
 	"yunion.io/x/onecloud/cmd/climc/shell"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/modulebase"
@@ -51,6 +53,7 @@ func init() {
 	cmd.BatchPut(new(options.ServerUpdateOptions))
 	cmd.GetMetadata(new(options.ServerIdOptions))
 	cmd.Perform("clone", new(options.ServerCloneOptions))
+	cmd.Perform("change-billing-type", new(options.ServerChangeBillingTypeOptions))
 	cmd.BatchPerform("start", new(options.ServerStartOptions))
 	cmd.BatchPerform("syncstatus", new(options.ServerIdsOptions))
 	cmd.BatchPerform("sync", new(options.ServerIdsOptions))
@@ -122,8 +125,22 @@ func init() {
 	cmd.Perform("reset-nic-traffic-limit", &options.ServerNicTrafficLimitOptions{})
 	cmd.Perform("set-nic-traffic-limit", &options.ServerNicTrafficLimitOptions{})
 	cmd.Perform("add-sub-ips", &options.ServerAddSubIpsOptions{})
-
+	cmd.Perform("update-sub-ips", &options.ServerUpdateSubIpsOptions{})
+	cmd.BatchPerform("restore-virtual-isolated-devices", &options.ServerIdsOptions{})
+	cmd.BatchPerform("set-os-info", &options.ServerSetOSInfoOptions{})
+	// 与 server-start 复用参数时单独包一层，避免继承 mcp-desc 被注册为 MCP tool
+	cmd.BatchPerform("start-rescue", &options.ServerStartRescueOptions{})
+	cmd.BatchPerform("stop-rescue", &options.ServerStopRescueOptions{})
+	cmd.BatchPerform("sync-os-info", &options.ServerIdsOptions{})
+	cmd.BatchPerform("set-root-disk-matcher", &options.ServerSetRootDiskMatcher{})
+	cmd.Perform("disable-auto-merge-snapshot", &options.ServerDisableAutoMergeSnapshot{})
+	cmd.BatchPerform("set-tpm", &options.ServerSetTpmOptions{})
+	cmd.Perform("set-kickstart", &options.ServerKickstartConfigOptions{})
+	cmd.Perform("delete-kickstart", &options.ServerIdOptions{})
+	cmd.Perform("kickstart-complete", &options.ServerKickstartCompleteOptions{})
+	cmd.Get("kickstart", new(options.ServerIdOptions))
 	cmd.Get("vnc", new(options.ServerVncOptions))
+	cmd.Get("modification-types", new(options.ServerIdOptions))
 	cmd.Get("desc", new(options.ServerIdOptions))
 	cmd.Get("status", new(options.ServerIdOptions))
 	cmd.Get("iso", new(options.ServerIdOptions))
@@ -135,6 +152,16 @@ func init() {
 	cmd.Get("cpuset-cores", new(options.ServerIdOptions))
 	cmd.Get("sshport", new(options.ServerIdOptions))
 	cmd.Get("qemu-info", new(options.ServerIdOptions))
+	cmd.Get("hardware-info", new(options.ServerIdOptions))
+	cmd.Get("screen-dump-show", new(options.ServerScreenDumpOptions))
+	cmd.Get("numa-info", new(options.ServerIdOptions))
+	cmd.BatchPerform("screen-dump", new(options.ServerIdsOptions))
+	cmd.Perform("set-network-num-queues", new(options.ServerSetNetworkNumQueues))
+	cmd.Perform("set-network-secgroup", new(options.ServerNetworkSecGroupsOptions))
+	cmd.Perform("add-network-secgroup", new(options.ServerNetworkSecGroupsOptions))
+	cmd.Perform("revoke-network-secgroup", new(options.ServerNetworkSecGroupsOptions))
+	cmd.Perform("change-disk-driver", new(options.ServerChangeDiskDriverOptions))
+	cmd.Perform("set-iso", new(options.ServerSetIsoOptions))
 
 	cmd.GetProperty(&options.ServerStatusStatisticsOptions{})
 	cmd.GetProperty(&options.ServerProjectStatisticsOptions{})
@@ -176,59 +203,6 @@ func init() {
 		return nil
 	})
 
-	/*R(&options.ServerBatchMetadataOptions{}, "server-batch-update-user-tag", "add tags for some server", func(s *mcclient.ClientSession, opts *options.ServerBatchMetadataOptions) error {
-		params, err := opts.Params()
-		if err != nil {
-			return err
-		}
-		result, err := modules.Servers.PerformClassAction(s, "batch-user-metadata", params)
-		if err != nil {
-			return err
-		}
-		printObject(result)
-		return nil
-	})
-
-	R(&options.ServerBatchMetadataOptions{}, "server-batch-replace-user-tag", "Set tags for some server", func(s *mcclient.ClientSession, opts *options.ServerBatchMetadataOptions) error {
-		params, err := opts.Params()
-		if err != nil {
-			return err
-		}
-		result, err := modules.Servers.PerformClassAction(s, "batch-set-user-metadata", params)
-		if err != nil {
-			return err
-		}
-		printObject(result)
-		return nil
-	})
-
-	R(&options.ResourceMetadataOptions{}, "server-update-user-tag", "Set tag of a server", func(s *mcclient.ClientSession, opts *options.ResourceMetadataOptions) error {
-		params, err := opts.Params()
-		if err != nil {
-			return err
-		}
-		result, err := modules.Servers.PerformAction(s, opts.ID, "user-metadata", params)
-		if err != nil {
-			return err
-		}
-		printObject(result)
-		return nil
-	})
-
-	R(&options.ResourceMetadataOptions{}, "server-update-user-tag", "Set tag of a server", func(s *mcclient.ClientSession, opts *options.ResourceMetadataOptions) error {
-		params, err := opts.Params()
-		if err != nil {
-			return err
-		}
-		result, err := modules.Servers.PerformAction(s, opts.ID, "set-user-metadata", params)
-		if err != nil {
-			return err
-		}
-		printObject(result)
-		return nil
-	})
-	*/
-
 	R(&baseoptions.ResourceMetadataOptions{}, "server-set-metadata", "Set raw metadata of a server", func(s *mcclient.ClientSession, opts *baseoptions.ResourceMetadataOptions) error {
 		params, err := opts.Params()
 		if err != nil {
@@ -249,8 +223,10 @@ func init() {
 			params.Name = opts.NAME
 			params.AutoStart = opts.AutoStart
 			params.Eip = opts.Eip
-			params.EipChargeType = opts.EipChargeType
+			params.EipChargeType = billing_api.ParseNetChargeType(opts.EipChargeType)
 			params.EipBw = opts.EipBw
+			params.EipTxBw = opts.EipTxBw
+			params.EipRxBw = opts.EipRxBw
 
 			server, err := modules.Servers.Create(s, params.JSON(params))
 			if err != nil {
@@ -320,7 +296,7 @@ func init() {
 
 	type ServerDiskSnapshotOptions struct {
 		SERVER       string `help:"server ID or Name"`
-		DISK         string `help:"create snapshot disk id"`
+		DISK         string `help:"Disk ID for snapshot creation"`
 		SNAPSHOTNAME string `help:"Snapshot name"`
 	}
 	R(&ServerDiskSnapshotOptions{}, "server-disk-create-snapshot", "Task server disk snapshot", func(s *mcclient.ClientSession, args *ServerDiskSnapshotOptions) error {
@@ -760,7 +736,7 @@ func init() {
 
 	type ServerSnapshotAndClone struct {
 		ID          string `help:"ID or name of VM" json:"-"`
-		NAME        string `help:"Newly instance name" json:"name"`
+		NAME        string `help:"New instance name" json:"name"`
 		AutoStart   bool   `help:"Auto start new guest"`
 		AllowDelete bool   `help:"Allow new guest delete" json:"-"`
 		Count       int    `help:"Guest count"`
@@ -799,7 +775,7 @@ func init() {
 		ID   string `help:"ID or name of server"`
 		Save string `help:"save xml into this file"`
 	}
-	R(&ServerJnlpOptions{}, "server-jnlp", "Get baremetal server jnlp file contentn", func(s *mcclient.ClientSession, args *ServerJnlpOptions) error {
+	R(&ServerJnlpOptions{}, "server-jnlp", "Get baremetal server jnlp file content", func(s *mcclient.ClientSession, args *ServerJnlpOptions) error {
 		spec, err := modules.Servers.GetSpecific(s, args.ID, "jnlp", nil)
 		if err != nil {
 			return err
@@ -851,15 +827,15 @@ func init() {
 			return fmt.Errorf("Not found ip address from server %s", opts.ID)
 		}
 
-		privateKey := ""
+		var privateKeys []string
 		params := jsonutils.NewDict()
 		if len(opts.Key) > 0 {
-			key, e := ioutil.ReadFile(opts.Key)
+			key, e := os.ReadFile(opts.Key)
 			if e != nil {
 				return e
 			}
 			params.Add(jsonutils.NewString(string(key)), "private_key")
-			privateKey = string(key)
+			privateKeys = append(privateKeys, string(key))
 		}
 
 		i, e := modules.Servers.PerformAction(s, srvid, "login-info", params)
@@ -898,6 +874,7 @@ func init() {
 					if err != nil {
 						return err
 					}
+					defer closeForward(s, srvid, forwardItem)
 					host = forwardItem.ProxyAddr
 					port = forwardItem.ProxyPort
 				}
@@ -906,7 +883,7 @@ func init() {
 
 		if opts.UseCloudroot {
 			var err error
-			privateKey, err = modules.Sshkeypairs.FetchPrivateKeyBySession(context.Background(), s)
+			privateKeys, err = modules.Sshkeypairs.FetchProjectPrivateKeysBySession(context.Background(), s)
 			if err != nil {
 				return err
 			}
@@ -914,28 +891,24 @@ func init() {
 			user = "cloudroot"
 		}
 
+		if len(privateKeys) == 0 {
+			privateKeys = append(privateKeys, "")
+		}
+
 		var sshCli *ssh.Client
-		err = nil
-		for ; sshCli == nil; sshCli, err = ssh.NewClient(host, port, user, passwd, privateKey) {
+		var errs []error
+		for _, privateKey := range privateKeys {
+			cli, err := ssh.NewClient(host, port, user, passwd, privateKey)
 			if err == nil {
-				continue
-			}
-			if opts.Host != "" {
-				return err
-			}
-			if forwardItem != nil {
-				closeForward(s, srvid, forwardItem)
-				return err
+				sshCli = cli
+				break
 			} else {
-				if vpcid != "default" {
-					forwardItem, e = openForward(s, srvid)
-					if e != nil {
-						return e
-					}
-					host = forwardItem.ProxyAddr
-					port = forwardItem.ProxyPort
-				}
+				errs = append(errs, err)
 			}
+		}
+
+		if sshCli == nil {
+			return errors.NewAggregate(errs)
 		}
 
 		log.Infof("ssh %s:%d", host, port)
@@ -946,9 +919,6 @@ func init() {
 			return err
 		}
 
-		if forwardItem != nil {
-			closeForward(s, srvid, forwardItem)
-		}
 		return nil
 	})
 }

@@ -16,7 +16,11 @@ package db
 
 import (
 	"context"
+	"crypto/md5"
+	"database/sql"
+	"fmt"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -27,6 +31,7 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -52,6 +57,9 @@ type SStandaloneAnonResourceBase struct {
 	// 是否是模拟资源, 部分从公有云上同步的资源并不真实存在, 例如宿主机
 	// list 接口默认不会返回这类资源，除非显示指定 is_emulate=true 过滤参数
 	IsEmulated bool `nullable:"false" default:"false" list:"admin" create:"admin_optional" json:"is_emulated"`
+
+	// 用以组织架构变更通知其他服务权限变更
+	OrgNodeMd5 string `width:"32" charset:"ascii" nullable:"true"`
 }
 
 func (model *SStandaloneAnonResourceBase) BeforeInsert() {
@@ -100,13 +108,13 @@ func (manager *SStandaloneAnonResourceBaseManager) FilterByNotId(q *sqlchemy.SQu
 	return q.NotEquals("id", idStr)
 }
 
-func (manager *SStandaloneAnonResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SStandaloneAnonResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if userCred != nil {
 		result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), man.KeywordPlural(), policy.PolicyActionList)
 		if !result.ObjectTags.IsEmpty() {
 			policyTagFilters := tagutils.STagFilters{}
 			policyTagFilters.AddFilters(result.ObjectTags)
-			q = ObjectIdQueryWithTagFilters(q, "id", man.Keyword(), policyTagFilters)
+			q = ObjectIdQueryWithTagFilters(ctx, q, "id", man.Keyword(), policyTagFilters)
 		}
 	}
 	return q
@@ -132,6 +140,10 @@ func (manager *SStandaloneAnonResourceBaseManager) FilterByHiddenSystemAttribute
 	return q
 }
 
+func (manager *SStandaloneAnonResourceBaseManager) RawFetchById(idStr string) (IModel, error) {
+	return FetchById2(manager.GetIStandaloneModelManager(), idStr, true)
+}
+
 func (manager *SStandaloneAnonResourceBaseManager) FetchById(idStr string) (IModel, error) {
 	return FetchById(manager.GetIStandaloneModelManager(), idStr)
 }
@@ -153,7 +165,7 @@ func (manager *SStandaloneAnonResourceBaseManager) ListItemFilter(
 		q = q.In("id", input.Ids)
 	}
 
-	q = manager.SMetadataResourceBaseModelManager.ListItemFilter(manager.GetIModelManager(), q, input.MetadataResourceListInput)
+	q = manager.SMetadataResourceBaseModelManager.ListItemFilter(ctx, manager.GetIModelManager(), q, input.MetadataResourceListInput)
 
 	return q, nil
 }
@@ -243,6 +255,12 @@ func (model *SStandaloneAnonResourceBase) SetMetadata(ctx context.Context, key s
 	if err != nil {
 		return errors.Wrap(err, "SetValue")
 	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
+	}
 	if isUserMetadata(key) {
 		model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
 	}
@@ -254,22 +272,15 @@ func (model *SStandaloneAnonResourceBase) SetAllMetadata(ctx context.Context, di
 	if err != nil {
 		return errors.Wrap(err, "SetValuesWithLog")
 	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
+	}
 	if containsUserMetadata(dictstore) {
 		model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
 	}
-	return nil
-}
-
-func (model *SStandaloneAnonResourceBase) SetUserMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
-	dictStore, err := ensurePrefixString(dictstore, USER_TAG_PREFIX)
-	if err != nil {
-		return errors.Wrapf(err, "ensurePrefixString %s", USER_TAG_PREFIX)
-	}
-	err = Metadata.SetValuesWithLog(ctx, model, dictStore, userCred)
-	if err != nil {
-		return errors.Wrap(err, "SetValuesWithLog")
-	}
-	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
 	return nil
 }
 
@@ -307,6 +318,25 @@ func ensurePrefixString(input map[string]string, prefix string) (map[string]inte
 	return dictStore, nil
 }
 
+func (model *SStandaloneAnonResourceBase) SetUserMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+	dictStore, err := ensurePrefixString(dictstore, USER_TAG_PREFIX)
+	if err != nil {
+		return errors.Wrapf(err, "ensurePrefixString %s", USER_TAG_PREFIX)
+	}
+	err = Metadata.SetValuesWithLog(ctx, model, dictStore, userCred)
+	if err != nil {
+		return errors.Wrap(err, "SetValuesWithLog")
+	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
+	}
+	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
+	return nil
+}
+
 func (model *SStandaloneAnonResourceBase) SetUserMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
 	var err error
 	dictStore, err := ensurePrefixString(dictstore, USER_TAG_PREFIX)
@@ -317,25 +347,55 @@ func (model *SStandaloneAnonResourceBase) SetUserMetadataAll(ctx context.Context
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
 	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
+	}
 	model.GetIStandaloneModel().OnMetadataUpdated(ctx, userCred)
 	return nil
 }
 
-func (model *SStandaloneAnonResourceBase) SetCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+func (model *SStandaloneAnonResourceBase) SetCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error {
 	var err error
 	dictStore, err := ensurePrefixString(dictstore, CLOUD_TAG_PREFIX)
 	if err != nil {
 		return errors.Wrap(err, "ensurePrefix")
 	}
-	err = Metadata.SetAll(ctx, model, dictStore, userCred, CLOUD_TAG_PREFIX)
-	if err != nil {
-		return errors.Wrap(err, "SetAll")
+	if readOnly {
+		err = Metadata.SetAllWithoutDelelte(ctx, model, dictStore, userCred)
+		if err != nil {
+			return errors.Wrap(err, "SetAll")
+		}
+	} else {
+		err = Metadata.SetAll(ctx, model, dictStore, userCred, CLOUD_TAG_PREFIX)
+		if err != nil {
+			return errors.Wrap(err, "SetAll")
+		}
 	}
 	userTags := map[string]interface{}{}
 	for k, v := range dictstore {
 		userTags[strings.Replace(k, CLOUD_TAG_PREFIX, USER_TAG_PREFIX, 1)] = v
 	}
-	return Metadata.SetAll(ctx, model, userTags, userCred, USER_TAG_PREFIX)
+	if readOnly {
+		err := Metadata.SetAllWithoutDelelte(ctx, model, userTags, userCred)
+		if err != nil {
+			return errors.Wrap(err, "SetAllWithoutDelelte")
+		}
+	} else {
+		err := Metadata.SetAll(ctx, model, userTags, userCred, USER_TAG_PREFIX)
+		if err != nil {
+			return errors.Wrap(err, "SetAll")
+		}
+	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
+	}
+	return nil
 }
 
 func (model *SStandaloneAnonResourceBase) SetOrganizationMetadataAll(ctx context.Context, meta map[string]string, userCred mcclient.TokenCredential) error {
@@ -349,21 +409,41 @@ func (model *SStandaloneAnonResourceBase) SetOrganizationMetadataAll(ctx context
 			return errors.Wrap(err, "SetAllOrganization")
 		}
 	}
-	{
-		userTags := make(map[string]interface{})
-		for k, _ := range meta {
-			if strings.HasPrefix(k, ORGANIZATION_TAG_PREFIX) {
-				k = k[len(ORGANIZATION_TAG_PREFIX):]
-			}
-			k = USER_TAG_PREFIX + k
-			userTags[k] = "none"
-		}
-		err := Metadata.SetValuesWithLog(ctx, model, userTags, userCred)
-		if err != nil {
-			return errors.Wrap(err, "SetValuesWithLog userTags")
-		}
+	_, err := Update(model, func() error {
+		model.OrgNodeMd5 = fmt.Sprintf("%x", md5.Sum([]byte(jsonutils.Marshal(meta).String())))
+		model.UpdatedAt = time.Now()
+		model.UpdateVersion += 1
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "Update")
 	}
+
+	// 避免加入组织架构后，项目所在的层级会移除此项目
+	//{
+	//	userTags := make(map[string]interface{})
+	//	for k, _ := range meta {
+	//		if strings.HasPrefix(k, ORGANIZATION_TAG_PREFIX) {
+	//			k = k[len(ORGANIZATION_TAG_PREFIX):]
+	//		}
+	//		k = USER_TAG_PREFIX + k
+	//		userTags[k] = "none"
+	//	}
+	//	err := Metadata.SetValuesWithLog(ctx, model, userTags, userCred)
+	//	if err != nil {
+	//		return errors.Wrap(err, "SetValuesWithLog userTags")
+	//	}
+	//}
 	return nil
+}
+
+func (model *SStandaloneAnonResourceBase) forceUpdate() error {
+	_, err := Update(model, func() error {
+		model.UpdateVersion += 1
+		model.UpdatedAt = time.Now()
+		return nil
+	})
+	return err
 }
 
 func (model *SStandaloneAnonResourceBase) SetClassMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
@@ -375,6 +455,12 @@ func (model *SStandaloneAnonResourceBase) SetClassMetadataValues(ctx context.Con
 	err = Metadata.SetValuesWithLog(ctx, model, dictStore, userCred)
 	if err != nil {
 		return errors.Wrap(err, "SetValuesWithLog")
+	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
 	}
 	return nil
 }
@@ -388,6 +474,12 @@ func (model *SStandaloneAnonResourceBase) SetClassMetadataAll(ctx context.Contex
 	err = Metadata.SetAll(ctx, model, afterCheck, userCred, CLASS_TAG_PREFIX)
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
+	}
+	{
+		err := model.forceUpdate()
+		if err != nil {
+			return errors.Wrap(err, "forceUpdate")
+		}
 	}
 	return nil
 }
@@ -494,12 +586,16 @@ func (model *SStandaloneAnonResourceBase) IsInSameClass(ctx context.Context, pMo
 	return IsInSameClass(ctx, model, pModel)
 }
 
-func (model *SStandaloneAnonResourceBase) SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error {
+func (model *SStandaloneAnonResourceBase) SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error {
 	dictStore, err := ensurePrefixString(dictstore, SYS_CLOUD_TAG_PREFIX)
 	if err != nil {
 		return errors.Wrap(err, "ensurePrefixString")
 	}
-	err = Metadata.SetAll(ctx, model, dictStore, userCred, SYS_CLOUD_TAG_PREFIX)
+	if readOnly {
+		err = Metadata.SetAllWithoutDelelte(ctx, model, dictStore, userCred)
+	} else {
+		err = Metadata.SetAll(ctx, model, dictStore, userCred, SYS_CLOUD_TAG_PREFIX)
+	}
 	if err != nil {
 		return errors.Wrap(err, "SetAll")
 	}
@@ -619,6 +715,7 @@ func (model *SStandaloneAnonResourceBase) PerformUserMetadata(ctx context.Contex
 }
 
 // 全量替换资源的所有用户标签
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) PerformSetUserMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetUserMetadataInput) (jsonutils.JSONObject, error) {
 	err := model.SetUserMetadataAll(ctx, input, userCred)
 	if err != nil {
@@ -628,24 +725,27 @@ func (model *SStandaloneAnonResourceBase) PerformSetUserMetadata(ctx context.Con
 }
 
 // 更新资源的 class 标签
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) PerformClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformClassMetadataInput) (jsonutils.JSONObject, error) {
 	err := model.SetClassMetadataValues(ctx, input, userCred)
 	if err != nil {
-		return nil, errors.Wrap(err, "SetUserMetadataValues")
+		return nil, errors.Wrap(err, "SetClassMetadataValues")
 	}
 	return nil, nil
 }
 
 // 全量替换资源的所有 class 标签
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) PerformSetClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetClassMetadataInput) (jsonutils.JSONObject, error) {
 	err := model.SetClassMetadataAll(ctx, input, userCred)
 	if err != nil {
-		return nil, errors.Wrap(err, "SetUserMetadataAll")
+		return nil, errors.Wrap(err, "SetClassMetadataAll")
 	}
 	return nil, nil
 }
 
 // 全量替换资源的所有 class 标签
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) PerformSetOrgMetadata(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformSetClassMetadataInput) (jsonutils.JSONObject, error) {
 	err := model.SetOrganizationMetadataAll(ctx, input, userCred)
 	if err != nil {
@@ -668,10 +768,12 @@ func validateDictStore(input map[string]string, prefix string) (map[string]strin
 	return dictStore, nil
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) GetDetailsClassMetadata(ctx context.Context, userCred mcclient.TokenCredential, input apis.GetClassMetadataInput) (apis.GetClassMetadataOutput, error) {
 	return model.GetAllClassMetadata()
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SStandaloneAnonResourceBase) GetDetailsOrgMetadata(ctx context.Context, userCred mcclient.TokenCredential, input apis.GetClassMetadataInput) (apis.GetClassMetadataOutput, error) {
 	return model.GetAllOrganizationMetadata()
 }
@@ -685,24 +787,21 @@ type sPolicyTags struct {
 func (model *SStandaloneAnonResourceBase) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	model.SResourceBase.PostUpdate(ctx, userCred, query, data)
 
-	meta := make(map[string]string)
-	err := data.Unmarshal(&meta, "__meta__")
-	if err == nil {
-		model.PerformMetadata(ctx, userCred, nil, meta)
-	}
-
-	model.applyPolicyTags(ctx, userCred, data)
+	model.TrySaveMetadataInput(ctx, userCred, data)
 }
 
 func (model *SStandaloneAnonResourceBase) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	model.SResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
 
+	model.TrySaveMetadataInput(ctx, userCred, data)
+}
+
+func (model *SStandaloneAnonResourceBase) TrySaveMetadataInput(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) {
 	meta := make(map[string]string)
 	err := data.Unmarshal(&meta, "__meta__")
 	if err == nil {
 		model.PerformMetadata(ctx, userCred, nil, meta)
 	}
-
 	model.applyPolicyTags(ctx, userCred, data)
 }
 
@@ -711,12 +810,12 @@ func (model *SStandaloneAnonResourceBase) applyPolicyTags(ctx context.Context, u
 	data.Unmarshal(&tags)
 	log.Debugf("applyPolicyTags: %s", jsonutils.Marshal(tags))
 	if len(tags.PolicyObjectTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyObjectTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyObjectTags.Flattern()))
 	}
 	if model.Keyword() == "project" && len(tags.PolicyProjectTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyProjectTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyProjectTags.Flattern()))
 	} else if model.Keyword() == "domain" && len(tags.PolicyDomainTags) > 0 {
-		model.PerformMetadata(ctx, userCred, nil, tagutils.Tagset2MapString(tags.PolicyDomainTags.Flattern()))
+		model.PerformMetadata(ctx, userCred, nil, tagutils.TagsetMap2MapString(tags.PolicyDomainTags.Flattern()))
 	}
 }
 
@@ -822,6 +921,7 @@ type SGetResourceTagValuePairsInput struct {
 	OrderByTagKey string `json:"order_by_tag_key"`
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SStandaloneAnonResourceBaseManager) GetPropertyTagValuePairs(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -924,6 +1024,7 @@ type SGetResourceTagValueTreeInput struct {
 	ShowMap *bool    `json:"show_map"`
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SStandaloneAnonResourceBaseManager) GetPropertyTagValueTree(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -933,6 +1034,7 @@ func (manager *SStandaloneAnonResourceBaseManager) GetPropertyTagValueTree(
 		manager.GetIStandaloneModelManager(),
 		manager.Keyword(),
 		"id",
+		"",
 		ctx,
 		userCred,
 		query,
@@ -943,6 +1045,7 @@ func GetPropertyTagValueTree(
 	manager IModelManager,
 	tagObjType string,
 	tagIdField string,
+	sumField string,
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject,
@@ -953,7 +1056,7 @@ func GetPropertyTagValueTree(
 		return nil, errors.Wrap(err, "Unmarshal")
 	}
 
-	valueMap, err := GetTagValueCountMap(manager, tagObjType, tagIdField, input.Keys, ctx, userCred, query)
+	valueMap, err := GetTagValueCountMap(manager, tagObjType, tagIdField, sumField, input.Keys, ctx, userCred, query)
 	if err != nil {
 		return nil, errors.Wrap(err, "AllStringAmp")
 	}
@@ -970,21 +1073,36 @@ func GetTagValueCountMap(
 	manager IModelManager,
 	tagObjType string,
 	tagIdField string,
+	sumField string,
 	keys []string,
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject,
 ) ([]map[string]string, error) {
 	var err error
-	objSubQ := manager.Query().SubQuery()
-	objQ := objSubQ.Query(objSubQ.Field(tagIdField), sqlchemy.COUNT("_sub_count_"))
+	objQ := manager.NewQuery(ctx, userCred, query, false)
 	objQ, err = ListItemQueryFilters(manager, ctx, objQ, userCred, query, policy.PolicyActionList)
 	if err != nil {
 		return nil, errors.Wrap(err, "ListItemQueryFilters")
 	}
-	objQ = objQ.GroupBy(objSubQ.Field(tagIdField))
-	q := objQ.SubQuery().Query(sqlchemy.SUM(tagValueCountKey, objQ.Field("_sub_count_")))
-	metadataSQ := Metadata.Query().Equals("obj_type", tagObjType).In("key", keys).SubQuery()
+	objSubQ := objQ.SubQuery().Query()
+	objSubQ = objSubQ.AppendField(objSubQ.Field(tagIdField))
+	objSubQ = objSubQ.GroupBy(objSubQ.Field(tagIdField))
+	var sumFieldQ sqlchemy.IQueryField
+	if len(sumField) > 0 {
+		sumFieldQ = sqlchemy.SUM("_sub_count_", objSubQ.Field(sumField))
+	} else {
+		sumFieldQ = sqlchemy.COUNT("_sub_count_")
+	}
+	objSubQ = objSubQ.AppendField(sumFieldQ)
+
+	// objSubQ.DebugQuery2("GetTagValueCountMap objSubQ")
+
+	q := objSubQ.SubQuery().Query()
+	q = q.AppendField(sqlchemy.SUM(tagValueCountKey, q.Field("_sub_count_")))
+
+	metadataMan := GetMetadaManagerInContext(ctx)
+	metadataSQ := metadataMan.Query().Equals("obj_type", tagObjType).In("key", keys).SubQuery()
 	groupBy := make([]interface{}, 0)
 	for i, key := range keys {
 		valueFieldName := TagValueKey(i)
@@ -994,14 +1112,82 @@ func GetTagValueCountMap(
 			sqlchemy.NewFunction(
 				sqlchemy.NewCase().When(sqlchemy.IsNull(subq.Field("value")), sqlchemy.NewStringField(tagutils.NoValue)).Else(subq.Field("value")),
 				valueFieldName,
+				false,
 			),
 		)
 		groupBy = append(groupBy, q.Field(valueFieldName))
 	}
 	q = q.GroupBy(groupBy...)
+
+	// q.DebugQuery2("GetTagValueCountMap")
+
 	valueMap, err := q.AllStringMap()
 	if err != nil {
 		return nil, errors.Wrap(err, "AllStringAmp")
 	}
 	return valueMap, nil
+}
+
+func (manager *SStandaloneAnonResourceBaseManager) HistoryDataClean(ctx context.Context, timeBefor time.Time) (int, error) {
+	q := manager.RawQuery("id").IsTrue("deleted").LE("deleted_at", timeBefor)
+	rows, err := q.Rows()
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, errors.Wrap(err, "Query")
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		err := rows.Scan(&id)
+		if err != nil {
+			return 0, errors.Wrap(err, "rows.Scan")
+		}
+		ids = append(ids, id)
+	}
+	var purge = func(ids []string) error {
+		vars := []interface{}{}
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
+			vars = append(vars, ids[i])
+		}
+		placeholder := strings.Join(placeholders, ",")
+		sql := fmt.Sprintf(
+			"delete from %s where id in (%s)",
+			manager.TableSpec().Name(), placeholder,
+		)
+		lockman.LockRawObject(ctx, manager.Keyword(), "purge")
+		defer lockman.ReleaseRawObject(ctx, manager.Keyword(), "purge")
+
+		_, err = sqlchemy.GetDB().Exec(
+			sql, vars...,
+		)
+		if err != nil {
+			return errors.Wrapf(err, strings.ReplaceAll(sql, "?", "%s"), vars...)
+		}
+		return nil
+	}
+
+	var splitByLen = func(data []string, splitLen int) [][]string {
+		var result [][]string
+		for i := 0; i < len(data); i += splitLen {
+			end := i + splitLen
+			if end > len(data) {
+				end = len(data)
+			}
+			result = append(result, data[i:end])
+		}
+		return result
+	}
+	idsArr := splitByLen(ids, 100)
+	for i := range idsArr {
+		err = purge(idsArr[i])
+		if err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
 }

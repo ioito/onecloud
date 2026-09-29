@@ -34,11 +34,15 @@ type SNic struct {
 	Mac     string   `json:"mac"`
 	Dns     string   `json:"dns"`
 	Ntp     string   `json:"ntp"`
-	MaskLen int8     `json:"masklen"`
+	Masklen int8     `json:"masklen"`
 	Net     string   `json:"net"`
 	Gateway string   `json:"gateway"`
 	LinkUp  bool     `json:"link_up"`
 	Routes  []SRoute `json:"routes,omitempty"`
+
+	Ip6Addr  string `json:"ip6_addr"`
+	Masklen6 uint8  `json:"masklen6"`
+	Gateway6 string `json:"gateway6"`
 
 	Interface string `json:"interface"`
 	Bridge    string `json:"bridge"`
@@ -46,12 +50,16 @@ type SNic struct {
 	VlanId int `json:"vlan_id"`
 
 	Bandwidth int `json:"bandwidth"`
+
+	Index int `json:"index"`
+
+	IsDefault *bool `json:"is_default"`
 }
 
 type SRoute []string
 
 func (n SNic) GetNetMask() string {
-	return netutils.Masklen2Mask(n.MaskLen).String()
+	return netutils.Masklen2Mask(n.Masklen).String()
 }
 
 func (n SNic) GetMac() net.HardwareAddr {
@@ -59,28 +67,35 @@ func (n SNic) GetMac() net.HardwareAddr {
 }
 
 type SServerNic struct {
-	Name      string   `json:"name"`
-	Index     int      `json:"index"`
-	Bridge    string   `json:"bridge"`
-	Domain    string   `json:"domain"`
-	Ip        string   `json:"ip"`
-	Vlan      int      `json:"vlan"`
-	Driver    string   `json:"driver"`
-	Masklen   int      `json:"masklen"`
-	Virtual   bool     `json:"virtual"`
-	Manual    bool     `json:"manual"`
-	WireId    string   `json:"wire_id"`
-	NetId     string   `json:"net_id"`
-	Mac       string   `json:"mac"`
-	BandWidth int      `json:"bw"`
-	Mtu       int16    `json:"mtu,omitempty"`
-	Dns       string   `json:"dns"`
-	Ntp       string   `json:"ntp"`
-	Net       string   `json:"net"`
-	Interface string   `json:"interface"`
-	Gateway   string   `json:"gateway"`
-	Ifname    string   `json:"ifname"`
-	Routes    []SRoute `json:"routes,omitempty"`
+	Name          string   `json:"name"`
+	Index         int      `json:"index"`
+	Bridge        string   `json:"bridge"`
+	Domain        string   `json:"domain"`
+	Ip            string   `json:"ip"`
+	Vlan          int      `json:"vlan"`
+	VlanInterface bool     `json:"vlan_interface"`
+	Driver        string   `json:"driver"`
+	Masklen       int      `json:"masklen"`
+	Virtual       bool     `json:"virtual"`
+	Manual        bool     `json:"manual"`
+	WireId        string   `json:"wire_id"`
+	NetId         string   `json:"net_id"`
+	Mac           string   `json:"mac"`
+	BandWidth     int      `json:"bw"`
+	Mtu           int16    `json:"mtu,omitempty"`
+	Dns           string   `json:"dns"`
+	Ntp           string   `json:"ntp"`
+	Net           string   `json:"net"`
+	Interface     string   `json:"interface"`
+	Gateway       string   `json:"gateway"`
+	Ifname        string   `json:"ifname"`
+	Routes        []SRoute `json:"routes,omitempty"`
+
+	Ip6      string `json:"ip6"`
+	Masklen6 int    `json:"masklen6"`
+	Gateway6 string `json:"gateway6"`
+
+	IsDefault bool `json:"is_default"`
 
 	NicType compute.TNicType `json:"nic_type,omitempty"`
 
@@ -109,11 +124,17 @@ func (n SServerNic) ToNic() SNic {
 		Mac:     n.Mac,
 		Dns:     n.Dns,
 		Ntp:     n.Ntp,
-		MaskLen: int8(n.Masklen),
+		Masklen: int8(n.Masklen),
 		Net:     n.Net,
 		Gateway: n.Gateway,
 		Routes:  n.Routes,
 		LinkUp:  n.LinkUp,
 		Mtu:     n.Mtu,
+
+		Ip6Addr:  n.Ip6,
+		Masklen6: uint8(n.Masklen6),
+		Gateway6: n.Gateway6,
+
+		IsDefault: &n.IsDefault,
 	}
 }

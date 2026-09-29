@@ -16,6 +16,7 @@ package guestdrivers
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -38,6 +39,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	guestdriver_types "yunion.io/x/onecloud/pkg/compute/guestdrivers/types"
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/compute/options"
@@ -130,13 +132,29 @@ func (self *SKVMGuestDriver) DoGuestCreateDisksTask(ctx context.Context, guest *
 }
 
 func (self *SKVMGuestDriver) RequestDiskSnapshot(ctx context.Context, guest *models.SGuest, task taskman.ITask, snapshotId, diskId string) error {
+	obj, err := models.SnapshotManager.FetchById(snapshotId)
+	if err != nil {
+		return errors.Wrapf(err, "failed to find snapshot %s", snapshotId)
+	}
+	snapshot := obj.(*models.SSnapshot)
+
 	host, _ := guest.GetHost()
 	url := fmt.Sprintf("%s/servers/%s/snapshot", host.ManagerUri, guest.Id)
 	body := jsonutils.NewDict()
 	body.Set("disk_id", jsonutils.NewString(diskId))
 	body.Set("snapshot_id", jsonutils.NewString(snapshotId))
+
+	if snapshot.DiskBackupId != "" {
+		backupObj, err := models.DiskBackupManager.FetchById(snapshot.DiskBackupId)
+		if err != nil {
+			return errors.Wrapf(err, "failed to find backup %s", snapshot.DiskBackupId)
+		}
+		backup := backupObj.(*models.SDiskBackup)
+		body.Set("backup_disk_config", jsonutils.Marshal(backup.DiskConfig))
+	}
+
 	header := self.getTaskRequestHeader(task)
-	_, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
 	return err
 }
 
@@ -191,9 +209,9 @@ func (self *SKVMGuestDriver) GetGuestVncInfo(ctx context.Context, userCred mccli
 	if err != nil {
 		return nil, errors.Wrapf(err, "Fail to request VNC info")
 	}
-	results, err := ret.GetString("results")
+	results, _ := ret.GetString("results")
 	if len(results) == 0 {
-		return nil, errors.Wrapf(err, "Can't get vnc information from host.")
+		return nil, errors.Wrapf(httperrors.ErrInvalidStatus, "Can't get vnc information from host.")
 	}
 	// info_vnc = result['results'].split('\n')
 	// port = int(info_vnc[1].split(':')[-1].split()[0])
@@ -241,13 +259,16 @@ func (self *SKVMGuestDriver) GetGuestVncInfo(ctx context.Context, userCred mccli
 func (self *SKVMGuestDriver) RequestStopOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask, syncStatus bool) error {
 	body := jsonutils.NewDict()
 	params := task.GetParams()
+	isForce, _ := params.Bool("is_force")
+	if isForce {
+		body.Set("is_force", jsonutils.JSONTrue)
+	}
 	timeout, err := params.Int("timeout")
 	if err != nil {
-		timeout = 30
-	}
-	isForce, err := params.Bool("is_force")
-	if isForce {
-		timeout = 0
+		timeout = int64(options.Options.DefaultGuestStopTimeout)
+		if isForce {
+			timeout = int64(options.Options.DefaultGuestForceStopTimeout)
+		}
 	}
 	body.Add(jsonutils.NewInt(timeout), "timeout")
 
@@ -280,6 +301,10 @@ func (self *SKVMGuestDriver) RequestUndeployGuestOnHost(ctx context.Context, gue
 
 func (self *SKVMGuestDriver) GetJsonDescAtHost(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, host *models.SHost, params *jsonutils.JSONDict) (jsonutils.JSONObject, error) {
 	desc := guest.GetJsonDescAtHypervisor(ctx, host)
+	if len(desc.UserData) > 0 {
+		// host 需要加密后的user-data以提供 http://169.254.169.254/latest/user-data 解密访问
+		desc.UserData = base64.StdEncoding.EncodeToString([]byte(desc.UserData))
+	}
 	return jsonutils.Marshal(desc), nil
 }
 
@@ -312,7 +337,11 @@ func (self *SKVMGuestDriver) RequestStartOnHost(ctx context.Context, guest *mode
 	header := self.getTaskRequestHeader(task)
 
 	config := jsonutils.NewDict()
-	desc, err := guest.GetDriver().GetJsonDescAtHost(ctx, userCred, guest, host, nil)
+	drv, err := guest.GetDriver()
+	if err != nil {
+		return err
+	}
+	desc, err := drv.GetJsonDescAtHost(ctx, userCred, guest, host, nil)
 	if err != nil {
 		return errors.Wrapf(err, "GetJsonDescAtHost")
 	}
@@ -418,20 +447,15 @@ func (self *SKVMGuestDriver) RequestAssociateEip(ctx context.Context, userCred m
 	if err := eip.AssociateInstance(ctx, userCred, api.EIP_ASSOCIATE_TYPE_SERVER, guest); err != nil {
 		return errors.Wrapf(err, "associate eip %s(%s) to vm %s(%s)", eip.Name, eip.Id, guest.Name, guest.Id)
 	}
-	if err := eip.SetStatus(userCred, api.EIP_STATUS_READY, api.EIP_STATUS_ASSOCIATE); err != nil {
+	if err := eip.SetStatus(ctx, userCred, api.EIP_STATUS_READY, api.EIP_STATUS_ASSOCIATE); err != nil {
 		return errors.Wrapf(err, "set eip status to %s", api.EIP_STATUS_ALLOCATE)
 	}
 	return nil
 }
 
-func (self *SKVMGuestDriver) NeedStopForChangeSpec(ctx context.Context, guest *models.SGuest, cpuChanged, memChanged bool) bool {
-	return guest.GetMetadata(ctx, "hotplug_cpu_mem", nil) != "enable" || apis.IsARM(guest.OsArch)
-	// (memChanged && guest.GetMetadata(ctx, "__hugepage", nil) == "native") ||
-	// apis.IsARM(guest.OsArch)
-}
-
-func (self *SKVMGuestDriver) RequestChangeVmConfig(ctx context.Context, guest *models.SGuest, task taskman.ITask, instanceType string, vcpuCount, vmemSize int64) error {
-	if jsonutils.QueryBoolean(task.GetParams(), "guest_online", false) {
+func (self *SKVMGuestDriver) RequestChangeVmConfig(ctx context.Context, guest *models.SGuest, task taskman.ITask, instanceType string, vcpuCount, cpuSockets, vmemSize int64) error {
+	taskParams := task.GetParams()
+	if jsonutils.QueryBoolean(taskParams, "guest_online", false) {
 		addCpu := vcpuCount - int64(guest.VcpuCount)
 		addMem := vmemSize - int64(guest.VmemSize)
 		if addCpu < 0 || addMem < 0 {
@@ -441,9 +465,15 @@ func (self *SKVMGuestDriver) RequestChangeVmConfig(ctx context.Context, guest *m
 		body := jsonutils.NewDict()
 		if vcpuCount > int64(guest.VcpuCount) {
 			body.Set("add_cpu", jsonutils.NewInt(addCpu))
+			body.Set("total_cpu", jsonutils.NewInt(int64(guest.VcpuCount)))
 		}
 		if vmemSize > int64(guest.VmemSize) {
 			body.Set("add_mem", jsonutils.NewInt(addMem))
+			body.Set("total_mem", jsonutils.NewInt(int64(guest.VmemSize)))
+		}
+		if taskParams.Contains("cpu_numa_pin") {
+			cpuNumaPin, _ := taskParams.Get("cpu_numa_pin")
+			body.Set("cpu_numa_pin", cpuNumaPin)
 		}
 		host, _ := guest.GetHost()
 		url := fmt.Sprintf("%s/servers/%s/hotplug-cpu-mem", host.ManagerUri, guest.Id)
@@ -473,7 +503,7 @@ func (self *SKVMGuestDriver) RequestDetachDisk(ctx context.Context, guest *model
 }
 
 func (self *SKVMGuestDriver) RequestAttachDisk(ctx context.Context, guest *models.SGuest, disk *models.SDisk, task taskman.ITask) error {
-	return guest.StartSyncTask(
+	return guest.StartSyncTaskWithoutSyncstatus(
 		ctx,
 		task.GetUserCred(),
 		jsonutils.QueryBoolean(task.GetParams(), "sync_desc_only", false),
@@ -600,8 +630,8 @@ func (self *SKVMGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY}, nil
 }
 
-func (self *SKVMGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
+func (self *SKVMGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return true, nil
 }
 
 func (self *SKVMGuestDriver) GetDeployStatus() ([]string, error) {
@@ -609,9 +639,15 @@ func (self *SKVMGuestDriver) GetDeployStatus() ([]string, error) {
 }
 
 func (self *SKVMGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
-	if guest.GetDiskIndex(disk.Id) <= 0 && guest.Status == api.VM_RUNNING {
-		return fmt.Errorf("Cann't online resize root disk")
+	if guest.Hypervisor == api.HYPERVISOR_KVM {
+		if guest.GetDiskIndex(disk.Id) <= 0 && guest.Status == api.VM_RUNNING {
+			return fmt.Errorf("Cann't online resize root disk")
+		}
+		if guest.Status == api.VM_RUNNING && storage.StorageType == api.STORAGE_SLVM {
+			return fmt.Errorf("shared lvm storage cann't online resize")
+		}
 	}
+
 	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_RUNNING}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
@@ -619,7 +655,11 @@ func (self *SKVMGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *mode
 }
 
 func (self *SKVMGuestDriver) RequestSyncConfigOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask) error {
-	desc, err := guest.GetDriver().GetJsonDescAtHost(ctx, task.GetUserCred(), guest, host, nil)
+	drv, err := guest.GetDriver()
+	if err != nil {
+		return err
+	}
+	desc, err := drv.GetJsonDescAtHost(ctx, task.GetUserCred(), guest, host, nil)
 	if err != nil {
 		return errors.Wrapf(err, "GetJsonDescAtHost")
 	}
@@ -628,9 +668,20 @@ func (self *SKVMGuestDriver) RequestSyncConfigOnHost(ctx context.Context, guest 
 	if fw_only, _ := task.GetParams().Bool("fw_only"); fw_only {
 		body.Add(jsonutils.JSONTrue, "fw_only")
 	}
+	if setUefiBootOrder, _ := task.GetParams().Bool("set_uefi_boot_order"); setUefiBootOrder {
+		body.Add(jsonutils.JSONTrue, "set_uefi_boot_order")
+	}
 	url := fmt.Sprintf("%s/servers/%s/sync", host.ManagerUri, guest.Id)
 	header := self.getTaskRequestHeader(task)
 	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	return err
+}
+
+func (self *SKVMGuestDriver) RequestSetPortMappingOnHost(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, host *models.SHost, task taskman.ITask, input api.ServerSetPortMappingInput) error {
+	body := jsonutils.Marshal(input)
+	url := fmt.Sprintf("%s/servers/%s/set-port-mapping", host.ManagerUri, guest.Id)
+	header := self.getTaskRequestHeader(task)
+	_, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
 	return err
 }
 
@@ -690,8 +741,15 @@ func (self *SKVMGuestDriver) RequestRebuildRootDisk(ctx context.Context, guest *
 }
 
 func (self *SKVMGuestDriver) RequestSyncToBackup(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
-	host, _ := guest.GetHost()
-	desc, err := guest.GetDriver().GetJsonDescAtHost(ctx, task.GetUserCred(), guest, host, nil)
+	host, err := guest.GetHost()
+	if err != nil {
+		return err
+	}
+	drv, err := guest.GetDriver()
+	if err != nil {
+		return err
+	}
+	desc, err := drv.GetJsonDescAtHost(ctx, task.GetUserCred(), guest, host, nil)
 	if err != nil {
 		return errors.Wrapf(err, "GetJsonDescAtHost")
 	}
@@ -765,7 +823,7 @@ func (self *SKVMGuestDriver) IsSupportLiveMigrate() bool {
 }
 
 func checkAssignHost(ctx context.Context, userCred mcclient.TokenCredential, preferHost string) error {
-	iHost, _ := models.HostManager.FetchByIdOrName(userCred, preferHost)
+	iHost, _ := models.HostManager.FetchByIdOrName(ctx, userCred, preferHost)
 	if iHost == nil {
 		return httperrors.NewBadRequestError("Host %s not found", preferHost)
 	}
@@ -779,7 +837,7 @@ func checkAssignHost(ctx context.Context, userCred mcclient.TokenCredential, pre
 
 func (self *SKVMGuestDriver) CheckMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestMigrateInput) error {
 	if len(guest.BackupHostId) > 0 {
-		return httperrors.NewBadRequestError("Guest have backup, can't migrate")
+		return httperrors.NewBadRequestError("guest has backup and cannot migrate")
 	}
 	if !input.IsRescueMode && guest.Status != api.VM_READY {
 		return httperrors.NewServerStatusError("Cannot normal migrate guest in status %s, try rescue mode or server-live-migrate?", guest.Status)
@@ -804,7 +862,7 @@ func (self *SKVMGuestDriver) CheckMigrate(ctx context.Context, guest *models.SGu
 			}
 		}
 	}
-	devices, err := guest.GetIsolatedDevices()
+	devices, err := guest.GetGuestIsolatedDevices()
 	if err != nil {
 		return errors.Wrapf(err, "GetIsolatedDevices")
 	}
@@ -822,7 +880,7 @@ func (self *SKVMGuestDriver) CheckMigrate(ctx context.Context, guest *models.SGu
 
 func (self *SKVMGuestDriver) CheckLiveMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestLiveMigrateInput) error {
 	if len(guest.BackupHostId) > 0 {
-		return httperrors.NewBadRequestError("Guest have backup, can't migrate")
+		return httperrors.NewBadRequestError("guest has backup and cannot migrate")
 	}
 	if utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_SUSPEND}) {
 		if input.MaxBandwidthMb != nil && *input.MaxBandwidthMb < 50 {
@@ -832,7 +890,7 @@ func (self *SKVMGuestDriver) CheckLiveMigrate(ctx context.Context, guest *models
 		if cdrom != nil && len(cdrom.ImageId) > 0 {
 			return httperrors.NewBadRequestError("Cannot live migrate with cdrom")
 		}
-		devices, err := guest.GetIsolatedDevices()
+		devices, err := guest.GetGuestIsolatedDevices()
 		if err != nil {
 			return errors.Wrapf(err, "GetIsolatedDevices")
 		}
@@ -865,7 +923,7 @@ func (self *SKVMGuestDriver) RequestCancelLiveMigrate(ctx context.Context, guest
 }
 
 func (self *SKVMGuestDriver) ValidateDetachNetwork(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest) error {
-	if guest.Status == api.VM_RUNNING && guest.GetMetadata(ctx, "hot_remove_nic", nil) != "enable" {
+	if guest.Status == api.VM_RUNNING && guest.GetMetadata(ctx, api.VM_METADATA_HOT_REMOVE_NIC, nil) != "enable" {
 		return httperrors.NewBadRequestError("Guest %s can't hot remove nic", guest.GetName())
 	}
 	return nil
@@ -907,6 +965,18 @@ func (self *SKVMGuestDriver) RequestChangeDiskStorage(ctx context.Context, userC
 	body := jsonutils.Marshal(input)
 	header := self.getTaskRequestHeader(task)
 	url := fmt.Sprintf("%s/servers/%s/storage-clone-disk", host.ManagerUri, guest.GetId())
+	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	return err
+}
+
+func (self *SKVMGuestDriver) RequestResetUefiFirmwareVars(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest) error {
+	host, err := guest.GetHost()
+	if err != nil {
+		return err
+	}
+	body := jsonutils.NewDict()
+	header := mcclient.GetTokenHeaders(userCred)
+	url := fmt.Sprintf("%s/servers/%s/reset-uefi-vars", host.ManagerUri, guest.GetId())
 	_, _, err = httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
 	return err
 }
@@ -957,8 +1027,8 @@ func (self *SKVMGuestDriver) validateVGA(ovdi, ovga string, nvdi, nvga *string) 
 
 func (self *SKVMGuestDriver) validateMachineType(machine string, osArch string) error {
 	var candidate []string
-	if apis.IsARM(osArch) {
-		candidate = []string{api.VM_MACHINE_TYPE_ARM_VIRT}
+	if apis.IsARM(osArch) || apis.IsRISCV(osArch) {
+		candidate = []string{api.VM_MACHINE_TYPE_VIRT}
 	} else {
 		candidate = []string{api.VM_MACHINE_TYPE_PC, api.VM_MACHINE_TYPE_Q35}
 	}
@@ -989,6 +1059,21 @@ func (self *SKVMGuestDriver) ValidateCreateData(ctx context.Context, userCred mc
 			return nil, errors.Wrap(err, "validateMachineType")
 		}
 	}
+
+	for i := range input.Secgroups {
+		if input.Secgroups[i] == api.SECGROUP_DEFAULT_ID {
+			continue
+		}
+		secObj, err := validators.ValidateModel(ctx, userCred, models.SecurityGroupManager, &input.Secgroups[i])
+		if err != nil {
+			return nil, err
+		}
+		secgroup := secObj.(*models.SSecurityGroup)
+		if secgroup.CloudregionId != api.DEFAULT_REGION_ID {
+			return nil, httperrors.NewInputParameterError("invalid secgroup %s", secgroup.Name)
+		}
+	}
+
 	return input, nil
 }
 
@@ -1082,10 +1167,10 @@ func (self *SKVMGuestDriver) QgaRequestGuestInfoTask(ctx context.Context, userCr
 	return res, nil
 }
 
-func (self *SKVMGuestDriver) QgaRequestSetNetwork(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) (jsonutils.JSONObject, error) {
+func (self *SKVMGuestDriver) QgaRequestSetNetwork(ctx context.Context, task taskman.ITask, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) (jsonutils.JSONObject, error) {
 	url := fmt.Sprintf("%s/servers/%s/qga-set-network", host.ManagerUri, guest.Id)
 	httpClient := httputils.GetDefaultClient()
-	header := mcclient.GetTokenHeaders(userCred)
+	header := task.GetTaskRequestHeader()
 	_, res, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, body, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "host request")
@@ -1095,6 +1180,17 @@ func (self *SKVMGuestDriver) QgaRequestSetNetwork(ctx context.Context, userCred 
 
 func (self *SKVMGuestDriver) QgaRequestGetNetwork(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) (jsonutils.JSONObject, error) {
 	url := fmt.Sprintf("%s/servers/%s/qga-get-network", host.ManagerUri, guest.Id)
+	httpClient := httputils.GetDefaultClient()
+	header := mcclient.GetTokenHeaders(userCred)
+	_, res, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, nil, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "host request")
+	}
+	return res, nil
+}
+
+func (self *SKVMGuestDriver) QgaRequestGetOsInfo(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) (jsonutils.JSONObject, error) {
+	url := fmt.Sprintf("%s/servers/%s/qga-get-os-info", host.ManagerUri, guest.Id)
 	httpClient := httputils.GetDefaultClient()
 	header := mcclient.GetTokenHeaders(userCred)
 	_, res, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, nil, false)
@@ -1127,14 +1223,45 @@ func (self *SKVMGuestDriver) RequestQgaCommand(ctx context.Context, userCred mcc
 	return res, nil
 }
 
+func (self *SKVMGuestDriver) RequestGuestScreenDump(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) (jsonutils.JSONObject, error) {
+	url := fmt.Sprintf("%s/servers/%s/guest-screen-dump", host.ManagerUri, guest.Id)
+	httpClient := httputils.GetDefaultClient()
+	header := mcclient.GetTokenHeaders(userCred)
+	_, res, err := httputils.JSONRequest(httpClient, ctx, "POST", url, header, nil, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "host request")
+	}
+	return res, nil
+}
+
 func (self *SKVMGuestDriver) FetchMonitorUrl(ctx context.Context, guest *models.SGuest) string {
 	if options.Options.KvmMonitorAgentUseMetadataService && !guest.IsSriov() {
-		return apis.MetaServiceMonitorAgentUrl
+		// Only guests in a non-default onecloud VPC are guaranteed to reach the
+		// metadata service at the link-local address, those subnets are served
+		// by sdnagent with a per-subnet netns proxy. Guests in the default VPC
+		// and classic networks keep using the public TSDB endpoint.
+		inVpc, err := guest.IsOneCloudVpcNetwork()
+		if err != nil {
+			log.Errorf("IsOneCloudVpcNetwork for guest %s error: %v", guest.Id, err)
+		}
+		if inVpc {
+			var metadataIp string
+			strictIpv6, err := guest.IsStrictIpv6()
+			if err != nil {
+				log.Errorf("IsStrictIpv6 for guest %s error: %v", guest.Id, err)
+			}
+			if strictIpv6 {
+				metadataIp = "[" + options.Options.MetadataServerIp6s[0] + "]"
+			} else {
+				metadataIp = options.Options.MetadataServerIp4s[0]
+			}
+			return fmt.Sprintf(apis.MetaServiceMonitorAgentUrl, metadataIp)
+		}
 	}
 	return self.SVirtualizedGuestDriver.FetchMonitorUrl(ctx, guest)
 }
 
-func (self *SKVMGuestDriver) RequestResetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *models.SHost, guest *models.SGuest, input *api.ServerNicTrafficLimit) error {
+func (self *SKVMGuestDriver) RequestResetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *models.SHost, guest *models.SGuest, input []api.ServerNicTrafficLimit) error {
 	url := fmt.Sprintf("%s/servers/%s/reset-nic-traffic-limit", host.ManagerUri, guest.Id)
 	httpClient := httputils.GetDefaultClient()
 	header := task.GetTaskRequestHeader()
@@ -1146,7 +1273,7 @@ func (self *SKVMGuestDriver) RequestResetNicTrafficLimit(ctx context.Context, ta
 	return nil
 }
 
-func (self *SKVMGuestDriver) RequestSetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *models.SHost, guest *models.SGuest, input *api.ServerNicTrafficLimit) error {
+func (self *SKVMGuestDriver) RequestSetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *models.SHost, guest *models.SGuest, input []api.ServerNicTrafficLimit) error {
 	url := fmt.Sprintf("%s/servers/%s/set-nic-traffic-limit", host.ManagerUri, guest.Id)
 	httpClient := httputils.GetDefaultClient()
 	header := task.GetTaskRequestHeader()
@@ -1156,4 +1283,89 @@ func (self *SKVMGuestDriver) RequestSetNicTrafficLimit(ctx context.Context, task
 		return errors.Wrap(err, "host request")
 	}
 	return nil
+}
+
+func (self *SKVMGuestDriver) RequestStartRescue(ctx context.Context, task taskman.ITask, body jsonutils.JSONObject, host *models.SHost, guest *models.SGuest) error {
+	header := self.getTaskRequestHeader(task)
+	client := httputils.GetDefaultClient()
+	url := fmt.Sprintf("%s/servers/%s/start-rescue", host.ManagerUri, guest.Id)
+	_, _, err := httputils.JSONRequest(client, ctx, "POST", url, header, body, false)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (self *SKVMGuestDriver) ValidateSyncOSInfo(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest) error {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY}) {
+		return httperrors.NewBadRequestError("cannot sync guest OS info in status %s", guest.Status)
+	}
+	return nil
+}
+
+func (kvm *SKVMGuestDriver) ValidateGuestChangeConfigInput(ctx context.Context, guest *models.SGuest, input api.ServerChangeConfigInput) (*api.ServerChangeConfigSettings, error) {
+	confs, err := kvm.SBaseGuestDriver.ValidateGuestChangeConfigInput(ctx, guest, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SBaseGuestDriver.ValidateGuestChangeConfigInput")
+	}
+
+	if confs.ExtraCpuChanged() && guest.Status != api.VM_READY {
+		return nil, httperrors.NewInvalidStatusError("Can't change extra cpus on vm status %s", guest.Status)
+	}
+
+	var resetNics []api.ServerNicTrafficLimit
+	var setNics []api.ServerNicTrafficLimit
+	for i := range input.ResetTrafficLimits {
+		input, needResetTraffic, err := guest.ValidateChangeNicBillingModeInput(ctx, input.ResetTrafficLimits[i], true)
+		if err != nil {
+			return nil, errors.Wrap(err, "ValidateChangeNicBillingModeInput")
+		}
+		if needResetTraffic {
+			resetNics = append(resetNics, input)
+		} else {
+			setNics = append(setNics, input)
+		}
+	}
+	for i := range input.SetTrafficLimits {
+		input, needResetTraffic, err := guest.ValidateChangeNicBillingModeInput(ctx, input.ResetTrafficLimits[i], false)
+		if err != nil {
+			return nil, errors.Wrap(err, "ValidateChangeNicBillingModeInput")
+		}
+		if needResetTraffic {
+			resetNics = append(resetNics, input)
+		} else {
+			setNics = append(setNics, input)
+		}
+	}
+	if len(resetNics) > 0 {
+		confs.ResetTrafficLimits = resetNics
+	}
+	if len(setNics) > 0 {
+		confs.SetTrafficLimits = setNics
+	}
+	return confs, nil
+}
+
+func (kvm *SKVMGuestDriver) ValidateGuestHotChangeConfigInput(ctx context.Context, guest *models.SGuest, confs *api.ServerChangeConfigSettings) (*api.ServerChangeConfigSettings, error) {
+	if guest.GetMetadata(ctx, api.VM_METADATA_HOTPLUG_CPU_MEM, nil) != "enable" {
+		return confs, errors.Wrap(errors.ErrInvalidStatus, "host plug cpu memory is disabled")
+	}
+	if apis.IsARM(guest.OsArch) || apis.IsRISCV(guest.OsArch) {
+		return confs, errors.Wrapf(errors.ErrInvalidStatus, "cpu architecture is %s", guest.OsArch)
+	}
+	return confs, nil
+}
+
+func (kvm *SKVMGuestDriver) GetRandomNetworkTypes() []api.TNetworkType {
+	return []api.TNetworkType{api.NETWORK_TYPE_GUEST, api.NETWORK_TYPE_HOSTLOCAL}
+}
+
+func (kvm *SKVMGuestDriver) RequestUploadGuestStatus(ctx context.Context, guest *models.SGuest, task taskman.ITask) error {
+	host, _ := guest.GetHost()
+	url := fmt.Sprintf("%s/servers/%s/upload-status", host.ManagerUri, guest.Id)
+	body := jsonutils.NewDict()
+	header := kvm.getTaskRequestHeader(task)
+	_, _, err := httputils.JSONRequest(httputils.GetDefaultClient(), ctx, "POST", url, header, body, false)
+	return err
 }

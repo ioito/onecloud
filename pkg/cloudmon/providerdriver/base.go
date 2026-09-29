@@ -21,13 +21,17 @@ import (
 	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 
-	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	"yunion.io/x/onecloud/pkg/util/hashcache"
 	"yunion.io/x/onecloud/pkg/util/influxdb"
 )
 
@@ -43,7 +47,29 @@ func (self *SBaseCollectDriver) IsSupportMetrics() bool {
 }
 
 func (self *SBaseCollectDriver) CollectAccountMetrics(ctx context.Context, account api.CloudaccountDetail) (influxdb.SMetricData, error) {
-	return influxdb.SMetricData{}, errors.Wrapf(cloudprovider.ErrNotImplemented, "CollectAccountMetrics")
+	metric := influxdb.SMetricData{
+		Name:      string(cloudprovider.METRIC_RESOURCE_TYPE_CLOUD_ACCOUNT),
+		Timestamp: time.Now(),
+		Tags:      []influxdb.SKeyValue{},
+		Metrics:   []influxdb.SKeyValue{},
+	}
+	for k, v := range account.GetMetricTags() {
+		metric.Tags = append([]influxdb.SKeyValue{
+			{
+				Key:   k,
+				Value: v,
+			},
+		}, metric.Tags...)
+	}
+	for k, v := range account.GetMetricPairs() {
+		metric.Metrics = append([]influxdb.SKeyValue{
+			{
+				Key:   k,
+				Value: v,
+			},
+		}, metric.Metrics...)
+	}
+	return metric, nil
 }
 
 func (self *SBaseCollectDriver) CollectDBInstanceMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.DBInstanceDetails, start, end time.Time) error {
@@ -94,7 +120,7 @@ func (self *SBaseCollectDriver) CollectStorageMetrics(ctx context.Context, manag
 
 func (self *SBaseCollectDriver) sendMetrics(ctx context.Context, manager api.CloudproviderDetails, resName string, resCnt int, metrics []influxdb.SMetricData) error {
 	s := auth.GetAdminSession(ctx, options.Options.Region)
-	urls, err := s.GetServiceURLs(apis.SERVICE_TYPE_INFLUXDB, options.Options.SessionEndpointType)
+	urls, err := tsdb.GetDefaultServiceSourceURLs(s, options.Options.SessionEndpointType)
 	if err != nil {
 		return errors.Wrap(err, "GetServiceURLs")
 	}
@@ -146,6 +172,7 @@ func (self *SCollectByResourceIdDriver) CollectDBInstanceMetrics(ctx context.Con
 				EndTime:      end,
 			}
 			opts.ResourceId = rds.ExternalId
+			opts.RegionExtId = rds.RegionExtId
 			opts.Engine = rds.Engine
 
 			tags := []influxdb.SKeyValue{}
@@ -195,7 +222,11 @@ func (self *SCollectByResourceIdDriver) CollectDBInstanceMetrics(ctx context.Con
 }
 
 func (self *SCollectByResourceIdDriver) CollectServerMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.ServerDetails, start, end time.Time) error {
-	ch := make(chan struct{}, options.Options.CloudResourceCollectMetricsBatchCount)
+	cnt := options.Options.CloudResourceCollectMetricsBatchCount
+	if manager.Provider == api.CLOUD_PROVIDER_ORACLE { // oracle 限速
+		cnt = options.Options.OracleCloudResourceCollectMetricsBatchCount
+	}
+	ch := make(chan struct{}, cnt)
 	defer close(ch)
 	metrics := []influxdb.SMetricData{}
 	var wg sync.WaitGroup
@@ -275,12 +306,19 @@ func (self *SCollectByResourceIdDriver) CollectServerMetrics(ctx context.Context
 	return self.sendMetrics(ctx, manager, "server", len(res), metrics)
 }
 
+var (
+	hostMemoryCache = hashcache.NewCache(1024, time.Minute*5)
+	hostCpuCache    = hashcache.NewCache(1024, time.Minute*5)
+	hostIdCache     = hashcache.NewCache(1024, time.Minute*5)
+)
+
 func (self *SCollectByResourceIdDriver) CollectHostMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.HostDetails, start, end time.Time) error {
 	ch := make(chan struct{}, options.Options.CloudResourceCollectMetricsBatchCount)
 	defer close(ch)
 	metrics := []influxdb.SMetricData{}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	s := auth.GetAdminSession(ctx, options.Options.Region)
 	for i := range res {
 		ch <- struct{}{}
 		wg.Add(1)
@@ -319,8 +357,17 @@ func (self *SCollectByResourceIdDriver) CollectHostMetrics(ctx context.Context, 
 				}
 				return
 			}
+			cpu, cpuCnt, memory, memoryCnt := 0.0, 0.0, 0.0, 0.0
 			for _, values := range data {
 				for _, value := range values.Values {
+					switch values.MetricType {
+					case cloudprovider.HOST_METRIC_TYPE_CPU_USAGE:
+						cpu += value.Value
+						cpuCnt++
+					case cloudprovider.HOST_METRIC_TYPE_MEM_USAGE:
+						memory += value.Value
+						memoryCnt++
+					}
 					metric := influxdb.SMetricData{
 						Name:      values.MetricType.Name(),
 						Timestamp: value.Timestamp,
@@ -344,6 +391,21 @@ func (self *SCollectByResourceIdDriver) CollectHostMetrics(ctx context.Context, 
 					metrics = append(metrics, metric)
 					mu.Unlock()
 				}
+			}
+			avgCpu := cpu / float64(cpuCnt)
+			avgMemory := memory / float64(memoryCnt)
+			info := hostIdCache.AtomicGet(host.Id)
+			if gotypes.IsNil(info) {
+				pingInfo := api.SHostPingInput{}
+				pingInfo.WithData = true
+				pingInfo.MemoryUsedMb = int(float64(host.MemSize)*avgMemory) / 100
+				pingInfo.CpuUsagePercent = avgCpu
+				_, err := compute.Hosts.PerformAction(s, host.Id, "ping", jsonutils.Marshal(pingInfo))
+				if err != nil {
+					log.Errorf("perform ping %s(%s) error: %v", host.Name, host.Id, err)
+					return
+				}
+				hostIdCache.AtomicSet(host.Id, host.Id)
 			}
 		}(res[i])
 	}
@@ -601,6 +663,7 @@ func (self *SCollectByResourceIdDriver) CollectLoadbalancerMetrics(ctx context.C
 				EndTime:      end,
 			}
 			opts.ResourceId = lb.ExternalId
+			opts.RegionExtId = lb.RegionExtId
 
 			tags := []influxdb.SKeyValue{}
 			for k, v := range lb.GetMetricTags() {
@@ -803,6 +866,7 @@ func (self *SCollectByMetricTypeDriver) CollectHostMetrics(ctx context.Context, 
 	metrics := []influxdb.SMetricData{}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	s := auth.GetAdminSession(ctx, options.Options.Region)
 	for _, _metricType := range cloudprovider.ALL_HOST_METRIC_TYPES {
 		wg.Add(1)
 		go func(metricType cloudprovider.TMetricType) {
@@ -844,7 +908,9 @@ func (self *SCollectByMetricTypeDriver) CollectHostMetrics(ctx context.Context, 
 						Value: v,
 					})
 				}
+				total := 0.0
 				for _, v := range value.Values {
+					total += v.Value
 					metric := influxdb.SMetricData{
 						Name:      value.MetricType.Name(),
 						Timestamp: v.Timestamp,
@@ -867,6 +933,24 @@ func (self *SCollectByMetricTypeDriver) CollectHostMetrics(ctx context.Context, 
 					mu.Lock()
 					metrics = append(metrics, metric)
 					mu.Unlock()
+				}
+				avg := total / float64(len(value.Values))
+				info := hostIdCache.AtomicGet(vm.Id)
+				if gotypes.IsNil(info) {
+					pingInfo := api.SHostPingInput{}
+					pingInfo.WithData = true
+					switch metricType {
+					case cloudprovider.HOST_METRIC_TYPE_CPU_USAGE:
+						pingInfo.CpuUsagePercent = avg
+					case cloudprovider.HOST_METRIC_TYPE_MEM_USAGE:
+						pingInfo.MemoryUsedMb = int(float64(vm.MemSize)*avg) / 100
+					}
+					_, err := compute.Hosts.PerformAction(s, vm.Id, "ping", jsonutils.Marshal(pingInfo))
+					if err != nil {
+						log.Errorf("perform ping %s(%s) error: %v", vm.Name, vm.Id, err)
+						return
+					}
+					hostIdCache.AtomicSet(vm.Id, vm.Id)
 				}
 			}
 		}(_metricType)
@@ -1094,4 +1178,71 @@ func (self *SCollectByMetricTypeDriver) CollectK8sMetrics(ctx context.Context, m
 	wg.Wait()
 
 	return self.sendMetrics(ctx, manager, "k8s", len(res), metrics)
+}
+
+func (driver *SCollectByMetricTypeDriver) CollectLoadbalancerMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.LoadbalancerDetails, start, end time.Time) error {
+	metrics := []influxdb.SMetricData{}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, _metricType := range cloudprovider.ALL_LB_METRIC_TYPES {
+		wg.Add(1)
+		go func(metricType cloudprovider.TMetricType) {
+			defer func() {
+				wg.Done()
+			}()
+			opts := &cloudprovider.MetricListOptions{
+				ResourceType: cloudprovider.METRIC_RESOURCE_TYPE_LB,
+				MetricType:   metricType,
+				StartTime:    start,
+				EndTime:      end,
+			}
+			data, err := provider.GetMetrics(opts)
+			if err != nil {
+				if errors.Cause(err) != cloudprovider.ErrNotImplemented && errors.Cause(err) != cloudprovider.ErrNotSupported {
+					log.Errorf("get slb %s(%s) %s error: %v", manager.Name, manager.Id, metricType, err)
+					return
+				}
+				return
+			}
+			for _, value := range data {
+				slb, ok := res[value.Id]
+				if !ok {
+					continue
+				}
+				tags := []influxdb.SKeyValue{}
+				for k, v := range slb.GetMetricTags() {
+					tags = append(tags, influxdb.SKeyValue{
+						Key:   k,
+						Value: v,
+					})
+				}
+				for _, v := range value.Values {
+					metric := influxdb.SMetricData{
+						Name:      value.MetricType.Name(),
+						Timestamp: v.Timestamp,
+						Tags:      []influxdb.SKeyValue{},
+						Metrics: []influxdb.SKeyValue{
+							{
+								Key:   value.MetricType.Key(),
+								Value: strconv.FormatFloat(v.Value, 'E', -1, 64),
+							},
+						},
+					}
+					for k, v := range v.Tags {
+						metric.Tags = append(metric.Tags, influxdb.SKeyValue{
+							Key:   k,
+							Value: v,
+						})
+					}
+					metric.Tags = append(metric.Tags, tags...)
+					mu.Lock()
+					metrics = append(metrics, metric)
+					mu.Unlock()
+				}
+			}
+		}(_metricType)
+	}
+	wg.Wait()
+
+	return driver.sendMetrics(ctx, manager, "slb", len(res), metrics)
 }

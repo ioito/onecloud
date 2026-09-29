@@ -25,6 +25,7 @@ import (
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/identity"
@@ -75,11 +76,11 @@ type SCredential struct {
 	UserId    string `width:"64" charset:"ascii" nullable:"false" list:"user" create:"required"`
 	ProjectId string `width:"64" charset:"ascii" nullable:"true" list:"user" create:"required"`
 	Type      string `width:"255" charset:"utf8" nullable:"false" list:"user" create:"required"`
-	KeyHash   string `width:"64" charset:"ascii" nullable:"false" create:"required"`
+	KeyHash   string `width:"64" charset:"ascii" nullable:"false" create:"required" update:"user"`
 
 	Extra *jsonutils.JSONDict `nullable:"true" list:"admin"`
 
-	EncryptedBlob string `nullable:"false" create:"required"`
+	EncryptedBlob string `nullable:"false" create:"required" update:"user"`
 
 	Enabled tristate.TriState `default:"true" list:"user" update:"user" create:"optional"`
 }
@@ -132,7 +133,7 @@ func (manager *SCredentialManager) ValidateCreateData(
 	} else if projectId == api.DEFAULT_PROJECT {
 		// do nothing
 	} else {
-		_, err := ProjectManager.FetchById(projectId)
+		projectObj, err := ProjectManager.FetchById(projectId)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return input, httperrors.NewResourceNotFoundError2(ProjectManager.Keyword(), projectId)
@@ -140,6 +141,7 @@ func (manager *SCredentialManager) ValidateCreateData(
 				return input, httperrors.NewGeneralError(err)
 			}
 		}
+		input.ProjectId = projectObj.GetId()
 	}
 	if len(input.Name) == 0 {
 		input.Name = fmt.Sprintf("%s-%s-%s", input.Type, projectId, userId)
@@ -172,6 +174,18 @@ func (cred *SCredential) ValidateUpdateData(ctx context.Context, userCred mcclie
 	input.StandaloneResourceBaseUpdateInput, err = cred.SStandaloneResourceBase.ValidateUpdateData(ctx, userCred, query, input.StandaloneResourceBaseUpdateInput)
 	if err != nil {
 		return input, errors.Wrap(err, "SStandaloneResourceBase.ValidateUpdateData")
+	}
+
+	if len(input.Blob) > 0 {
+		if !sets.NewString(api.CONTAINER_SECRET_TYPE, api.CONTAINER_IMAGE_TYPE).Has(cred.Type) {
+			return input, httperrors.NewNotSupportedError("blob update only supported for credential type %v", sets.NewString(api.CONTAINER_SECRET_TYPE, api.CONTAINER_IMAGE_TYPE).List())
+		}
+		blobEnc, err := keys.CredentialKeyManager.Encrypt([]byte(input.Blob))
+		if err != nil {
+			return input, httperrors.NewInternalServerError("encrypt blob: %s", err)
+		}
+		input.EncryptedBlob = string(blobEnc)
+		input.KeyHash = keys.CredentialKeyManager.PrimaryKeyHash()
 	}
 
 	return input, nil
@@ -235,19 +249,26 @@ func (manager *SCredentialManager) ResourceScope() rbacscope.TRbacScope {
 	return rbacscope.ScopeUser
 }
 
-func (manager *SCredentialManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SCredentialManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
-		if scope == rbacscope.ScopeUser {
-			if len(owner.GetUserId()) > 0 {
-				q = q.Equals("user_id", owner.GetUserId())
-			}
+		q = q.Equals("user_id", owner.GetUserId())
+		ownerProjectId := owner.GetProjectId()
+		if len(ownerProjectId) > 0 {
+			q = q.In("project_id", []string{ownerProjectId, api.DEFAULT_PROJECT})
 		}
 	}
 	return q
 }
 
 func (cred *SCredential) GetOwnerId() mcclient.IIdentityProvider {
-	owner := db.SOwnerId{UserId: cred.UserId}
+	owner := db.SOwnerId{
+		UserId:    cred.UserId,
+		ProjectId: cred.ProjectId,
+	}
+	usr, _ := UserManager.FetchUserExtended(cred.UserId, "", "", "")
+	if usr != nil {
+		owner.UserDomainId = usr.DomainId
+	}
 	return &owner
 }
 
@@ -262,7 +283,7 @@ func (manager *SCredentialManager) FetchOwnerId(ctx context.Context, data jsonut
 			domainOwner = &db.SOwnerId{DomainId: api.DEFAULT_DOMAIN_ID}
 		}
 		data.(*jsonutils.JSONDict).Remove(key)
-		usrObj, err := UserManager.FetchByIdOrName(domainOwner, userStr)
+		usrObj, err := UserManager.FetchByIdOrName(ctx, domainOwner, userStr)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("user", userStr)

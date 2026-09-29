@@ -24,7 +24,6 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
-	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -62,7 +61,14 @@ type SIsolatedDeviceModel struct {
 	DevType string `width:"16" charset:"ascii" nullable:"false" list:"domain" create:"domain_required"`
 
 	HotPluggable tristate.TriState `default:"false" list:"domain" create:"domain_optional" update:"domain"`
+
+	// Disable auto detect isolated devices on host
+	DisableAutoDetect tristate.TriState `default:"false" list:"domain" create:"domain_optional" update:"domain"`
 }
+
+var _ db.IStandaloneModel = new(SIsolatedDeviceModel)
+
+func (self *SIsolatedDeviceModel) SetName(name string) {}
 
 func (manager *SIsolatedDeviceModelManager) ValidateCreateData(ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -70,10 +76,6 @@ func (manager *SIsolatedDeviceModelManager) ValidateCreateData(ctx context.Conte
 	query jsonutils.JSONObject,
 	input api.IsolatedDeviceModelCreateInput,
 ) (api.IsolatedDeviceModelCreateInput, error) {
-	if utils.IsInStringArray(input.DevType, api.VALID_PASSTHROUGH_TYPES) {
-		return input, httperrors.NewInputParameterError("device type %q unsupported", input.DevType)
-	}
-
 	input.VendorId = strings.ToLower(input.VendorId)
 	input.DeviceId = strings.ToLower(input.DeviceId)
 	deviceVendorReg := regexp.MustCompile(`^[a-f0-9]{4}$`)
@@ -102,23 +104,44 @@ func (self *SIsolatedDeviceModel) PostCreate(ctx context.Context, userCred mccli
 	if err != nil {
 		log.Errorf("!!!data.Unmarshal api.IsolatedDeviceModelCreateInput fail %s", err)
 	}
-	go func() {
-		defer self.RemoveMetadata(ctx, api.MEAT_PROBED_HOST_COUNT, userCred)
 
+	go func() {
 		for i := range input.Hosts {
-			iHost, err := HostManager.FetchByIdOrName(userCred, input.Hosts[i])
+			iHost, err := HostManager.FetchByIdOrName(ctx, userCred, input.Hosts[i])
 			if err != nil {
 				log.Errorf("failed fetch host %s: %s", input.Hosts[i], err)
 				continue
 			}
 			host := iHost.(*SHost)
+
+			if self.DisableAutoDetect.Bool() {
+				err = self.Attach2Host(ctx, userCred, host)
+				if err != nil {
+					log.Errorf("failed attach to host %s: %s", input.Hosts[i], err)
+					continue
+				}
+			}
+
 			log.Infof("start request host %s scan isolated devices", host.GetName())
 			if err := host.RequestScanIsolatedDevices(ctx, userCred); err != nil {
 				log.Errorf("failed scan isolated device %s", err)
 			}
-			self.SetMetadata(ctx, api.MEAT_PROBED_HOST_COUNT, strconv.Itoa(i+1), userCred)
 		}
 	}()
+}
+
+func (self *SIsolatedDeviceModel) Attach2Host(ctx context.Context, userCred mcclient.TokenCredential, host *SHost) error {
+	hs := SHostIsolatedDeviceModel{}
+	hs.SetModelManager(HostIsolatedDeviceModelManager, &hs)
+
+	hs.IsolatedDeviceModelId = self.Id
+	hs.HostId = host.Id
+	err := HostIsolatedDeviceModelManager.TableSpec().Insert(ctx, &hs)
+	if err != nil {
+		return err
+	}
+	db.OpsLog.LogAttachEvent(ctx, host, self, userCred, nil)
+	return nil
 }
 
 func (self *SIsolatedDeviceModel) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
@@ -140,7 +163,7 @@ func (self *SIsolatedDeviceModel) PostDelete(ctx context.Context, userCred mccli
 	}
 	go func() {
 		for i := range hosts {
-			iHost, err := HostManager.FetchByIdOrName(userCred, hosts[i])
+			iHost, err := HostManager.FetchByIdOrName(ctx, userCred, hosts[i])
 			if err != nil {
 				log.Errorf("failed fetch host %s: %s", hosts[i], err)
 				continue
@@ -217,6 +240,15 @@ func (manager *SIsolatedDeviceModelManager) ListItemFilter(
 	if len(query.DeviceId) > 0 {
 		q = q.Equals("device_id", query.DeviceId)
 	}
+	if len(query.HostId) > 0 {
+		hidmq := HostIsolatedDeviceModelManager.Query("isolated_device_model_id").Equals("host_id", query.HostId).SubQuery()
+		q = q.Filter(sqlchemy.OR(
+			sqlchemy.IsFalse(q.Field("disable_auto_detect")),
+			sqlchemy.IsNull(q.Field("disable_auto_detect")),
+			sqlchemy.In(q.Field("id"), hidmq)),
+		)
+	}
+
 	return q, nil
 }
 
@@ -248,4 +280,48 @@ func (manager *SIsolatedDeviceModelManager) GetByDevType(devType string) (*SIsol
 	}
 	devModel.SetModelManager(manager, devModel)
 	return devModel, nil
+}
+
+func (obj *SIsolatedDeviceModel) PerformSetHardwareInfo(ctx context.Context, userCred mcclient.TokenCredential, _ jsonutils.JSONObject, data *api.IsolatedDeviceModelHardwareInfo) (*api.IsolatedDeviceModelHardwareInfo, error) {
+	settings := map[string]interface{}{
+		api.ISOLATED_DEVICE_MODEL_METADATA_MEMORY_MB: data.MemoryMB,
+		api.ISOLATED_DEVICE_MODEL_METADATA_TFLOPS:    data.TFLOPS,
+		api.ISOLATED_DEVICE_MODEL_METADATA_BANDWIDTH: data.Bandwidth,
+	}
+
+	for k, v := range settings {
+		if err := obj.SetMetadata(ctx, k, v, userCred); err != nil {
+			return nil, errors.Wrapf(err, "set %s to %v", k, v)
+		}
+	}
+	return data, nil
+}
+
+func (obj *SIsolatedDeviceModel) GetDetailsHardwareInfo(ctx context.Context, userCred mcclient.TokenCredential, _ jsonutils.JSONObject) (*api.IsolatedDeviceModelHardwareInfo, error) {
+	info := new(api.IsolatedDeviceModelHardwareInfo)
+	// parse memory size MB
+	if memStr := obj.GetMetadata(ctx, api.ISOLATED_DEVICE_MODEL_METADATA_MEMORY_MB, userCred); memStr != "" {
+		memSize, err := strconv.Atoi(memStr)
+		if err != nil {
+			return nil, errors.Wrapf(err, "convert memory size %d to int", memSize)
+		}
+		info.MemoryMB = memSize
+	}
+	// parse bandwidth
+	if bwStr := obj.GetMetadata(ctx, api.ISOLATED_DEVICE_MODEL_METADATA_BANDWIDTH, userCred); bwStr != "" {
+		bw, err := strconv.ParseFloat(bwStr, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "convert bandwidth %s to float", bwStr)
+		}
+		info.Bandwidth = bw
+	}
+	// parse TFLOPS
+	if tflopsStr := obj.GetMetadata(ctx, api.ISOLATED_DEVICE_MODEL_METADATA_TFLOPS, userCred); tflopsStr != "" {
+		tflops, err := strconv.ParseFloat(tflopsStr, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "convert TFLOPS %s to float", tflopsStr)
+		}
+		info.TFLOPS = tflops
+	}
+	return info, nil
 }

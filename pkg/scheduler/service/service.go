@@ -18,14 +18,12 @@ import (
 	"context"
 	"io/ioutil"
 	"net"
-	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"yunion.io/x/log"
-	"yunion.io/x/pkg/util/prometheus"
 	"yunion.io/x/pkg/utils"
 	_ "yunion.io/x/sqlchemy/backends"
 
@@ -44,6 +42,7 @@ import (
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/cloudregion"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/netinterface"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/network"
+	"yunion.io/x/onecloud/pkg/scheduler/data_manager/network_additional_wire"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/schedtag"
 	skuman "yunion.io/x/onecloud/pkg/scheduler/data_manager/sku"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/wire"
@@ -106,7 +105,7 @@ func StartService() error {
 	o.Options.EnableDBChecksumTables = false
 	o.Options.DBChecksumSkipInit = true
 
-	return StartServiceWrapper(&dbOpts, commonOpts, func(_ *appsrv.Application) error {
+	return StartServiceWrapper(&dbOpts, commonOpts, func(app *appsrv.Application) error {
 		common_options.StartOptionManager(&o.Options, o.Options.ConfigSyncPeriodSeconds, compute_api.SERVICE_TYPE, compute_api.SERVICE_VERSION, o.OnOptionsChange)
 
 		// gin http framework mode configuration
@@ -119,13 +118,14 @@ func StartService() error {
 		startSched := func() {
 			stopEverything := make(chan struct{})
 			ctx := context.Background()
-			go skuman.Start(utils.ToDuration(o.Options.SkuRefreshInterval))
+			go skuman.Start(ctx, utils.ToDuration(o.Options.SkuRefreshInterval))
 			go schedtag.Start(ctx, utils.ToDuration("30s"))
+			go network_additional_wire.Start(ctx, utils.ToDuration("30m"))
 
 			for _, f := range []func(ctx context.Context){
 				cloudregion.Manager.Start,
 				zone.Manager.Start,
-				cloudprovider.Manager.Start,
+				cloudprovider.GetManager().Start,
 				cloudaccount.Manager.Start,
 				wire.Manager.Start,
 				network.Manager.Start,
@@ -140,11 +140,11 @@ func StartService() error {
 		}
 		startSched()
 		//InitHandlers(app)
-		return startHTTP(&o.Options)
+		return startHTTP(app, &o.Options)
 	})
 }
 
-func startHTTP(opt *o.SchedulerOptions) error {
+func startHTTP(app *appsrv.Application, opt *o.SchedulerOptions) error {
 	gin.DefaultWriter = ioutil.Discard
 
 	router := gin.Default()
@@ -152,13 +152,11 @@ func startHTTP(opt *o.SchedulerOptions) error {
 	router.Use(middleware.ErrorHandler)
 	router.Use(middleware.KeystoneTokenVerifyMiddleware())
 
-	prometheus.InstallHandler(router)
-	schedhandler.InstallHandler(router)
+	// prometheus.InstallHandler(router)
+	schedhandler.InstallHandler(router, opt.EnableAppProfiling)
 
-	server := &http.Server{
-		Addr:    net.JoinHostPort(opt.Address, strconv.Itoa(int(opt.Port))),
-		Handler: router,
-	}
+	server := appsrv.InitHTTPServer(app, net.JoinHostPort(opt.Address, strconv.Itoa(int(opt.Port))))
+	server.Handler = router
 
 	log.Infof("Start server on: %s:%d", opt.Address, opt.Port)
 

@@ -24,25 +24,27 @@ import (
 )
 
 type NetworkListOptions struct {
+	_ struct{} `mcp-desc:"【创建流程中的中间步骤】本工具不能完成创建。公有云须带 provider（如 [\"Aliyun\"]）及 region；查完网络后凑齐同云镜像与规格，立刻 climc_server_create。严禁只调用本工具后就停止"`
+
 	options.BaseListOptions
 
-	Ip         string   `help:"search networks that contain this IP"`
-	ZoneIds    []string `help:"search networks in zones"`
+	Ip         string   `help:"search networks that contain this IP" mcp:"true"`
+	ZoneIds    []string `help:"search networks in zones" mcp:"true"`
 	Wire       string   `help:"search networks belongs to a wire" json:"-"`
-	Host       string   `help:"search networks attached to a host"`
-	Vpc        string   `help:"search networks belongs to a VPC"`
-	Region     string   `help:"search networks belongs to a CloudRegion" json:"cloudregion"`
+	Host       string   `help:"search networks attached to a host" mcp:"true"`
+	Vpc        string   `help:"search networks belongs to a VPC" mcp:"true"`
+	Region     string   `help:"search networks belongs to a CloudRegion" json:"cloudregion" mcp:"true"`
 	City       string   `help:"search networks belongs to a city"`
-	Usable     *bool    `help:"search usable networks"`
-	ServerType string   `help:"search networks belongs to a ServerType" choices:"baremetal|container|eip|guest|ipmi|pxe"`
+	Usable     *bool    `help:"search usable networks" mcp:"true"`
+	ServerType string   `help:"search networks belongs to a ServerType" choices:"baremetal|container|eip|guest|ipmi|pxe|hostlocal" mcp:"true"`
 	Schedtag   string   `help:"filter networks by schedtag"`
 
 	HostSchedtagId string `help:"filter by host schedtag"`
 
-	IsAutoAlloc *bool `help:"search network with is_auto_alloc"`
+	IsAutoAlloc *bool `help:"search network with is_auto_alloc" mcp:"true"`
 	IsClassic   *bool `help:"search classic on-premise network"`
 
-	Status string `help:"filter by network status"`
+	// Status string `help:"filter by network status"`
 
 	GuestIpStart []string `help:"search by guest_ip_start"`
 	GuestIpEnd   []string `help:"search by guest_ip_end"`
@@ -64,31 +66,34 @@ func (opts *NetworkListOptions) Params() (jsonutils.JSONObject, error) {
 	return options.ListStructToParams(opts)
 }
 
-type NetworkUpdateOptions struct {
-	options.BaseUpdateOptions
+type NetworkCreateOptions struct {
+	WIRE    string `help:"ID or Name of wire in which the network is created"`
+	NETWORK string `help:"Name of new network"`
+	StartIp string `help:"Start of IPv4 address range" positional:"true" json:"start_ip"`
+	EndIp   string `help:"End of IPv4 address range" positional:"true" json:"end_ip"`
+	NetMask int64  `help:"Length of network mask" positional:"true" json:"net_mask"`
+	Gateway string `help:"Default gateway"`
 
-	StartIp     string `help:"Start ip"`
-	EndIp       string `help:"end ip"`
-	NetMask     int64  `help:"Netmask"`
-	Gateway     string `help:"IP of gateway"`
-	Dns         string `help:"IP of DNS server"`
-	Domain      string `help:"Domain"`
-	Dhcp        string `help:"DHCP server IP"`
-	Ntp         string `help:"Ntp server domain names"`
-	VlanId      int64  `help:"Vlan ID"`
-	ExternalId  string `help:"External ID"`
+	StartIp6 string `help:"IPv6 start ip"`
+	EndIp6   string `help:"IPv6 end ip"`
+	NetMask6 int64  `help:"IPv6 netmask"`
+	Gateway6 string `help:"IPv6 gateway"`
+
+	VlanId      int64  `help:"Vlan ID" default:"1"`
+	IfnameHint  string `help:"Hint for ifname generation"`
 	AllocPolicy string `help:"Address allocation policy" choices:"none|stepdown|stepup|random"`
-	IsAutoAlloc *bool  `help:"Add network into auto-allocation pool" negative:"no_auto_alloc"`
+	ServerType  string `help:"Server type" choices:"baremetal|container|eip|guest|ipmi|pxe|hostlocal"`
+	IsAutoAlloc *bool  `help:"Auto allocation IP pool"`
+	BgpType     string `help:"BGP/line type (e.g. BGP, ChinaTelecom)" positional:"false"`
+	Desc        string `help:"Description" metavar:"DESCRIPTION"`
 }
 
-func (opts *NetworkUpdateOptions) Params() (jsonutils.JSONObject, error) {
+func (opts *NetworkCreateOptions) Params() (jsonutils.JSONObject, error) {
 	params := jsonutils.NewDict()
-	if len(opts.Name) > 0 {
-		params.Add(jsonutils.NewString(opts.Name), "name")
-	}
-	if len(opts.Desc) > 0 {
-		params.Add(jsonutils.NewString(opts.Desc), "description")
-	}
+
+	params.Add(jsonutils.NewString(opts.WIRE), "wire")
+	params.Add(jsonutils.NewString(opts.NETWORK), "name")
+
 	if len(opts.StartIp) > 0 {
 		params.Add(jsonutils.NewString(opts.StartIp), "guest_ip_start")
 	}
@@ -101,6 +106,105 @@ func (opts *NetworkUpdateOptions) Params() (jsonutils.JSONObject, error) {
 	if len(opts.Gateway) > 0 {
 		params.Add(jsonutils.NewString(opts.Gateway), "guest_gateway")
 	}
+
+	if len(opts.StartIp6) > 0 {
+		params.Add(jsonutils.NewString(opts.StartIp6), "guest_ip6_start")
+	}
+	if len(opts.EndIp6) > 0 {
+		params.Add(jsonutils.NewString(opts.EndIp6), "guest_ip6_end")
+	}
+	if opts.NetMask6 > 0 {
+		params.Add(jsonutils.NewInt(opts.NetMask6), "guest_ip6_mask")
+	}
+	if len(opts.Gateway6) > 0 {
+		params.Add(jsonutils.NewString(opts.Gateway6), "guest_gateway6")
+	}
+
+	if opts.VlanId > 0 {
+		params.Add(jsonutils.NewInt(opts.VlanId), "vlan_id")
+	}
+	if len(opts.ServerType) > 0 {
+		params.Add(jsonutils.NewString(opts.ServerType), "server_type")
+	}
+	if len(opts.IfnameHint) > 0 {
+		params.Add(jsonutils.NewString(opts.IfnameHint), "ifname_hint")
+	}
+	if len(opts.AllocPolicy) > 0 {
+		params.Add(jsonutils.NewString(opts.AllocPolicy), "alloc_policy")
+	}
+	if len(opts.Desc) > 0 {
+		params.Add(jsonutils.NewString(opts.Desc), "description")
+	}
+	if len(opts.BgpType) > 0 {
+		params.Add(jsonutils.NewString(opts.BgpType), "bgp_type")
+	}
+	if opts.IsAutoAlloc != nil {
+		params.Add(jsonutils.NewBool(*opts.IsAutoAlloc), "is_auto_alloc")
+	}
+
+	return params, nil
+}
+
+type NetworkUpdateOptions struct {
+	options.BaseUpdateOptions
+
+	StartIp string `help:"Start ip"`
+	EndIp   string `help:"end ip"`
+	NetMask int64  `help:"Netmask"`
+	Gateway string `help:"IP of gateway"`
+
+	StartIp6 string `help:"IPv6 start ip"`
+	EndIp6   string `help:"IPv6 end ip"`
+	NetMask6 int64  `help:"IPv6 netmask"`
+	Gateway6 string `help:"IPv6 gateway"`
+
+	Dns         string `help:"IP of DNS server"`
+	Domain      string `help:"Domain"`
+	Dhcp        string `help:"DHCP server IP"`
+	Ntp         string `help:"Ntp server domain names"`
+	VlanId      int64  `help:"Vlan ID"`
+	ExternalId  string `help:"External ID"`
+	AllocPolicy string `help:"Address allocation policy" choices:"none|stepdown|stepup|random"`
+	IsAutoAlloc *bool  `help:"Add network into auto-allocation pool" negative:"no_auto_alloc"`
+
+	ServerType string `help:"specify network server_type" choices:"baremetal|container|guest|pxe|ipmi|eip|hostlocal"`
+}
+
+func (opts *NetworkUpdateOptions) Params() (jsonutils.JSONObject, error) {
+	params := jsonutils.NewDict()
+	if len(opts.Name) > 0 {
+		params.Add(jsonutils.NewString(opts.Name), "name")
+	}
+	if len(opts.Desc) > 0 {
+		params.Add(jsonutils.NewString(opts.Desc), "description")
+	}
+
+	if len(opts.StartIp) > 0 {
+		params.Add(jsonutils.NewString(opts.StartIp), "guest_ip_start")
+	}
+	if len(opts.EndIp) > 0 {
+		params.Add(jsonutils.NewString(opts.EndIp), "guest_ip_end")
+	}
+	if opts.NetMask > 0 {
+		params.Add(jsonutils.NewInt(opts.NetMask), "guest_ip_mask")
+	}
+	if len(opts.Gateway) > 0 {
+		params.Add(jsonutils.NewString(opts.Gateway), "guest_gateway")
+	}
+
+	if len(opts.StartIp6) > 0 {
+		params.Add(jsonutils.NewString(opts.StartIp6), "guest_ip6_start")
+	}
+	if len(opts.EndIp6) > 0 {
+		params.Add(jsonutils.NewString(opts.EndIp6), "guest_ip6_end")
+	}
+	if opts.NetMask6 > 0 {
+		params.Add(jsonutils.NewInt(opts.NetMask6), "guest_ip6_mask")
+	}
+	if len(opts.Gateway6) > 0 {
+		params.Add(jsonutils.NewString(opts.Gateway6), "guest_gateway6")
+	}
+
 	if len(opts.Dns) > 0 {
 		if opts.Dns == "none" {
 			params.Add(jsonutils.NewString(""), "guest_dns")
@@ -140,6 +244,9 @@ func (opts *NetworkUpdateOptions) Params() (jsonutils.JSONObject, error) {
 	}
 	if opts.IsAutoAlloc != nil {
 		params.Add(jsonutils.NewBool(*opts.IsAutoAlloc), "is_auto_alloc")
+	}
+	if len(opts.ServerType) > 0 {
+		params.Add(jsonutils.NewString(opts.ServerType), "server_type")
 	}
 	if params.Size() == 0 {
 		return nil, shell.InvalidUpdateError()

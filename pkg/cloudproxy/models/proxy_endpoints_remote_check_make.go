@@ -33,7 +33,8 @@ import (
 )
 
 func (proxyendpoint *SProxyEndpoint) remoteCheckMake(ctx context.Context, userCred mcclient.TokenCredential) error {
-	ctx, _ = context.WithTimeout(ctx, 7*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 7*time.Second)
+	defer cancel()
 	conf := ssh_util.ClientConfig{
 		Username:   proxyendpoint.User,
 		Host:       proxyendpoint.Host,
@@ -122,7 +123,7 @@ func (proxyendpoint *SProxyEndpoint) remoteConfigure(ctx context.Context, userCr
 	host.SetVar("ansible_port", fmt.Sprintf("%d", proxyendpoint.Port))
 	host.SetVar("ansible_become", "yes")
 	pb := &ansible.Playbook{
-		PrivateKey: []byte(proxyendpoint.PrivateKey),
+		PrivateKeys: []string{proxyendpoint.PrivateKey},
 		Inventory: ansible.Inventory{
 			Hosts: []ansible.Host{host},
 		},
@@ -154,7 +155,9 @@ func (proxyendpoint *SProxyEndpoint) remoteConfigure(ctx context.Context, userCr
 		},
 	}
 
-	cliSess := auth.GetSession(ctx, userCred, "")
+	// the playbook content here is server-generated; use the admin session
+	// since ansible playbook creation requires system admin privilege
+	cliSess := auth.GetAdminSession(ctx, "")
 	pbId := ""
 	pbName := "pe-remote-configure-" + proxyendpoint.Name
 	_, err := ansible_modules.AnsiblePlaybooks.UpdateOrCreatePbModel(

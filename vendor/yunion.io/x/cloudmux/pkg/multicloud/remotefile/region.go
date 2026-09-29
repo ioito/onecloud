@@ -35,7 +35,7 @@ type SRegion struct {
 }
 
 func (self *SRegion) GetGlobalId() string {
-	return fmt.Sprintf("%s%s", self.client.GetCloudRegionExternalIdPrefix(), self.Id)
+	return fmt.Sprintf("%s/%s", self.client.GetCloudRegionExternalIdPrefix(), self.Id)
 }
 
 func (self *SRegion) GetProvider() string {
@@ -250,19 +250,6 @@ func (self *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICl
 	return nil, cloudprovider.ErrNotFound
 }
 
-func (self *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, err := self.client.GetSecgroups()
-	if err != nil {
-		return nil, err
-	}
-	for i := range secgroups {
-		if secgroups[i].GetName() == opts.Name {
-			return &secgroups[i], nil
-		}
-	}
-	return nil, cloudprovider.ErrNotFound
-}
-
 func (self *SRegion) GetILoadBalancers() ([]cloudprovider.ICloudLoadbalancer, error) {
 	lbs, err := self.client.GetLoadbalancers()
 	if err != nil {
@@ -376,4 +363,16 @@ func (self *SRegion) GetIMiscResources() ([]cloudprovider.ICloudMiscResource, er
 
 func (self *SRegion) GetCapabilities() []string {
 	return self.client.GetCapabilities()
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	vms, err := region.client.GetInstances()
+	if err != nil {
+		return nil, err
+	}
+	ret := []cloudprovider.ICloudVM{}
+	for i := range vms {
+		ret = append(ret, &vms[i])
+	}
+	return ret, nil
 }

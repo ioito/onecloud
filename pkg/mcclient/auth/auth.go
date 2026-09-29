@@ -20,16 +20,17 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
-	"yunion.io/x/pkg/appctx"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/cache"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis/identity"
-	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/syncman"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -123,7 +124,7 @@ func (c *TokenCacheVerify) Verify(ctx context.Context, cli *mcclient.Client, adm
 			return cred, nil
 		} else {
 			c.DeleteToken(token)
-			log.Infof("Remove expired cache token: %s", token)
+			log.Infof("Remove expired cache token: %s", utils.TruncateString(token, 16))
 		}
 	}
 
@@ -162,34 +163,44 @@ type authManager struct {
 	accessKeyCache   *sAccessKeyCache
 }
 
+var (
+	authManagerInstane *authManager
+	authManagerLock    *sync.Mutex = &sync.Mutex{}
+)
+
 func newAuthManager(cli *mcclient.Client, info *AuthInfo) *authManager {
-	authm := &authManager{
+	authManagerLock.Lock()
+	defer authManagerLock.Unlock()
+
+	if authManagerInstane != nil {
+		authManagerInstane.client = cli
+		authManagerInstane.info = info
+		return authManagerInstane
+	}
+	authManagerInstane = &authManager{
 		client:           cli,
 		info:             info,
 		tokenCacheVerify: NewTokenCacheVerify(),
 		accessKeyCache:   newAccessKeyCache(),
 	}
-	authm.InitSync(authm)
-	go authm.startRefreshRevokeTokens()
-	return authm
+	authManagerInstane.InitSync(authManagerInstane)
+	go authManagerInstane.startRefreshRevokeTokens()
+	return authManagerInstane
 }
 
 func (a *authManager) startRefreshRevokeTokens() {
-	ticker := time.NewTicker(5 * time.Minute)
-	for range ticker.C {
-		err := a.refreshRevokeTokens(context.Background())
-		if err != nil {
-			log.Errorf("%s", err)
-		}
+	err := a.refreshRevokeTokens(context.Background())
+	if err != nil {
+		log.Errorf("%s", err)
 	}
-	ticker.Stop()
+	time.AfterFunc(5*time.Minute, a.startRefreshRevokeTokens)
 }
 
 func (a *authManager) refreshRevokeTokens(ctx context.Context) error {
 	if a.adminCredential == nil {
 		return fmt.Errorf("refreshRevokeTokens: No valid admin token credential")
 	}
-	tokens, err := a.client.FetchInvalidTokens(ctx, a.adminCredential.GetTokenString())
+	tokens, err := a.client.FetchInvalidTokens(getContext(ctx), a.adminCredential.GetTokenString())
 	if err != nil {
 		return errors.Wrap(err, "client.FetchInvalidTokens")
 	}
@@ -212,10 +223,15 @@ func (a *authManager) verifyRequest(req http.Request, virtualHost bool) (mcclien
 
 func (a *authManager) verify(ctx context.Context, token string) (mcclient.TokenCredential, error) {
 	if a.adminCredential == nil {
+		a.reAuth()
 		return nil, errors.Wrap(httperrors.ErrInvalidCredential, "No valid admin token credential")
 	}
 	cred, err := a.tokenCacheVerify.Verify(ctx, a.client, a.adminCredential.GetTokenString(), token)
 	if err != nil {
+		if httputils.ErrorCode(err) == 403 {
+			// adminCredential need to be refresh
+			a.reAuth()
+		}
 		return nil, errors.Wrap(err, "tokenCacheVerify.Verify")
 	}
 	return cred, nil
@@ -262,12 +278,12 @@ func (a *authManager) authAdmin() error {
 	}
 }
 
-func (a *authManager) DoSync(first bool) (time.Duration, error) {
+func (a *authManager) DoSync(first bool, timeout bool) (time.Duration, error) {
 	err := a.authAdmin()
 	if err != nil {
 		return time.Minute, errors.Wrap(err, "authAdmin")
 	} else {
-		return a.adminCredential.GetExpires().Sub(time.Now()) / 2, nil
+		return time.Until(a.adminCredential.GetExpires()) / 2, nil
 	}
 }
 
@@ -280,19 +296,19 @@ func (a *authManager) Name() string {
 }
 
 func (a *authManager) reAuth() {
-	a.SyncOnce()
+	a.SyncOnce(false, false)
 }
 
-func (a *authManager) GetServiceURL(service, region, zone, endpointType string) (string, error) {
-	return a.getAdminSession(context.Background(), region, zone, endpointType).GetServiceURL(service, endpointType)
+func (a *authManager) GetServiceURL(service, region, zone, endpointType string, method httputils.THttpMethod) (string, error) {
+	return a.getAdminSession(context.Background(), region, zone, endpointType).GetServiceURL(service, endpointType, method)
 }
 
-func (a *authManager) GetServiceURLs(service, region, zone, endpointType string) ([]string, error) {
-	return a.getAdminSession(context.Background(), region, zone, endpointType).GetServiceURLs(service, endpointType)
+func (a *authManager) GetServiceURLs(service, region, zone, endpointType string, method httputils.THttpMethod) ([]string, error) {
+	return a.getAdminSession(context.Background(), region, zone, endpointType).GetServiceURLs(service, endpointType, method)
 }
 
 func (a *authManager) getServiceIPs(service, region, zone, endpointType string, needResolve bool) ([]string, error) {
-	urls, err := a.GetServiceURLs(service, region, zone, endpointType)
+	urls, err := a.GetServiceURLs(service, region, zone, endpointType, httputils.POST)
 	if err != nil {
 		return nil, errors.Wrap(err, "GetServiceURLs")
 	}
@@ -338,6 +354,10 @@ func (a *authManager) getAdminSession(ctx context.Context, region, zone, endpoin
 	return a.getSession(ctx, manager.adminCredential, region, zone, endpointType)
 }
 
+func getContext(ctx context.Context) context.Context {
+	return mcclient.FixContext(ctx)
+}
+
 func (a *authManager) getSession(ctx context.Context, token mcclient.TokenCredential, region, zone, endpointType string) *mcclient.ClientSession {
 	cli := Client()
 	if cli == nil {
@@ -346,11 +366,7 @@ func (a *authManager) getSession(ctx context.Context, token mcclient.TokenCreden
 	if endpointType == "" && globalEndpointType != "" {
 		endpointType = globalEndpointType
 	}
-	srvType := consts.GetServiceType()
-	if len(srvType) > 0 && len(appctx.AppContextServiceName(ctx)) == 0 {
-		ctx = context.WithValue(ctx, appctx.APP_CONTEXT_KEY_APPNAME, srvType)
-	}
-	return cli.NewSession(ctx, region, zone, endpointType, token)
+	return cli.NewSession(getContext(ctx), region, zone, endpointType, token)
 }
 
 func GetCatalogData(serviceTypes []string, region string) jsonutils.JSONObject {
@@ -369,16 +385,16 @@ func VerifyRequest(req http.Request, virtualHost bool) (mcclient.TokenCredential
 	return manager.verifyRequest(req, virtualHost)
 }
 
-func GetServiceURL(service, region, zone, endpointType string) (string, error) {
-	return manager.GetServiceURL(service, region, zone, endpointType)
+func GetServiceURL(service, region, zone, endpointType string, method httputils.THttpMethod) (string, error) {
+	return manager.GetServiceURL(service, region, zone, endpointType, method)
 }
 
-func GetPublicServiceURL(service, region, zone string) (string, error) {
-	return manager.GetServiceURL(service, region, zone, identity.EndpointInterfacePublic)
+func GetPublicServiceURL(service, region, zone string, method httputils.THttpMethod) (string, error) {
+	return manager.GetServiceURL(service, region, zone, identity.EndpointInterfacePublic, method)
 }
 
-func GetServiceURLs(service, region, zone, endpointType string) ([]string, error) {
-	return manager.GetServiceURLs(service, region, zone, endpointType)
+func GetServiceURLs(service, region, zone, endpointType string, method httputils.THttpMethod) ([]string, error) {
+	return manager.GetServiceURLs(service, region, zone, endpointType, method)
 }
 
 func GetDNSServers(region, zone string) ([]string, error) {

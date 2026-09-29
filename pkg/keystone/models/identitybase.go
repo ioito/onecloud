@@ -17,6 +17,7 @@ package models
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -130,12 +131,12 @@ func (manager *SIdentityBaseResourceManager) GetIIdentityModelManager() IIdentit
 	return manager.GetVirtualObject().(IIdentityModelManager)
 }
 
-func (manager *SIdentityBaseResourceManager) FetchByName(userCred mcclient.IIdentityProvider, idStr string) (db.IModel, error) {
-	return db.FetchByName(manager.GetIIdentityModelManager(), userCred, idStr)
+func (manager *SIdentityBaseResourceManager) FetchByName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (db.IModel, error) {
+	return db.FetchByName(ctx, manager.GetIIdentityModelManager(), userCred, idStr)
 }
 
-func (manager *SIdentityBaseResourceManager) FetchByIdOrName(userCred mcclient.IIdentityProvider, idStr string) (db.IModel, error) {
-	return db.FetchByIdOrName(manager.GetIIdentityModelManager(), userCred, idStr)
+func (manager *SIdentityBaseResourceManager) FetchByIdOrName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (db.IModel, error) {
+	return db.FetchByIdOrName(ctx, manager.GetIIdentityModelManager(), userCred, idStr)
 }
 
 func (manager *SIdentityBaseResourceManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
@@ -417,6 +418,7 @@ func (manager *SIdentityBaseResourceManager) GetPropertyDomainTagValueTree(
 		manager.GetIIdentityModelManager(),
 		"domain",
 		"domain_id",
+		"",
 		ctx,
 		userCred,
 		query,
@@ -425,11 +427,18 @@ func (manager *SIdentityBaseResourceManager) GetPropertyDomainTagValueTree(
 
 func (model *SIdentityBaseResource) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	if !model.PendingDeleted {
-		newName := fmt.Sprintf("%s-deleted-%s", model.Name, timeutils.ShortDate(timeutils.UtcNow()))
+		newName := model.Name
+		if !strings.Contains(model.Name, "-deleted-") {
+			newName = fmt.Sprintf("%s-deleted-%s", model.Name, timeutils.ShortDate(timeutils.UtcNow()))
+		}
 		err := model.SPendingDeletedBase.MarkPendingDelete(model.GetIStandaloneModel(), ctx, userCred, newName)
 		if err != nil {
 			return errors.Wrap(err, "MarkPendingDelete")
 		}
+	}
+	err := db.Metadata.RemoveAll(ctx, model, userCred)
+	if err != nil {
+		return errors.Wrapf(err, "Metadata.RemoveAll")
 	}
 	return nil // DeleteModel(ctx, userCred, model.GetIVirtualModel())
 }

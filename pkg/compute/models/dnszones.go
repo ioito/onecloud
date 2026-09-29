@@ -70,8 +70,31 @@ type SDnsZone struct {
 	db.SExternalizedResourceBase
 	SManagedResourceBase
 
+	NameServers         *api.SNameServers `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional"`
+	OriginalNameServers *api.SNameServers `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional"`
+
 	ZoneType    string `width:"32" charset:"ascii" nullable:"false" list:"domain" create:"domain_required"`
+	Registrar   string `width:"32" charset:"utf8" nullable:"true" list:"domain" create:"domain_optional"`
 	ProductType string `width:"32" charset:"ascii" nullable:"false" list:"domain" create:"domain_optional"`
+}
+
+func (self *SDnsZone) GetUniqValues() jsonutils.JSONObject {
+	return jsonutils.Marshal(map[string]string{"manager_id": self.ManagerId})
+}
+
+func (manager *SDnsZoneManager) FetchUniqValues(ctx context.Context, data jsonutils.JSONObject) jsonutils.JSONObject {
+	managerId, _ := data.GetString("manager_id")
+	return jsonutils.Marshal(map[string]string{"manager_id": managerId})
+}
+
+func (manager *SDnsZoneManager) FilterByUniqValues(q *sqlchemy.SQuery, values jsonutils.JSONObject) *sqlchemy.SQuery {
+	managerId, _ := values.GetString("manager_id")
+	if len(managerId) > 0 {
+		q = q.Equals("manager_id", managerId)
+	} else {
+		q = q.IsNullOrEmpty("manager_id")
+	}
+	return q
 }
 
 // 创建
@@ -95,7 +118,7 @@ func (manager *SDnsZoneManager) ValidateCreateData(
 	}
 	var provider *SCloudprovider = nil
 	if len(input.CloudproviderId) > 0 {
-		providerObj, err := validators.ValidateModel(userCred, CloudproviderManager, &input.CloudproviderId)
+		providerObj, err := validators.ValidateModel(ctx, userCred, CloudproviderManager, &input.CloudproviderId)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +131,7 @@ func (manager *SDnsZoneManager) ValidateCreateData(
 	case cloudprovider.PrivateZone:
 		vpcIds := []string{}
 		for i := range input.VpcIds {
-			vpcObj, err := validators.ValidateModel(userCred, VpcManager, &input.VpcIds[i])
+			vpcObj, err := validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcIds[i])
 			if err != nil {
 				return input, err
 			}
@@ -118,7 +141,7 @@ func (manager *SDnsZoneManager) ValidateCreateData(
 				input.CloudproviderId = vpc.ManagerId
 			}
 			if vpc.ManagerId != input.ManagerId {
-				return nil, httperrors.NewConflictError("conflict cloudprovider %s with vpc %s", input.ManagerId, vpc.Name)
+				return nil, httperrors.NewConflictError("cloud provider %s conflicts with VPC %s", input.ManagerId, vpc.Name)
 			}
 			if len(vpc.ManagerId) > 0 {
 				factory, err := vpc.GetProviderFactory()
@@ -127,7 +150,7 @@ func (manager *SDnsZoneManager) ValidateCreateData(
 				}
 				zoneTypes := factory.GetSupportedDnsZoneTypes()
 				if isIn, _ := utils.InArray(cloudprovider.TDnsZoneType(input.ZoneType), zoneTypes); !isIn && len(zoneTypes) > 0 {
-					return input, httperrors.NewNotSupportedError("Not support %s for vpc %s, supported %s", input.ZoneType, vpc.Name, zoneTypes)
+					return input, httperrors.NewNotSupportedError("zone type %s is not supported for VPC %s; supported: %s", input.ZoneType, vpc.Name, zoneTypes)
 				}
 			}
 			vpcIds = append(vpcIds, vpc.GetId())
@@ -144,10 +167,10 @@ func (manager *SDnsZoneManager) ValidateCreateData(
 		}
 		zoneTypes := factory.GetSupportedDnsZoneTypes()
 		if isIn, _ := utils.InArray(cloudprovider.TDnsZoneType(input.ZoneType), zoneTypes); !isIn && len(zoneTypes) > 0 {
-			return input, httperrors.NewNotSupportedError("Not support %s for account %s, supported %s", input.ZoneType, provider.Name, zoneTypes)
+			return input, httperrors.NewNotSupportedError("zone type %s is not supported for account %s; supported: %s", input.ZoneType, provider.Name, zoneTypes)
 		}
 		if !strings.ContainsRune(input.Name, '.') {
-			return input, httperrors.NewNotSupportedError("top level public domain name %s not support", input.Name)
+			return input, httperrors.NewNotSupportedError("top-level public domain name %s is not supported", input.Name)
 		}
 	default:
 		return input, httperrors.NewInputParameterError("unknown zone type %s", input.ZoneType)
@@ -204,7 +227,7 @@ func (self *SDnsZone) StartDnsZoneCreateTask(ctx context.Context, userCred mccli
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.DNS_ZONE_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DNS_ZONE_STATUS_CREATING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -231,7 +254,7 @@ func (manager *SDnsZoneManager) ListItemFilter(
 	}
 
 	if len(query.VpcId) > 0 {
-		vpc, err := VpcManager.FetchByIdOrName(userCred, query.VpcId)
+		vpc, err := VpcManager.FetchByIdOrName(ctx, userCred, query.VpcId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("vpc", query.VpcId)
@@ -352,7 +375,7 @@ func (self *SDnsZone) StartDnsZoneDeleteTask(ctx context.Context, userCred mccli
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.DNS_ZONE_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DNS_ZONE_STATUS_DELETING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -446,7 +469,7 @@ func (self *SCloudprovider) SyncDnsZones(ctx context.Context, userCred mcclient.
 
 	if !xor {
 		for i := 0; i < len(commondb); i += 1 {
-			err = commondb[i].syncWithDnsZone(ctx, userCred, self, commonext[i])
+			err = commondb[i].SyncWithDnsZone(ctx, userCred, commonext[i])
 			if err != nil {
 				result.UpdateError(err)
 				continue
@@ -497,20 +520,34 @@ func (self *SDnsZone) GetICloudDnsZone(ctx context.Context) (cloudprovider.IClou
 	return provider.GetICloudDnsZoneById(self.ExternalId)
 }
 
-func (self *SDnsZone) syncWithDnsZone(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, ext cloudprovider.ICloudDnsZone) error {
+func (self *SDnsZone) SyncWithDnsZone(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudDnsZone) error {
 	_, err := db.Update(self, func() error {
+		self.ExternalId = ext.GetGlobalId()
 		self.Status = ext.GetStatus()
 		self.ProductType = string(ext.GetDnsProductType())
+		if v, err := ext.GetNameServers(); err == nil {
+			ns := api.SNameServers{}
+			ns = append(ns, v...)
+			self.NameServers = &ns
+		}
+		if v, err := ext.GetOriginalNameServers(); err == nil {
+			ns := api.SNameServers{}
+			ns = append(ns, v...)
+			self.OriginalNameServers = &ns
+		}
+		self.Registrar = ext.GetRegistrar()
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	privider := self.GetCloudprovider()
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
-	if privider != nil {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, self.ManagerId)
+	provider := self.GetCloudprovider()
+	if provider != nil {
+		if account, _ := provider.GetCloudaccount(); account != nil {
+			syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+		}
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 
 	return nil
@@ -525,14 +562,25 @@ func (self *SCloudprovider) newFromCloudDnsZone(ctx context.Context, userCred mc
 	zone.Enabled = tristate.True
 	zone.ZoneType = string(ext.GetZoneType())
 	zone.ProductType = string(ext.GetDnsProductType())
+	if v, err := ext.GetNameServers(); err == nil {
+		ns := api.SNameServers{}
+		ns = append(ns, v...)
+		zone.NameServers = &ns
+	}
+	if v, err := ext.GetOriginalNameServers(); err == nil {
+		ns := api.SNameServers{}
+		ns = append(ns, v...)
+		zone.OriginalNameServers = &ns
+	}
+	zone.Registrar = ext.GetRegistrar()
 	zone.SetModelManager(DnsZoneManager, zone)
 	err := DnsZoneManager.TableSpec().Insert(ctx, zone)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, zone, ext)
-	SyncCloudProject(ctx, userCred, zone, self.GetOwnerId(), ext, self.Id)
+	syncVirtualResourceMetadata(ctx, userCred, zone, ext, false)
+	SyncCloudProject(ctx, userCred, zone, self.GetOwnerId(), ext, self)
 
 	return zone, nil
 }
@@ -551,10 +599,10 @@ func (self *SDnsZone) PerformSyncstatus(ctx context.Context, userCred mcclient.T
 // 添加VPC
 func (self *SDnsZone) PerformAddVpcs(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneAddVpcsInput) (jsonutils.JSONObject, error) {
 	if self.Status != api.DNS_ZONE_STATUS_AVAILABLE {
-		return nil, httperrors.NewInvalidStatusError("dns zone can not uncache in status %s", self.Status)
+		return nil, httperrors.NewInvalidStatusError("cannot add VPCs to DNS zone in status %s", self.Status)
 	}
 	if cloudprovider.TDnsZoneType(self.ZoneType) != cloudprovider.PrivateZone {
-		return nil, httperrors.NewUnsupportOperationError("Only %s support cache for account", cloudprovider.PrivateZone)
+		return nil, httperrors.NewUnsupportOperationError("only %s supports VPC cache for account", cloudprovider.PrivateZone)
 	}
 	vpcs, err := self.GetVpcs()
 	if err != nil {
@@ -570,16 +618,16 @@ func (self *SDnsZone) PerformAddVpcs(ctx context.Context, userCred mcclient.Toke
 	}
 
 	for i := range input.VpcIds {
-		vpcObj, err := validators.ValidateModel(userCred, VpcManager, &input.VpcIds[i])
+		vpcObj, err := validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcIds[i])
 		if err != nil {
 			return nil, err
 		}
 		vpc := vpcObj.(*SVpc)
 		if utils.IsInStringArray(vpc.GetId(), localVpcIds) {
-			return nil, httperrors.NewConflictError("vpc %s has already in this dns zone", input.VpcIds[i])
+			return nil, httperrors.NewConflictError("vpc %s is already in this DNS zone", input.VpcIds[i])
 		}
 		if vpc.ManagerId != self.ManagerId {
-			return nil, httperrors.NewConflictError("vpc %s not same with dns zone account", input.VpcIds[i])
+			return nil, httperrors.NewConflictError("VPC %s does not belong to the same account as the DNS zone", input.VpcIds[i])
 		}
 	}
 	return nil, self.StartDnsZoneAddVpcsTask(ctx, userCred, input.VpcIds, "")
@@ -592,7 +640,7 @@ func (self *SDnsZone) StartDnsZoneAddVpcsTask(ctx context.Context, userCred mccl
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_SYNC_STATUS, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_SYNC_STATUS, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -603,17 +651,17 @@ func (self *SDnsZone) StartDnsZoneRemoveVpcsTask(ctx context.Context, userCred m
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_SYNC_STATUS, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_SYNC_STATUS, "")
 	return task.ScheduleRun(nil)
 }
 
 // 移除VPC
 func (self *SDnsZone) PerformRemoveVpcs(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.DnsZoneRemoveVpcsInput) (jsonutils.JSONObject, error) {
 	if self.Status != api.DNS_ZONE_STATUS_AVAILABLE {
-		return nil, httperrors.NewInvalidStatusError("dns zone can not uncache in status %s", self.Status)
+		return nil, httperrors.NewInvalidStatusError("cannot remove VPCs from DNS zone in status %s", self.Status)
 	}
 	if cloudprovider.TDnsZoneType(self.ZoneType) != cloudprovider.PrivateZone {
-		return nil, httperrors.NewUnsupportOperationError("Only %s support cache for account", cloudprovider.PrivateZone)
+		return nil, httperrors.NewUnsupportOperationError("only %s supports VPC cache for account", cloudprovider.PrivateZone)
 	}
 	vpcs, err := self.GetVpcs()
 	if err != nil {
@@ -673,6 +721,15 @@ func (manager *SDnsZoneManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fiel
 		return q, nil
 	}
 
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SDnsZoneManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
 	return q, httperrors.ErrNotFound
 }
 

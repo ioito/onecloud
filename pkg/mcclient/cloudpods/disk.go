@@ -28,8 +28,7 @@ import (
 )
 
 type SDisk struct {
-	multicloud.SVirtualResourceBase
-	multicloud.SBillingBase
+	multicloud.SDisk
 	CloudpodsTags
 	region *SRegion
 
@@ -123,6 +122,10 @@ func (self *SDisk) GetCacheMode() string {
 	if self.guestDisk != nil {
 		return self.guestDisk.CacheMode
 	}
+	return ""
+}
+
+func (self *SDisk) GetPreallocation() string {
 	return ""
 }
 

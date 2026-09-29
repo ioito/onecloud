@@ -40,8 +40,8 @@ type SStoragecacheResourceBaseManager struct {
 	SManagedResourceBaseManager
 }
 
-func ValidateStoragecacheResourceInput(userCred mcclient.TokenCredential, query api.StoragecacheResourceInput) (*SStoragecache, api.StoragecacheResourceInput, error) {
-	scObj, err := StoragecacheManager.FetchByIdOrName(userCred, query.StoragecacheId)
+func ValidateStoragecacheResourceInput(ctx context.Context, userCred mcclient.TokenCredential, query api.StoragecacheResourceInput) (*SStoragecache, api.StoragecacheResourceInput, error) {
+	scObj, err := StoragecacheManager.FetchByIdOrName(ctx, userCred, query.StoragecacheId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, query, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", StorageManager.Keyword(), query.StoragecacheId)
@@ -87,6 +87,51 @@ func (manager *SStoragecacheResourceBaseManager) FetchCustomizeColumns(
 		return nil
 	}
 
+	storageMap := make(map[string][]api.StorageInfo, 0)
+	{
+		q := StorageManager.Query("id", "name", "storage_type", "medium_type", "storagecache_id", "zone_id").In("storagecache_id", storagecacheIds)
+		zones := ZoneManager.Query().SubQuery()
+		q = q.Join(zones, sqlchemy.Equals(q.Field("zone_id"), zones.Field("id")))
+		q = q.AppendField(zones.Field("name").Label("zone"))
+
+		storages := make([]struct {
+			api.StorageInfo
+			StoragecacheId string `json:"storagecache_id"`
+		}, 0)
+		err := q.All(&storages)
+		if err != nil {
+			log.Errorf("Storage Info Query query fail %s", err)
+		} else {
+			for _, si := range storages {
+				storageMap[si.StoragecacheId] = append(storageMap[si.StoragecacheId], si.StorageInfo)
+			}
+		}
+	}
+
+	hostMap := make(map[string][]api.HostInfo, 0)
+	{
+		q := HostManager.Query("id", "name", "sn", "access_ip", "public_ip", "access_mac", "status", "host_status", "enabled", "resource_type", "billing_type", "host_type")
+		hostStorages := HoststorageManager.Query().SubQuery()
+		storages := StorageManager.Query().In("storagecache_id", storagecacheIds).SubQuery()
+		q = q.Join(hostStorages, sqlchemy.Equals(q.Field("id"), hostStorages.Field("host_id")))
+		q = q.Join(storages, sqlchemy.Equals(hostStorages.Field("storage_id"), storages.Field("id")))
+
+		q = q.AppendField(storages.Field("storagecache_id"))
+
+		hosts := make([]struct {
+			api.HostInfo
+			StoragecacheId string `json:"storagecache_id"`
+		}, 0)
+		err := q.All(&hosts)
+		if err != nil {
+			log.Errorf("Storage Info Query query fail %s", err)
+		} else {
+			for _, si := range hosts {
+				hostMap[si.StoragecacheId] = append(hostMap[si.StoragecacheId], si.HostInfo)
+			}
+		}
+	}
+
 	managerList := make([]interface{}, len(rows))
 
 	for i := range rows {
@@ -95,6 +140,18 @@ func (manager *SStoragecacheResourceBaseManager) FetchCustomizeColumns(
 			storagecache := storagecaches[storagecacheIds[i]]
 			rows[i].Storagecache = storagecache.Name
 			rows[i].ManagerId = storagecache.ManagerId
+		}
+		if info, ok := storageMap[storagecacheIds[i]]; ok {
+			rows[i].StorageInfo = info
+			for j := range info {
+				rows[i].Storages = append(rows[i].Storages, info[j].Name)
+			}
+		}
+		if info, ok := hostMap[storagecacheIds[i]]; ok {
+			rows[i].HostInfo = info
+			for j := range info {
+				rows[i].Hosts = append(rows[i].Hosts, info[j].Name)
+			}
 		}
 		managerList[i] = &SManagedResourceBase{rows[i].ManagerId}
 	}
@@ -114,7 +171,7 @@ func (manager *SStoragecacheResourceBaseManager) ListItemFilter(
 	query api.StoragecacheFilterListInput,
 ) (*sqlchemy.SQuery, error) {
 	if len(query.StoragecacheId) > 0 {
-		scObj, _, err := ValidateStoragecacheResourceInput(userCred, query.StoragecacheResourceInput)
+		scObj, _, err := ValidateStoragecacheResourceInput(ctx, userCred, query.StoragecacheResourceInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "ValidateStoragecacheResourceInput")
 		}
@@ -143,6 +200,15 @@ func (manager *SStoragecacheResourceBaseManager) QueryDistinctExtraField(q *sqlc
 		storages := StorageManager.Query("id", "manager_id").SubQuery()
 		q = q.LeftJoin(storages, sqlchemy.Equals(q.Field("storage_id"), storages.Field("id")))
 		return manager.SManagedResourceBaseManager.QueryDistinctExtraField(q, field)
+	}
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SStoragecacheResourceBaseManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
 	}
 	return q, httperrors.ErrNotFound
 }

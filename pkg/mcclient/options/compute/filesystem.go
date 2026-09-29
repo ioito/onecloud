@@ -42,7 +42,7 @@ func (opts *FileSystemIdOption) Params() (jsonutils.JSONObject, error) {
 
 type FileSystemCreateOptions struct {
 	NAME           string
-	Protocol       string `choices:"NFS|SMB|CPFS"`
+	Protocol       string `choices:"NFS|SMB|CPFS|CephFS"`
 	FileSystemType string
 	Capacity       int64  `json:"capacity"`
 	NetworkId      string `json:"network_id"`
@@ -52,5 +52,15 @@ type FileSystemCreateOptions struct {
 }
 
 func (opts *FileSystemCreateOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
+type FileSystemSetQuotaOption struct {
+	FileSystemIdOption
+	MaxGb    int64
+	MaxFiles int64
+}
+
+func (opts *FileSystemSetQuotaOption) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(opts), nil
 }

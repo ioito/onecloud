@@ -23,7 +23,9 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	baremetalapi "yunion.io/x/onecloud/pkg/apis/compute/baremetal"
 	o "yunion.io/x/onecloud/pkg/baremetal/options"
+	"yunion.io/x/onecloud/pkg/baremetal/profiles"
 	"yunion.io/x/onecloud/pkg/baremetal/utils/ipmitool"
 	"yunion.io/x/onecloud/pkg/cloudcommon/types"
 	"yunion.io/x/onecloud/pkg/httperrors"
@@ -68,7 +70,9 @@ func (self *SBaremetalIpmiProbeTask) DoIpmiProbe(ctx context.Context, args inter
 	if ipmiInfo.Password == "" {
 		return errors.Error("empty IPMI password")
 	}
-	redfishCli := redfish.NewRedfishDriver(ctx, "https://"+ipmiInfo.IpAddr, ipmiInfo.Username, ipmiInfo.Password, false)
+	// FIXME: 通过 redfish 探测出来的管理口网卡地址可能和 PXE 启动的网卡地址不一致
+	// 所以暂时注释掉这个探测逻辑，使用 doRawIpmiProbe
+	/* redfishCli := redfish.NewRedfishDriver(ctx, "https://"+ipmiInfo.IpAddr, ipmiInfo.Username, ipmiInfo.Password, false)
 	if redfishCli != nil {
 		redfishSuccess, err := self.doRedfishIpmiProbe(ctx, redfishCli)
 		if err == nil {
@@ -79,9 +83,12 @@ func (self *SBaremetalIpmiProbeTask) DoIpmiProbe(ctx context.Context, args inter
 			return errors.Wrap(err, "doRedfishIpmiProbe")
 		}
 		// else, redfish call fails, try IPMI
+	} */
+	log.Warningf("BMC not redfish-compatible for IPMI: %s, use raw probe", ipmiInfo.IpAddr)
+	ipmiTool, err := ipmitool.NewLanPlusIPMI(ipmiInfo.IpAddr, ipmiInfo.Username, ipmiInfo.Password)
+	if err != nil {
+		return errors.Wrap(err, "NewLanPlusIPMI")
 	}
-	log.Warningf("BMC not redfish-compatible")
-	ipmiTool := ipmitool.NewLanPlusIPMI(ipmiInfo.IpAddr, ipmiInfo.Username, ipmiInfo.Password)
 	return self.doRawIpmiProbe(ctx, ipmiTool)
 }
 
@@ -95,7 +102,7 @@ func (self *SBaremetalIpmiProbeTask) doRedfishIpmiProbe(ctx context.Context, drv
 	if len(confs) == 0 {
 		return false, errors.Wrap(httperrors.ErrNotFound, "no IPMI lan")
 	}
-	err = self.sendIpmiNicInfo(&confs[0])
+	err = self.sendIpmiNicInfo(ctx, &confs[0])
 	if err != nil {
 		return false, errors.Wrap(err, "self.sendIpmiNicInfo")
 	}
@@ -141,18 +148,18 @@ func (self *SBaremetalIpmiProbeTask) doRedfishIpmiProbe(ctx context.Context, drv
 	for i := range sysInfo.EthernetNICs {
 		mac, err := net.ParseMAC(sysInfo.EthernetNICs[i])
 		if err == nil {
-			err = self.sendNicInfo(i, mac)
+			err = self.sendNicInfo(ctx, i, mac)
 			if err != nil {
 				return true, errors.Wrapf(err, "sendNicInfo %d %s", i, mac)
 			}
 		}
 	}
-	self.Baremetal.SyncStatus("", "Probe Redfish finished")
+	self.Baremetal.SyncStatus(ctx, "", "Probe Redfish finished")
 	SetTaskComplete(self, nil)
 	return true, nil
 }
 
-func (self *SBaremetalIpmiProbeTask) sendIpmiNicInfo(lanConf *types.SIPMILanConfig) error {
+func (self *SBaremetalIpmiProbeTask) sendIpmiNicInfo(ctx context.Context, lanConf *types.SIPMILanConfig) error {
 	speed := lanConf.SpeedMbps
 	if speed <= 0 {
 		speed = 100
@@ -164,18 +171,18 @@ func (self *SBaremetalIpmiProbeTask) sendIpmiNicInfo(lanConf *types.SIPMILanConf
 		Speed: speed,
 		Mtu:   1500,
 	}
-	err := self.Baremetal.SendNicInfo(ipmiNic, -1, api.NIC_TYPE_IPMI, true, lanConf.IPAddr, true)
+	err := self.Baremetal.SendNicInfo(ctx, ipmiNic, -1, api.NIC_TYPE_IPMI, true, lanConf.IPAddr, true)
 	if err != nil {
 		return errors.Wrap(err, "SendNicInfo")
 	}
 	return nil
 }
 
-func (self *SBaremetalIpmiProbeTask) sendNicInfo(index int, mac net.HardwareAddr) error {
+func (self *SBaremetalIpmiProbeTask) sendNicInfo(ctx context.Context, index int, mac net.HardwareAddr) error {
 	nicInfo := &types.SNicDevInfo{
 		Mac: mac,
 	}
-	err := self.Baremetal.SendNicInfo(nicInfo, index, "", false, "", false)
+	err := self.Baremetal.SendNicInfo(ctx, nicInfo, index, "", false, "", false)
 	if err != nil {
 		return errors.Wrap(err, "SendNicInfo")
 	}
@@ -184,27 +191,40 @@ func (self *SBaremetalIpmiProbeTask) sendNicInfo(index int, mac net.HardwareAddr
 
 func (self *SBaremetalIpmiProbeTask) doRawIpmiProbe(ctx context.Context, cli ipmitool.IPMIExecutor) error {
 	sysInfo, err := ipmitool.GetSysInfo(cli)
+	var profile *baremetalapi.BaremetalProfileSpec
 	if err != nil {
 		// ignore error for qemu
 		log.Errorf("ipmitool.GetSysInfo error %s", err)
-	}
-	guid := ipmitool.GetSysGuid(cli)
-	var conf *types.SIPMILanConfig
-	var channel int
-	for _, lanChannel := range ipmitool.GetLanChannels(sysInfo) {
-		conf, err = ipmitool.GetLanConfig(cli, lanChannel)
+	} else {
+		profile, err = profiles.GetProfile(ctx, sysInfo)
 		if err != nil {
-			// ignore error
-			log.Errorf("ipmitool.GetLanConfig for channel %d fail: %s", lanChannel, err)
-		} else {
-			channel = lanChannel
-			break
+			return errors.Wrap(err, "GetProfile")
 		}
 	}
-	if conf == nil {
-		return errors.Wrap(httperrors.ErrNotFound, "no IPMI lan")
+	guid := ipmitool.GetSysGuid(cli)
+	var preferredChannels []uint8
+	if profile != nil {
+		preferredChannels = profile.LanChannels
 	}
-	err = self.sendIpmiNicInfo(conf)
+	ipmiInfo := self.Baremetal.GetRawIPMIConfig()
+	if ipmiInfo == nil {
+		ipmiInfo = &types.SIPMIInfo{}
+	}
+	discovery, err := ipmitool.DiscoverLanConfig(cli, preferredChannels, ipmitool.LanConfigSelectionOptions{
+		ConnectedIP:         ipmiInfo.IpAddr,
+		PersistedChannel:    ipmiInfo.LanChannel,
+		RequireConfiguredIP: true,
+		AllowFallback:       profile == nil,
+	})
+	if err != nil {
+		return errors.Wrapf(httperrors.ErrNotFound, "no IPMI lan: %s", err)
+	}
+	if discovery == nil || discovery.Selected == nil || discovery.Selected.Config == nil {
+		return errors.Wrap(httperrors.ErrNotFound, "no IPMI lan selected")
+	}
+	conf := discovery.Selected.Config
+	channel := discovery.Selected.Channel
+	err = self.sendIpmiNicInfo(ctx, conf)
 	if err != nil {
 		return errors.Wrap(err, "self.sendIpmiNicInfo")
 	}
@@ -226,23 +246,22 @@ func (self *SBaremetalIpmiProbeTask) doRawIpmiProbe(ctx context.Context, cli ipm
 		updateInfo["uuid"] = guid
 	}
 	updateInfo["is_baremetal"] = true
-	ipmiInfo := self.Baremetal.GetRawIPMIConfig()
-	if ipmiInfo == nil {
-		ipmiInfo = &types.SIPMIInfo{}
-	}
 	ipmiInfo.Present = true
 	ipmiInfo.Verified = true
 	ipmiInfo.RedfishApi = false
 	ipmiInfo.CdromBoot = false
 	ipmiInfo.PxeBoot = o.Options.EnablePxeBoot
 	ipmiInfo.LanChannel = channel
+	if lanPlus, ok := cli.(*ipmitool.LanPlusIPMI); ok {
+		ipmiInfo.CipherSuite = lanPlus.GetCipherSuite()
+	}
 	updateData := jsonutils.Marshal(updateInfo)
 	updateData.(*jsonutils.JSONDict).Update(ipmiInfo.ToPrepareParams())
 	_, err = modules.Hosts.Update(self.Baremetal.GetClientSession(), self.Baremetal.GetId(), updateData)
 	if err != nil {
 		return errors.Wrap(err, "modules.Hosts.Update")
 	}
-	self.Baremetal.SyncStatus("", "Probie IPMI finished")
+	self.Baremetal.SyncStatus(ctx, "", "Probie IPMI finished")
 	SetTaskComplete(self, nil)
 	return nil
 }

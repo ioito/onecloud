@@ -17,14 +17,15 @@ package models
 import (
 	"context"
 	"fmt"
-	"runtime/debug"
+	"path"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
-
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/onecloud/pkg/apis/compute"
 	schedapi "yunion.io/x/onecloud/pkg/apis/scheduler"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
@@ -35,14 +36,20 @@ import (
 var HostPendingUsageManager *SHostPendingUsageManager
 
 type SHostPendingUsageManager struct {
-	store *SHostMemoryPendingUsageStore
+	store              *SHostMemoryPendingUsageStore
+	reloadAllStartTime time.Time    // 记录 ReloadAll 开始时间
+	reloadStartTime    time.Time    // 记录部分 Reload 开始时间
+	reloadAllLock      sync.RWMutex // 保护 reloadAllStartTime
+	reloadLock         sync.RWMutex // 保护 reloadStartTime
 }
 
 func init() {
 	pendingStore := NewHostMemoryPendingUsageStore()
 
 	HostPendingUsageManager = &SHostPendingUsageManager{
-		store: pendingStore,
+		store:              pendingStore,
+		reloadAllStartTime: time.Time{}, // 初始化为零值
+		reloadStartTime:    time.Time{}, // 初始化为零值
 	}
 }
 
@@ -50,18 +57,18 @@ func (m *SHostPendingUsageManager) Keyword() string {
 	return "pending_usage_manager"
 }
 
-func (m *SHostPendingUsageManager) newSessionUsage(req *api.SchedInfo, hostId string) *SessionPendingUsage {
-	su := NewSessionUsage(req.SessionId, hostId)
-	su.Usage = NewPendingUsageBySchedInfo(hostId, req)
+func (m *SHostPendingUsageManager) newSessionUsage(req *api.SchedInfo, hostId string, candidate *schedapi.CandidateResource) *SessionPendingUsage {
+	usage := NewPendingUsageBySchedInfo(hostId, req, candidate)
+	su := NewSessionUsage(req.SessionId, hostId, usage)
 	return su
-}
-
-func (m *SHostPendingUsageManager) newPendingUsage(hostId string) *SPendingUsage {
-	return NewPendingUsageBySchedInfo(hostId, nil)
 }
 
 func (m *SHostPendingUsageManager) GetPendingUsage(hostId string) (*SPendingUsage, error) {
 	return m.getPendingUsage(hostId)
+}
+
+func (m *SHostPendingUsageManager) GetNetPendingUsage(netId string) int {
+	return m.store.GetNetPendingUsage(netId)
 }
 
 func (m *SHostPendingUsageManager) getPendingUsage(hostId string) (*SPendingUsage, error) {
@@ -76,32 +83,35 @@ func (m *SHostPendingUsageManager) GetSessionUsage(sessionId, hostId string) (*S
 	return m.store.GetSessionUsage(sessionId, hostId)
 }
 
-func (m *SHostPendingUsageManager) AddPendingUsage(req *api.SchedInfo, candidate *schedapi.CandidateResource) {
+func (m *SHostPendingUsageManager) AddPendingUsage(guestId string, req *api.SchedInfo, candidate *schedapi.CandidateResource) {
 	hostId := candidate.HostId
+	log.Infof("[PendingUsage] AddPendingUsage: sessionId=%s, hostId=%s, memory=%dMB, cpu=%d",
+		req.SessionId, hostId, req.Memory, req.Ncpu)
 
 	sessionUsage, _ := m.GetSessionUsage(req.SessionId, hostId)
 	if sessionUsage == nil {
-		sessionUsage = m.newSessionUsage(req, hostId)
-		sessionUsage.StartTimer()
+		sessionUsage = m.newSessionUsage(req, hostId, candidate)
+		log.Infof("[PendingUsage] Created new SessionPendingUsage: %s", sessionUsage)
 	}
-	m.addSessionUsage(candidate.HostId, sessionUsage)
+	m.addSessionUsage(candidate.HostId, guestId, sessionUsage)
 	if candidate.BackupCandidate != nil {
-		m.AddPendingUsage(req, candidate.BackupCandidate)
+		m.AddPendingUsage(guestId, req, candidate.BackupCandidate)
 	}
 }
 
 // addSessionUsage add pending usage and session usage
-func (m *SHostPendingUsageManager) addSessionUsage(hostId string, usage *SessionPendingUsage) {
+func (m *SHostPendingUsageManager) addSessionUsage(hostId, guestId string, usage *SessionPendingUsage) {
 	ctx := context.Background()
 	lockman.LockClass(ctx, m, hostId)
 	defer lockman.ReleaseClass(ctx, m, hostId)
 
 	pendingUsage, _ := m.getPendingUsage(hostId)
 	if pendingUsage == nil {
-		pendingUsage = m.newPendingUsage(hostId)
+		pendingUsage = NewPendingUsageBySchedInfo(hostId, nil, nil)
 	}
-	pendingUsage.Add(usage.Usage)
-	usage.AddCount()
+	// add pending usage
+	pendingUsage.Add(usage.Usage, guestId)
+	usage.AddCount(guestId)
 	m.store.SetSessionUsage(usage.SessionId, hostId, usage)
 	m.store.SetPendingUsage(hostId, pendingUsage)
 }
@@ -118,14 +128,99 @@ func (m *SHostPendingUsageManager) CancelPendingUsage(hostId string, su *Session
 	if su == nil {
 		return nil
 	}
+
+	oldMemory := pendingUsage.Memory
+	oldCpu := pendingUsage.Cpu
 	pendingUsage.Sub(su.Usage)
 	m.store.SetPendingUsage(hostId, pendingUsage)
 	su.SubCount()
+
+	log.Infof("[PendingUsage] CancelPendingUsage: %s, host %s pending usage memory: %d->%dMB, cpu: %d->%d",
+		su, hostId, oldMemory, pendingUsage.Memory, oldCpu, pendingUsage.Cpu)
 	return nil
 }
 
 func (m *SHostPendingUsageManager) DeleteSessionUsage(usage *SessionPendingUsage) {
 	m.store.DeleteSessionUsage(usage)
+}
+
+// GCExpiredSessionUsages releases session pending usage that has lived longer than ttl.
+// This is a safety net to avoid leaked pending usages.
+func (m *SHostPendingUsageManager) GCExpiredSessionUsages(ttl time.Duration) int {
+	if ttl <= 0 {
+		return 0
+	}
+	now := time.Now()
+	expired := make([]*SessionPendingUsage, 0)
+
+	m.store.RangeSessionUsages(func(su *SessionPendingUsage) bool {
+		if su == nil {
+			return true
+		}
+		if now.Sub(su.CreatedAt) > ttl {
+			expired = append(expired, su)
+		}
+		return true
+	})
+
+	cleared := 0
+	for _, su := range expired {
+		hostId := su.Usage.HostId
+		// best-effort cancel + delete
+		_ = m.CancelPendingUsage(hostId, su)
+		m.DeleteSessionUsage(su)
+		cleared++
+		log.Warningf("[PendingUsage] GCExpiredSessionUsage cleared: ttl=%v, now=%v, %s", ttl, now, su)
+	}
+	return cleared
+}
+
+// SetReloadStartTime marks the start of a partial reload operation
+// This should be called before Reload to protect pending usage added during reload
+func (m *SHostPendingUsageManager) SetReloadStartTime() {
+	m.reloadLock.Lock()
+	defer m.reloadLock.Unlock()
+	m.reloadStartTime = time.Now()
+	log.Infof("[PendingUsage] SetReloadStartTime: cutoff time set to %v", m.reloadStartTime)
+}
+
+// GetReloadStartTime returns the cutoff time for partial reload
+func (m *SHostPendingUsageManager) GetReloadStartTime() time.Time {
+	m.reloadLock.RLock()
+	defer m.reloadLock.RUnlock()
+	return m.reloadStartTime
+}
+
+// GetStore returns the underlying store for direct access
+func (m *SHostPendingUsageManager) GetStore() *SHostMemoryPendingUsageStore {
+	return m.store
+}
+
+// SetReloadAllStartTime marks the start of a full reload operation
+// This should be called before ReloadAll to protect pending usage added during reload
+func (m *SHostPendingUsageManager) SetReloadAllStartTime() {
+	m.reloadAllLock.Lock()
+	defer m.reloadAllLock.Unlock()
+	m.reloadAllStartTime = time.Now()
+	log.Infof("[PendingUsage] SetReloadAllStartTime: cutoff time set to %v", m.reloadAllStartTime)
+}
+
+// ClearAllPendingUsage clears all pending usage created before the last ReloadAll start
+// This is called when all hosts are fully reloaded
+func (m *SHostPendingUsageManager) ClearAllPendingUsage() {
+	m.reloadAllLock.RLock()
+	cutoffTime := m.reloadAllStartTime
+	m.reloadAllLock.RUnlock()
+
+	if cutoffTime.IsZero() {
+		// No ReloadAll has been started, clear all
+		log.Warningf("[PendingUsage] ClearAllPendingUsage: skipping clear all (no cutoff time)")
+	} else {
+		// Only clear pending usage created before ReloadAll started
+		log.Infof("[PendingUsage] ClearAllPendingUsage: clearing created before %v", cutoffTime)
+		m.store.clearAllPendingUsageBefore(cutoffTime)
+		log.Infof("[PendingUsage] Cleared pending usage created before %v", cutoffTime)
+	}
 }
 
 type SHostMemoryPendingUsageStore struct {
@@ -136,6 +231,16 @@ func NewHostMemoryPendingUsageStore() *SHostMemoryPendingUsageStore {
 	return &SHostMemoryPendingUsageStore{
 		store: new(sync.Map),
 	}
+}
+
+func (s *SHostMemoryPendingUsageStore) RangeSessionUsages(f func(*SessionPendingUsage) bool) {
+	s.store.Range(func(_, v interface{}) bool {
+		su, ok := v.(*SessionPendingUsage)
+		if !ok || su == nil {
+			return true
+		}
+		return f(su)
+	})
 }
 
 func (self *SHostMemoryPendingUsageStore) sessionUsageKey(sid, hostId string) string {
@@ -177,23 +282,120 @@ func (self *SHostMemoryPendingUsageStore) DeleteSessionUsage(usage *SessionPendi
 	self.store.Delete(self.sessionUsageKey(usage.SessionId, usage.Usage.HostId))
 }
 
+func (self *SHostMemoryPendingUsageStore) GetNetPendingUsage(id string) int {
+	total := 0
+	self.store.Range(func(hostId, usageObj interface{}) bool {
+		usage, ok := usageObj.(*SPendingUsage)
+		if ok {
+			total += usage.NetUsage.Get(id)
+		}
+		return true
+	})
+	return total
+}
+
+// clearPendingUsageBefore is the common implementation for clearing pending usage based on cutoffTime
+func (self *SHostMemoryPendingUsageStore) clearPendingUsageBefore(
+	shouldDelete func(*SessionPendingUsage) bool,
+	logPrefix string,
+	cutoffTime time.Time,
+) {
+	sessionKeysToDelete := make([]string, 0)
+	hostIdsToDelete := make(map[string]bool)
+	sessionUsagesToDelete := make(map[string]*SessionPendingUsage) // key -> sessionUsage
+
+	// First pass: collect session usages to delete
+	self.store.Range(func(key, value interface{}) bool {
+		keyStr, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		// Check if it's a session usage
+		if su, ok := value.(*SessionPendingUsage); ok {
+			if shouldDelete(su) {
+				sessionKeysToDelete = append(sessionKeysToDelete, keyStr)
+				hostIdsToDelete[su.Usage.HostId] = true
+				sessionUsagesToDelete[keyStr] = su
+			}
+		}
+		return true
+	})
+
+	log.Infof("[PendingUsage] %s: found %d session usages to delete (cutoff=%v)",
+		logPrefix, len(sessionKeysToDelete), cutoffTime)
+
+	// Delete session usages and update pending usage
+	deletedCount := 0
+	for _, key := range sessionKeysToDelete {
+		su := sessionUsagesToDelete[key]
+		if su != nil {
+			hostId := su.Usage.HostId
+			// Update pending usage by subtracting this session usage
+			if pendingUsage, err := self.GetPendingUsage(hostId); err == nil {
+				oldMemory := pendingUsage.Memory
+				oldCpu := pendingUsage.Cpu
+				pendingUsage.Sub(su.Usage)
+				if pendingUsage.IsEmpty() {
+					self.store.Delete(hostId)
+					log.Infof("[PendingUsage] Deleted empty pending usage for host %s", hostId)
+				} else {
+					self.store.Store(hostId, pendingUsage)
+					log.Debugf("[PendingUsage] Updated pending usage for host %s: memory %d->%dMB, cpu %d->%d",
+						hostId, oldMemory, pendingUsage.Memory, oldCpu, pendingUsage.Cpu)
+				}
+			}
+		}
+		// Delete session usage
+		self.store.Delete(key)
+		deletedCount++
+	}
+}
+
+// ClearHostPendingUsageBefore clears pending usage for specified hosts created before cutoffTime
+func (self *SHostMemoryPendingUsageStore) ClearHostPendingUsageBefore(hostIds []string, cutoffTime time.Time) {
+	hostIdSet := make(map[string]bool)
+	for _, hostId := range hostIds {
+		hostIdSet[hostId] = true
+	}
+
+	self.clearPendingUsageBefore(
+		func(su *SessionPendingUsage) bool {
+			return hostIdSet[su.Usage.HostId] && su.CreatedAt.Before(cutoffTime)
+		},
+		fmt.Sprintf("ClearHostPendingUsageBefore: hosts %v", hostIds),
+		cutoffTime,
+	)
+}
+
+// clearAllPendingUsageBefore clears pending usage and session usages created before cutoffTime
+func (self *SHostMemoryPendingUsageStore) clearAllPendingUsageBefore(cutoffTime time.Time) {
+	self.clearPendingUsageBefore(
+		func(su *SessionPendingUsage) bool {
+			return su.CreatedAt.Before(cutoffTime)
+		},
+		"clearAllPendingUsageBefore",
+		cutoffTime,
+	)
+}
+
 type SessionPendingUsage struct {
 	HostId    string
 	SessionId string
 	Usage     *SPendingUsage
 	countLock *sync.Mutex
 	count     int
-	cancelCh  chan string
+	CreatedAt time.Time // 记录创建时间，用于 ReloadAll 时判断是否应该清空
 }
 
-func NewSessionUsage(sid, hostId string) *SessionPendingUsage {
+func NewSessionUsage(sid, hostId string, usage *SPendingUsage) *SessionPendingUsage {
 	su := &SessionPendingUsage{
 		HostId:    hostId,
 		SessionId: sid,
-		Usage:     NewPendingUsageBySchedInfo(hostId, nil),
+		Usage:     usage,
 		count:     0,
 		countLock: new(sync.Mutex),
-		cancelCh:  make(chan string),
+		CreatedAt: time.Now(), // 记录创建时间
 	}
 	return su
 }
@@ -202,16 +404,29 @@ func (su *SessionPendingUsage) GetHostId() string {
 	return su.Usage.HostId
 }
 
-func (su *SessionPendingUsage) AddCount() {
+func (su *SessionPendingUsage) AddCount(guestId string) {
 	su.countLock.Lock()
 	defer su.countLock.Unlock()
 	su.count++
+	su.Usage.PendingGuestIds[guestId] = struct{}{}
 }
 
 func (su *SessionPendingUsage) SubCount() {
 	su.countLock.Lock()
 	defer su.countLock.Unlock()
 	su.count--
+	for guestId, _ := range su.Usage.PendingGuestIds {
+		delete(su.Usage.PendingGuestIds, guestId)
+		break
+	}
+}
+
+func (su *SessionPendingUsage) String() string {
+	if su == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("SessionPendingUsage{sessionId=%s, hostId=%s, count=%d, createdAt=%v}: %s",
+		su.SessionId, su.HostId, su.count, su.CreatedAt, jsonutils.Marshal(su.Usage.ToMap()))
 }
 
 type SResourcePendingUsage struct {
@@ -290,32 +505,75 @@ func (u *SResourcePendingUsage) IsEmpty() bool {
 }
 
 type SPendingUsage struct {
-	HostId         string
-	Cpu            int
-	Memory         int
-	IsolatedDevice int
+	HostId string
+	Cpu    int
+	CpuPin map[int]int
+	Memory int
+
+	PendingGuestIds map[string]struct{}
+
+	// nodeId: memSizeMB
+	NumaMemPin     map[int]int
+	IsolatedDevice *SResourcePendingUsage
 	DiskUsage      *SResourcePendingUsage
 	NetUsage       *SResourcePendingUsage
 	// Lock is not need here
 	InstanceGroupUsage map[string]*api.CandidateGroup
 }
 
-func NewPendingUsageBySchedInfo(hostId string, req *api.SchedInfo) *SPendingUsage {
+func NewPendingUsageBySchedInfo(hostId string, req *api.SchedInfo, candidate *schedapi.CandidateResource) *SPendingUsage {
 	u := &SPendingUsage{
-		HostId:    hostId,
-		DiskUsage: NewResourcePendingUsage(nil),
-		NetUsage:  NewResourcePendingUsage(nil),
+		HostId:          hostId,
+		DiskUsage:       NewResourcePendingUsage(nil),
+		NetUsage:        NewResourcePendingUsage(nil),
+		IsolatedDevice:  NewResourcePendingUsage(nil),
+		PendingGuestIds: make(map[string]struct{}),
 	}
 
 	// group init
 	u.InstanceGroupUsage = make(map[string]*api.CandidateGroup)
+	u.CpuPin = make(map[int]int)
+	u.NumaMemPin = make(map[int]int)
 
 	if req == nil {
 		return u
 	}
 	u.Cpu = req.Ncpu
 	u.Memory = req.Memory
-	u.IsolatedDevice = len(req.IsolatedDevices)
+
+	if candidate != nil && len(candidate.CpuNumaPin) > 0 {
+		for _, cpuNumaPin := range candidate.CpuNumaPin {
+			if cpuNumaPin.MemSizeMB != nil {
+				if v, ok := u.NumaMemPin[cpuNumaPin.NodeId]; ok {
+					u.NumaMemPin[cpuNumaPin.NodeId] = v + *cpuNumaPin.MemSizeMB
+				} else {
+					u.NumaMemPin[cpuNumaPin.NodeId] = *cpuNumaPin.MemSizeMB
+				}
+			}
+
+			for i := range cpuNumaPin.CpuPin {
+				if v, ok := u.CpuPin[cpuNumaPin.CpuPin[i]]; ok {
+					u.CpuPin[cpuNumaPin.CpuPin[i]] = v + 1
+				} else {
+					u.CpuPin[cpuNumaPin.CpuPin[i]] = 1
+				}
+			}
+		}
+	}
+
+	for _, dev := range req.IsolatedDevices {
+		devType := dev.DevType
+		sharingMode := dev.SharingMode
+		pendingKey := path.Join(devType, sharingMode)
+		if sharingMode == compute.DEVICE_SHARING_MODE_HAMI {
+			oSize := u.IsolatedDevice.Get(pendingKey)
+			size := dev.MemoryRequest
+			u.IsolatedDevice.Set(pendingKey, oSize+size)
+		} else {
+			oCnt := u.IsolatedDevice.Get(pendingKey)
+			u.IsolatedDevice.Set(pendingKey, oCnt+1)
+		}
+	}
 
 	for _, disk := range req.Disks {
 		backend := disk.Backend
@@ -324,13 +582,27 @@ func NewPendingUsageBySchedInfo(hostId string, req *api.SchedInfo) *SPendingUsag
 		u.DiskUsage.Set(backend, osize+size)
 	}
 
-	for _, net := range req.Networks {
-		id := net.Network
-		if id == "" {
-			continue
+	if candidate != nil && len(candidate.Nets) > 0 {
+		for _, net := range candidate.Nets {
+			// 只对建议 network_id 为1个的时候设置 pending_usage
+			// 多个的情况下只有交给 region 那边自己判断
+			// 这里只是尽让调度器提前判断出子网是否空闲 ip
+			if len(net.NetworkIds) != 1 {
+				continue
+			}
+			id := net.NetworkIds[0]
+			ocount := u.NetUsage.Get(id)
+			u.NetUsage.Set(id, ocount+1)
 		}
-		ocount := u.NetUsage.Get(id)
-		u.NetUsage.Set(id, ocount+1)
+	} else {
+		for _, net := range req.Networks {
+			id := net.Network
+			if id == "" {
+				continue
+			}
+			ocount := u.NetUsage.Get(id)
+			u.NetUsage.Set(id, ocount+1)
+		}
 	}
 
 	// group add
@@ -352,17 +624,43 @@ func (self *SPendingUsage) ToMap() map[string]interface{} {
 	return map[string]interface{}{
 		"cpu":             self.Cpu,
 		"memory":          self.Memory,
-		"isolated_device": self.IsolatedDevice,
+		"isolated_device": self.IsolatedDevice.ToMap(),
 		"disk":            self.DiskUsage.ToMap(),
 		"net":             self.NetUsage.ToMap(),
 		"instance_groups": self.InstanceGroupUsage,
 	}
 }
 
-func (self *SPendingUsage) Add(sUsage *SPendingUsage) {
+func (self *SPendingUsage) Add(sUsage *SPendingUsage, addGuestId string) {
 	self.Cpu = self.Cpu + sUsage.Cpu
+	for k, v1 := range sUsage.CpuPin {
+		if v2, ok := self.CpuPin[k]; ok {
+			self.CpuPin[k] = v1 + v2
+		} else {
+			self.CpuPin[k] = v1
+		}
+	}
+
+	for guestId := range sUsage.PendingGuestIds {
+		if _, ok := self.PendingGuestIds[guestId]; !ok {
+			log.Infof("add guest %s in pending usage", guestId)
+			self.PendingGuestIds[guestId] = struct{}{}
+		}
+	}
+	if addGuestId != "" {
+		log.Infof("add guest %s in pending usage", addGuestId)
+		self.PendingGuestIds[addGuestId] = struct{}{}
+	}
+
 	self.Memory = self.Memory + sUsage.Memory
-	self.IsolatedDevice = self.IsolatedDevice + sUsage.IsolatedDevice
+	for k, v1 := range sUsage.NumaMemPin {
+		if v2, ok := self.NumaMemPin[k]; ok {
+			self.NumaMemPin[k] = v1 + v2
+		} else {
+			self.NumaMemPin[k] = v1
+		}
+	}
+	self.IsolatedDevice.Add(sUsage.IsolatedDevice)
 	self.DiskUsage.Add(sUsage.DiskUsage)
 	self.NetUsage.Add(sUsage.NetUsage)
 	for id, cg := range sUsage.InstanceGroupUsage {
@@ -376,8 +674,25 @@ func (self *SPendingUsage) Add(sUsage *SPendingUsage) {
 
 func (self *SPendingUsage) Sub(sUsage *SPendingUsage) {
 	self.Cpu = quotas.NonNegative(self.Cpu - sUsage.Cpu)
+	for k, v1 := range sUsage.CpuPin {
+		if v2, ok := self.CpuPin[k]; ok {
+			self.CpuPin[k] = quotas.NonNegative(v2 - v1)
+		}
+	}
+
+	for guestId := range sUsage.PendingGuestIds {
+		log.Infof("delete guest %s in pending usage", guestId)
+		delete(self.PendingGuestIds, guestId)
+	}
+
 	self.Memory = quotas.NonNegative(self.Memory - sUsage.Memory)
-	self.IsolatedDevice = quotas.NonNegative(self.IsolatedDevice - sUsage.IsolatedDevice)
+	for k, v1 := range sUsage.NumaMemPin {
+		if v2, ok := self.NumaMemPin[k]; ok {
+			self.NumaMemPin[k] = quotas.NonNegative(v2 - v1)
+		}
+	}
+
+	self.IsolatedDevice.Sub(sUsage.IsolatedDevice)
 	self.DiskUsage.Sub(sUsage.DiskUsage)
 	self.NetUsage.Sub(sUsage.NetUsage)
 	for id, cg := range sUsage.InstanceGroupUsage {
@@ -399,7 +714,7 @@ func (self *SPendingUsage) IsEmpty() bool {
 	if self.Memory > 0 {
 		return false
 	}
-	if self.IsolatedDevice > 0 {
+	if !self.IsolatedDevice.IsEmpty() {
 		return false
 	}
 	if !self.DiskUsage.IsEmpty() {
@@ -412,47 +727,4 @@ func (self *SPendingUsage) IsEmpty() bool {
 		return false
 	}
 	return true
-}
-
-func (self *SessionPendingUsage) cancelSelf() {
-	hostId := self.Usage.HostId
-	count := self.count
-
-	for i := 0; i <= count; i++ {
-		HostPendingUsageManager.CancelPendingUsage(hostId, self)
-	}
-}
-
-func (self *SessionPendingUsage) StartTimer() {
-	timeout := 1 * time.Minute
-	go func() {
-		for {
-			select {
-			case <-time.After(timeout):
-				log.Infof("timeout cancel session usage %#v", self)
-				self.cancelSelf()
-				goto ForEnd
-			case sid := <-self.cancelCh:
-				log.Infof("Cancel session %s usage, count: %d", sid, self.count)
-				if self.count <= 0 {
-					goto ForEnd
-				} else {
-					log.Infof("continue waiting next cancel...")
-				}
-			}
-		}
-	ForEnd:
-		log.Infof("delete session usage %#v", self)
-		HostPendingUsageManager.DeleteSessionUsage(self)
-	}()
-}
-
-func (self *SessionPendingUsage) StopTimer() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Errorf("SessionPendingUsage %#v stop timer: %v", self, r)
-			debug.PrintStack()
-		}
-	}()
-	self.cancelCh <- self.SessionId
 }

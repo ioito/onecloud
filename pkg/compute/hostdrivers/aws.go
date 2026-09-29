@@ -43,18 +43,26 @@ func (self *SAwsHostDriver) GetHypervisor() string {
 	return api.HYPERVISOR_AWS
 }
 
+func (self *SAwsHostDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_AWS
+}
+
 func (self *SAwsHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb int) error {
-	if storage.StorageType == api.STORAGE_GP2_SSD || storage.StorageType == api.STORAGE_GP3_SSD {
+	if storage.StorageType == api.STORAGE_GP2_SSD {
 		if sizeGb < 1 || sizeGb > 16384 {
 			return fmt.Errorf("The %s disk size must be in the range of 1G ~ 16384GB", storage.StorageType)
+		}
+	} else if storage.StorageType == api.STORAGE_GP3_SSD {
+		if sizeGb < 1 || sizeGb > 65536 {
+			return fmt.Errorf("The %s disk size must be in the range of 1G ~ 65536GB", storage.StorageType)
 		}
 	} else if storage.StorageType == api.STORAGE_IO1_SSD || storage.StorageType == api.STORAGE_IO2_SSD {
 		if sizeGb < 4 || sizeGb > 16384 {
 			return fmt.Errorf("The %s disk size must be in the range of 4G ~ 16384GB", storage.StorageType)
 		}
 	} else if utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_ST1_HDD, api.STORAGE_SC1_HDD}) {
-		if sizeGb < 500 || sizeGb > 16384 {
-			return fmt.Errorf("The %s disk size must be in the range of 500G ~ 16384GB", storage.StorageType)
+		if sizeGb < 125 || sizeGb > 16384 {
+			return fmt.Errorf("The %s disk size must be in the range of 125G ~ 16384GB", storage.StorageType)
 		}
 	} else if storage.StorageType == api.STORAGE_STANDARD_HDD {
 		if sizeGb < 1 || sizeGb > 1024 {
@@ -67,5 +75,5 @@ func (self *SAwsHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb in
 }
 
 func (self *SAwsHostDriver) ValidateResetDisk(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, snapshot *models.SSnapshot, guests []models.SGuest, input *api.DiskResetInput) (*api.DiskResetInput, error) {
-	return nil, httperrors.NewBadRequestError("Aws not support reset disk, you can create new disk with snapshot")
+	return nil, httperrors.NewBadRequestError("AWS does not support resetting disks; create a new disk from snapshot instead")
 }

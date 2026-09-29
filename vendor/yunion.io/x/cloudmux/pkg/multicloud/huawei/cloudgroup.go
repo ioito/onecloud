@@ -16,11 +16,11 @@ package huawei
 
 import (
 	"fmt"
-	"strings"
+	"net/url"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
+	api "yunion.io/x/cloudmux/pkg/apis/cloudid"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
@@ -67,55 +67,27 @@ func (group *SCloudgroup) RemoveUser(name string) error {
 	return group.client.RemoveUserFromGroup(group.Id, user.GetGlobalId())
 }
 
-func (group *SCloudgroup) DetachSystemPolicy(roleId string) error {
+func (group *SCloudgroup) DetachPolicy(roleId string, policyType api.TPolicyType) error {
+	if policyType == api.PolicyTypeCustom {
+		return group.client.DetachGroupCustomRole(group.Id, roleId)
+	}
 	return group.client.DetachGroupRole(group.Id, roleId)
 }
 
-func (group *SCloudgroup) DetachCustomPolicy(roleId string) error {
-	return group.client.DetachGroupCustomRole(group.Id, roleId)
-}
-
-func (group *SCloudgroup) AttachSystemPolicy(roleId string) error {
+func (group *SCloudgroup) AttachPolicy(roleId string, policyType api.TPolicyType) error {
+	if policyType == api.PolicyTypeCustom {
+		return group.client.AttachGroupCustomRole(group.Id, roleId)
+	}
 	return group.client.AttachGroupRole(group.Id, roleId)
 }
 
-func (group *SCloudgroup) AttachCustomPolicy(roleId string) error {
-	return group.client.AttachGroupCustomRole(group.Id, roleId)
-}
-
-func (group *SCloudgroup) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (group *SCloudgroup) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	roles, err := group.client.GetGroupRoles(group.Id)
 	if err != nil {
 		return nil, errors.Wrap(err, "GetGroupRoles")
 	}
 	ret := []cloudprovider.ICloudpolicy{}
 	for i := range roles {
-		_, err := group.client.GetRole(roles[i].GetName())
-		if err != nil {
-			if errors.Cause(err) == cloudprovider.ErrNotFound {
-				continue
-			}
-			return nil, errors.Wrapf(err, "GetRole(%s)", roles[i].GetName())
-		}
-		ret = append(ret, &roles[i])
-	}
-	return ret, nil
-}
-
-func (group *SCloudgroup) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	roles, err := group.client.GetGroupRoles(group.Id)
-	if err != nil {
-		return nil, errors.Wrap(err, "GetGroupRoles")
-	}
-	ret := []cloudprovider.ICloudpolicy{}
-	for i := range roles {
-		_, err := group.client.GetCustomRole(roles[i].GetName())
-		if err != nil {
-			if errors.Cause(err) == cloudprovider.ErrNotFound {
-				continue
-			}
-			return nil, errors.Wrapf(err, "GetRole(%s)", roles[i].GetName())
-		}
 		ret = append(ret, &roles[i])
 	}
 	return ret, nil
@@ -134,24 +106,24 @@ func (group *SCloudgroup) GetICloudusers() ([]cloudprovider.IClouduser, error) {
 	return ret, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneListGroups
 func (self *SHuaweiClient) GetGroups(domainId, name string) ([]SCloudgroup, error) {
-	params := map[string]string{}
+	query := url.Values{}
 	if len(domainId) > 0 {
-		params["domain_id"] = self.ownerId
+		query.Set("domain_id", self.ownerId)
 	}
 	if len(name) > 0 {
-		params["name"] = name
-	}
-
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
+		query.Set("name", name)
 	}
 
 	groups := []SCloudgroup{}
-	err = doListAllWithNextLink(client.Groups.List, params, &groups)
+	resp, err := self.list(SERVICE_IAM_V3, "", "groups", query)
 	if err != nil {
-		return nil, errors.Wrap(err, "doListAllWithOffset")
+		return nil, err
+	}
+	err = resp.Unmarshal(&groups, "groups")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
 	}
 	return groups, nil
 }
@@ -171,59 +143,53 @@ func (self *SHuaweiClient) GetICloudgroups() ([]cloudprovider.ICloudgroup, error
 	return ret, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneListUsersForGroupByAdmin
 func (self *SHuaweiClient) GetGroupUsers(groupId string) ([]SClouduser, error) {
-	client, err := self.newGeneralAPIClient()
+	resp, err := self.list(SERVICE_IAM_V3, "", fmt.Sprintf("groups/%s/users", groupId), nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
-
-	resp, err := client.Groups.ListInContextWithSpec(nil, fmt.Sprintf("%s/users", groupId), nil, "users")
-	if err != nil {
-		return nil, errors.Wrap(err, "")
+		return nil, errors.Wrapf(err, "list group users")
 	}
 	users := []SClouduser{}
-	err = jsonutils.Update(&users, resp.Data)
+	err = resp.Unmarshal(&users, "users")
 	if err != nil {
-		return nil, errors.Wrap(err, "jsonutils.Update")
+		return nil, errors.Wrap(err, "Unmarshal")
 	}
 	return users, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneCheckDomainPermissionForGroup
 func (self *SHuaweiClient) GetGroupRoles(groupId string) ([]SRole, error) {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
-	resp, err := client.Domains.ListRoles(self.ownerId, groupId)
+	res := fmt.Sprintf("domains/%s/groups/%s/roles", self.ownerId, groupId)
+	resp, err := self.list(SERVICE_IAM_V3, "", res, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "ListRoles")
 	}
 	roles := []SRole{}
-	err = jsonutils.Update(&roles, resp.Data)
+	err = resp.Unmarshal(&roles, "roles")
 	if err != nil {
-		return nil, errors.Wrap(err, "jsonutils.Update")
+		return nil, errors.Wrap(err, "Unmarshal")
 	}
 	return roles, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneCreateGroup
 func (self *SHuaweiClient) CreateGroup(name, desc string) (*SCloudgroup, error) {
-	params := map[string]string{
+	params := map[string]interface{}{
 		"name": name,
 	}
 	if len(desc) > 0 {
 		params["description"] = desc
 	}
-	client, err := self.newGeneralAPIClient()
+	resp, err := self.post(SERVICE_IAM_V3, "", "groups", map[string]interface{}{"group": params})
 	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
+		return nil, err
 	}
-
-	group := SCloudgroup{client: self}
-	err = DoCreate(client.Groups.Create, jsonutils.Marshal(map[string]interface{}{"group": params}), &group)
+	group := &SCloudgroup{client: self}
+	err = resp.Unmarshal(group, "group")
 	if err != nil {
-		return nil, errors.Wrap(err, "DoCreate")
+		return nil, errors.Wrapf(err, "Unmarshal")
 	}
-	return &group, nil
+	return group, nil
 }
 
 func (self *SHuaweiClient) CreateICloudgroup(name, desc string) (cloudprovider.ICloudgroup, error) {
@@ -234,12 +200,10 @@ func (self *SHuaweiClient) CreateICloudgroup(name, desc string) (cloudprovider.I
 	return group, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneDeleteGroup
 func (self *SHuaweiClient) DeleteGroup(id string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
-	return DoDeleteWithSpec(client.Groups.DeleteInContextWithSpec, nil, id, "", nil, nil)
+	_, err := self.delete(SERVICE_IAM_V3, "", "groups/"+id)
+	return err
 }
 
 func (self *SHuaweiClient) GetICloudgroupByName(name string) (cloudprovider.ICloudgroup, error) {
@@ -257,88 +221,83 @@ func (self *SHuaweiClient) GetICloudgroupByName(name string) (cloudprovider.IClo
 	return &groups[0], nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneAddUserToGroup
 func (self *SHuaweiClient) AddUserToGroup(groupId, userId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
-	_, err = client.Groups.UpdateInContextWithSpec(nil, groupId, fmt.Sprintf("users/%s", userId), nil, "")
+	_, err := self.put(SERVICE_IAM_V3, "", fmt.Sprintf("groups/%s/users/%s", groupId, userId), nil)
 	return err
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneRemoveUserFromGroup
 func (self *SHuaweiClient) RemoveUserFromGroup(groupId, userId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
-	_, err = client.Groups.DeleteInContextWithSpec(nil, groupId, fmt.Sprintf("users/%s", userId), nil, nil, "")
+	_, err := self.delete(SERVICE_IAM_V3, "", fmt.Sprintf("groups/%s/users/%s", groupId, userId))
 	return err
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=ListCustomPolicies
 func (self *SHuaweiClient) GetCustomRoles() ([]SRole, error) {
-	params := map[string]string{}
-
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
+	query := url.Values{}
+	query.Set("per_page", "300")
+	page := 1
+	query.Set("page", fmt.Sprintf("%d", page))
+	ret := []SRole{}
+	for {
+		resp, err := self.list(SERVICE_IAM, "", "OS-ROLE/roles", query)
+		if err != nil {
+			return nil, err
+		}
+		part := struct {
+			Roles       []SRole
+			TotalNumber int
+		}{}
+		err = resp.Unmarshal(&part)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, part.Roles...)
+		if len(ret) >= part.TotalNumber || len(part.Roles) == 0 {
+			break
+		}
+		page++
+		query.Set("page", fmt.Sprintf("%d", page))
 	}
-
-	client.Roles.SetVersion("v3.0/OS-ROLE")
-	defer client.Roles.SetVersion("v3.0")
-
-	roles := []SRole{}
-	err = doListAllWithNextLink(client.Roles.List, params, &roles)
-	if err != nil {
-		return nil, errors.Wrap(err, "doListAllWithOffset")
-	}
-	return roles, nil
+	return ret, nil
 }
 
-func (self *SHuaweiClient) GetCustomRole(name string) (*SRole, error) {
-	roles, err := self.GetCustomRoles()
+func (self *SHuaweiClient) GetCustomRole(id string) (*SRole, error) {
+	resp, err := self.list(SERVICE_IAM, "", "OS-ROLE/roles/"+id, nil)
 	if err != nil {
-		return nil, errors.Wrapf(err, "GetCustomRoles(%s)", name)
+		return nil, err
 	}
-	for i := range roles {
-		if roles[i].DisplayName == name {
-			return &roles[i], nil
-		}
+	ret := &SRole{}
+	err = resp.Unmarshal(ret, "role")
+	if err != nil {
+		return nil, err
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, name)
+	return ret, nil
 }
 
-func (self *SHuaweiClient) GetRole(name string) (*SRole, error) {
-	roles, err := self.GetRoles("", "")
+func (self *SHuaweiClient) GetRole(id string) (*SRole, error) {
+	resp, err := self.list(SERVICE_IAM_V3, "", "roles/"+id, nil)
 	if err != nil {
-		return nil, errors.Wrapf(err, "GetRoles(%s)", name)
+		return nil, err
 	}
-	for i := range roles {
-		if roles[i].DisplayName == name {
-			return &roles[i], nil
-		}
+	ret := &SRole{}
+	err = resp.Unmarshal(ret, "role")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, name)
+	return ret, nil
 }
 
 func (self *SHuaweiClient) DetachGroupRole(groupId, roleId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
 	role, err := self.GetRole(roleId)
 	if err != nil {
 		return errors.Wrapf(err, "GetRole(%s)", roleId)
 	}
 	if role.Type == "AX" || role.Type == "AA" {
-		err = client.Domains.AddRole(self.ownerId, groupId, role.Id)
+		err := self.KeystoneRemoveDomainPermissionFromGroup(self.ownerId, groupId, roleId)
 		if err != nil {
-			return errors.Wrapf(err, "AddRole")
-		}
-		if strings.Contains(strings.ToLower(role.Policy.String()), "obs") {
-			err = client.Projects.AddProjectRole(self.GetMosProjectId(), groupId, role.Id)
-			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
-			}
+			return errors.Wrapf(err, "remove domain role")
 		}
 	}
 	if role.Type == "XA" || role.Type == "AA" {
@@ -347,34 +306,53 @@ func (self *SHuaweiClient) DetachGroupRole(groupId, roleId string) error {
 			return errors.Wrapf(err, "GetProjects")
 		}
 		for _, project := range projects {
-			err = client.Projects.AddProjectRole(project.ID, groupId, role.Id)
+			err := self.KeystoneRemoveProjectPermissionFromGroup(project.Id, groupId, role.Id)
 			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
+				return errors.Wrapf(err, "remove project role ")
 			}
 		}
 	}
 	return nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneRemoveProjectPermissionFromGroup
+func (self *SHuaweiClient) KeystoneRemoveProjectPermissionFromGroup(projectId, groupId, roleId string) error {
+	res := fmt.Sprintf("projects/%s/groups/%s/roles/%s", projectId, groupId, roleId)
+	_, err := self.delete(SERVICE_IAM_V3, "", res)
+	return err
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneAssociateGroupWithProjectPermission
+func (self *SHuaweiClient) KeystoneAssociateGroupWithProjectPermission(projectId, groupId, roleId string) error {
+	res := fmt.Sprintf("projects/%s/groups/%s/roles/%s", self.GetMosProjectId(), groupId, roleId)
+	_, err := self.put(SERVICE_IAM_V3, "", res, nil)
+	return err
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneAssociateGroupWithDomainPermission
+func (self *SHuaweiClient) KeystoneAssociateGroupWithDomainPermission(domainId, groupId, roleId string) error {
+	res := fmt.Sprintf("domains/%s/groups/%s/roles/%s", domainId, groupId, roleId)
+	_, err := self.put(SERVICE_IAM_V3, "", res, nil)
+	return err
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneRemoveDomainPermissionFromGroup
+func (self *SHuaweiClient) KeystoneRemoveDomainPermissionFromGroup(domainId, groupId, roleId string) error {
+	res := fmt.Sprintf("domains/%s/groups/%s/roles/%s", domainId, groupId, roleId)
+	_, err := self.delete(SERVICE_IAM_V3, "", res)
+	return err
+}
+
 func (self *SHuaweiClient) AttachGroupRole(groupId, roleId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
 	role, err := self.GetRole(roleId)
 	if err != nil {
 		return errors.Wrapf(err, "GetRole(%s)", roleId)
 	}
+
 	if role.Type == "AX" || role.Type == "AA" {
-		err = client.Domains.AddRole(self.ownerId, groupId, role.Id)
+		err := self.KeystoneAssociateGroupWithDomainPermission(self.ownerId, groupId, roleId)
 		if err != nil {
 			return errors.Wrapf(err, "AddRole")
-		}
-		if strings.Contains(strings.ToLower(role.Policy.String()), "obs") {
-			err = client.Projects.AddProjectRole(self.GetMosProjectId(), groupId, role.Id)
-			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
-			}
 		}
 	}
 	if role.Type == "XA" || role.Type == "AA" {
@@ -383,9 +361,9 @@ func (self *SHuaweiClient) AttachGroupRole(groupId, roleId string) error {
 			return errors.Wrapf(err, "GetProjects")
 		}
 		for _, project := range projects {
-			err = client.Projects.AddProjectRole(project.ID, groupId, role.Id)
+			err := self.KeystoneAssociateGroupWithProjectPermission(project.Id, groupId, role.Id)
 			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
+				return errors.Wrapf(err, "add project role ")
 			}
 		}
 	}
@@ -393,24 +371,14 @@ func (self *SHuaweiClient) AttachGroupRole(groupId, roleId string) error {
 }
 
 func (self *SHuaweiClient) AttachGroupCustomRole(groupId, roleId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
 	role, err := self.GetCustomRole(roleId)
 	if err != nil {
 		return errors.Wrapf(err, "GetRole(%s)", roleId)
 	}
 	if role.Type == "AX" || role.Type == "AA" {
-		err = client.Domains.AddRole(self.ownerId, groupId, role.Id)
+		err := self.KeystoneAssociateGroupWithDomainPermission(self.ownerId, groupId, roleId)
 		if err != nil {
 			return errors.Wrapf(err, "AddRole")
-		}
-		if strings.Contains(strings.ToLower(role.Policy.String()), "obs") {
-			err = client.Projects.AddProjectRole(self.GetMosProjectId(), groupId, role.Id)
-			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
-			}
 		}
 	}
 	if role.Type == "XA" || role.Type == "AA" {
@@ -419,9 +387,9 @@ func (self *SHuaweiClient) AttachGroupCustomRole(groupId, roleId string) error {
 			return errors.Wrapf(err, "GetProjects")
 		}
 		for _, project := range projects {
-			err = client.Projects.AddProjectRole(project.ID, groupId, role.Id)
+			err := self.KeystoneAssociateGroupWithProjectPermission(project.Id, groupId, role.Id)
 			if err != nil {
-				return errors.Wrapf(err, "AddProjectRole")
+				return errors.Wrapf(err, "add project role ")
 			}
 		}
 	}
@@ -429,24 +397,14 @@ func (self *SHuaweiClient) AttachGroupCustomRole(groupId, roleId string) error {
 }
 
 func (self *SHuaweiClient) DetachGroupCustomRole(groupId, roleId string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
-	}
 	role, err := self.GetCustomRole(roleId)
 	if err != nil {
 		return errors.Wrapf(err, "GetCustomRole(%s)", roleId)
 	}
 	if role.Type == "AX" || role.Type == "AA" {
-		err = client.Domains.DeleteRole(self.ownerId, groupId, role.Id)
+		err := self.KeystoneRemoveDomainPermissionFromGroup(self.ownerId, groupId, roleId)
 		if err != nil {
 			return errors.Wrapf(err, "DeleteRole")
-		}
-		if strings.Contains(strings.ToLower(role.Policy.String()), "obs") {
-			err = client.Projects.DeleteProjectRole(self.GetMosProjectId(), groupId, role.Id)
-			if err != nil {
-				return errors.Wrapf(err, "DeleteProjectRole")
-			}
 		}
 	}
 	if role.Type == "XA" || role.Type == "AA" {
@@ -455,9 +413,9 @@ func (self *SHuaweiClient) DetachGroupCustomRole(groupId, roleId string) error {
 			return errors.Wrapf(err, "GetProjects")
 		}
 		for _, project := range projects {
-			err = client.Projects.DeleteProjectRole(project.ID, groupId, role.Id)
+			err := self.KeystoneRemoveProjectPermissionFromGroup(project.Id, groupId, role.Id)
 			if err != nil {
-				return errors.Wrapf(err, "DeleteProjectRole")
+				return errors.Wrapf(err, "remove project role ")
 			}
 		}
 	}

@@ -15,8 +15,6 @@
 package watcher
 
 import (
-	"context"
-
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -28,6 +26,7 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/mcclient/informer"
+	"yunion.io/x/onecloud/pkg/util/ctx"
 )
 
 type SInformerSyncManager struct {
@@ -39,21 +38,21 @@ type SInformerSyncManager struct {
 func (manager *SInformerSyncManager) OnAdd(obj *jsonutils.JSONDict) {
 	log.Infof("[CREATED]: \n%s", obj.String())
 	if manager.NeedSync(obj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
 func (manager *SInformerSyncManager) OnUpdate(oldObj, newObj *jsonutils.JSONDict) {
 	log.Infof("[UPDATED]: \n[NEW]: %s\n[OLD]: %s", newObj.String(), oldObj.String())
 	if manager.NeedSync(oldObj) || manager.NeedSync(newObj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
 func (manager *SInformerSyncManager) OnDelete(obj *jsonutils.JSONDict) {
 	log.Infof("[DELETED]: \n%s", obj.String())
 	if manager.NeedSync(obj) {
-		manager.SyncOnce()
+		manager.SyncOnce(false, false)
 	}
 }
 
@@ -81,7 +80,7 @@ func (manager *SInformerSyncManager) StartWatching(resMan informer.IResourceMana
 
 func (manager *SInformerSyncManager) startWatcher() error {
 	log.Infof("[%s] Start resource informer watcher for %s", manager.Name(), manager.resourceManager.GetKeyword())
-	ctx := context.Background()
+	ctx := ctx.CtxWithTime()
 	s := auth.GetAdminSession(ctx, consts.GetRegion())
 	informer.NewWatchManagerBySessionBg(s, func(watchMan *informer.SWatchManager) error {
 		if err := watchMan.For(manager.resourceManager).AddEventHandler(ctx, manager); err != nil {

@@ -54,7 +54,7 @@ var LB_HEALTHCHECK_TYPE_MAP = map[string]string{
 }
 
 type SLoadbalancer struct {
-	multicloud.SResourceBase
+	multicloud.SLoadbalancerBase
 	huawei.HuaweiTags
 	region *SRegion
 	subnet *SNetwork
@@ -86,12 +86,12 @@ type Pool struct {
 	ID string `json:"id"`
 }
 
-func (self *SLoadbalancer) GetIEIP() (cloudprovider.ICloudEIP, error) {
+func (self *SLoadbalancer) GetIEIPs() ([]cloudprovider.ICloudEIP, error) {
 	if self.GetEip() == nil {
 		return nil, nil
 	}
 
-	return self.eip, nil
+	return []cloudprovider.ICloudEIP{self.eip}, nil
 }
 
 func (self *SLoadbalancer) GetId() string {

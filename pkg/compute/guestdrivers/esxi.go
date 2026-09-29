@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -25,11 +26,9 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
-	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -45,9 +44,20 @@ type SESXiGuestDriver struct {
 	SManagedVirtualizedGuestDriver
 }
 
+type SOneCloudGuestDriver struct {
+	SESXiGuestDriver
+}
+
+func (self *SOneCloudGuestDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_ONECLOUD
+}
+
 func init() {
 	driver := SESXiGuestDriver{}
 	models.RegisterGuestDriver(&driver)
+
+	driver2 := SOneCloudGuestDriver{}
+	models.RegisterGuestDriver(&driver2)
 }
 
 func (self *SESXiGuestDriver) DoScheduleCPUFilter() bool { return true }
@@ -166,12 +176,15 @@ func (self *SESXiGuestDriver) ChooseHostStorage(host *models.SHost, guest *model
 		if err != nil {
 			return nil, errors.Wrapf(err, "unable to fetch Guest of InstanceSnapshot %q", ispId)
 		}
-		storages := ispGuest.GetStorages()
+		storages, err := ispGuest.GetStorages()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetStorages")
+		}
 		if len(storages) == 0 {
 			return self.SVirtualizedGuestDriver.ChooseHostStorage(host, guest, diskConfig, storageIds)
 		}
 		if utils.IsInStringArray(storages[0].GetId(), storageIds) {
-			return storages[0], nil
+			return &storages[0], nil
 		}
 		return self.SVirtualizedGuestDriver.ChooseHostStorage(host, guest, diskConfig, storageIds)
 	}
@@ -206,15 +219,8 @@ func (self *SESXiGuestDriver) GetAttachDiskStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SESXiGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
-}
-
-func (self *SESXiGuestDriver) ValidateChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, cpuChanged bool, memChanged bool, newDisks []*api.DiskConfig) error {
-	for i := range newDisks {
-		newDisks[i].Format = "vmdk"
-	}
-	return nil
+func (self *SESXiGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return true, nil
 }
 
 func (self *SESXiGuestDriver) CanKeepDetachDisk() bool {
@@ -246,6 +252,10 @@ func (self *SESXiGuestDriver) GetDeployStatus() ([]string, error) {
 func (self *SESXiGuestDriver) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, data *api.ServerCreateInput) (*api.ServerCreateInput, error) {
 	for i := 0; i < len(data.Disks); i++ {
 		data.Disks[i].Format = "vmdk"
+	}
+
+	if data.CpuSockets > data.VcpuCount {
+		return nil, httperrors.NewInputParameterError("The number of cpu sockets cannot be greater than the number of cpus")
 	}
 
 	// check disk config
@@ -286,11 +296,11 @@ func (self *SESXiGuestDriver) ValidateCreateData(ctx context.Context, userCred m
 }
 
 func (self *SESXiGuestDriver) ValidateCreateEip(ctx context.Context, userCred mcclient.TokenCredential, input api.ServerCreateEipInput) error {
-	return httperrors.NewInputParameterError("%s not support create eip", self.GetHypervisor())
+	return httperrors.NewInputParameterError("%s does not support creating eip", self.GetHypervisor())
 }
 
 func (self *SESXiGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_RUNNING, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	count, err := guest.GetInstanceSnapshotCount()
@@ -330,10 +340,14 @@ func (self *SESXiGuestDriver) GetJsonDescAtHost(ctx context.Context, userCred mc
 			return nil, fmt.Errorf("unable to fetch disk %s", diskId)
 		}
 		storage, err := disk.GetStorage()
+		if err != nil {
+			return nil, errors.Wrap(err, "disk.GetStorage")
+		}
 		if storage == nil {
-			return nil, errors.Wrapf(err, "unable to fetch storage of disk %s", diskId)
+			return nil, errors.Wrapf(httperrors.ErrInvalidStatus, "unable to fetch storage of disk %s", diskId)
 		}
 		desc.Disks[i].StorageId = storage.GetExternalId()
+		desc.Disks[i].Preallocation = disk.Preallocation
 	}
 	templateId := desc.Disks[0].TemplateId
 	if len(templateId) == 0 {
@@ -392,7 +406,7 @@ func (self *SESXiGuestDriver) GetJsonDescAtHost(ctx context.Context, userCred mc
 	}
 
 	if storageCacheHost == nil {
-		storageCacheHost, err = storageCaches[0].GetHost()
+		storageCacheHost, err = storageCaches[0].GetMasterHost()
 		if err != nil {
 			return jsonutils.Marshal(desc), errors.Wrapf(err, "unable to GetHost of storageCache %s", storageCaches[0].Id)
 		}
@@ -435,6 +449,8 @@ func (self *SESXiGuestDriver) RequestDeployGuestOnHost(ctx context.Context, gues
 		extId = guest.ExternalId
 	}
 	config.Add(jsonutils.NewString(extId), "guest_ext_id")
+	tags, _ := guest.GetAllUserMetadata()
+	config.Set("tags", jsonutils.Marshal(tags))
 
 	account := host.GetCloudaccount()
 	accessInfo, err := account.GetVCenterAccessInfo(storage.ExternalId)
@@ -442,23 +458,16 @@ func (self *SESXiGuestDriver) RequestDeployGuestOnHost(ctx context.Context, gues
 		return err
 	}
 
+	provider := host.GetCloudprovider()
+
 	action, _ := config.GetString("action")
 	if action == "create" {
-		project, err := db.TenantCacheManager.FetchTenantById(ctx, guest.ProjectId)
-		if err != nil {
-			return errors.Wrapf(err, "FetchTenantById(%s)", guest.ProjectId)
+		projectId, _ := provider.SyncProject(ctx, task.GetUserCred(), guest.ProjectId)
+		if len(projectId) > 0 {
+			config.Add(jsonutils.NewString(projectId), "desc", "project_id")
 		}
-
-		projects, err := account.GetExternalProjectsByProjectIdOrName(project.Id, project.Name)
-		if err != nil {
-			return errors.Wrapf(err, "GetExternalProjectsByProjectIdOrName(%s,%s)", project.Id, project.Name)
-		}
-
-		extProj := models.GetAvailableExternalProject(project, projects)
-		if extProj != nil {
-			config.Add(jsonutils.NewString(extProj.Name), "desc", "resource_pool")
-		} else {
-			config.Add(jsonutils.NewString(project.Name), "desc", "resource_pool")
+		if len(guest.ResourcePool) > 0 {
+			config.Add(jsonutils.NewString(guest.ResourcePool), "desc", "resource_pool")
 		}
 	}
 
@@ -577,10 +586,6 @@ func (self *SESXiGuestDriver) DoGuestCreateDisksTask(ctx context.Context, guest 
 	return nil
 }
 
-func (self *SESXiGuestDriver) RequestRenewInstance(ctx context.Context, guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
-	return time.Time{}, nil
-}
-
 func (self *SESXiGuestDriver) IsSupportEip() bool {
 	return false
 }
@@ -605,80 +610,6 @@ func (self *SESXiGuestDriver) CheckLiveMigrate(ctx context.Context, guest *model
 	return nil
 }
 
-func (self *SESXiGuestDriver) RequestMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestMigrateInput, task taskman.ITask) error {
-	return self.RequestLiveMigrate(ctx, guest, userCred, api.GuestLiveMigrateInput{PreferHostId: input.PreferHostId}, task)
-}
-
-func (self *SESXiGuestDriver) RequestLiveMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestLiveMigrateInput, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iVM, err := guest.GetIVM(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "guest.GetIVM")
-		}
-		iHost, err := models.HostManager.FetchById(input.PreferHostId)
-		if err != nil {
-			return nil, errors.Wrapf(err, "models.HostManager.FetchById(%s)", input.PreferHostId)
-		}
-		host := iHost.(*models.SHost)
-		hostExternalId := host.ExternalId
-		if err = iVM.LiveMigrateVM(hostExternalId); err != nil {
-			return nil, errors.Wrapf(err, "iVM.LiveMigrateVM(%s)", hostExternalId)
-		}
-		hostExternalId = iVM.GetIHostId()
-		if hostExternalId == "" {
-			return nil, errors.Wrap(fmt.Errorf("empty hostExternalId"), "iVM.GetIHostId()")
-		}
-		iHost, err = db.FetchByExternalIdAndManagerId(models.HostManager, hostExternalId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
-			if host, _ := guest.GetHost(); host != nil {
-				return q.Equals("manager_id", host.ManagerId)
-			}
-			return q
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "db.FetchByExternalId(models.HostManager,%s)", hostExternalId)
-		}
-		host = iHost.(*models.SHost)
-		_, err = db.Update(guest, func() error {
-			guest.HostId = host.GetId()
-			return nil
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "db.Update guest.hostId")
-		}
-		disks, err := guest.GetDisks()
-		if err != nil {
-			return nil, errors.Wrapf(err, "GetDisks")
-		}
-		iRegion, err := host.GetIRegion(ctx)
-		if err != nil {
-			return nil, errors.Wrapf(err, "GetIRegion")
-		}
-		for i := range disks {
-			iDisk, err := iRegion.GetIDiskById(disks[i].ExternalId)
-			if err != nil {
-				return nil, errors.Wrapf(err, "GetIDisk(%s)", disks[i].ExternalId)
-			}
-			iStorage, err := db.FetchByExternalIdAndManagerId(models.StorageManager, iDisk.GetIStorageId(), func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
-				hcs := models.HoststorageManager.Query().SubQuery()
-				return q.Join(hcs, sqlchemy.Equals(hcs.Field("storage_id"), q.Field("id"))).Filter(sqlchemy.Equals(hcs.Field("host_id"), host.GetId()))
-			})
-			if err != nil {
-				return nil, errors.Wrapf(err, "FetchStorageByExternalId(%s)", iDisk.GetIStorageId())
-			}
-			storage := iStorage.(*models.SStorage)
-			_, err = db.Update(&disks[i], func() error {
-				disks[i].StorageId = storage.Id
-				return nil
-			})
-			if err != nil {
-				return nil, errors.Wrapf(err, "db.Update disk %s storageid", disks[i].Name)
-			}
-		}
-		return nil, nil
-	})
-	return nil
-}
-
 func (self *SESXiGuestDriver) RequestStartOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, userCred mcclient.TokenCredential, task taskman.ITask) error {
 	ivm, err := guest.GetIVM(ctx)
 	if err != nil {
@@ -695,10 +626,10 @@ func (self *SESXiGuestDriver) RequestStartOnHost(ctx context.Context, guest *mod
 		if err != nil {
 			return errors.Wrapf(err, "Wait vm running")
 		}
-		guest.SetStatus(userCred, api.VM_RUNNING, "StartOnHost")
+		guest.SetStatus(ctx, userCred, api.VM_RUNNING, "StartOnHost")
 		return task.ScheduleRun(result)
 	}
-	return guest.SetStatus(userCred, api.VM_RUNNING, "StartOnHost")
+	return guest.SetStatus(ctx, userCred, api.VM_RUNNING, "StartOnHost")
 }
 
 func (self *SESXiGuestDriver) RequestStopOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask, syncStatus bool) error {
@@ -809,4 +740,91 @@ func (self *SESXiGuestDriver) SyncOsInfo(ctx context.Context, userCred mcclient.
 		}
 	}
 	return nil
+}
+
+func (drv *SESXiGuestDriver) RequestUndeployGuestOnHost(ctx context.Context, guest *models.SGuest, host *models.SHost, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iVm, err := guest.GetIVM(ctx)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(err, "GetIVM")
+		}
+
+		err = iVm.DeleteVM(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "DeleteVM")
+		}
+
+		return nil, cloudprovider.WaitDeleted(iVm, time.Second*10, time.Minute*3)
+	})
+	return nil
+}
+
+func (drv *SESXiGuestDriver) ValidateGuestHotChangeConfigInput(ctx context.Context, guest *models.SGuest, confs *api.ServerChangeConfigSettings) (*api.ServerChangeConfigSettings, error) {
+	// cannot chagne esxi VM CPU cores per sockets
+	corePerSocket := guest.VcpuCount / guest.CpuSockets
+	if confs.VcpuCount%corePerSocket != 0 {
+		return confs, errors.Wrapf(httperrors.ErrInputParameter, "cpu count %d should be times of %d", confs.VcpuCount, corePerSocket)
+	}
+	confs.CpuSockets = confs.VcpuCount / corePerSocket
+
+	// https://kb.vmware.com/s/article/2008405
+	// cannot increase memory beyond 3G if the initial CPU memory is lower than 3G
+	startVmem := guest.VmemSize
+	vmemMbStr := guest.GetMetadata(ctx, api.VM_METADATA_START_VMEM_MB, nil)
+	if len(vmemMbStr) > 0 {
+		vmemMb, _ := strconv.Atoi(vmemMbStr)
+		if vmemMb > 0 {
+			startVmem = int(vmemMb)
+		}
+	}
+	maxAllowVmem := 16 * startVmem
+	if startVmem <= 3*1024 {
+		maxAllowVmem = 3 * 1024
+	}
+	if confs.VmemSize > maxAllowVmem {
+		return confs, errors.Wrapf(httperrors.ErrInputParameter, "memory cannot be resized beyond %dMB", maxAllowVmem)
+	}
+	return confs, nil
+}
+
+func (esxi *SESXiGuestDriver) ValidateGuestChangeConfigInput(ctx context.Context, guest *models.SGuest, input api.ServerChangeConfigInput) (*api.ServerChangeConfigSettings, error) {
+	confs, err := esxi.SBaseGuestDriver.ValidateGuestChangeConfigInput(ctx, guest, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SBaseGuestDriver.ValidateGuestChangeConfigInput")
+	}
+
+	if input.CpuSockets != nil && *input.CpuSockets > 0 {
+		confs.CpuSockets = *input.CpuSockets
+	}
+
+	defaultStorageId := ""
+	if root, _ := guest.GetSystemDisk(); root != nil {
+		defaultStorageId = root.StorageId
+	}
+	storages, err := guest.GetStorages()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetStorages")
+	}
+	storageMap := map[string]string{}
+	for _, storage := range storages {
+		storageMap[storage.StorageType] = storage.Id
+		if len(defaultStorageId) == 0 {
+			defaultStorageId = storage.Id
+		}
+	}
+	for i := range confs.Create {
+		confs.Create[i].Format = "vmdk"
+		if len(confs.Create[i].Storage) == 0 {
+			// 若不指定存储类型，默认和系统盘一致
+			if len(confs.Create[i].Backend) == 0 {
+				confs.Create[i].Storage = defaultStorageId
+			} else if storageId, ok := storageMap[confs.Create[i].Backend]; ok { // 否则和已有磁盘存储保持一致
+				confs.Create[i].Storage = storageId
+			}
+		}
+	}
+	return confs, nil
 }

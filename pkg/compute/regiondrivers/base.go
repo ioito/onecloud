@@ -17,14 +17,12 @@ package regiondrivers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/billing"
-	"yunion.io/x/pkg/util/pinyinutils"
-	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -66,15 +64,19 @@ func (self *SBaseRegionDriver) RequestDeleteLoadbalancer(ctx context.Context, us
 	return fmt.Errorf("Not Implement RequestDeleteLoadbalancer")
 }
 
-func (self *SBaseRegionDriver) RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
+func (self *SBaseRegionDriver) RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement RequestCreateLoadbalancerAcl")
 }
 
-func (self *SBaseRegionDriver) RequestSyncLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
-	return fmt.Errorf("Not Implement RequestSyncLoadbalancerAcl")
+func (self *SBaseRegionDriver) RequestUpdateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestUpdateLoadbalancerAcl")
 }
 
-func (self *SBaseRegionDriver) RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
+func (self *SBaseRegionDriver) RequestLoadbalancerAclSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestLoadbalancerAclSyncstatus")
+}
+
+func (self *SBaseRegionDriver) RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement RequestDeleteLoadbalancerAcl")
 }
 
@@ -82,12 +84,16 @@ func (self *SBaseRegionDriver) IsCertificateBelongToRegion() bool {
 	return true
 }
 
-func (self *SBaseRegionDriver) RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SCachedLoadbalancerCertificate, task taskman.ITask) error {
+func (self *SBaseRegionDriver) RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement RequestCreateLoadbalancerCertificate")
 }
 
-func (self *SBaseRegionDriver) RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SCachedLoadbalancerCertificate, task taskman.ITask) error {
+func (self *SBaseRegionDriver) RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
 	return fmt.Errorf("Not Implement RequestDeleteLoadbalancerCertificate")
+}
+
+func (self *SBaseRegionDriver) RequestLoadbalancerCertificateSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
+	return fmt.Errorf("Not Implement RequestLoadbalancerCertificateSyncstatus")
 }
 
 func (self *SBaseRegionDriver) RequestCreateLoadbalancerBackendGroup(ctx context.Context, userCred mcclient.TokenCredential, lbbg *models.SLoadbalancerBackendGroup, task taskman.ITask) error {
@@ -156,18 +162,6 @@ func (self *SBaseRegionDriver) RequestDeleteLoadbalancerListenerRule(ctx context
 	return fmt.Errorf("Not Implement RequestDeleteLoadbalancerListenerRule")
 }
 
-func (self *SBaseRegionDriver) RequestUpdateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, sp *models.SSnapshotPolicy, input cloudprovider.SnapshotPolicyInput, task taskman.ITask) error {
-	return fmt.Errorf("Not Implement RequestUpdateSnapshotPolicy")
-}
-
-func (self *SBaseRegionDriver) RequestApplySnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy, data jsonutils.JSONObject) error {
-	return fmt.Errorf("Not Implement RequestApplySnapshotPolicy")
-}
-
-func (self *SBaseRegionDriver) RequestCancelSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy, data jsonutils.JSONObject) error {
-	return fmt.Errorf("Not Implement RequestCancelSnapshotPolicy")
-}
-
 func (self *SBaseRegionDriver) ValidateSnapshotDelete(ctx context.Context, snapshot *models.SSnapshot) error {
 	return fmt.Errorf("Not Implement ValidateSnapshotDelete")
 }
@@ -196,18 +190,6 @@ func (self *SBaseRegionDriver) OnDiskReset(ctx context.Context, userCred mcclien
 	return fmt.Errorf("Not Implement OnDiskReset")
 }
 
-func (self *SBaseRegionDriver) ValidateCreateSnapshopolicyDiskData(ctx context.Context,
-	userCred mcclient.TokenCredential, disk *models.SDisk, snapshotPolicy *models.SSnapshotPolicy) error {
-
-	if disk.DomainId != snapshotPolicy.DomainId {
-		return httperrors.NewBadRequestError("disk and snapshotpolicy should have same domain")
-	}
-	if disk.ProjectId != snapshotPolicy.ProjectId {
-		return httperrors.NewBadRequestError("disk and snapshotpolicy should have same project")
-	}
-	return nil
-}
-
 func (self *SBaseRegionDriver) OnSnapshotDelete(ctx context.Context, snapshot *models.SSnapshot, task taskman.ITask, data jsonutils.JSONObject) error {
 	return fmt.Errorf("Not implement OnSnapshotDelete")
 }
@@ -228,44 +210,29 @@ func (self *SBaseRegionDriver) RequestDeleteVpc(ctx context.Context, userCred mc
 	return fmt.Errorf("Not implement RequestDeleteVpc")
 }
 
-func (self *SBaseRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return false
+func (self *SBaseRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateSecurityGroupInput")
 }
 
-func (self *SBaseRegionDriver) GenerateSecurityGroupName(name string) string {
-	return pinyinutils.Text2Pinyin(name)
+func (self *SBaseRegionDriver) ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateSecurityGroupRuleInput")
 }
 
-func (self *SBaseRegionDriver) RequestCacheSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, vpc *models.SVpc, secgroup *models.SSecurityGroup, remoteProjectId string, task taskman.ITask) error {
-	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestCacheSecurityGroup")
+func (self *SBaseRegionDriver) GetDefaultSecurityGroupNamePrefix() string {
+	return "default-auto"
 }
 
-func (self *SBaseRegionDriver) IsSecurityGroupBelongVpc() bool {
-	return false
+func (self *SBaseRegionDriver) RequestCreateSecurityGroup(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	secgroup *models.SSecurityGroup,
+	rules api.SSecgroupRuleResourceSet,
+) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestCreateSecurityGroup")
 }
 
-func (self *SBaseRegionDriver) IsVpcBelongGlobalVpc() bool {
-	return false
-}
-
-func (self *SBaseRegionDriver) IsSecurityGroupBelongGlobalVpc() bool {
-	return false
-}
-
-func (self *SBaseRegionDriver) GetDefaultSecurityGroupVpcId() string {
-	return api.NORMAL_VPC_ID
-}
-
-func (self *SBaseRegionDriver) GetSecurityGroupPublicScope(service string) rbacscope.TRbacScope {
-	return rbacscope.ScopeSystem
-}
-
-func (self *SBaseRegionDriver) GetSecurityGroupVpcId(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, host *models.SHost, vpc *models.SVpc) (string, error) {
-	return "", errors.Wrapf(cloudprovider.ErrNotImplemented, "GetSecurityGroupVpcId")
-}
-
-func (self *SBaseRegionDriver) RequestSyncSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, vpcId string, vpc *models.SVpc, secgroup *models.SSecurityGroup, removeProjectId, service string) (string, error) {
-	return "", errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestSyncSecurityGroup")
+func (self *SBaseRegionDriver) RequestDeleteSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, secgroup *models.SSecurityGroup, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestDeleteSecurityGroup")
 }
 
 func (self *SBaseRegionDriver) ValidateCreateDBInstanceData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.DBInstanceCreateInput, skus []models.SDBInstanceSku, network *models.SNetwork) (api.DBInstanceCreateInput, error) {
@@ -394,8 +361,8 @@ func (self *SBaseRegionDriver) GetRdsSupportSecgroupCount() int {
 	return 0
 }
 
-func (self *SBaseRegionDriver) RequestRenewElasticcache(ctx context.Context, userCred mcclient.TokenCredential, instance *models.SElasticcache, bc billing.SBillingCycle) (time.Time, error) {
-	return time.Time{}, fmt.Errorf("Not Implement RequestRenewElasticcache")
+func (self *SBaseRegionDriver) RequestRenewElasticcache(ctx context.Context, userCred mcclient.TokenCredential, instance *models.SElasticcache, bc billing.SBillingCycle) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestRenewElasticcache")
 }
 
 func (self *SBaseRegionDriver) IsSupportedElasticcacheAutoRenew() bool {
@@ -434,16 +401,12 @@ func (self *SBaseRegionDriver) RequestAssociateEip(ctx context.Context, userCred
 	return httperrors.NewNotImplementedError("RequestAssociateEip")
 }
 
-func (self *SBaseRegionDriver) RequestSyncAccessGroup(ctx context.Context, userCred mcclient.TokenCredential, fs *models.SFileSystem, mt *models.SMountTarget, ag *models.SAccessGroup, task taskman.ITask) error {
-	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestSyncAccessGroup")
-}
-
 func (self *SBaseRegionDriver) ValidateCreateWafInstanceData(ctx context.Context, userCred mcclient.TokenCredential, input api.WafInstanceCreateInput) (api.WafInstanceCreateInput, error) {
 	return input, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateWafInstanceData")
 }
 
 func (self *SBaseRegionDriver) ValidateCreateWafRuleData(ctx context.Context, userCred mcclient.TokenCredential, waf *models.SWafInstance, input api.WafRuleCreateInput) (api.WafRuleCreateInput, error) {
-	return input, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateWafRuleData")
+	return input, nil
 }
 
 func (self *SBaseRegionDriver) RequestCreateNetwork(ctx context.Context, userCred mcclient.TokenCredential, net *models.SNetwork, task taskman.ITask) error {
@@ -508,4 +471,52 @@ func (self *SBaseRegionDriver) RequestCreateKubeCluster(ctx context.Context, use
 
 func (self *SBaseRegionDriver) RequestCreateKubeNodePool(ctx context.Context, userCred mcclient.TokenCredential, pool *models.SKubeNodePool, task taskman.ITask) error {
 	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestCreateKubeNodePool")
+}
+
+func (drv *SBaseRegionDriver) RequestPrepareSecurityGroups(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	secgroups []models.SSecurityGroup,
+	vpc *models.SVpc,
+	callback func(ids []string) error,
+	task taskman.ITask,
+) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestPrepareSecurityGroups")
+}
+
+func (drv *SBaseRegionDriver) CreateDefaultSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, vpc *models.SVpc) (*models.SSecurityGroup, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "CreateDefaultSecurityGroup")
+}
+
+func (drv *SBaseRegionDriver) GetSecurityGroupFilter(vpc *models.SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "GetSecurityGroupFilter")
+}
+
+func (self *SBaseRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateUpdateSecurityGroupInput")
+}
+
+func (self *SBaseRegionDriver) ValidateCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, input *api.SSnapshotPolicyCreateInput) (*api.SSnapshotPolicyCreateInput, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "ValidateCreateSnapshotPolicy")
+}
+
+func (self *SBaseRegionDriver) RequestCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, sp *models.SSnapshotPolicy, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestCreateSnapshotPolicy")
+}
+
+func (self *SBaseRegionDriver) RequestDeleteSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, sp *models.SSnapshotPolicy, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestDeleteSnapshotPolicy")
+}
+
+func (self *SBaseRegionDriver) RequestSnapshotPolicyBindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *models.SSnapshotPolicy, diskIds []string, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestSnapshotPolicyBindDisks")
+}
+
+func (self *SBaseRegionDriver) RequestSnapshotPolicyUnbindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *models.SSnapshotPolicy, diskIds []string, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestSnapshotPolicyUnbindDisks")
+}
+
+func (self *SBaseRegionDriver) RequestRemoteUpdateNetwork(ctx context.Context, userCred mcclient.TokenCredential, network *models.SNetwork, replaceTags bool, task taskman.ITask) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "RequestRemoteUpdateNetwork")
 }

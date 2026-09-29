@@ -30,11 +30,12 @@ import (
 )
 
 type sNVIDIAVgpuDevice struct {
-	pfDev   *PCIDevice
-	cloudId string
-	hostId  string
-	guestId string
-	devType string
+	pfDev       *PCIDevice
+	cloudId     string
+	hostId      string
+	guestId     string
+	devType     string
+	sharingMode string
 
 	mdevId  string
 	model   string
@@ -43,6 +44,10 @@ type sNVIDIAVgpuDevice struct {
 
 func (dev *sNVIDIAVgpuDevice) String() string {
 	return jsonutils.Marshal(dev).String()
+}
+
+func (dev *sNVIDIAVgpuDevice) IsInfinibandNic() bool {
+	return false
 }
 
 func (dev *sNVIDIAVgpuDevice) GetCloudId() string {
@@ -81,6 +86,10 @@ func (dev *sNVIDIAVgpuDevice) GetDeviceType() string {
 	return dev.devType
 }
 
+func (dev *sNVIDIAVgpuDevice) GetSharingMode() string {
+	return dev.sharingMode
+}
+
 func (dev *sNVIDIAVgpuDevice) GetModelName() string {
 	modelName := dev.pfDev.ModelName
 	if dev.pfDev.ModelName == "" {
@@ -91,6 +100,54 @@ func (dev *sNVIDIAVgpuDevice) GetModelName() string {
 
 func (dev *sNVIDIAVgpuDevice) CustomProbe(idx int) error {
 	return nil
+}
+
+func (dev *sNVIDIAVgpuDevice) GetDevicePath() string {
+	return ""
+}
+
+func (dev *sNVIDIAVgpuDevice) GetVirtualNum() int {
+	return 1
+}
+
+func (dev *sNVIDIAVgpuDevice) HotPluggable() bool {
+	return true
+}
+
+func (dev *sNVIDIAVgpuDevice) GetContainerDeviceManager() IContainerDeviceManager {
+	return nil
+}
+
+func (dev *sNVIDIAVgpuDevice) GetNvidiaMpsMemoryLimit() int {
+	return -1
+}
+
+func (dev *sNVIDIAVgpuDevice) GetNvidiaMpsMemoryTotal() int {
+	return -1
+}
+
+func (dev *sNVIDIAVgpuDevice) GetNvidiaMpsThreadPercentage() int {
+	return -1
+}
+
+func (dev *sNVIDIAVgpuDevice) GetMemorySize() int {
+	return 0
+}
+
+func (dev *sNVIDIAVgpuDevice) GetCardPath() string {
+	return ""
+}
+
+func (dev *sNVIDIAVgpuDevice) GetRenderPath() string {
+	return ""
+}
+
+func (dev *sNVIDIAVgpuDevice) GetIndex() int {
+	return -1
+}
+
+func (dev *sNVIDIAVgpuDevice) GetDeviceMinor() int {
+	return -1
 }
 
 func (dev *sNVIDIAVgpuDevice) SetDeviceInfo(info CloudDeviceInfo) {
@@ -160,13 +217,22 @@ func (dev *sNVIDIAVgpuDevice) GetQemuId() string {
 	return "dev_" + dev.mdevId
 }
 
-func (dev *sNVIDIAVgpuDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotPlugOption, error) {
+func (dev *sNVIDIAVgpuDevice) GetNumaNode() (int, error) {
+	numaNodePath := fmt.Sprintf("/sys/bus/pci/devices/0000:%s/numa_node", dev.GetAddr())
+	numaNode, err := fileutils2.FileGetIntContent(numaNodePath)
+	if err != nil {
+		return -1, errors.Wrap(err, "get device numa node")
+	}
+	return numaNode, nil
+}
+
+func (dev *sNVIDIAVgpuDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice, guestDesc *desc.SGuestDesc) ([]*HotPlugOption, error) {
 	ret := make([]*HotPlugOption, 0)
 
 	var masterDevOpt *HotPlugOption
 	for i := 0; i < len(isolatedDev.VfioDevs); i++ {
 		sysfsdev := path.Join("/sys/bus/mdev/devices", isolatedDev.MdevId)
-		opts := map[string]string{
+		opts := map[string]interface{}{
 			"sysfsdev": sysfsdev,
 			"bus":      isolatedDev.VfioDevs[i].BusStr(),
 			"addr":     isolatedDev.VfioDevs[i].SlotFunc(),
@@ -174,9 +240,9 @@ func (dev *sNVIDIAVgpuDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolated
 		}
 		if isolatedDev.VfioDevs[i].Multi != nil {
 			if *isolatedDev.VfioDevs[i].Multi {
-				opts["multifunction"] = "on"
+				opts["multifunction"] = true
 			} else {
-				opts["multifunction"] = "off"
+				opts["multifunction"] = false
 			}
 		}
 
@@ -211,13 +277,19 @@ func (dev *sNVIDIAVgpuDevice) GetHotUnplugOptions(isolatedDev *desc.SGuestIsolat
 	}, nil
 }
 
-func NewNvidiaVgpuDevice(dev *PCIDevice, devType, mdevId, model string, profile map[string]string) *sNVIDIAVgpuDevice {
+// GetPCIEInfo implements IDevice.
+func (dev *sNVIDIAVgpuDevice) GetPCIEInfo() *compute.IsolatedDevicePCIEInfo {
+	return dev.pfDev.PCIEInfo
+}
+
+func NewNvidiaVgpuDevice(dev *PCIDevice, devType, sharingMode, mdevId, model string, profile map[string]string) *sNVIDIAVgpuDevice {
 	return &sNVIDIAVgpuDevice{
-		pfDev:   dev,
-		devType: devType,
-		mdevId:  mdevId,
-		model:   model,
-		profile: profile,
+		pfDev:       dev,
+		devType:     devType,
+		sharingMode: sharingMode,
+		mdevId:      mdevId,
+		model:       model,
+		profile:     profile,
 	}
 }
 
@@ -264,7 +336,7 @@ func getNvidiaVGpus(gpuPF string) ([]*sNVIDIAVgpuDevice, error) {
 				profile[key] = strings.TrimSpace(value)
 			}
 		}
-		mdev := NewNvidiaVgpuDevice(pfDev, compute.LEGACY_VGPU_TYPE, files[i].Name(), model, profile)
+		mdev := NewNvidiaVgpuDevice(pfDev, compute.GPU_TYPE, compute.DEVICE_SHARING_MODE_MDEV, files[i].Name(), model, profile)
 		nvidiaVgpus = append(nvidiaVgpus, mdev)
 	}
 	return nvidiaVgpus, nil

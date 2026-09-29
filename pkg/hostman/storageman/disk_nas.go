@@ -31,6 +31,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 )
 
+var _ IDisk = (*SNasDisk)(nil)
+
 type SNasDisk struct {
 	SLocalDisk
 }
@@ -41,34 +43,23 @@ func NewNasDisk(storage IStorage, id string) *SNasDisk {
 
 func (d *SNasDisk) CreateFromTemplate(ctx context.Context, imageId, format string, size int64, encryptInfo *apis.SEncryptInfo) (jsonutils.JSONObject, error) {
 	imageCacheManager := storageManager.GetStoragecacheById(d.Storage.GetStoragecacheId())
-	ret, err := d.SLocalDisk.createFromTemplate(ctx, imageId, format, imageCacheManager, encryptInfo)
-	if err != nil {
-		return nil, err
-	}
-	retSize, _ := ret.Int("disk_size")
-	log.Infof("REQSIZE: %d, RETSIZE: %d", size, retSize)
-	if size > retSize {
-		params := jsonutils.NewDict()
-		params.Set("size", jsonutils.NewInt(size))
-		return d.Resize(ctx, params)
-	}
-	return ret, nil
+	return d.SLocalDisk.createFromTemplateAndResize(ctx, imageId, format, imageCacheManager, encryptInfo, size)
 }
 
-func (d *SNasDisk) CreateFromImageFuse(ctx context.Context, url string, size int64, encryptInfo *apis.SEncryptInfo) error {
+func (d *SNasDisk) CreateFromRemoteHostImage(ctx context.Context, url string, size int64, encryptInfo *apis.SEncryptInfo) error {
 	return fmt.Errorf("Not implemented")
 }
 
-func (d *SNasDisk) CreateFromSnapshotLocation(ctx context.Context, snapshotLocation string, size int64, encryptInfo *apis.SEncryptInfo) error {
+func (d *SNasDisk) CreateFromSnapshotLocation(ctx context.Context, snapshotLocation string, size int64, encryptInfo *apis.SEncryptInfo) (jsonutils.JSONObject, error) {
 	snapshotPath := path.Join(d.Storage.GetPath(), snapshotLocation)
 	newImg, err := qemuimg.NewQemuImage(d.GetPath())
 	if err != nil {
-		return errors.Wrap(err, "new image from snapshot")
+		return nil, errors.Wrap(err, "new image from snapshot")
 	}
 	if newImg.IsValid() {
 		if err := newImg.Delete(); err != nil {
 			log.Errorln(err)
-			return err
+			return nil, err
 		}
 	}
 	if encryptInfo != nil {
@@ -77,31 +68,27 @@ func (d *SNasDisk) CreateFromSnapshotLocation(ctx context.Context, snapshotLocat
 		err = newImg.CreateQcow2(0, false, snapshotPath, "", "", "")
 	}
 	if err != nil {
-		return errors.Wrap(err, "create image from snapshot")
+		return nil, errors.Wrap(err, "create image from snapshot")
 	}
 	retSize, _ := d.GetDiskDesc().Int("disk_size")
 	log.Infof("REQSIZE: %d, RETSIZE: %d", size, retSize)
 	if size > retSize {
-		params := jsonutils.NewDict()
-		params.Set("size", jsonutils.NewInt(size))
+		params := new(SDiskResizeInput)
+		diskInfo := jsonutils.NewDict()
+		diskInfo.Set("size", jsonutils.NewInt(size))
 		if encryptInfo != nil {
-			params.Set("encrypt_info", jsonutils.Marshal(encryptInfo))
+			diskInfo.Set("encrypt_info", jsonutils.Marshal(encryptInfo))
 		}
-		_, err = d.Resize(ctx, params)
-		return err
+		params.DiskInfo = diskInfo
+		return d.Resize(ctx, params)
 	}
-	return nil
+	return d.GetDiskDesc(), nil
 }
 
 func (d *SNasDisk) ResetFromSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	resetParams, ok := params.(*SDiskReset)
 	if !ok {
 		return nil, hostutils.ParamsError
-	}
-
-	outOfChain, err := resetParams.Input.Bool("out_of_chain")
-	if err != nil {
-		return nil, httperrors.NewMissingParameterError("out_of_chain")
 	}
 
 	location, err := resetParams.Input.GetString("location")
@@ -120,7 +107,7 @@ func (d *SNasDisk) ResetFromSnapshot(ctx context.Context, params interface{}) (j
 			encryptInfo = &encInfo
 		}
 	}
-	return d.resetFromSnapshot(snapshotPath, outOfChain, encryptInfo)
+	return d.resetFromSnapshot(snapshotPath, encryptInfo)
 }
 
 func (d *SNasDisk) GetSnapshotLocation() string {

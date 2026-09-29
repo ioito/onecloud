@@ -18,10 +18,15 @@ import (
 	"context"
 
 	"yunion.io/x/pkg/errors"
+
+	"yunion.io/x/onecloud/pkg/apis/monitor"
 )
 
 type TsdbQueryEndpoint interface {
 	Query(ctx context.Context, ds *DataSource, query *TsdbQuery) (*Response, error)
+	FilterMeasurement(ctx context.Context, ds *DataSource, from, to string, ms *monitor.InfluxMeasurement, tagFilter *monitor.MetricQueryTag) (*monitor.InfluxMeasurement, error)
+	FillSelect(query *monitor.AlertQuery, isAlert bool) *monitor.AlertQuery
+	FillGroupBy(query *monitor.AlertQuery, inputQuery *monitor.MetricQueryInput, tagId string, isAlert bool) *monitor.AlertQuery
 }
 
 var registry map[string]GetTsdbQueryEndpointFn
@@ -32,19 +37,33 @@ func init() {
 	registry = make(map[string]GetTsdbQueryEndpointFn)
 }
 
-const (
-	ErrorNotFoundExecutorDataSource = errors.Error("Not find executor for data source")
+var (
+	ErrorNotFoundExecutorDataSource error = errors.Error("Not find executor for data source")
 )
 
-func getTsdbQueryEndpointFor(dsInfo *DataSource) (TsdbQueryEndpoint, error) {
-	if fn, exists := registry[dsInfo.Type]; exists {
-		executor, err := fn(dsInfo)
-		if err != nil {
-			return nil, err
-		}
-		return executor, nil
+func getDataSourceFunc(dsType string) (GetTsdbQueryEndpointFn, error) {
+	fn, exists := registry[dsType]
+	if !exists {
+		return nil, errors.Wrapf(ErrorNotFoundExecutorDataSource, "type: %s", dsType)
 	}
-	return nil, errors.Wrapf(ErrorNotFoundExecutorDataSource, "type: %s", dsInfo.Type)
+	return fn, nil
+}
+
+func GetTsdbQueryEndpointFor(dsInfo *DataSource) (TsdbQueryEndpoint, error) {
+	fn, err := getDataSourceFunc(dsInfo.Type)
+	if err != nil {
+		return nil, errors.Wrap(err, "getDataSourceFunc")
+	}
+	executor, err := fn(dsInfo)
+	if err != nil {
+		return nil, errors.Wrap(err, "construct datasource query endpoint")
+	}
+	return executor, nil
+}
+
+func IsValidDataSource(dsType string) error {
+	_, err := getDataSourceFunc(dsType)
+	return err
 }
 
 func RegisterTsdbQueryEndpoint(dataSourceType string, fn GetTsdbQueryEndpointFn) {

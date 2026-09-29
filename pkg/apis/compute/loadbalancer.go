@@ -19,14 +19,15 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/billing"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/util/ansible"
 )
 
 type LoadbalancerAgentDeployInput struct {
 	apis.Meta
 
-	Host         ansible.Host
-	DeployMethod string
+	Host         ansible.Host `json:"host"`
+	DeployMethod string       `json:"deploy_method"`
 }
 
 const (
@@ -57,11 +58,25 @@ type LoadbalancerListInput struct {
 	// 套餐名称
 	LoadbalancerSpec []string `json:"loadbalancer_spec"`
 
+	// filter by security group
+	SecgroupId string `json:"secgroup_id"`
+
 	// filter for EIP
 	WithEip                  *bool  `json:"with_eip"`
 	WithoutEip               *bool  `json:"without_eip"`
 	EipAssociable            *bool  `json:"eip_associable"`
 	UsableLoadbalancerForEip string `json:"usable_loadbalancer_for_eip"`
+}
+
+type LbEip struct {
+	// 公网IP地址
+	Eip string `json:"eip"`
+
+	EipId string `json:"eip_id"`
+
+	// 公网IP地址类型: 弹性、非弹性
+	// example: public_ip
+	EipMode string `json:"eip_mode"`
 }
 
 type LoadbalancerDetails struct {
@@ -79,17 +94,26 @@ type LoadbalancerDetails struct {
 
 	SLoadbalancer
 
-	// 公网IP地址
-	Eip string `json:"eip"`
+	LbEip
 
-	EipId string `json:"eip_id"`
-
-	// 公网IP地址类型: 弹性、非弹性
-	// example: public_ip
-	EipMode string `json:"eip_mode"`
+	Eips []LbEip `json:"eips"`
 
 	// 后端服务器组名称
 	BackendGroup string `json:"backend_group"`
+
+	// 关联安全组列表
+	Secgroups []SimpleSecurityGroup `json:"secgroups"`
+	LoadbalancerUsage
+}
+
+type LoadbalancerUsage struct {
+	BackendGroupCount int `json:"backend_group_count"`
+	ListenerCount     int `json:"listener_count"`
+}
+
+type SimpleSecurityGroup struct {
+	Id   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type LoadbalancerResourceInfo struct {
@@ -158,11 +182,11 @@ type LoadbalancerCreateInput struct {
 	// 弹性公网IP线路类型
 	EipBgpType string `json:"eip_bgp_type,omitzero"`
 	// 弹性公网IP计费类型
-	EipChargeType string `json:"eip_charge_type,omitempty"`
+	EipChargeType billing_api.TNetChargeType `json:"eip_charge_type,omitempty"`
 	// 是否跟随主机删除而自动释放
 	EipAutoDellocate bool `json:"eip_auto_dellocate,omitempty"`
 
-	// swagger: ignore
+	// swagger:ignore
 	Eip string `json:"eip" yunion-deprecated-by:"eip_id"`
 	// EIP Id
 	EipId string `json:"eip_id"`
@@ -177,7 +201,7 @@ type LoadbalancerCreateInput struct {
 	// 包年包月时长
 	Duration string `json:"duration"`
 	// swagger:ignore
-	BillingType string `json:"billing_type"`
+	BillingType billing_api.TBillingType `json:"billing_type"`
 	// swagger:ignore
 	BillingCycle string `json:"billing_cycle"`
 
@@ -189,8 +213,8 @@ type LoadbalancerCreateInput struct {
 	// Cloudregion string `json:"cloudregion"`
 	NetworkResourceInput
 	// 多子网
-	// swagger: ignore
-	Networks []string
+	// swagger:ignore
+	Networks []string `json:"networks"`
 	// Network     string `json:"network"`
 	CloudproviderResourceInput
 	// Manager     string `json:"manager"`
@@ -211,7 +235,7 @@ type LoadbalancerAssociateEipInput struct {
 
 type LoadbalancerCreateEipInput struct {
 	// 计费方式，traffic or bandwidth
-	ChargeType string `json:"charge_type"`
+	ChargeType billing_api.TNetChargeType `json:"charge_type"`
 
 	// Bandwidth
 	Bandwidth int64 `json:"bandwidth"`
@@ -244,7 +268,9 @@ func (self LoadbalancerDetails) GetMetricTags() map[string]string {
 		"status":         self.Status,
 		"tenant":         self.Project,
 		"tenant_id":      self.ProjectId,
+		"account":        self.Account,
+		"account_id":     self.AccountId,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }

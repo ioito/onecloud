@@ -18,7 +18,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,15 +34,18 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
-	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/qemu"
 	qemucerts "yunion.io/x/onecloud/pkg/hostman/guestman/qemu/certs"
+	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
+	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
+	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/uefi"
 	"yunion.io/x/onecloud/pkg/hostman/monitor"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
+	"yunion.io/x/onecloud/pkg/util/mountutils"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemutils"
 )
@@ -69,10 +74,17 @@ import sys
 import os
 import time
 import subprocess
+import shlex
 
 with open(os.devnull, 'w')  as FNULL:
     try:
-        cmd = subprocess.check_output(['bash', '%s'], stderr=FNULL).split()
+        cmd_raw = subprocess.check_output(['bash', '%s'], stderr=FNULL)
+        if sys.version_info[0] >= 3:
+            cmd_str = cmd_raw.decode('utf-8').strip()
+        else:
+            cmd_str = cmd_raw.strip()
+
+        cmd = shlex.split(cmd_str)
     except BaseException as e:
         sys.stderr.write('%%s' %% e)
         sys.exit(1)
@@ -123,6 +135,10 @@ func (s *SKVMGuestInstance) IsKvmSupport() bool {
 	return s.manager.GetHost().IsKvmSupport()
 }
 
+func (s *SKVMGuestInstance) IsSupportCpuHotplug() bool {
+	return s.manager.host.IsX8664()
+}
+
 func (s *SKVMGuestInstance) IsNestedVirt() bool {
 	return s.manager.GetHost().IsNestedVirtualization()
 }
@@ -131,17 +147,29 @@ func (s *SKVMGuestInstance) GetKernelVersion() string {
 	return s.manager.host.GetKernelVersion()
 }
 
-func (s *SKVMGuestInstance) HideKVM() bool {
-	if s.hasGPU() {
+func (s *SKVMGuestInstance) HideHypervisor() bool {
+	if s.IsRunning() && s.IsMonitorAlive() {
+		cmdline, _ := fileutils2.FileGetContents(path.Join("/proc", strconv.Itoa(s.GetPid()), "cmdline"))
+		if strings.Contains(cmdline, "hypervisor=off") {
+			return true
+		}
+	}
+	if s.hasGPU() && s.GetOsName() == OS_NAME_WINDOWS {
 		return true
 	}
+	return false
+}
+
+func (s *SKVMGuestInstance) HideKVM() bool {
 	if s.IsRunning() && s.IsMonitorAlive() {
 		cmdline, _ := fileutils2.FileGetContents(path.Join("/proc", strconv.Itoa(s.GetPid()), "cmdline"))
 		if strings.Contains(cmdline, "kvm=off") {
 			return true
 		}
 	}
-
+	if s.hasGPU() && s.GetOsName() != OS_NAME_WINDOWS {
+		return true
+	}
 	return false
 }
 
@@ -176,6 +204,10 @@ func (s *SKVMGuestInstance) getOsVersion() string {
 	return s.Desc.Metadata["os_version"]
 }
 
+func (s *SKVMGuestInstance) getOsCurrentVersion() string {
+	return s.Desc.Metadata["os_current_version"]
+}
+
 func (s *SKVMGuestInstance) pciInitialized() bool {
 	return len(s.Desc.PCIControllers) > 0
 }
@@ -200,10 +232,18 @@ func (s *SKVMGuestInstance) getUsbControllerType() string {
 // is windows prioer to windows server 2003
 func (s *SKVMGuestInstance) IsOldWindows() bool {
 	if s.GetOsName() == OS_NAME_WINDOWS {
-		ver := s.getOsVersion()
-		if len(ver) > 1 && ver[0:2] == "5." {
-			return true
+		cv := s.getOsCurrentVersion()
+		if len(cv) > 0 {
+			if len(cv) > 1 && cv[0:2] == "5." {
+				return true
+			}
+		} else {
+			ver := s.getOsVersion()
+			if len(ver) > 1 && ver[0:2] == "5." {
+				return true
+			}
 		}
+
 	}
 	return false
 }
@@ -214,12 +254,20 @@ func (s *SKVMGuestInstance) isWindows10() bool {
 		if strings.Contains(strings.ToLower(distro), "windows 10") {
 			return true
 		}
+		osVer := s.getOsVersion()
+		if strings.Contains(strings.ToLower(osVer), "windows 10") {
+			return true
+		}
 	}
 	return false
 }
 
 func (s *SKVMGuestInstance) isMemcleanEnabled() bool {
-	return s.Desc.Metadata["enable_memclean"] == "true"
+	return s.Desc.Metadata[api.VM_METADATA_ENABLE_MEMCLEAN] == "true"
+}
+
+func (s *SKVMGuestInstance) isDisableAutoMergeSnapshots() bool {
+	return s.Desc.Metadata[api.VM_METADATA_DISABLE_AUTO_MERGE_SNAPSHOT] == "true"
 }
 
 func (s *SKVMGuestInstance) getMachine() string {
@@ -233,7 +281,7 @@ func (s *SKVMGuestInstance) getMachine() string {
 func (s *SKVMGuestInstance) getBios() string {
 	bios := s.Desc.Bios
 	if bios == "" {
-		bios = "bios"
+		bios = api.VM_BOOT_MODE_BIOS
 	}
 	return bios
 }
@@ -243,12 +291,12 @@ func (s *SKVMGuestInstance) isQ35() bool {
 }
 
 func (s *SKVMGuestInstance) isVirt() bool {
-	return s.getMachine() == api.VM_MACHINE_TYPE_ARM_VIRT
+	return s.getMachine() == api.VM_MACHINE_TYPE_VIRT
 }
 
 func (s *SKVMGuestInstance) isPcie() bool {
 	return utils.IsInStringArray(s.getMachine(),
-		[]string{api.VM_MACHINE_TYPE_Q35, api.VM_MACHINE_TYPE_ARM_VIRT})
+		[]string{api.VM_MACHINE_TYPE_Q35, api.VM_MACHINE_TYPE_VIRT})
 }
 
 func (s *SKVMGuestInstance) GetVdiProtocol() string {
@@ -273,6 +321,10 @@ func (s *SKVMGuestInstance) disableIsaSerialDev() bool {
 
 func (s *SKVMGuestInstance) disablePvpanicDev() bool {
 	return s.Desc.Metadata["disable_pvpanic"] == "true"
+}
+
+func (s *SKVMGuestInstance) enableTpmDev() bool {
+	return s.Desc.Metadata[api.VM_METADATA_ENABLE_TPM] == "true"
 }
 
 func (s *SKVMGuestInstance) getQuorumChildIndex() int64 {
@@ -320,10 +372,12 @@ func (s *SKVMGuestInstance) extraOptions() string {
 		case *jsonutils.JSONArray:
 			for i := 0; i < jsonV.Size(); i++ {
 				vAtI, _ := jsonV.GetAt(i)
-				cmd += fmt.Sprintf(" -%s %s", k, vAtI.String())
+				vStr, _ := vAtI.GetString()
+				cmd += fmt.Sprintf(" -%s %s", k, vStr)
 			}
 		default:
-			cmd += fmt.Sprintf(" -%s %s", k, v.String())
+			vstr, _ := v.GetString()
+			cmd += fmt.Sprintf(" -%s %s", k, vstr)
 		}
 	}
 	return cmd
@@ -338,6 +392,7 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 		HomeDir:              s.HomeDir(),
 		HugepagesEnabled:     s.manager.host.IsHugepagesEnabled(),
 		EnableMemfd:          s.isMemcleanEnabled(),
+		EnableTpm:            s.enableTpmDev(),
 		PidFilePath:          s.GetPidFilePath(),
 	}
 
@@ -367,6 +422,8 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 	// inject qemu arch
 	if s.manager.host.IsAarch64() {
 		input.QemuArch = qemu.Arch_aarch64
+	} else if s.manager.host.IsRiscv64() {
+		input.QemuArch = qemu.Arch_riscv64
 	} else {
 		input.QemuArch = qemu.Arch_x86_64
 	}
@@ -436,10 +493,6 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 	cmd += "QEMU_CMD=$DEFAULT_QEMU_CMD\n"
 	if s.IsKvmSupport() && !options.HostOptions.DisableKVM {
 		cmd += "QEMU_CMD_KVM_ARG=-enable-kvm\n"
-	} else if utils.IsInStringArray(s.manager.host.GetCpuArchitecture(), apis.ARCH_X86) {
-		// -no-kvm仅x86适用，且将在qemu 5.2之后移除
-		// https://gitlab.com/qemu-project/qemu/-/blob/master/docs/about/removed-features.rst
-		cmd += "QEMU_CMD_KVM_ARG=-no-kvm\n"
 	} else {
 		cmd += "QEMU_CMD_KVM_ARG=\n"
 	}
@@ -465,6 +518,28 @@ function nic_mtu() {
 }
 `
 
+	if input.EnableTpm {
+		input.OVMFPath = options.HostOptions.SecbootOvmfPath
+		input.OVMFVarsPath = options.HostOptions.SecbootOvmfVarsPath
+		cmd += `
+function start_swtpm() {
+    local swtpm_binary=$1
+    local swtpm_dir=$2
+    local swtpm_socket=$swtpm_dir/swtpm.sock
+    local swtpm_log=$swtpm_dir/swtpm.log
+    local swtpm_pid=$swtpm_dir/swtpm.pid
+
+    if [ -f "$swtpm_pid" ] && ps -p $(cat "$swtpm_pid") >/dev/null 2>&1; then
+        return 0
+    fi
+
+    mkdir -p $swtpm_dir
+    $swtpm_binary socket --tpmstate dir=$swtpm_dir --ctrl type=unixio,path=$swtpm_socket --log file=$swtpm_log,level=20 --pid file=$swtpm_pid --tpm2 -d
+}
+`
+		cmd += fmt.Sprintf("start_swtpm %s %s\n", options.HostOptions.BinarySwtpmPath, s.getSwtpmDirPath())
+	}
+
 	// Generate Start VM script
 	cmd += `CMD="$QEMU_CMD $QEMU_CMD_KVM_ARG`
 
@@ -487,12 +562,12 @@ function nic_mtu() {
 	input.EnableUUID = options.HostOptions.EnableVmUuid
 	if s.Desc.Bios == qemu.BIOS_UEFI {
 		if len(input.OVMFPath) == 0 {
-			input.OVMFPath = options.HostOptions.OvmfPath
+			input.OVMFPath, input.OVMFVarsPath = s.getOvmfVarsSourcePath()
 		}
 	}
 
 	// inject usb devices
-	if input.QemuArch == qemu.Arch_aarch64 {
+	if !input.QemuArch.IsX86() {
 		input.Devices = append(input.Devices,
 			fmt.Sprintf("usb-tablet,id=input0,bus=%s.0,port=1", s.Desc.Usb.Id),
 			fmt.Sprintf("usb-kbd,id=input1,bus=%s.0,port=2", s.Desc.Usb.Id),
@@ -532,6 +607,7 @@ function nic_mtu() {
 			s.LiveMigrateUseTls = false
 		}
 	} else if s.Desc.IsSlave {
+		log.Infof("backup guest with dest port %v", s.LiveMigrateDestPort)
 		input.LiveMigratePort = uint(*s.LiveMigrateDestPort)
 	}
 
@@ -543,6 +619,19 @@ function nic_mtu() {
 		if err := s.slaveDiskPrepare(input, diskUri); err != nil {
 			return "", err
 		}
+	}
+
+	input.IsSupportCpuHotplug = s.IsSupportCpuHotplug()
+
+	// set rescue flag to input
+	if s.Desc.LightMode {
+		input.RescueInitrdPath = s.getRescueInitrdPath()
+		input.RescueKernelPath = s.getRescueKernelPath()
+	}
+
+	// check if kickstart is needed for KVM guests
+	if err := s.configureKickstartBoot(input); err != nil {
+		return "", errors.Wrap(err, "handle kickstart mount")
 	}
 
 	qemuOpts, err := qemu.GenerateStartOptions(input)
@@ -557,6 +646,224 @@ function nic_mtu() {
 	return cmd, nil
 }
 
+// shouldUseKickstart 判断是否需要启用kickstart自动化安装
+// 启动kickstart的条件：1. 虚拟机处于KVM虚拟化环境；2. 存在kickstart配置且未禁用；3. kickstart未完成
+func (s *SKVMGuestInstance) shouldUseKickstart() bool {
+	// 只在KVM虚拟化环境下处理kickstart
+	if s.Desc.GetHypervisor() != api.HYPERVISOR_KVM {
+		return false
+	}
+
+	kickstartCompleted, completedExists := s.Desc.Metadata[api.VM_METADATA_KICKSTART_COMPLETED_FLAG]
+	if completedExists && kickstartCompleted == "true" {
+		log.Debugf("Kickstart already completed for VM %s, skipping kickstart boot", s.Id)
+		return false
+	}
+
+	// 检查是否存在kickstart配置
+	kickstartConfigStr, configExists := s.Desc.Metadata[api.VM_METADATA_KICKSTART_CONFIG]
+	if !configExists || kickstartConfigStr == "" {
+		return false
+	} else {
+		kickstartConfigJson, err := jsonutils.ParseString(kickstartConfigStr)
+		if err != nil {
+			log.Errorf("Failed to parse kickstart config for VM %s: %v", s.Id, err)
+			return false
+		}
+		kickstartConfig := &api.KickstartConfig{}
+		if err := kickstartConfigJson.Unmarshal(kickstartConfig); err != nil {
+			log.Errorf("Failed to unmarshal kickstart config for VM %s: %v", s.Id, err)
+			return false
+		}
+		if kickstartConfig.Enabled != nil && !*kickstartConfig.Enabled {
+			log.Debugf("Kickstart is disabled in config for VM %s, skipping kickstart boot", s.Id)
+			return false
+		}
+	}
+
+	log.Debugf("VM %s needs kickstart: config exists and not completed yet", s.Id)
+	return true
+}
+
+// configureKickstartBoot 配置 kickstart 自动化安装的启动流程
+// 1. 挂载安装 ISO，获取内核和 initrd 路径
+// 2. 生成内核启动参数
+// 3. 创建 kickstart 监控器
+// 4. 如果包含完整配置，生成 kickstart 配置 ISO 并添加为 CDROM 设备
+func (s *SKVMGuestInstance) configureKickstartBoot(input *qemu.GenerateStartOptionsInput) error {
+	if !s.shouldUseKickstart() {
+		return nil
+	}
+
+	log.Debugf("Enabling kickstart boot for VM %s", s.Id)
+
+	kickstartConfigStr := s.Desc.Metadata[api.VM_METADATA_KICKSTART_CONFIG]
+
+	kickstartConfigJson, err := jsonutils.ParseString(kickstartConfigStr)
+	if err != nil {
+		return errors.Wrap(err, "parse kickstart config")
+	}
+
+	kickstartConfig := &api.KickstartConfig{}
+	if err := kickstartConfigJson.Unmarshal(kickstartConfig); err != nil {
+		return errors.Wrap(err, "unmarshal kickstart config")
+	}
+
+	// Find ISO file for kickstart installation from CDROM devices
+	var isoPath string
+	if len(s.Desc.Cdroms) > 0 {
+		for _, cdrom := range s.Desc.Cdroms {
+			if cdrom.Path != "" {
+				isoPath = cdrom.Path
+				break
+			}
+		}
+	}
+
+	if isoPath == "" {
+		log.Warningf("no ISO path found for kickstart, skip")
+		return nil
+	}
+
+	kickstartDir := s.getKickstartTmpDir()
+	mountPoint := filepath.Join(kickstartDir, KICKSTART_ISO_MOUNT_DIR)
+
+	// Check if mount point already exists and is mounted
+	if fileutils2.Exists(mountPoint) {
+		mountFile := "/proc/mounts"
+		if data, err := os.ReadFile(mountFile); err == nil {
+			lines := strings.Split(string(data), "\n")
+			mounted := false
+			for _, line := range lines {
+				parts := strings.Split(line, " ")
+				if len(parts) >= 2 && parts[1] == mountPoint {
+					mounted = true
+					break
+				}
+			}
+			if mounted {
+				log.Debugf("Reusing existing kickstart ISO mount at %s for guest %s", mountPoint, s.GetName())
+			} else {
+				os.RemoveAll(mountPoint)
+				if err := os.MkdirAll(mountPoint, 0755); err != nil {
+					return errors.Wrap(err, "create mount point")
+				}
+				if err := mountutils.MountWithParams(isoPath, mountPoint, "iso9660", []string{"-o", "loop,ro"}); err != nil {
+					os.RemoveAll(mountPoint)
+					return errors.Wrapf(err, "mount ISO %s to %s", isoPath, mountPoint)
+				}
+				log.Debugf("Successfully mounted kickstart ISO %s to %s for guest %s", isoPath, mountPoint, s.GetName())
+			}
+		}
+	} else {
+		if err := os.MkdirAll(mountPoint, 0755); err != nil {
+			return errors.Wrap(err, "create mount point")
+		}
+		if err := mountutils.MountWithParams(isoPath, mountPoint, "iso9660", []string{"-o", "loop,ro"}); err != nil {
+			os.RemoveAll(mountPoint)
+			return errors.Wrapf(err, "mount ISO %s to %s", isoPath, mountPoint)
+		}
+		log.Debugf("Successfully mounted kickstart ISO %s to %s for guest %s", isoPath, mountPoint, s.GetName())
+	}
+
+	mountPath := mountPoint
+
+	// get kernel and initrd path from mounted ISO
+	kernelPath, initrdPath, err := GetKernelInitrdPaths(mountPath, kickstartConfig.OSType)
+	if err != nil {
+		return errors.Wrap(err, "get kickstart kernel paths")
+	}
+
+	// Copy kernel and initrd files to local directory and unmount ISO
+	kernelCopyDir := filepath.Join(kickstartDir, "bootfiles")
+	if err := os.MkdirAll(kernelCopyDir, 0755); err != nil {
+		return errors.Wrap(err, "create kernel copy directory")
+	}
+
+	kernelFileName := filepath.Base(kernelPath)
+	initrdFileName := filepath.Base(initrdPath)
+
+	copiedKernelPath := filepath.Join(kernelCopyDir, kernelFileName)
+	copiedInitrdPath := filepath.Join(kernelCopyDir, initrdFileName)
+
+	if err := procutils.NewCommand("cp", kernelPath, copiedKernelPath).Run(); err != nil {
+		return errors.Wrapf(err, "copy kernel from %s to %s", kernelPath, copiedKernelPath)
+	}
+	log.Debugf("Successfully copied kernel from %s to %s for guest %s", kernelPath, copiedKernelPath, s.GetName())
+
+	if err := procutils.NewCommand("cp", initrdPath, copiedInitrdPath).Run(); err != nil {
+		return errors.Wrapf(err, "copy initrd from %s to %s", initrdPath, copiedInitrdPath)
+	}
+	log.Debugf("Successfully copied initrd from %s to %s for guest %s", initrdPath, copiedInitrdPath, s.GetName())
+
+	// Unmount ISO after copying files
+	log.Infof("Unmounting kickstart ISO at %s after copying kernel and initrd for guest %s", mountPoint, s.GetName())
+	if err := mountutils.Unmount(mountPoint, true); err != nil {
+		log.Warningf("Failed to unmount kickstart ISO at %s: %v", mountPoint, err)
+	} else {
+		log.Debugf("Successfully unmounted kickstart ISO at %s for guest %s", mountPoint, s.GetName())
+		// Remove mount point directory after unmounting
+		if err := os.RemoveAll(mountPoint); err != nil {
+			log.Warningf("Failed to remove mount point directory %s: %v", mountPoint, err)
+		}
+	}
+
+	// Use copied file paths instead of mounted paths
+	kernelPath = copiedKernelPath
+	initrdPath = copiedInitrdPath
+
+	var kickstartConfigIsoPath string
+	log.Debugf("Kickstart config for guest %s: Config length=%d, ConfigURL=%s",
+		s.GetName(), len(kickstartConfig.Config), kickstartConfig.ConfigURL)
+
+	isoPath, err = CreateKickstartConfigISO(kickstartConfig, s.getKickstartTmpDir())
+	if err != nil {
+		log.Errorf("Failed to create kickstart config ISO for guest %s: %v, falling back to URL/cdrom method", s.GetName(), err)
+	} else {
+		kickstartConfigIsoPath = isoPath
+		log.Debugf("Successfully created kickstart ISO for guest %s: %s", s.GetName(), isoPath)
+	}
+
+	kernelArgs := BuildKickstartAppendArgs(kickstartConfig, kickstartConfigIsoPath)
+	log.Debugf("Generated kickstart kernel args for guest %s: %s", s.GetName(), kernelArgs)
+
+	// Create kickstart serial monitor for status monitoring
+	kickstartMonitor := NewKickstartSerialMonitor(s)
+	serialFilePath := kickstartMonitor.GetSerialFilePath()
+
+	input.KickstartBoot = &qemu.KickstartBootInfo{
+		Config:         kickstartConfig,
+		MountPath:      mountPath,
+		KernelPath:     kernelPath,
+		InitrdPath:     initrdPath,
+		KernelArgs:     kernelArgs,
+		SerialFilePath: serialFilePath,
+		ConfigIsoPath:  kickstartConfigIsoPath,
+	}
+
+	// Add kickstart config ISO as additional CDROM device if created
+	if kickstartConfigIsoPath != "" {
+		if err := s.attachKickstartISO(kickstartConfigIsoPath); err != nil {
+			log.Warningf("Failed to attach kickstart config ISO %s: %v", kickstartConfigIsoPath, err)
+		}
+	}
+
+	s.kickstartMonitor = kickstartMonitor
+
+	log.Debugf("Kickstart boot configured for guest %s: kernel=%s, initrd=%s, args=%s, isoPath=%s",
+		s.GetName(), kernelPath, initrdPath, kernelArgs, kickstartConfigIsoPath)
+
+	return nil
+}
+
+func (s *SKVMGuestInstance) getRescueInitrdPath() string {
+	return path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_INITRAMFS)
+}
+
+func (s *SKVMGuestInstance) getRescueKernelPath() string {
+	return path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_KERNEL)
+}
+
 func (s *SKVMGuestInstance) slaveDiskPrepare(input *qemu.GenerateStartOptionsInput, diskUri string) error {
 	for i := 0; i < len(input.GuestDesc.Disks); i++ {
 		diskPath := input.GuestDesc.Disks[i].Path
@@ -564,12 +871,9 @@ func (s *SKVMGuestInstance) slaveDiskPrepare(input *qemu.GenerateStartOptionsInp
 		if err != nil {
 			return errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
 		}
-		if output, err := procutils.NewCommand("rm", "-f", diskPath).Output(); err != nil {
-			return errors.Errorf("failed delete slave top disk file %s %s", output, err)
-		}
-		diskUrl := fmt.Sprintf("%s/%s", diskUri, input.GuestDesc.Disks[i].DiskId)
-		if err := d.CreateFromImageFuse(context.Background(), diskUrl, 0, nil); err != nil {
-			return errors.Wrap(err, "failed create slave disk")
+		err = d.RebuildSlaveDisk(diskUri)
+		if err != nil {
+			return errors.Wrap(err, "RebuildSlaveDisk")
 		}
 	}
 	return nil
@@ -674,12 +978,27 @@ func (s *SKVMGuestInstance) generateStopScript(data *jsonutils.JSONDict) string 
 	cmd += "fi\n"
 
 	cmd += fmt.Sprintf("for d in $(ls -d /dev/hugepages/%s*)\n", uuid)
-	cmd += fmt.Sprintf("do\n")
-	cmd += fmt.Sprintf("  if [ -d $d ]; then\n")
-	cmd += fmt.Sprintf("    umount $d\n")
-	cmd += fmt.Sprintf("    rm -rf $d\n")
-	cmd += fmt.Sprintf("  fi\n")
-	cmd += fmt.Sprintf("done\n")
+	cmd += "do\n"
+	cmd += "  if [ -d $d ]; then\n"
+	cmd += "    umount $d\n"
+	cmd += "    rm -rf $d\n"
+	cmd += "  fi\n"
+	cmd += "done\n"
+
+	if s.enableTpmDev() {
+		// stop swtpm
+		cmd += fmt.Sprintf("SWTPM_PID_FILE=%s\n", s.getSwtpmPidPath())
+		cmd += "if [ -f $SWTPM_PID_FILE ]; then\n"
+		cmd += "  SWTPM_PID=`cat $SWTPM_PID_FILE`\n"
+		cmd += "  ps -p $SWTPM_PID > /dev/null\n"
+		cmd += "  if [ $? -eq 0 ]; then\n"
+		cmd += "    echo \"Kill swtpm process $SWTPM_PID\"\n"
+		cmd += "    kill -9 $SWTPM_PID > /dev/null 2>&1\n"
+		cmd += "  fi\n"
+		cmd += "  echo \"Remove swtpm PID $SWTPM_PID_FILE\"\n"
+		cmd += "  rm -f $SWTPM_PID_FILE\n"
+		cmd += "fi\n"
+	}
 
 	for _, nic := range nics {
 		if nic.Driver == api.NETWORK_DRIVER_VFIO {
@@ -747,6 +1066,22 @@ func (s *SKVMGuestInstance) getPKIDirPath() string {
 	return path.Join(s.HomeDir(), "pki")
 }
 
+func (s *SKVMGuestInstance) getSwtpmDirPath() string {
+	return path.Join(s.HomeDir(), "swtpm")
+}
+
+func (s *SKVMGuestInstance) getSwtpmSocketPath() string {
+	return path.Join(s.getSwtpmDirPath(), "swtpm.sock")
+}
+
+func (s *SKVMGuestInstance) getSwtpmLogPath() string {
+	return path.Join(s.getSwtpmDirPath(), "swtpm.log")
+}
+
+func (s *SKVMGuestInstance) getSwtpmPidPath() string {
+	return path.Join(s.getSwtpmDirPath(), "swtpm.pid")
+}
+
 func (s *SKVMGuestInstance) makePKIDir() error {
 	output, err := procutils.NewCommand("mkdir", "-p", s.getPKIDirPath()).Output()
 	if err != nil {
@@ -781,16 +1116,16 @@ func (s *SKVMGuestInstance) WriteMigrateCerts(certs map[string]string) error {
 	return nil
 }
 
-func (s *SKVMGuestInstance) SetNicDown(index int8) error {
+func (s *SKVMGuestInstance) SetNicDown(mac string) error {
 	var nic *desc.SGuestNetwork
 	for i := range s.Desc.Nics {
-		if s.Desc.Nics[i].Index == index {
+		if s.Desc.Nics[i].Mac == mac {
 			nic = s.Desc.Nics[i]
 			break
 		}
 	}
 	if nic == nil {
-		return errors.Errorf("guest %s has no nic index %d", s.GetName(), index)
+		return errors.Errorf("guest %s has no nic with mac %s", s.GetName(), mac)
 	}
 	scriptPath := s.getNicDownScriptPath(nic)
 	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", scriptPath).Output()
@@ -824,10 +1159,8 @@ func (s *SKVMGuestInstance) startMemCleaner() error {
 }
 
 func (s *SKVMGuestInstance) gpusHasVga() bool {
-	manager := s.manager.GetHost().GetIsolatedDeviceManager()
 	for i := 0; i < len(s.Desc.IsolatedDevices); i++ {
-		dev := manager.GetDeviceByAddr(s.Desc.IsolatedDevices[i].Addr)
-		if dev.GetDeviceType() == api.GPU_VGA_TYPE {
+		if s.Desc.IsolatedDevices[i].GpuType == api.GPU_VGA {
 			return true
 		}
 	}
@@ -838,7 +1171,7 @@ func (s *SKVMGuestInstance) hasGPU() bool {
 	manager := s.manager.GetHost().GetIsolatedDeviceManager()
 	for i := 0; i < len(s.Desc.IsolatedDevices); i++ {
 		dev := manager.GetDeviceByAddr(s.Desc.IsolatedDevices[i].Addr)
-		if dev.GetDeviceType() == api.GPU_VGA_TYPE || dev.GetDeviceType() == api.GPU_HPC_TYPE {
+		if dev.GetDeviceType() == api.GPU_TYPE {
 			return true
 		}
 	}
@@ -859,13 +1192,22 @@ func (s *SKVMGuestInstance) initCpuDesc(cpuMax uint) error {
 		return err
 	}
 	s.Desc.CpuDesc = cpuDesc
+
+	// if region not allocate cpu numa pin
+	if len(s.Desc.CpuNumaPin) == 0 {
+		err = s.allocGuestNumaCpuset()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (s *SKVMGuestInstance) initMemDesc(memSizeMB int64) {
+func (s *SKVMGuestInstance) initMemDesc(memSizeMB int64) error {
 	s.Desc.MemDesc = s.archMan.GenerateMemDesc()
 	s.Desc.MemDesc.SizeMB = memSizeMB
-	s.initDefaultMemObject(memSizeMB)
+
+	return s.initGuestMemObjects(memSizeMB)
 }
 
 func (s *SKVMGuestInstance) memObjectType() string {
@@ -878,24 +1220,89 @@ func (s *SKVMGuestInstance) memObjectType() string {
 	}
 }
 
-func (s *SKVMGuestInstance) initDefaultMemObject(memSizeMB int64) {
-	s.Desc.MemDesc.Mem = desc.NewObject(s.memObjectType(), "mem")
+func (s *SKVMGuestInstance) initGuestMemObjects(memSizeMB int64) error {
+	if len(s.Desc.CpuNumaPin) == 0 {
+		s.initDefaultMemObject(memSizeMB)
+		return nil
+	}
+
+	var numaMems int64
+	var numaCpus = int(s.Desc.CpuDesc.MaxCpus) / len(s.Desc.CpuNumaPin)
+	var leastCpus = int(s.Desc.CpuDesc.MaxCpus) % len(s.Desc.CpuNumaPin)
+	var cpuStart = 0
+	var cpuEnd = numaCpus - 1
+
+	var mems = make([]desc.SMemDesc, 0)
+	for i := 0; i < len(s.Desc.CpuNumaPin); i++ {
+		if s.Desc.CpuNumaPin[i].SizeMB <= 0 {
+			continue
+		}
+
+		numaMems += s.Desc.CpuNumaPin[i].SizeMB
+		memId := "mem"
+		nodeId := uint16(i)
+		if i > 0 {
+			memId += strconv.Itoa(i - 1)
+		}
+
+		if i == 0 {
+			cpuEnd += leastCpus
+		}
+		vcpus := fmt.Sprintf("%d-%d", cpuStart, cpuEnd)
+
+		for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+			s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu = cpuStart + j
+		}
+
+		cpuStart = cpuEnd + 1
+		cpuEnd = cpuStart + numaCpus - 1
+
+		if s.Desc.CpuNumaPin[i].Unregular {
+			continue
+		}
+		memDesc := desc.NewMemDesc(s.memObjectType(), memId, &nodeId, &vcpus)
+		memDesc.Options = s.getMemObjectOptions(s.Desc.CpuNumaPin[i].SizeMB, s.Desc.Uuid, s.Desc.CpuNumaPin[i].NodeId)
+		mems = append(mems, *memDesc)
+	}
+	if len(mems) == 0 {
+		// numa mems not regular
+		s.initDefaultMemObject(memSizeMB)
+		return nil
+	}
+
+	s.Desc.MemDesc.Mem = desc.NewMemsDesc(mems[0], mems[1:])
+	return nil
+}
+
+func (s *SKVMGuestInstance) getMemObjectOptions(memSizeMB int64, memPathSuffix string, hostNodes *uint16) map[string]string {
+	var opts map[string]string
 	if s.manager.host.IsHugepagesEnabled() {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
-			"mem-path": fmt.Sprintf("/dev/hugepages/%s", s.Desc.Uuid),
+		opts = map[string]string{
+			"mem-path": fmt.Sprintf("/dev/hugepages/%s", memPathSuffix),
 			"size":     fmt.Sprintf("%dM", memSizeMB),
 			"share":    "on", "prealloc": "on",
 		}
+		if hostNodes != nil {
+			opts["host-nodes"] = fmt.Sprintf("%d", *hostNodes)
+			opts["policy"] = "bind"
+		}
 	} else if s.isMemcleanEnabled() {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
+		opts = map[string]string{
 			"size":  fmt.Sprintf("%dM", memSizeMB),
 			"share": "on", "prealloc": "on",
 		}
 	} else {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
+		opts = map[string]string{
 			"size": fmt.Sprintf("%dM", memSizeMB),
 		}
 	}
+	return opts
+}
+
+func (s *SKVMGuestInstance) initDefaultMemObject(memSizeMB int64) {
+	defaultDesc := desc.NewMemDesc(s.memObjectType(), "mem", nil, nil)
+	defaultDesc.Options = s.getMemObjectOptions(memSizeMB, s.Desc.Uuid, nil)
+	s.Desc.MemDesc.Mem = desc.NewMemsDesc(*defaultDesc, nil)
 }
 
 func (s *SKVMGuestInstance) defaultMemNodeHasObject(memDevs []monitor.Memdev) bool {
@@ -917,9 +1324,13 @@ func (s *SKVMGuestInstance) initMemDescFromMemoryInfo(
 			return errors.Errorf("unsupported memory device type %s", memoryDevicesInfoList[i].Type)
 		}
 		memSize -= (memoryDevicesInfoList[i].Data.Size / 1024 / 1024)
+		memObj := desc.NewMemDesc(s.memObjectType(), path.Base(memoryDevicesInfoList[i].Data.Memdev), nil, nil)
+		memObj.Options = map[string]string{
+			"size": fmt.Sprintf("%dM", memoryDevicesInfoList[i].Data.Size/1024/1024),
+		}
 		memSlots = append(memSlots, &desc.SMemSlot{
 			SizeMB: memoryDevicesInfoList[i].Data.Size / 1024 / 1024,
-			MemObj: desc.NewObject(s.memObjectType(), path.Base(memoryDevicesInfoList[i].Data.Memdev)),
+			MemObj: memObj,
 			MemDev: &desc.SMemDevice{
 				Type: "pc-dimm", Id: *memoryDevicesInfoList[i].Data.ID,
 			},
@@ -942,23 +1353,28 @@ func (s *SKVMGuestInstance) fixGuestMachineType() {
 		s.Desc.Machine = api.VM_MACHINE_TYPE_Q35
 		s.Desc.Bios = qemu.BIOS_UEFI
 	}
-	if s.manager.host.IsAarch64() {
+	if !s.manager.host.IsX8664() {
 		if utils.IsInStringArray(s.Desc.Machine, []string{
 			"", api.VM_MACHINE_TYPE_PC, api.VM_MACHINE_TYPE_Q35,
 		}) {
-			s.Desc.Machine = api.VM_MACHINE_TYPE_ARM_VIRT
+			s.Desc.Machine = api.VM_MACHINE_TYPE_VIRT
 		}
+	}
+	if s.manager.host.IsAarch64() || s.manager.host.IsRiscv64() {
 		s.Desc.Bios = qemu.BIOS_UEFI
 	}
 }
 
 func (s *SKVMGuestInstance) initMachineDesc() {
+	if s.Desc.Machine == "" {
+		s.Desc.Machine = s.getMachine()
+	}
+
 	s.Desc.MachineDesc = s.archMan.GenerateMachineDesc(s.Desc.CpuDesc.Accel)
 	if options.HostOptions.NoHpet {
 		noHpet := true
 		s.Desc.NoHpet = &noHpet
 	}
-
 }
 
 func (s *SKVMGuestInstance) initQgaDesc() {
@@ -966,7 +1382,9 @@ func (s *SKVMGuestInstance) initQgaDesc() {
 }
 
 func (s *SKVMGuestInstance) initPvpanicDesc() {
-	s.Desc.Pvpanic = s.archMan.GeneratePvpanicDesc()
+	if !s.disablePvpanicDev() {
+		s.Desc.Pvpanic = s.archMan.GeneratePvpanicDesc()
+	}
 }
 
 func (s *SKVMGuestInstance) initIsaSerialDesc() {
@@ -975,8 +1393,21 @@ func (s *SKVMGuestInstance) initIsaSerialDesc() {
 	}
 }
 
+func (s *SKVMGuestInstance) initTpmDesc() {
+	if s.enableTpmDev() {
+		charDevId := "chrtpm"
+		s.Desc.Tpm = &desc.SGuestTpm{
+			TpmSock: desc.NewCharDev("socket", charDevId, ""),
+			Id:      "tpm0",
+		}
+		s.Desc.Tpm.TpmSock.Options = map[string]string{
+			"path": s.getSwtpmSocketPath(),
+		}
+	}
+}
+
 func (s *SKVMGuestInstance) getVfioDeviceHotPlugPciControllerType() *desc.PCI_CONTROLLER_TYPE {
-	if s.Desc.Machine == api.VM_MACHINE_TYPE_Q35 || s.Desc.Machine == api.VM_MACHINE_TYPE_ARM_VIRT {
+	if s.Desc.Machine == api.VM_MACHINE_TYPE_Q35 || s.Desc.Machine == api.VM_MACHINE_TYPE_VIRT {
 		_, _, found := s.findUnusedSlotForController(desc.CONTROLLER_TYPE_PCIE_ROOT_PORT, 0)
 		if found {
 			var contType desc.PCI_CONTROLLER_TYPE = desc.CONTROLLER_TYPE_PCIE_ROOT_PORT
@@ -1007,4 +1438,130 @@ func (s *SKVMGuestInstance) vfioDevCount() int {
 		}
 	}
 	return res
+}
+
+func (s *SKVMGuestInstance) getOvmfVarsPath() string {
+	ovmfVarsName := filepath.Base(options.HostOptions.OvmfVarsPath)
+	varsPath := path.Join(s.HomeDir(), ovmfVarsName)
+	if fileutils2.Exists(varsPath) {
+		return varsPath
+	}
+
+	ovmfVarsName = filepath.Base(options.HostOptions.SecbootOvmfVarsPath)
+	varsPath = path.Join(s.HomeDir(), ovmfVarsName)
+	if fileutils2.Exists(varsPath) {
+		return varsPath
+	}
+	ovmfVarsName = filepath.Base(options.HostOptions.Ovmf4MCodeVarsPath)
+	varsPath = path.Join(s.HomeDir(), ovmfVarsName)
+	return varsPath
+}
+
+func (s *SKVMGuestInstance) getOvmfVarsSourcePath() (string, string) {
+	ovmfVarsName := filepath.Base(options.HostOptions.OvmfVarsPath)
+	varsPath := path.Join(s.HomeDir(), ovmfVarsName)
+	if fileutils2.Exists(varsPath) {
+		return options.HostOptions.OvmfPath, options.HostOptions.OvmfVarsPath
+	}
+
+	ovmfVarsName = filepath.Base(options.HostOptions.SecbootOvmfVarsPath)
+	varsPath = path.Join(s.HomeDir(), ovmfVarsName)
+	if fileutils2.Exists(varsPath) {
+		return options.HostOptions.SecbootOvmfPath, options.HostOptions.SecbootOvmfVarsPath
+	}
+
+	if fileutils2.Exists(options.HostOptions.Ovmf4MCodeVarsPath) {
+		return options.HostOptions.Ovmf4MCodePath, options.HostOptions.Ovmf4MCodeVarsPath
+	} else {
+		return options.HostOptions.OvmfPath, options.HostOptions.OvmfVarsPath
+	}
+}
+
+func (s *SKVMGuestInstance) getDiskBootOrderType(driver string) uefi.OvmfDevicePathType {
+	switch driver {
+	case qemu.DISK_DRIVER_VIRTIO:
+		return uefi.DEVICE_TYPE_PCI
+	case qemu.DISK_DRIVER_SCSI, qemu.DISK_DRIVER_PVSCSI:
+		return uefi.DEVICE_TYPE_SCSI
+	case qemu.DISK_DRIVER_IDE:
+		if !s.manager.host.IsX8664() {
+			return uefi.DEVICE_TYPE_SCSI
+		}
+		return uefi.DEVICE_TYPE_IDE
+	case qemu.DISK_DRIVER_SATA:
+		if !s.manager.host.IsX8664() {
+			return uefi.DEVICE_TYPE_SCSI
+		}
+		return uefi.DEVICE_TYPE_SATA
+	}
+	return uefi.DEVICE_TYPE_UNKNOWN
+}
+
+func (s *SKVMGuestInstance) getCdromBootOrder() uefi.OvmfDevicePathType {
+	if !s.manager.host.IsX8664() {
+		return uefi.DEVICE_TYPE_SCSI_CDROM
+	}
+	return uefi.DEVICE_TYPE_CDROM
+}
+
+func (s *SKVMGuestInstance) setUefiBootOrder(ctx context.Context) error {
+	params := &deployapi.OvmfBootOrderParams{
+		OvmfVarsPath: s.getOvmfVarsPath(),
+	}
+	devs := make([]*deployapi.BootDevices, 0)
+	for i := range s.Desc.Cdroms {
+		if s.Desc.Cdroms[i].BootIndex == nil || *s.Desc.Disks[i].BootIndex < 0 {
+			continue
+		}
+		dev := &deployapi.BootDevices{
+			BootOrder:   int32(*s.Desc.Cdroms[i].BootIndex),
+			AttachOrder: int32(s.Desc.Cdroms[i].Ordinal),
+			DevType:     int32(s.getCdromBootOrder()),
+		}
+		devs = append(devs, dev)
+	}
+	for i := range s.Desc.Disks {
+		if s.Desc.Disks[i].BootIndex == nil || *s.Desc.Disks[i].BootIndex < 0 {
+			continue
+		}
+		dev := &deployapi.BootDevices{
+			BootOrder:   int32(*s.Desc.Disks[i].BootIndex),
+			AttachOrder: int32(s.Desc.Disks[i].Index),
+			DevType:     int32(s.getDiskBootOrderType(s.Desc.Disks[i].Driver)),
+		}
+		devs = append(devs, dev)
+	}
+	params.Devs = devs
+	_, err := deployclient.GetDeployClient().SetOvmfBootOrder(ctx, params)
+	if err != nil {
+		return errors.Wrap(err, "SetOvmfBootOrder")
+	}
+	return nil
+}
+
+// attachKickstartISO attaches the kickstart ISO as an additional CDROM device
+// if the kickstart is not provided by URL
+func (s *SKVMGuestInstance) attachKickstartISO(isoPath string) error {
+	cdromId := fmt.Sprintf("kickstart_iso_%s", s.Id)
+
+	log.Debugf("Attaching kickstart ISO %s as CDROM device for guest %s", isoPath, s.GetName())
+
+	kickstartCdrom := &desc.SGuestCdrom{
+		Id:      cdromId,
+		Path:    isoPath,
+		Ordinal: int64(len(s.Desc.Cdroms)),
+		Scsi:    desc.NewScsiDevice("scsi.0", "scsi-cd", fmt.Sprintf("scsi-cd-%s", cdromId)),
+		DriveOptions: map[string]string{
+			"readonly": "on",
+			"media":    "cdrom",
+			"if":       "none",
+		},
+	}
+
+	s.Desc.Cdroms = append(s.Desc.Cdroms, kickstartCdrom)
+
+	log.Debugf("Successfully attached kickstart ISO %s as SCSI CDROM device %s (ordinal=%d) for guest %s",
+		isoPath, cdromId, kickstartCdrom.Ordinal, s.GetName())
+
+	return nil
 }

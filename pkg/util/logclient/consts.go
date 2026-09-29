@@ -28,6 +28,9 @@ const (
 	ACT_CLOUD_FULLSYNC               = "cloud_fullsync"
 	ACT_CLOUD_SYNC                   = "cloud_sync"
 	ACT_CREATE                       = "create"
+	ACT_POST_CREATE_HOOK             = "post_create_hook"
+	ACT_POST_DELETE_HOOK             = "post_delete_hook"
+	ACT_POST_UPDATE_HOOK             = "post_update_hook"
 	ACT_DELETE                       = "delete"
 	ACT_PENDING_DELETE               = "pending_delete"
 	ACT_DISABLE                      = "disable"
@@ -59,6 +62,8 @@ const (
 	ACT_VM_SRC_CHECK                 = "vm_src_check"
 	ACT_VM_START                     = "vm_start"
 	ACT_VM_STOP                      = "vm_stop"
+	ACT_VM_START_RESCUE              = "vm_start_rescue"
+	ACT_VM_STOP_RESCUE               = "vm_stop_rescue"
 	ACT_VM_SUSPEND                   = "vm_suspend"
 	ACT_VM_RESTART                   = "vm_restart"
 	ACT_VM_RESUME                    = "vm_resume"
@@ -107,8 +112,9 @@ const (
 	ACT_VM_CONVERT                   = "vm_convert"
 	ACT_FREEZE                       = "freeze"
 	ACT_UNFREEZE                     = "unfreeze"
+	ACT_CHANGE_BILLING_TYPE          = "change_billing_type"
 	// 到期释放
-	ACT_SET_EXPIRED_TIME        = "set_expired_time"
+	ACT_SET_RELEASE_TIME        = "set_release_time"
 	ACT_VM_SYNC_ISOLATED_DEVICE = "vm_sync_isolated_device"
 
 	ACT_CACHED_IMAGE = "cached_image"
@@ -127,7 +133,8 @@ const (
 	ACT_AUTHENTICATE = "authenticate"
 	ACT_LOGOUT       = "logout"
 
-	ACT_HEALTH_CHECK = "health_check"
+	ACT_HEALTH_CHECK           = "health_check"
+	ACT_HOST_DOWN_AUTO_MIGRATE = "host_down_auto_migrate"
 
 	ACT_RECYCLE_PREPAID      = "recycle_prepaid"
 	ACT_UNDO_RECYCLE_PREPAID = "undo_recycle_prepaid"
@@ -139,7 +146,9 @@ const (
 	ACT_HOST_IMPORT_LIBVIRT_SERVERS = "host_import_libvirt_servers"
 	ACT_GUEST_CREATE_FROM_IMPORT    = "guest_create_from_import"
 	ACT_GUEST_PANICKED              = "guest_panicked"
+	ACT_GUEST_SCREEN_DUMP           = "guest_screen_dump"
 	ACT_HOST_MAINTAINING            = "host_maintaining"
+	ACT_HOST_UNMAINTENANCE          = "host_unmaintenance"
 
 	ACT_MKDIR          = "mkdir"
 	ACT_DELETE_OBJECT  = "delete_object"
@@ -242,6 +251,13 @@ const (
 	ACT_CONSOLE           = "console"
 	ACT_WEBSSH            = "webssh"
 	ACT_SET_USER_PASSWORD = "set_user_password"
+	ACT_MAKESSHABLE       = "make_sshable"
+	ACT_TRYSSHABLE        = "try_sshable"
+
+	ACT_ISO_ATTACH = "iso_attach"
+	ACT_ISO_DETACH = "iso_detach"
+
+	ACT_SYNC_OS_INFO = "sync_os_info"
 
 	ACT_PANIC = "panic"
 
@@ -259,6 +275,7 @@ const (
 	ACT_DISSOCIATE = "dissociate"
 
 	ACT_BIND     = "bind"
+	ACT_UNBIND   = "unbind"
 	ACT_PROGRESS = "progress"
 
 	ACT_ADD_BASTION_SERVER = "add_bastion_server"
@@ -269,4 +286,41 @@ const (
 	ACT_REPORT_COLLECT_DATA = "report_collect_data"
 	ACT_REPORT_SEND         = "report_send"
 	ACT_REPORT_TEMPLATE     = "report_template"
+
+	ACT_CREATE_SECURITY_GROUP_RULE = "create_security_group_rule"
+	ACT_DELETE_SECURITY_GROUP_RULE = "delete_security_group_rule"
+
+	ACT_CLEAN_PROJECT = "clean_project"
+	ACT_JOIN_PROJECT  = "join_project"
+	ACT_LEAVE_PROJECT = "leave_project"
+
+	ACT_SET_SCHED_TAG    = "set_sched_tag"
+	ACT_RESET_CREDENTIAL = "reset_credential"
+
+	ACT_AUTO_MIGRATE_ON_HOST_DOWN                 = "auto_migrate_on_host"
+	ACT_SET_RESERVE_RESOURCE_FOR_ISOLATED_DEVICES = "set_reserve_resource_for_isolated_devices"
+
+	ACT_UNCONVERT_START    = "unconverting"
+	ACT_UNCONVERT_COMPLETE = "unconverted"
+	ACT_SET_COMMIT_BOUND   = "set_commit_bound"
+
+	ACT_COLLECT_METRICS = "collect_metrics"
+
+	ACT_CONFIGURE            = "configure"
+	ACT_ACTIVATE             = "activate"
+	ACT_SUSPEND              = "suspend"
+	ACT_APPROVED             = "approved"
+	ACT_REJECTED             = "rejected"
+	ACT_TRANSFERRED          = "transferred"
+	ACT_TRANSFERRED_REJECTED = "trans_rejected"
+	ACT_ADD_RATE             = "add_rate"
+	ACT_REMOVE_RATE          = "remove_rate"
+
+	ACT_CLONE   = "clone"
+	ACT_REBUILD = "rebuild"
+
+	ACT_REGISTER_AIPROXY   = "register_aiproxy"
+	ACT_UNREGISTER_AIPROXY = "unregister_aiproxy"
+
+	ACT_RESUME_IMPORT = "resume_import"
 )

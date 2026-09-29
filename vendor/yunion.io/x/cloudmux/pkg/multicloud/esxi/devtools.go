@@ -15,40 +15,55 @@
 package esxi
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
 	"github.com/vmware/govmomi/vim25/types"
 
+	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/pkg/errors"
 )
 
 type SDiskConfig struct {
+	Uefi          bool
 	SizeMb        int64
 	Uuid          string
 	ControllerKey int32
 	UnitNumber    int32
 	Key           int32
 	ImagePath     string
+	DestPath      string
 	IsRoot        bool
 	Datastore     *SDatastore
+	Preallocation string
 }
 
 // In fact, it is the default lable of first one disk
 const rootDiskMark = "Hard disk 1"
 
-func NewDiskDev(sizeMb int64, config SDiskConfig) *types.VirtualDisk {
+func NewDiskDev(ctx context.Context, sizeMb int64, config SDiskConfig) (*types.VirtualDisk, error) {
 	device := types.VirtualDisk{}
 	diskFile := types.VirtualDiskFlatVer2BackingInfo{}
 	diskFile.DiskMode = "persistent"
 	thinProvisioned := true
+	if config.Preallocation == api.DISK_PREALLOCATION_FALLOC || config.Preallocation == api.DISK_PREALLOCATION_FULL {
+		thinProvisioned = false
+		if config.Preallocation == api.DISK_PREALLOCATION_FULL {
+			diskFile.EagerlyScrub = types.NewBool(true)
+		}
+	}
 	diskFile.ThinProvisioned = &thinProvisioned
 	diskFile.Uuid = config.Uuid
 	if len(config.ImagePath) > 0 {
 		diskFile.FileName = config.ImagePath
 	}
 	if config.Datastore != nil {
-		ref := config.Datastore.getDatastoreObj().Reference()
+		ds, err := config.Datastore.getDatastoreObj(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "getDatastoreObj")
+		}
+		ref := ds.Reference()
 		diskFile.Datastore = &ref
 	}
 	device.Backing = &diskFile
@@ -67,7 +82,7 @@ func NewDiskDev(sizeMb int64, config SDiskConfig) *types.VirtualDisk {
 		device.DeviceInfo = &types.Description{Label: label}
 	}
 
-	return &device
+	return &device, nil
 }
 
 func addDevSpec(device types.BaseVirtualDevice) *types.VirtualDeviceConfigSpec {

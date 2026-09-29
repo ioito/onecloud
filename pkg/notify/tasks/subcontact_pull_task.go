@@ -64,7 +64,7 @@ func init() {
 
 func (self *SubcontactPullTask) taskFailed(ctx context.Context, receiver *models.SReceiver, reason string) {
 	log.Errorf("fail to pull subcontact of receiver %q: %s", receiver.Id, reason)
-	receiver.SetStatus(self.UserCred, apis.RECEIVER_STATUS_PULL_FAILED, reason)
+	receiver.SetStatus(ctx, self.UserCred, apis.RECEIVER_STATUS_PULL_FAILED, reason)
 	logclient.AddActionLogWithContext(ctx, receiver, logclient.ACT_PULL_SUBCONTACT, reason, self.UserCred, false)
 	self.SetStageFailed(ctx, jsonutils.NewString(reason))
 }
@@ -80,8 +80,12 @@ func (self *SubcontactPullTask) OnInit(ctx context.Context, obj db.IStandaloneMo
 	// sync email and mobile to keystone
 	s := auth.GetSession(ctx, self.UserCred, "")
 	mobile := receiver.Mobile
-	if strings.HasPrefix(mobile, "+86 ") {
-		mobile = strings.TrimSpace(mobile[4:])
+	if strings.HasPrefix(mobile, "+") {
+		spaceIdx := strings.Index(mobile, " ")
+		if spaceIdx > 0 {
+			mobile = mobile[spaceIdx+1:]
+		}
+		mobile = strings.TrimSpace(mobile)
 	}
 	params := map[string]string{
 		"email":  receiver.Email,
@@ -218,7 +222,7 @@ func (self *SubcontactPullTask) OnInit(ctx context.Context, obj db.IStandaloneMo
 		return
 	}
 	// success
-	receiver.SetStatus(self.UserCred, apis.RECEIVER_STATUS_READY, "")
+	receiver.SetStatus(ctx, self.UserCred, apis.RECEIVER_STATUS_READY, "")
 	logclient.AddActionLogWithContext(ctx, receiver, logclient.ACT_PULL_SUBCONTACT, "", self.UserCred, true)
 	self.SetStageComplete(ctx, nil)
 }

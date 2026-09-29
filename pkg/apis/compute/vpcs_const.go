@@ -80,6 +80,9 @@ type VpcListInput struct {
 	// example: 192.168.222.0/24
 	CidrBlock []string `json:"cidr_block"`
 
+	// IPv6地址段
+	CidrBlock6 []string `json:"cidr_block6"`
+
 	// enmu: eip, none
 	ExternalAccessMode string `json:"external_access_mode"`
 
@@ -88,7 +91,7 @@ type VpcListInput struct {
 	OrderByNetworkCount string `json:"order_by_network_count"`
 	// 按二层网络数量排序
 	// pattern:asc|desc
-	OrderByWireCount string `json:""order_by_wire_count`
+	OrderByWireCount string `json:"order_by_wire_count"`
 }
 
 const (

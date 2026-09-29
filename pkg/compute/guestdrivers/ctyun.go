@@ -94,8 +94,8 @@ func (self *SCtyunGuestDriver) GetAttachDiskStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SCtyunGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SCtyunGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SCtyunGuestDriver) GetRebuildRootStatus() ([]string, error) {
@@ -107,7 +107,7 @@ func (self *SCtyunGuestDriver) GetGuestInitialStateAfterRebuild() string {
 }
 
 func (self *SCtyunGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	if !utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_CTYUN_SATA, api.STORAGE_CTYUN_SAS, api.STORAGE_CTYUN_SSD}) {

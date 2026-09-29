@@ -19,7 +19,6 @@ import (
 	"strings"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -49,7 +48,7 @@ type InterfaceIPConfiguration struct {
 }
 
 type InterfacePropertiesFormat struct {
-	NetworkSecurityGroup SSecurityGroup             `json:"networkSecurityGroup,omitempty"`
+	NetworkSecurityGroup *SSecurityGroup            `json:"networkSecurityGroup,omitempty"`
 	IPConfigurations     []InterfaceIPConfiguration `json:"ipConfigurations,omitempty"`
 	MacAddress           string                     `json:"macAddress,omitempty"`
 	Primary              bool                       `json:"primary,omitempty"`
@@ -101,7 +100,7 @@ func (self *SInstanceNic) InClassicNetwork() bool {
 func (self *SInstanceNic) updateSecurityGroup(secgroupId string) error {
 	region := self.instance.host.zone.region
 	if len(secgroupId) > 0 {
-		self.Properties.NetworkSecurityGroup = SSecurityGroup{ID: secgroupId}
+		self.Properties.NetworkSecurityGroup = &SSecurityGroup{ID: secgroupId}
 	}
 	return region.update(jsonutils.Marshal(self), nil)
 }
@@ -168,18 +167,7 @@ func (self *SRegion) CreateNetworkInterface(resourceGroup string, nicName string
 }
 
 func (self *SRegion) GetINetworkInterfaces() ([]cloudprovider.ICloudNetworkInterface, error) {
-	nics, err := self.GetNetworkInterfaces()
-	if err != nil {
-		return nil, errors.Wrapf(err, "GetNetworkInterfaces")
-	}
-	ret := []cloudprovider.ICloudNetworkInterface{}
-	for i := range nics {
-		if len(nics[i].Properties.VirtualMachine.ID) > 0 {
-			continue
-		}
-		ret = append(ret, &nics[i])
-	}
-	return ret, nil
+	return []cloudprovider.ICloudNetworkInterface{}, nil
 }
 
 func (self *SInstanceNic) GetAssociateId() string {

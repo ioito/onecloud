@@ -1,8 +1,8 @@
 FROM alpine:3.15.4
 
-MAINTAINER "Zexi Li <lizexi@yunionyun.com>"
+LABEL maintainer="Zexi Li <lizexi@yunionyun.com>"
 
-ENV TZ UTC
+ENV TZ="UTC"
 
 RUN mkdir -p /opt/yunion/bin
 

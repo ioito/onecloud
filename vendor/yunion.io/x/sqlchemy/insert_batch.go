@@ -32,14 +32,18 @@ const (
 )
 
 func (t *STableSpec) InsertBatch(dataList []interface{}) error {
+	qChar := t.Database().backend.QuoteChar()
+
 	var sql string
 	var fieldCount int
 	{
 		buffer := new(bytes.Buffer)
 
-		buffer.WriteString("INSERT INTO `")
+		buffer.WriteString("INSERT INTO ")
+		buffer.WriteString(qChar)
 		buffer.WriteString(t.Name())
-		buffer.WriteString("` (")
+		buffer.WriteString(qChar)
+		buffer.WriteString(" (")
 		headers := make([]string, 0)
 		format := make([]string, 0)
 
@@ -48,7 +52,7 @@ func (t *STableSpec) InsertBatch(dataList []interface{}) error {
 				continue
 			}
 			name := col.Name()
-			headers = append(headers, fmt.Sprintf("`%s`", name))
+			headers = append(headers, fmt.Sprintf("%s%s%s", qChar, name, qChar))
 			if col.IsCreatedAt() || col.IsUpdatedAt() {
 				if t.Database().backend.SupportMixedInsertVariables() {
 					format = append(format, t.Database().backend.CurrentUTCTimeStampString())
@@ -107,6 +111,13 @@ func (t *STableSpec) InsertBatch(dataList []interface{}) error {
 					params = append(params, nil)
 				}
 			} else {
+				// validate text width
+				if col.IsString() && col.GetWidth() > 0 {
+					newStr, ok := ov.(string)
+					if ok && len(newStr) > col.GetWidth() {
+						ov = newStr[:col.GetWidth()]
+					}
+				}
 				params = append(params, col.ConvertFromValue(ov))
 			}
 		}

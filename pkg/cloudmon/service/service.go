@@ -33,6 +33,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/cloudmon/resources"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	_ "yunion.io/x/onecloud/pkg/mcclient/modules/loader"
 )
 
 func StartService() {
@@ -48,14 +49,18 @@ func StartService() {
 
 	res := resources.NewResources()
 	if !opts.IsSlaveNode {
-		cron := cronman.InitCronJobManager(true, options.Options.CronJobWorkerCount)
+		cron := cronman.InitCronJobManager(true, options.Options.CronJobWorkerCount, options.Options.TimeZone)
 		cron.AddJobAtIntervalsWithStartRun("InitResources", time.Duration(opts.ResourcesSyncInterval)*time.Minute, res.Init, true)
 		cron.AddJobAtIntervals("IncrementResources", time.Duration(opts.ResourcesSyncInterval)*time.Minute, res.IncrementSync)
 		cron.AddJobAtIntervals("DecrementResources", time.Duration(opts.ResourcesSyncInterval)*time.Minute, res.DecrementSync)
 		cron.AddJobAtIntervals("UpdateResources", time.Duration(opts.ResourcesSyncInterval)*time.Minute, res.UpdateSync)
 		cron.AddJobAtIntervalsWithStarTime("CollectResources", time.Duration(opts.CollectMetricInterval)*time.Minute, res.CollectMetrics)
 
-		cron.AddJobAtIntervals("PingProb", time.Duration(opts.PingProbIntervalHours)*time.Hour, misc.PingProbe)
+		cron.AddJobAtIntervalsWithStartRun("PingProb", time.Duration(opts.PingProbIntervalHours)*time.Hour, misc.PingProbe, true)
+
+		cron.AddJobAtIntervalsWithStartRun("StatusProbe", time.Duration(opts.StatusProbeIntervalMinutes)*time.Minute, misc.StatusProbe, true)
+
+		cron.AddJobAtIntervalsWithStartRun("BucketProbe", time.Duration(opts.BucketProbeIntervalMinutes)*time.Minute, misc.BucketProbe, true)
 
 		cron.AddJobEveryFewDays("UsageMetricCollect", 1, 23, 10, 10, misc.UsegReport, false)
 		cron.AddJobEveryFewDays("AlertHistoryMetricCollect", 1, 23, 59, 59, misc.AlertHistoryReport, false)
@@ -88,5 +93,7 @@ func StartService() {
 			session := auth.GetAdminSession(ctx, commonOpts.Region)
 			notifyclient.EventNotifyServiceAbnormal(ctx, session.GetToken(), consts.GetServiceType(), method, path, body, err)
 		})
+
+	app_common.ExportOptionsHandler(app, &options.Options)
 	app_common.ServeForever(app, baseOpts)
 }

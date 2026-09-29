@@ -78,7 +78,7 @@ func (self *SHCSOPGuestDriver) GetMinimalSysDiskSizeGb() int {
 }
 
 func (self *SHCSOPGuestDriver) GetStorageTypes() []string {
-	storages, _ := models.StorageManager.GetStorageTypesByHostType(api.HYPERVISOR_HOSTTYPE[self.GetHypervisor()])
+	storages, _ := models.StorageManager.GetStorageTypesByProvider(self.GetProvider())
 	return storages
 }
 
@@ -98,8 +98,8 @@ func (self *SHCSOPGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SHCSOPGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SHCSOPGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SHCSOPGuestDriver) GetDeployStatus() ([]string, error) {

@@ -611,8 +611,8 @@ func (instance *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*clo
 	return instance.host.zone.region.GetInstanceVNC(instance.Id, origin)
 }
 
-func (instance *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
-	return instance.host.zone.region.DeployVM(instance.Id, name, password, publicKey, deleteKeypair, description)
+func (instance *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
+	return instance.host.zone.region.DeployVM(instance.Id, opts)
 }
 
 func (instance *SInstance) RebuildRoot(ctx context.Context, desc *cloudprovider.SManagedVMRebuildRootConfig) (string, error) {
@@ -699,11 +699,11 @@ func (region *SRegion) DeleteVM(instanceId string) error {
 	return region.doDeleteVM(instanceId)
 }
 
-func (region *SRegion) DeployVM(instanceId string, name string, password string, keypairName string, deleteKeypair bool, description string) error {
-	if len(password) > 0 {
+func (region *SRegion) DeployVM(instanceId string, opts *cloudprovider.SInstanceDeployOptions) error {
+	if len(opts.Password) > 0 {
 		params := map[string]map[string]string{
 			"changePassword": {
-				"adminPass": password,
+				"adminPass": opts.Password,
 			},
 		}
 		resource := fmt.Sprintf("/servers/%s/action", instanceId)
@@ -828,7 +828,7 @@ func (region *SRegion) LiveMigrateVM(instanceId string, hostName string) error {
 	return nil
 }
 
-//仅live-migration
+// 仅live-migration
 func (region *SRegion) ListServerMigration(instanceId string) error {
 	resource := fmt.Sprintf("/servers/%s/migrations", instanceId)
 	_, err := region.ecsGet(resource)
@@ -838,7 +838,7 @@ func (region *SRegion) ListServerMigration(instanceId string) error {
 	return nil
 }
 
-//仅live-migration
+// 仅live-migration
 func (region *SRegion) DeleteMigration(instanceId string, migrationId string) error {
 	resource := fmt.Sprintf("/servers/%s/migrations/%s", instanceId, migrationId)
 	_, err := region.ecsDelete(resource)
@@ -848,7 +848,7 @@ func (region *SRegion) DeleteMigration(instanceId string, migrationId string) er
 	return nil
 }
 
-//仅live-migration
+// 仅live-migration
 func (region *SRegion) ForceCompleteMigration(instanceId string, migrationId string) error {
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.JSONNull, "force_complete")
@@ -872,11 +872,11 @@ func (region *SRegion) GetMigrations(instanceId string, migrationType string) (j
 	return migrations, nil
 }
 
-func (instance *SInstance) AssignSecurityGroup(secgroupId string) error {
+func (self *SRegion) AssignSecurityGroup(instanceId, projectId, secgroupId string) error {
 	if secgroupId == SECGROUP_NOT_SUPPORT {
 		return fmt.Errorf("Security groups are not supported. Security group components are not installed")
 	}
-	secgroup, err := instance.host.zone.region.GetSecurityGroup(secgroupId)
+	secgroup, err := self.GetSecurityGroup(secgroupId)
 	if err != nil {
 		return errors.Wrapf(err, "GetSecurityGroup(%s)", secgroupId)
 	}
@@ -885,8 +885,8 @@ func (instance *SInstance) AssignSecurityGroup(secgroupId string) error {
 			"name": secgroup.Name,
 		},
 	}
-	resource := fmt.Sprintf("/servers/%s/action", instance.Id)
-	_, err = instance.host.zone.region.ecsDo(instance.GetProjectId(), resource, params)
+	resource := fmt.Sprintf("/servers/%s/action", instanceId)
+	_, err = self.ecsDo(projectId, resource, params)
 	return err
 }
 
@@ -931,7 +931,7 @@ func (instance *SInstance) SetSecurityGroups(secgroupIds []string) error {
 	}
 	for _, add := range set.Difference(newG, local).List() {
 		secgroupId := add.(string)
-		err := instance.AssignSecurityGroup(secgroupId)
+		err := instance.host.zone.region.AssignSecurityGroup(instance.Id, instance.GetProjectId(), secgroupId)
 		if err != nil {
 			return errors.Wrapf(err, "AssignSecurityGroup(%s)", secgroupId)
 		}

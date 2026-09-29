@@ -17,7 +17,6 @@ package aws
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -77,6 +76,10 @@ func (self *SDisk) GetName() string {
 
 func (self *SDisk) GetIops() int {
 	return self.Iops
+}
+
+func (self *SDisk) GetThroughput() int {
+	return self.Throughput
 }
 
 func (self *SDisk) GetGlobalId() string {
@@ -158,6 +161,10 @@ func (self *SDisk) GetTemplateId() string {
 	return ""
 }
 
+func (self *SDisk) GetDeviceName() string {
+	return self.getDevice()
+}
+
 func (self *SDisk) getDevice() string {
 	for _, dev := range self.Attachments {
 		if len(dev.Device) > 0 {
@@ -197,6 +204,10 @@ func (self *SDisk) GetMountpoint() string {
 
 func (self *SDisk) Delete(ctx context.Context) error {
 	return self.storage.zone.region.DeleteDisk(self.VolumeId)
+}
+
+func (self *SDisk) SetTags(tags map[string]string, replace bool) error {
+	return self.storage.zone.region.setTags("volume", self.VolumeId, tags, replace)
 }
 
 func (self *SDisk) CreateISnapshot(ctx context.Context, name string, desc string) (cloudprovider.ICloudSnapshot, error) {
@@ -241,7 +252,14 @@ func (self *SDisk) Reset(ctx context.Context, snapshotId string) (string, error)
 	if self.State != "available" {
 		return "", errors.Wrapf(cloudprovider.ErrInvalidStatus, "invalid status %s", self.State)
 	}
-	disk, err := self.storage.zone.region.CreateDisk(self.AvailabilityZone, self.VolumeType, self.GetName(), self.GetDiskSizeMB()/1024, self.Iops, self.Throughput, snapshotId, self.GetDescription())
+	opts := &cloudprovider.DiskCreateConfig{
+		Name:       self.GetName(),
+		SizeGb:     self.GetDiskSizeMB() / 1024,
+		Iops:       self.Iops,
+		Throughput: self.Throughput,
+		SnapshotId: snapshotId,
+	}
+	disk, err := self.storage.zone.region.CreateDisk(self.AvailabilityZone, self.VolumeType, opts)
 	if err != nil {
 		return "", errors.Wrapf(err, "CreateDisk")
 	}
@@ -294,13 +312,6 @@ func (self *SRegion) GetDisks(instanceId string, zoneId string, storageType stri
 		params["NextToken"] = part.NextToken
 	}
 
-	if len(instanceId) > 0 {
-		// 	系统盘必须放在第零个位置
-		sort.Slice(disks, func(i, j int) bool {
-			return disks[i].getDevice() < disks[j].getDevice()
-		})
-	}
-
 	return disks, nil
 }
 
@@ -320,7 +331,7 @@ func (self *SRegion) GetDisk(diskId string) (*SDisk, error) {
 			return &disks[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, diskId)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", diskId)
 }
 
 func (self *SRegion) DeleteDisk(diskId string) error {
@@ -344,50 +355,69 @@ func (self *SRegion) ResizeDisk(diskId string, sizeGb int64) error {
 	return self.ec2Request("ModifyVolume", params, &ret)
 }
 
-// io1类型的卷需要指定IOPS参数,最大不超过32000。这里根据aws网站的建议值进行设置
-// io2类型的卷需要指定IOPS参数,最大不超过64000。
-// GenDiskIops Base 100, 卷每增加2G。IOPS增加1。最多到3000 iops
+// io1 卷 IOPS 默认按容量估算，上限 32000（参见 AWS Provisioned IOPS 文档）
+// io2 卷 IOPS 上限 64000
+// GenDiskIops: Base 100, 卷每增加 2GiB IOPS 增加 1
 func GenDiskIops(diskType string, sizeGB int) int64 {
 	switch diskType {
-	case api.STORAGE_IO1_SSD, api.STORAGE_IO2_SSD:
+	case api.STORAGE_IO1_SSD:
 		iops := int64(100 + sizeGB/2)
-		if iops < 32000 {
-			return iops
+		if iops < 100 {
+			return 100
 		}
-		return 100
+		if iops > 32000 {
+			return 32000
+		}
+		return iops
+	case api.STORAGE_IO2_SSD:
+		iops := int64(100 + sizeGB/2)
+		if iops < 100 {
+			return 100
+		}
+		if iops > 64000 {
+			return 64000
+		}
+		return iops
 	case api.STORAGE_GP3_SSD:
 		return 3000
 	}
 	return 0
 }
 
-func (self *SRegion) CreateDisk(zoneId string, volumeType string, name string, sizeGb, iops, throughput int, snapshotId string, desc string) (*SDisk, error) {
+func (self *SRegion) CreateDisk(zoneId string, volumeType string, opts *cloudprovider.DiskCreateConfig) (*SDisk, error) {
 	params := map[string]string{
 		"AvailabilityZone": zoneId,
 		"ClientToken":      utils.GenRequestId(20),
-		"Size":             fmt.Sprintf("%d", sizeGb),
+		"Size":             fmt.Sprintf("%d", opts.SizeGb),
 		"VolumeType":       volumeType,
 	}
 	tagIdx := 1
-	if len(name) > 0 {
-		params[fmt.Sprintf("TagSpecification.%d.ResourceType", tagIdx)] = "volume"
-		params[fmt.Sprintf("TagSpecification.%d.Tag.1.Key", tagIdx)] = "Name"
-		params[fmt.Sprintf("TagSpecification.%d.Tag.1.Value", tagIdx)] = name
-		if len(desc) > 0 {
-			params[fmt.Sprintf("TagSpecification.%d.Tag.2.Key", tagIdx)] = "Description"
-			params[fmt.Sprintf("TagSpecification.%d.Tag.2.Value", tagIdx)] = desc
+	if len(opts.Name) > 0 {
+		params["TagSpecification.1.ResourceType"] = "volume"
+		params[fmt.Sprintf("TagSpecification.1.Tag.%d.Key", tagIdx)] = "Name"
+		params[fmt.Sprintf("TagSpecification.1.Tag.%d.Value", tagIdx)] = opts.Name
+		tagIdx++
+		if len(opts.Desc) > 0 {
+			params[fmt.Sprintf("TagSpecification.1.Tag.%d.Key", tagIdx)] = "Description"
+			params[fmt.Sprintf("TagSpecification.1.Tag.%d.Value", tagIdx)] = opts.Desc
 		}
+	}
+	for k, v := range opts.Tags {
+		params["TagSpecification.1.ResourceType"] = "volume"
+		params[fmt.Sprintf("TagSpecification.1.Tag.%d.Key", tagIdx)] = k
+		params[fmt.Sprintf("TagSpecification.1.Tag.%d.Value", tagIdx)] = v
 		tagIdx++
 	}
-	if len(snapshotId) > 0 {
-		params["SnapshotId"] = snapshotId
+	if len(opts.SnapshotId) > 0 {
+		params["SnapshotId"] = opts.SnapshotId
 	}
-	if throughput >= 125 && throughput <= 1000 && volumeType == api.STORAGE_GP3_SSD {
-		params["Throughput"] = fmt.Sprintf("%d", throughput)
+	// gp3 吞吐：125–2000 MiB/s（参见 AWS gp3 文档）
+	if opts.Throughput >= 125 && opts.Throughput <= 2000 && volumeType == api.STORAGE_GP3_SSD {
+		params["Throughput"] = fmt.Sprintf("%d", opts.Throughput)
 	}
 
-	if iops == 0 {
-		iops = int(GenDiskIops(volumeType, sizeGb))
+	if opts.Iops == 0 {
+		opts.Iops = int(GenDiskIops(volumeType, opts.SizeGb))
 	}
 
 	if utils.IsInStringArray(volumeType, []string{
@@ -395,7 +425,7 @@ func (self *SRegion) CreateDisk(zoneId string, volumeType string, name string, s
 		api.STORAGE_IO2_SSD,
 		api.STORAGE_GP3_SSD,
 	}) {
-		params["Iops"] = fmt.Sprintf("%d", iops)
+		params["Iops"] = fmt.Sprintf("%d", opts.Iops)
 	}
 	ret := &SDisk{}
 	return ret, self.ec2Request("CreateVolume", params, ret)

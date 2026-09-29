@@ -51,30 +51,6 @@ func (self *SGoogleProviderFactory) IsClouduserSupportPassword() bool {
 	return false
 }
 
-func (factory *SGoogleProviderFactory) IsCloudpolicyWithSubscription() bool {
-	return true
-}
-
-func (factory *SGoogleProviderFactory) IsClouduserpolicyWithSubscription() bool {
-	return true
-}
-
-func (factory *SGoogleProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (factory *SGoogleProviderFactory) IsClouduserNeedInitPolicy() bool {
-	return true
-}
-
-func (factory *SGoogleProviderFactory) IsSupportResetClouduserPassword() bool {
-	return false
-}
-
-func (factory *SGoogleProviderFactory) GetClouduserMinPolicyCount() int {
-	return 1
-}
-
 func (self *SGoogleProviderFactory) IsClouduserBelongCloudprovider() bool {
 	return true
 }
@@ -193,7 +169,7 @@ type SGoogleProvider struct {
 }
 
 func (self *SGoogleProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(google.GOOGLE_API_VERSION), "api_version")
@@ -216,7 +192,7 @@ func (self *SGoogleProvider) GetIamLoginUrl() string {
 	return "https://console.cloud.google.com"
 }
 
-func (self *SGoogleProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SGoogleProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -277,11 +253,7 @@ func (self *SGoogleProvider) GetICloudgroupByName(name string) (cloudprovider.IC
 }
 
 func (self *SGoogleProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SGoogleProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SGoogleProvider) CreateIClouduser(conf *cloudprovider.SClouduserCreateConfig) (cloudprovider.IClouduser, error) {

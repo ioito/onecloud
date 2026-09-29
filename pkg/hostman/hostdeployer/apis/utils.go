@@ -15,12 +15,15 @@
 package apis
 
 import (
+	"encoding/base64"
 	"encoding/json"
 
+	"yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/types"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 )
@@ -29,6 +32,7 @@ func NewDeployInfo(
 	publicKey *SSHKeys,
 	deploys []*DeployContent,
 	password string,
+	isRandomPassword,
 	isInit bool,
 	enableTty bool,
 	defaultRootUser bool,
@@ -43,6 +47,7 @@ func NewDeployInfo(
 		PublicKey:               publicKey,
 		Deploys:                 deploys,
 		Password:                password,
+		IsRandomPassword:        isRandomPassword,
 		IsInit:                  isInit,
 		EnableTty:               enableTty,
 		DefaultRootUser:         defaultRootUser,
@@ -54,6 +59,10 @@ func NewDeployInfo(
 		depInfo.Telegraf = &Telegraf{
 			TelegrafConf: telegrafConf,
 		}
+	}
+	userDataDecoded, _ := base64.StdEncoding.DecodeString(userData)
+	if len(userDataDecoded) > 0 {
+		userData = string(userDataDecoded)
 	}
 	depInfo.UserData = userData
 	return depInfo
@@ -117,6 +126,10 @@ func GuestnetworksDescToDeployDesc(guestnetworks []*desc.SGuestNetwork) []*Nic {
 
 	nics := make([]*Nic, len(guestnetworks))
 	for i, nic := range guestnetworks {
+		domain := nic.Domain
+		if apis.IsIllegalSearchDomain(domain) {
+			domain = ""
+		}
 		nics[i] = new(Nic)
 		nics[i].Mac = nic.Mac
 		nics[i].Ip = nic.Ip
@@ -125,7 +138,7 @@ func GuestnetworksDescToDeployDesc(guestnetworks []*desc.SGuestNetwork) []*Nic {
 		nics[i].Virtual = nic.Virtual
 		nics[i].Gateway = nic.Gateway
 		nics[i].Dns = nic.Dns
-		nics[i].Domain = nic.Domain
+		nics[i].Domain = domain
 		if nic.Routes != nil {
 			nics[i].Routes = nic.Routes.String()
 		}
@@ -148,6 +161,11 @@ func GuestnetworksDescToDeployDesc(guestnetworks []*desc.SGuestNetwork) []*Nic {
 		nics[i].LinkUp = nic.LinkUp
 		nics[i].Mtu = int64(nic.Mtu)
 		//nics[i].Name = nic.Name
+		nics[i].IsDefault = nic.IsDefault
+
+		nics[i].Ip6 = nic.Ip6
+		nics[i].Masklen6 = int32(nic.Masklen6)
+		nics[i].Gateway6 = nic.Gateway6
 	}
 
 	return nics
@@ -180,4 +198,47 @@ func NewReleaseInfo(distro, version, arch string) *ReleaseInfo {
 		Version: version,
 		Arch:    arch,
 	}
+}
+
+func GuestNicsToServerNics(nics []*desc.SGuestNetwork) []*types.SServerNic {
+	ret := make([]*types.SServerNic, len(nics))
+	for i := 0; i < len(nics); i++ {
+		routes := ""
+		if nics[i].Routes != nil {
+			routes, _ = nics[i].Routes.GetString()
+		}
+
+		ret[i] = &types.SServerNic{
+			Name:      "",
+			Index:     int(nics[i].Index),
+			Bridge:    nics[i].Bridge,
+			Domain:    nics[i].Domain,
+			Ip:        nics[i].Ip,
+			Vlan:      int(nics[i].Vlan),
+			Driver:    nics[i].Driver,
+			Masklen:   int(nics[i].Masklen),
+			Virtual:   nics[i].Virtual,
+			Manual:    nics[i].Manual != nil && *nics[i].Manual,
+			WireId:    nics[i].WireId,
+			NetId:     nics[i].NetId,
+			Mac:       nics[i].Mac,
+			BandWidth: int(nics[i].Bw),
+			Dns:       nics[i].Dns,
+			Net:       nics[i].Net,
+			Interface: nics[i].Interface,
+			Gateway:   nics[i].Gateway,
+			Ifname:    nics[i].Ifname,
+			Routes:    ConvertRoutes(routes),
+			NicType:   compute.TNicType(nics[i].NicType),
+			LinkUp:    nics[i].LinkUp,
+			Mtu:       int16(nics[i].Mtu),
+			TeamWith:  nics[i].TeamWith,
+			IsDefault: nics[i].IsDefault,
+
+			Ip6:      nics[i].Ip6,
+			Masklen6: int(nics[i].Masklen6),
+			Gateway6: nics[i].Gateway6,
+		}
+	}
+	return ret
 }

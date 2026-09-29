@@ -25,7 +25,7 @@ import (
 type newRootFsDriverFunc func(part IDiskPartition) IRootFsDriver
 
 var (
-	privatePrefixes    []string
+	// privatePrefixes    []string
 	rootfsDrivers      = make([]newRootFsDriverFunc, 0)
 	hostCpuArch        string
 	cloudrootDirectory string
@@ -35,22 +35,19 @@ func GetRootfsDrivers() []newRootFsDriverFunc {
 	return rootfsDrivers
 }
 
-func Init(initPrivatePrefixes []string, cloudrootDir string) error {
-	if len(initPrivatePrefixes) > 0 {
-		privatePrefixes = make([]string, len(initPrivatePrefixes))
-		copy(privatePrefixes, initPrivatePrefixes)
-	}
-
+func Init(cloudrootDir string) error {
 	linuxFsDrivers := []newRootFsDriverFunc{
-		NewFangdeRootFs, NewUnionOSRootFs,
-		NewAnolisRootFs, NewGalaxyKylinRootFs, NewNeoKylinRootFs,
+		NewOpenRuyiRootFs, NewFangdeRootFs, NewUnionOSRootFs,
+		NewAnolisRootFs, NewRockyRootFs, NewOpenCloudOsRootFs, NewAlmaLinuxRootFs,
+		NewOpenKylinRootfs, NewUOSDesktopRootfs,
+		NewGalaxyKylinRootFs, NewNeoKylinRootFs,
 		NewFangdeDeskRootfs, NewUKylinRootfs,
 		NewCentosRootFs, NewFedoraRootFs,
 		NewRhelRootFs,
 		NewOpenSuseRootFs,
 		NewDebianRootFs, NewCirrosRootFs, NewCirrosNewRootFs, NewUbuntuRootFs,
 		NewGentooRootFs, NewArchLinuxRootFs, NewOpenWrtRootFs, NewCoreOsRootFs,
-		NewOpenEulerRootFs,
+		NewOpenEulerRootFs, NewTencentOsRootFs, NewCTyunOSRootFs,
 	}
 	rootfsDrivers = append(rootfsDrivers, linuxFsDrivers...)
 	rootfsDrivers = append(rootfsDrivers, NewMacOSRootFs)

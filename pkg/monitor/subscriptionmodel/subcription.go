@@ -39,7 +39,6 @@ import (
 	sub "yunion.io/x/onecloud/pkg/monitor/influxdbsubscribe"
 	"yunion.io/x/onecloud/pkg/monitor/models"
 	"yunion.io/x/onecloud/pkg/monitor/registry"
-	"yunion.io/x/onecloud/pkg/monitor/tsdb"
 )
 
 var (
@@ -81,7 +80,7 @@ func (self *SSubscriptionManager) AddSubscription() {
 		return
 	}
 	log.Infof("drop success")
-	err = models.DataSourceManager.AddSubscription(sub)
+	/*err = models.DataSourceManager.AddSubscription(sub)
 	if err != nil {
 		log.Errorln("add subscription err:", err)
 		return
@@ -90,7 +89,7 @@ func (self *SSubscriptionManager) AddSubscription() {
 	if err := self.LoadSystemAlerts(); err != nil {
 		log.Errorf("load system alerts error: %v", err)
 		return
-	}
+	}*/
 }
 
 func (self *SSubscriptionManager) LoadSystemAlerts() error {
@@ -250,13 +249,13 @@ func getQueryEvalType(evalType string) string {
 }
 
 func (self *SSubscriptionManager) getPointsByAlertDetail(details monitor.CommonAlertMetricDetails, alert models.SCommonAlert,
-	points []sub.Point) *tsdb.TimeSeries {
+	points []sub.Point) *monitor.TimeSeries {
 	metricPoints := make([]sub.Point, 0)
 
-	serie := tsdb.TimeSeries{
+	serie := monitor.TimeSeries{
 		RawName: "",
 		Name:    "",
-		Points:  make(tsdb.TimeSeriesPoints, 0),
+		Points:  make(monitor.TimeSeriesPoints, 0),
 		Tags:    nil,
 	}
 
@@ -297,7 +296,7 @@ func (self *SSubscriptionManager) getPointsByAlertDetail(details monitor.CommonA
 	for _, metricPoint := range metricPoints {
 		if len(model.Selects) > 1 {
 			fieldMap := metricPoint.Fields()
-			point := make(tsdb.TimePoint, 0)
+			point := make(monitor.TimePoint, 0)
 			for _, sel := range model.Selects {
 				point = append(point, parseValue(fieldMap[sel[0].Params[0]]))
 			}
@@ -311,7 +310,7 @@ func (self *SSubscriptionManager) getPointsByAlertDetail(details monitor.CommonA
 		for fieldPoint.Next() {
 			if string(fieldPoint.FieldKey()) == details.Field && isValid(fieldPoint) {
 				val := fieldPoint.FloatValue()
-				timePoint := tsdb.NewTimePoint(&val, float64(metricPoint.UnixNano()))
+				timePoint := monitor.NewTimePoint(&val, float64(metricPoint.UnixNano()))
 				serie.Points = append(serie.Points, timePoint)
 			}
 		}
@@ -420,7 +419,7 @@ func (n *SSubscriptionManager) doNotify(nIds []string, evalCtx *alerting.EvalCon
 }
 
 func (self *SSubscriptionManager) notifyBySysConfig(evalContext alerting.EvalContext) error {
-	config := notifiers.GetNotifyTemplateConfig(&evalContext)
+	config := notifiers.GetNotifyTemplateConfig(&evalContext, false, evalContext.EvalMatches)
 	contentConfig := templates.NewTemplateConfig(config)
 	content, err := contentConfig.GenerateMarkdown()
 	if err != nil {

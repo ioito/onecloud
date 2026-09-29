@@ -102,17 +102,20 @@ type SDiskInfo struct {
 	StorageType       string
 	SizeGB            int
 	Iops              int
+	Driver            string
+	CacheMode         string
 	Name              string
 	// aws gp3 only
 	Throughput int
 }
 
 type GuestDiskCreateOptions struct {
-	SizeMb    int
-	UUID      string
-	Driver    string
-	Idx       int
-	StorageId string
+	SizeMb        int
+	UUID          string
+	Driver        string
+	Idx           int
+	StorageId     string
+	Preallocation string `choices:"off|metadata|full|falloc"`
 }
 
 const (
@@ -148,17 +151,26 @@ type SManagedVMCreateConfig struct {
 	ExternalNetworkId   string
 	ExternalVpcId       string
 	IpAddr              string
+	MacAddr             string
+	Bridge              string
+	Gateway             string
+	Masklen             int8
+	Dns                 string
 	Description         string
 	SysDisk             SDiskInfo
 	DataDisks           []SDiskInfo
+	KeypairName         string
 	PublicKey           string
-	ExternalSecgroupId  string
 	ExternalSecgroupIds []string
 	Account             string
 	Password            string
 	UserData            string
 	ProjectId           string
 	EnableMonitorAgent  bool
+
+	// 金山云按量付费类型
+	// Daily（按量付费（按日月结）)、 HourlyInstantSettlement（按量付费（按小时月结））
+	KsyunPostpaidChargeType string
 
 	SPublicIpInfo
 
@@ -170,21 +182,31 @@ type SManagedVMCreateConfig struct {
 	UserDataType                    string
 	WindowsUserDataType             string
 	IsWindowsUserDataTypeNeedEncode bool
+
+	IsolateDevices []SIsolateDevice
+}
+
+type SIsolateDevice struct {
+	Id   string
+	Name string
 }
 
 type SManagedVMChangeConfig struct {
 	Cpu          int
+	CpuSocket    int
 	MemoryMB     int
 	InstanceType string
 }
 
 type SManagedVMRebuildRootConfig struct {
-	Account   string
-	Password  string
-	ImageId   string
-	PublicKey string
-	SysSizeGB int
-	OsType    string
+	Account     string
+	Password    string
+	ImageId     string
+	KeypairName string
+	PublicKey   string
+	SysSizeGB   int
+	OsType      string
+	UserData    string
 }
 
 func (vmConfig *SManagedVMCreateConfig) GetConfig(config *jsonutils.JSONDict) error {
@@ -204,7 +226,7 @@ func (vmConfig *SManagedVMCreateConfig) GetConfig(config *jsonutils.JSONDict) er
 		vmConfig.PublicKey = publicKey
 	}
 	//目前所写的userData格式仅支持Linux
-	if strings.ToLower(vmConfig.OsType) == strings.ToLower(osprofile.OS_TYPE_LINUX) {
+	if strings.EqualFold(vmConfig.OsType, osprofile.OS_TYPE_LINUX) {
 		adminPublicKey, _ := config.GetString("admin_public_key")
 		projectPublicKey, _ := config.GetString("project_public_key")
 		vmConfig.UserData = generateUserData(adminPublicKey, projectPublicKey, vmConfig.UserData)
@@ -262,7 +284,7 @@ func (vmConfig *SManagedVMCreateConfig) GetUserData() (string, error) {
 		}
 		return "", err
 	}
-	if strings.ToLower(vmConfig.OsType) == strings.ToLower(osprofile.OS_TYPE_LINUX) {
+	if strings.EqualFold(vmConfig.OsType, osprofile.OS_TYPE_LINUX) {
 		switch vmConfig.UserDataType {
 		case CLOUD_SHELL:
 			return oUserData.UserDataScriptBase64(), nil
@@ -335,6 +357,9 @@ type ServerVncOutput struct {
 	Protocol string `json:"protocol"`
 	Port     int64  `json:"port"`
 
+	// volcengine
+	Region string `json:"region"`
+
 	Url          string `json:"url"`
 	InstanceId   string `json:"instance_id"`
 	InstanceName string `json:"instance_name"`
@@ -348,10 +373,27 @@ type ServerVncOutput struct {
 	ConnectParams string `json:"connect_params"`
 	Session       string `json:"session"`
 
+	// sangfor
+	Cookie string `json:"cookie"`
+
 	Hypervisor string `json:"hypervisor"`
 }
 
 type SInstanceUpdateOptions struct {
 	NAME        string
+	HostName    string
 	Description string
+}
+
+type SInstanceDeployOptions struct {
+	Username      string
+	Password      string
+	PublicKey     string
+	KeypairName   string
+	DeleteKeypair bool
+	UserData      string
+}
+
+type SInstanceModificationType struct {
+	InstanceType string
 }

@@ -29,7 +29,6 @@ import (
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
-	"yunion.io/x/onecloud/pkg/apis/notify"
 	api "yunion.io/x/onecloud/pkg/apis/notify"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
@@ -60,13 +59,15 @@ type SRobot struct {
 	db.SSharableVirtualResourceBase
 	db.SEnabledResourceBase
 
-	Type        string               `width:"16" nullable:"false" create:"required" get:"user" list:"user" index:"true"`
-	Address     string               `nullable:"false" create:"required" update:"user" get:"user" list:"user"`
-	Lang        string               `width:"16" nullable:"false" create:"required" update:"user" get:"user" list:"user"`
-	Header      jsonutils.JSONObject `length:"long" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
-	Body        jsonutils.JSONObject `length:"long" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
-	MsgKey      string               `width:"16" nullable:"true"  update:"user" get:"user" list:"user"`
-	UseTemplate tristate.TriState    `default:"false" list:"domain" update:"user" create:"admin_optional"`
+	Type    string               `width:"16" nullable:"false" create:"required" get:"user" list:"user" index:"true"`
+	Address string               `nullable:"false" create:"required" update:"user" get:"user" list:"user"`
+	Lang    string               `width:"16" nullable:"false" create:"required" update:"user" get:"user" list:"user"`
+	Header  jsonutils.JSONObject `length:"long" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	Body    jsonutils.JSONObject `length:"long" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	MsgKey  string               `width:"16" nullable:"true"  update:"user" get:"user" list:"user"`
+	// webhook 签名加密
+	SecretKey   string            `width:"128" nullable:"true" update:"user"`
+	UseTemplate tristate.TriState `default:"false" list:"domain" update:"user" create:"admin_optional"`
 }
 
 var RobotList = []string{api.FEISHU_ROBOT, api.DINGTALK_ROBOT, api.WORKWX_ROBOT, api.WEBHOOK, api.WEBHOOK_ROBOT}
@@ -98,11 +99,12 @@ func (rm *SRobotManager) ValidateCreateData(ctx context.Context, userCred mcclie
 			Contact:  input.Address,
 			DomainId: input.ProjectDomainId,
 		},
-		Header:  input.Header,
-		Body:    input.Body,
-		MsgKey:  input.MsgKey,
-		Title:   "Validate",
-		Message: "This is a verification message, please ignore.",
+		Header:    input.Header,
+		Body:      input.Body,
+		MsgKey:    input.MsgKey,
+		SecretKey: input.SecretKey,
+		Title:     "Validate",
+		Message:   "This is a verification message, please ignore.",
 	})
 	if err != nil {
 		if errors.ErrConnectRefused == errors.Cause(err) {
@@ -156,13 +158,14 @@ func (r *SRobot) ValidateUpdateData(ctx context.Context, userCred mcclient.Token
 	}
 	if len(input.Address) > 0 {
 		// check Address
-		dirver := GetDriver(fmt.Sprintf("%s-robot", r.Type))
-		err := dirver.Send(ctx, api.SendParams{
-			Header:  input.Header,
-			Body:    input.Body,
-			MsgKey:  input.MsgKey,
-			Title:   "Validate",
-			Message: "This is a verification message, please ignore.",
+		driver := GetDriver(fmt.Sprintf("%s-robot", r.Type))
+		err := driver.Send(ctx, api.SendParams{
+			Header:    input.Header,
+			Body:      input.Body,
+			MsgKey:    input.MsgKey,
+			SecretKey: input.SecretKey,
+			Title:     "Validate",
+			Message:   "This is a verification message, please ignore.",
 			Receivers: api.SNotifyReceiver{
 				Contact: input.Address,
 			},
@@ -269,7 +272,7 @@ func (r *SRobot) PerformDisable(ctx context.Context, userCred mcclient.TokenCred
 }
 
 func (r *SRobot) PostDelete(ctx context.Context, userCred mcclient.TokenCredential) {
-	q := SubscriberManager.Query().Equals("type", notify.SUBSCRIBER_TYPE_ROBOT).Equals("identification", r.GetId())
+	q := SubscriberManager.Query().Equals("type", api.SUBSCRIBER_TYPE_ROBOT).Equals("identification", r.GetId())
 	subscribers := make([]SSubscriber, 0, 2)
 	err := db.FetchModelObjects(SubscriberManager, q, &subscribers)
 	if err != nil {
@@ -295,4 +298,8 @@ func GetRobotTypeById(id string) (string, error) {
 	log.Infoln("this is robot:", jsonutils.Marshal(imode))
 	robot := imode.(*SRobot)
 	return robot.Type, nil
+}
+
+func (r *SRobot) GetName() string {
+	return r.Name
 }

@@ -34,6 +34,7 @@ import (
 	identity_apis "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
@@ -43,6 +44,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=loadbalanceragent
+// +onecloud:swagger-gen-model-plural=loadbalanceragents
 type SLoadbalancerAgentManager struct {
 	SLoadbalancerLogSkipper
 	db.SStandaloneResourceBaseManager
@@ -277,11 +280,12 @@ func (p *SLoadbalancerAgentParamsTelegraf) updateBy(pp *SLoadbalancerAgentParams
 }
 
 func (p *SLoadbalancerAgentParamsTelegraf) initDefault(data *jsonutils.JSONDict) {
-	if p.InfluxDbOutputUrl == "" {
+	{
 		baseOpts := &options.Options
-		u, _ := auth.GetServiceURL("influxdb", baseOpts.Region, "",
-			identity_apis.EndpointInterfacePublic)
-		p.InfluxDbOutputUrl = u
+		u, _ := tsdb.GetDefaultServiceSourceURL(auth.GetAdminSession(context.Background(), baseOpts.Region), identity_apis.EndpointInterfacePublic)
+		if u != "" {
+			p.InfluxDbOutputUrl = u
+		}
 		p.InfluxDbOutputUnsafeSsl = true
 	}
 	if p.HaproxyInputInterval == 0 {
@@ -381,7 +385,7 @@ func (man *SLoadbalancerAgentManager) GetPropertyDefaultParams(ctx context.Conte
 	{
 		clusterV := validators.NewModelIdOrNameValidator("cluster", "loadbalancercluster", userCred)
 		clusterV.Optional(true)
-		if err := clusterV.Validate(query.(*jsonutils.JSONDict)); err != nil {
+		if err := clusterV.Validate(ctx, query.(*jsonutils.JSONDict)); err != nil {
 			return nil, err
 		}
 		if clusterV.Model != nil {
@@ -411,7 +415,7 @@ func (man *SLoadbalancerAgentManager) ValidateCreateData(ctx context.Context, us
 			// "cluster":    clusterV,
 		}
 		for _, v := range keyV {
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
 		}
@@ -420,7 +424,7 @@ func (man *SLoadbalancerAgentManager) ValidateCreateData(ctx context.Context, us
 	input := apis.StandaloneResourceCreateInput{}
 	err := data.Unmarshal(&input)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
+		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput failed %s", err)
 	}
 	input, err = man.SStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
@@ -522,7 +526,7 @@ func (lbagent *SLoadbalancerAgent) ValidateUpdateData(ctx context.Context, userC
 			"hb_timeout": validators.NewNonNegativeValidator("hb_timeout").Optional(true),
 		}
 		for _, v := range keyV {
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
 		}
@@ -585,6 +589,8 @@ func (manager *SLoadbalancerAgentManager) FetchCustomizeColumns(
 			StandaloneResourceDetails:       stdRows[i],
 			LoadbalancerClusterResourceInfo: clusterRows[i],
 		}
+		lbagent := objs[i].(*SLoadbalancerAgent)
+		rows[i].WireId, _ = lbagent.inferWireId()
 	}
 
 	return rows
@@ -603,7 +609,7 @@ func (manager *SLoadbalancerAgentManager) FetchCustomizeColumns(
 		q.GroupBy(clusterQuery.Field("name"))
 		q.AppendField(clusterQuery.Field("name", "cluster"))
 	default:
-		return q, httperrors.NewBadRequestError("unsupport field %s", field)
+		return q, httperrors.NewBadRequestError("unsupported field %s", field)
 	}
 	return q, nil
 }*/
@@ -660,7 +666,7 @@ func (lbagent *SLoadbalancerAgent) PerformHb(ctx context.Context, userCred mccli
 		}
 		for _, v := range keyV {
 			v.Optional(true)
-			if err := v.Validate(data); err != nil {
+			if err := v.Validate(ctx, data); err != nil {
 				return nil, err
 			}
 		}
@@ -711,7 +717,7 @@ func (lbagent *SLoadbalancerAgent) PerformJoinCluster(
 	if len(lbagent.ClusterId) > 0 {
 		return nil, errors.Wrap(httperrors.ErrConflict, "lbagent has been join cluster")
 	}
-	clusterObj, err := LoadbalancerClusterManager.FetchByIdOrName(userCred, input.ClusterId)
+	clusterObj, err := LoadbalancerClusterManager.FetchByIdOrName(ctx, userCred, input.ClusterId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, errors.Wrapf(httperrors.ErrNotFound, "%s %s", LoadbalancerClusterManager.Keyword(), input.ClusterId)
@@ -731,7 +737,20 @@ func (lbagent *SLoadbalancerAgent) PerformJoinCluster(
 	if len(peerAgents) >= 2 {
 		return nil, errors.Wrap(httperrors.ErrTooLarge, "too many agents")
 	}
-	priority := 255
+
+	clusterWireId, err := cluster.inferWireId()
+	if err != nil {
+		return nil, errors.Wrap(err, "cluster.inferWireId")
+	}
+	agentWireId, err := lbagent.inferWireId()
+	if err != nil {
+		return nil, errors.Wrap(err, "lbagent.inferWireId")
+	}
+	if clusterWireId != agentWireId {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "cluster and agent must be on the same wire")
+	}
+
+	priority := 200
 	if input.Priority > 0 {
 		for i := range peerAgents {
 			if input.Priority == peerAgents[i].Priority {
@@ -806,7 +825,7 @@ func (lbagent *SLoadbalancerAgent) PerformParamsPatch(ctx context.Context, userC
 	d := jsonutils.NewDict()
 	d.Set("params", data)
 	paramsV := validators.NewStructValidator("params", &params)
-	if err := paramsV.Validate(d); err != nil {
+	if err := paramsV.Validate(ctx, d); err != nil {
 		return nil, err
 	}
 	{
@@ -842,6 +861,44 @@ func (lbagent *SLoadbalancerAgent) PerformParamsPatch(ctx context.Context, userC
 	return nil, nil
 }
 
+func (manager *SLoadbalancerAgentManager) HbDetectionTask(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
+	q := manager.Query().NotEquals("ha_state", api.LB_HA_STATE_UNKNOWN)
+	q = q.Filter(sqlchemy.OR(
+		sqlchemy.LT(q.Field("hb_last_seen"), time.Now().Add(-time.Duration(options.Options.LbaagentOfflineMaxSeconds)*time.Second)),
+		sqlchemy.IsNull(q.Field("hb_last_seen")),
+	))
+	lbagents := []SLoadbalancerAgent{}
+	err := db.FetchModelObjects(manager, q, &lbagents)
+	if err != nil {
+		log.Errorf("LoadbalancerAgentManager.HbDetectionTask error %s", err)
+		return
+	}
+	for i := range lbagents {
+		lbagent := &lbagents[i]
+		diff, err := db.Update(lbagent, func() error {
+			lbagent.HaState = api.LB_HA_STATE_UNKNOWN
+			return nil
+		})
+		if err != nil {
+			log.Errorf("LoadbalancerAgentManager.HbDetectionTask error %s", err)
+			continue
+		}
+		db.OpsLog.LogEvent(lbagent, db.ACT_UPDATE, diff, userCred)
+		logclient.AddActionLogWithContext(ctx, lbagent, logclient.ACT_UPDATE, diff, userCred, true)
+	}
+}
+
+func (lbagent *SLoadbalancerAgent) inferWireId() (string, error) {
+	nets, err := NetworkManager.findClassicNetworksByIp(lbagent.IP)
+	if err != nil {
+		return "", errors.Wrap(err, "NetworkManager.findClassicNetworksByIp")
+	}
+	if len(nets) == 0 {
+		return "", errors.Wrapf(errors.ErrNotFound, "no networks found for ip %s", lbagent.IP)
+	}
+	return nets[0].WireId, nil
+}
+
 const (
 	loadbalancerKeepalivedConfTmplDefault = `
 global_defs {
@@ -862,11 +919,13 @@ vrrp_instance YunionLB {
 	{{ if .vrrp.unicast_peer -}} unicast_peer { {{- println }}
 		{{- range .vrrp.unicast_peer }}		{{ println . }} {{- end }}
 	}
+	unicast_src_ip {{ .vrrp.unicast_src_ip }}
 	{{- end }}
 	priority {{ .vrrp.priority }}
 	advert_int {{ .vrrp.advert_int }}
 	garp_master_refresh {{ .vrrp.garp_master_refresh }}
 	{{ if .vrrp.preempt -}} preempt {{- else -}} nopreempt {{- end }}
+	{{ if .vrrp.preempt -}} preempt_delay 300 {{- else -}} state BACKUP {{- end }}
 	virtual_ipaddress {
 		{{- printf "\n" }}
 		{{- range .vrrp.addresses }}		{{ println . }} {{- end }}
@@ -908,6 +967,8 @@ listen stats
 	urls = ["{{ .telegraf.influx_db_output_url }}"]
 	database = "{{ .telegraf.influx_db_output_name }}"
 	insecure_skip_verify = {{ .telegraf.influx_db_output_unsafe_ssl }}
+	skip_database_creation = true
+	timeout = "30s"
 
 [[inputs.haproxy]]
 	interval = "{{ .telegraf.haproxy_input_interval }}s"

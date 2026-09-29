@@ -171,7 +171,7 @@ func (manager *SVpcResourceBaseManager) ListItemFilter(
 		case api.CLASSIC_VPC_NAME:
 			conditions = append(conditions, sqlchemy.Equals(q.Field("name"), api.CLASSIC_VPC_NAME))
 		default:
-			_, err := validators.ValidateModel(userCred, VpcManager, &vpcId)
+			_, err := validators.ValidateModel(ctx, userCred, VpcManager, &vpcId)
 			if err != nil {
 				return nil, err
 			}
@@ -213,6 +213,16 @@ func (manager *SVpcResourceBaseManager) QueryDistinctExtraField(q *sqlchemy.SQue
 		vpcs := VpcManager.Query("id", "manager_id").SubQuery()
 		q = q.LeftJoin(vpcs, sqlchemy.Equals(q.Field("vpc_id"), vpcs.Field("id")))
 		return manager.SManagedResourceBaseManager.QueryDistinctExtraField(q, field)
+	}
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SVpcResourceBaseManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	switch resource {
+	case CloudproviderManager.Keyword():
+		vpcs := VpcManager.Query("id", "manager_id").SubQuery()
+		q = q.LeftJoin(vpcs, sqlchemy.Equals(q.Field("vpc_id"), vpcs.Field("id")))
+		return manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
 	}
 	return q, httperrors.ErrNotFound
 }

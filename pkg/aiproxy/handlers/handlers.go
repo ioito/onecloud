@@ -1,0 +1,104 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package handlers
+
+import (
+	"time"
+
+	"yunion.io/x/onecloud/pkg/aiproxy/models"
+	"yunion.io/x/onecloud/pkg/aiproxy/options"
+	"yunion.io/x/onecloud/pkg/appsrv"
+	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+)
+
+const (
+	openaiCompatAPIPrefix     = "/ai/openai/v1"
+	anthropicCompatAPIPrefix  = "/ai/anthropic/v1"
+	openaiLongProcessTimeout  = 2 * time.Hour
+	openaiShortProcessTimeout = 5 * time.Minute
+)
+
+func InitHandlers(app *appsrv.Application, isSlave bool) {
+	db.InitAllManagers()
+	db.RegistUserCredCacheUpdater()
+
+	app_common.ExportOptionsHandler(app, &options.Options)
+
+	taskman.AddTaskHandler("", app, isSlave)
+
+	db.AddScopeResourceCountHandler("", app)
+
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/chat/completions", chatCompletionsHandler, nil, "aiproxy_openai_v1_chat_completions", nil).
+		SetProcessTimeout(openaiLongProcessTimeout)
+	app.AddHandler2("POST", anthropicCompatAPIPrefix+"/messages", messagesHandler, nil, "aiproxy_anthropic_v1_messages", nil).
+		SetProcessTimeout(openaiLongProcessTimeout)
+	app.AddHandler2("HEAD", anthropicBasePrefix, anthropicBaseProbeHandler, nil, "aiproxy_anthropic_base_probe", nil)
+	app.AddHandler2("HEAD", anthropicCompatAPIPrefix+"/messages", anthropicMessagesHeadHandler, nil, "aiproxy_anthropic_v1_messages_head", nil)
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/completions", completionsHandler, nil, "aiproxy_openai_v1_completions", nil).
+		SetProcessTimeout(openaiLongProcessTimeout)
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/responses", responsesHandler, nil, "aiproxy_openai_v1_responses", nil).
+		SetProcessTimeout(openaiLongProcessTimeout)
+	app.AddHandler2("POST", "/ai/openai/responses", responsesHandler, nil, "aiproxy_openai_responses_compat", nil).
+		SetProcessTimeout(openaiLongProcessTimeout)
+	app.AddHandler2("GET", openaiCompatAPIPrefix+"/responses/<id>", responsesRetrieveHandler, nil, "aiproxy_openai_v1_responses_get", nil).
+		SetProcessTimeout(openaiShortProcessTimeout)
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/responses/<id>/cancel", responsesCancelHandler, nil, "aiproxy_openai_v1_responses_cancel", nil).
+		SetProcessTimeout(openaiShortProcessTimeout)
+	app.AddHandler2("DELETE", openaiCompatAPIPrefix+"/responses/<id>", responsesDeleteHandler, nil, "aiproxy_openai_v1_responses_delete", nil).
+		SetProcessTimeout(openaiShortProcessTimeout)
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/embeddings", embeddingsHandler, nil, "aiproxy_openai_v1_embeddings", nil).
+		SetProcessTimeout(openaiShortProcessTimeout)
+	app.AddHandler2("POST", openaiCompatAPIPrefix+"/images/generations", imagesGenerationsHandler, nil, "aiproxy_openai_v1_images_generations", nil).
+		SetProcessTimeout(openaiShortProcessTimeout)
+	app.AddHandler2("GET", openaiCompatAPIPrefix+"/models", modelsHandler, nil, "aiproxy_openai_v1_models", nil)
+	app.AddHandler2("GET", openaiCompatAPIPrefix+"/models/<model>", modelRetrieveHandler, nil, "aiproxy_openai_v1_models_retrieve", nil)
+	app.AddHandler2("GET", "/ai_proxy_usage", auth.Authenticate(aiProxyUsageListHandler), nil, "aiproxy_ai_proxy_usage_list", nil)
+	app.AddHandler2("GET", "/ai_proxy_usage/events/distinct-field", auth.Authenticate(aiProxyUsageEventsDistinctFieldHandler), nil, "aiproxy_ai_proxy_usage_events_distinct_field", nil)
+	app.AddHandler2("GET", "/ai_proxy_usage/<id>", auth.Authenticate(aiProxyUsageGetHandler), nil, "aiproxy_ai_proxy_usage_get", nil)
+
+	for _, manager := range []db.IModelManager{
+		taskman.TaskManager,
+		taskman.SubTaskManager,
+		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
+
+		db.SharedResourceManager,
+		db.UserCacheManager,
+		db.TenantCacheManager,
+	} {
+		db.RegisterModelManager(manager)
+	}
+
+	for _, manager := range []db.IModelManager{
+		db.OpsLog,
+		db.Metadata,
+
+		models.AiProviderManager,
+		models.AiModelManager,
+		models.AiKeyManager,
+		models.AiVirtualKeyManager,
+		models.AiRoutingManager,
+		models.AiRoutingModelManager,
+		models.AiProxyNodeManager,
+	} {
+		db.RegisterModelManager(manager)
+		handler := db.NewModelHandler(manager)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
+	}
+}

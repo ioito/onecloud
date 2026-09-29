@@ -21,19 +21,23 @@ import (
 )
 
 func TestNewEthernetConfig(t *testing.T) {
-	c := NewDHCP4EthernetConfig()
+	c := NewDHCPEthernetConfig().EnableDHCP4()
 
 	assert := assert.New(t)
 	assert.YAMLEq("dhcp4: true", c.YAMLString())
 
+	c.EnableDHCP6()
+	assert.YAMLEq("dhcp4: true\ndhcp6: true\naccept-ra: true", c.YAMLString())
 }
 
 func TestNewBondMode4(t *testing.T) {
 	c := NewBondMode4(
 		&EthernetConfig{
 			DHCP4:     false,
+			DHCP6:     false,
 			Gateway4:  "192.168.1.1",
-			Addresses: []string{"192.168.1.252/24"},
+			Gateway6:  "fd:3ffe:3200::1",
+			Addresses: []string{"192.168.1.252/24", "fd:3ffe:3200::2/64"},
 			Nameservers: &Nameservers{
 				Search:    []string{"local"},
 				Addresses: []string{"8.8.8.8", "8.8.4.4"},
@@ -45,8 +49,9 @@ func TestNewBondMode4(t *testing.T) {
 	yamlStr := `
 addresses:
 - 192.168.1.252/24
-dhcp4: false
+- fd:3ffe:3200::2/64
 gateway4: 192.168.1.1
+gateway6: fd:3ffe:3200::1
 interfaces:
 - enp2s0
 - enp3s0
@@ -67,10 +72,12 @@ parameters:
 
 func TestNewNetwork(t *testing.T) {
 	n := NewNetwork()
-	n.AddEthernet("eth0", NewDHCP4EthernetConfig())
+	n.AddEthernet("eth0", NewDHCPEthernetConfig().EnableDHCP4())
 	n.AddEthernet("eth1", NewStaticEthernetConfig(
 		"10.10.10.2/24",
+		"",
 		"10.10.10.1",
+		"",
 		[]string{"mydomain", "otherdomain"},
 		[]string{"114.114.114.114"},
 		nil,
@@ -86,7 +93,6 @@ network:
     eth1:
       addresses:
       - 10.10.10.2/24
-      dhcp4: false
       gateway4: 10.10.10.1
       nameservers:
         addresses:

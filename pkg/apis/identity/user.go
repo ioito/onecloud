@@ -23,12 +23,31 @@ const (
 	PasswordResetHintExpire     = "expire"
 )
 
+type SUserGroup struct {
+	Id       string `json:"id"`
+	Name     string `json:"name"`
+	Domain   string `json:"domain"`
+	DomainId string `json:"domain_id"`
+}
+
 type UserDetails struct {
 	EnabledIdentityBaseResourceDetails
 	// IdpResourceInfo
 
 	SUser
 
+	UserUsage
+
+	// 归属该用户的外部资源统计信息
+	ExternalResourceInfo
+
+	// 用户归属的的项目信息
+	Projects []SFetchDomainObjectWithMetadata `json:"projects"`
+	// 用户归属的组
+	Groups []SUserGroup `json:"groups"`
+}
+
+type UserUsage struct {
 	// 用户归属用户组的数量
 	GroupCount int `json:"group_count"`
 	// 用户归属项目的数量
@@ -39,25 +58,20 @@ type UserDetails struct {
 	FailedAuthCount int `json:"failed_auth_count"`
 	// 上传登录失败的时间
 	FailedAuthAt time.Time `json:"failed_auth_at"`
-	// 密码过期时间（如果开启了密码过期）
-	PasswordExpiresAt time.Time `json:"password_expires_at"`
 
 	// 登录后是否需要重置密码
 	NeedResetPassword bool `json:"need_reset_password"`
 	// 重置密码原因: admin_reset|expire
 	PasswordResetHint string `json:"password_reset_hint"`
 
-	// 该用户关联的外部认证源的认证信息
-	Idps []IdpResourceInfo `json:"idps"`
+	// 密码过期时间（如果开启了密码过期）
+	PasswordExpiresAt time.Time `json:"password_expires_at"`
 
 	// 该用户是否为本地用户（SQL维护的用户）
 	IsLocal bool `json:"is_local"`
 
-	// 归属该用户的外部资源统计信息
-	ExternalResourceInfo
-
-	// 用户归属的的项目信息
-	Projects []SFetchDomainObjectWithMetadata `json:"projects"`
+	// 该用户关联的外部认证源的认证信息
+	Idps []IdpResourceInfo `json:"idps"`
 }
 
 type ResetCredentialInput struct {

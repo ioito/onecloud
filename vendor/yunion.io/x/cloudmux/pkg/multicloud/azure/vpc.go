@@ -29,11 +29,6 @@ type AddressSpace struct {
 	AddressPrefixes []string `json:"addressPrefixes,omitempty"`
 }
 
-type SubnetPropertiesFormat struct {
-	AddressPrefix string `json:"addressPrefix,omitempty"`
-	//ProvisioningState string
-}
-
 type VirtualNetworkPropertiesFormat struct {
 	ProvisioningState      string
 	Status                 string
@@ -95,16 +90,7 @@ func (self *SRegion) DeleteVpc(vpcId string) error {
 }
 
 func (self *SVpc) GetISecurityGroups() ([]cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, err := self.region.ListSecgroups()
-	if err != nil {
-		return nil, errors.Wrapf(err, "ListSecgroups")
-	}
-	ret := []cloudprovider.ICloudSecurityGroup{}
-	for i := range secgroups {
-		secgroups[i].region = self.region
-		ret = append(ret, &secgroups[i])
-	}
-	return ret, nil
+	return []cloudprovider.ICloudSecurityGroup{}, nil
 }
 
 func (self *SVpc) GetIRouteTables() ([]cloudprovider.ICloudRouteTable, error) {
@@ -119,7 +105,7 @@ func (self *SVpc) GetIRouteTableById(routeTableId string) (cloudprovider.ICloudR
 func (self *SVpc) GetIWireById(wireId string) (cloudprovider.ICloudWire, error) {
 	wire := self.getWire()
 	if wire.GetGlobalId() != wireId {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, wireId)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", wireId)
 	}
 	return wire, nil
 }

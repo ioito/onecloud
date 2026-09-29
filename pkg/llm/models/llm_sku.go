@@ -1,0 +1,647 @@
+package models
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/sqlchemy"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	imageapi "yunion.io/x/onecloud/pkg/apis/image"
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	schedulerapi "yunion.io/x/onecloud/pkg/apis/scheduler"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/llm/utils/vram"
+	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	imagemodules "yunion.io/x/onecloud/pkg/mcclient/modules/image"
+	schedulermodules "yunion.io/x/onecloud/pkg/mcclient/modules/scheduler"
+	mcclientoptions "yunion.io/x/onecloud/pkg/mcclient/options"
+	"yunion.io/x/onecloud/pkg/util/stringutils2"
+)
+
+func init() {
+	GetLLMSkuManager()
+}
+
+var llmSkuManager *SLLMSkuManager
+
+func GetLLMSkuManager() *SLLMSkuManager {
+	if llmSkuManager != nil {
+		return llmSkuManager
+	}
+	llmSkuManager = &SLLMSkuManager{
+		SLLMSkuBaseManager: NewSLLMSkuBaseManager(
+			SLLMSku{},
+			"llm_skus_tbl",
+			"llm_sku",
+			"llm_skus",
+		),
+	}
+	llmSkuManager.SetVirtualObject(llmSkuManager)
+	return llmSkuManager
+}
+
+type SLLMSkuManager struct {
+	SLLMSkuBaseManager
+	SMountedModelsResourceManager
+}
+
+type SLLMSku struct {
+	SLLMSkuBase
+	SMountedModelsResource
+
+	// primary image id of primary container
+	LLMImageId string       `width:"128" charset:"ascii" nullable:"false" list:"user" create:"required" update:"user"`
+	LLMType    string       `width:"128" charset:"ascii" nullable:"false" list:"user" create:"required"`
+	LLMSpec    *api.LLMSpec `json:"llm_spec" length:"long" list:"user" create:"optional" update:"user"`
+
+	// Model source
+	Source              string   `width:"32" charset:"ascii" nullable:"true" list:"user" create:"optional" update:"user"`
+	HuggingfaceRepoId   string   `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	HuggingfaceFilename string   `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	ModelScopeModelId   string   `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	ModelScopeFilePath  string   `width:"256" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	LocalPath           string   `width:"512" charset:"utf8" nullable:"true" list:"user" create:"optional" update:"user"`
+	PreferHosts         []string `charset:"utf8" length:"medium" nullable:"true" list:"user" create:"optional" update:"user"`
+	Categories          []string `charset:"utf8" length:"medium" nullable:"true" list:"user" create:"optional" update:"user"`
+	BackendVersion      string   `width:"64" charset:"ascii" nullable:"true" list:"user" create:"optional" update:"user"`
+	BackendParameters   []string `charset:"utf8" length:"long" nullable:"true" list:"user" create:"optional" update:"user"`
+}
+
+func (man *SLLMSkuManager) ListItemFilter(
+	ctx context.Context,
+	q *sqlchemy.SQuery,
+	userCred mcclient.TokenCredential,
+	input api.LLMSkuListInput,
+) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = man.SLLMSkuBaseManager.ListItemFilter(ctx, q, userCred, input.SharableVirtualResourceListInput)
+	if err != nil {
+		return nil, errors.Wrapf(err, "SLLMSkuBaseManager.ListItemFilter")
+	}
+	if len(input.LLMType) > 0 {
+		q = q.Equals("llm_type", input.LLMType)
+	}
+	if len(input.LLMTypes) > 0 {
+		q = q.Filter(sqlchemy.In(q.Field("llm_type"), input.LLMTypes))
+	}
+	q, err = man.SMountedModelsResourceManager.ListItemFilter(ctx, q, userCred, input.MountedModelResourceListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SMountedAppsResourceManager")
+	}
+	if len(input.Source) > 0 {
+		q = q.Equals("source", input.Source)
+	}
+	if len(input.Categories) > 0 {
+		q = q.Contains("categories", fmt.Sprintf("%q", input.Categories))
+	}
+	return q, nil
+}
+
+func (manager *SLLMSkuManager) FetchCustomizeColumns(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	objs []interface{},
+	fields stringutils2.SSortedStrings,
+	isList bool,
+) []api.LLMSkuDetails {
+	skuIds := []string{}
+	imageIds := []string{}
+	templateIds := []string{}
+
+	skus := []SLLMSku{}
+	jsonutils.Update(&skus, objs)
+	virows := manager.SSharableVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	for _, sku := range skus {
+		skuIds = append(skuIds, sku.Id)
+		if imgId := sku.GetLLMImageId(); imgId != "" {
+			imageIds = append(imageIds, imgId)
+		}
+		if sku.Volumes != nil && len(*sku.Volumes) > 0 && len((*sku.Volumes)[0].TemplateId) > 0 {
+			templateIds = append(templateIds, (*sku.Volumes)[0].TemplateId)
+		}
+	}
+
+	q := GetLLMManager().Query().In("llm_sku_id", skuIds).GroupBy("llm_sku_id")
+	q = q.AppendField(q.Field("llm_sku_id"))
+	q = q.AppendField(sqlchemy.COUNT("llm_capacity"))
+	details := []struct {
+		LLMSkuId    string
+		LLMCapacity int
+	}{}
+	q.All(&details)
+	res := make([]api.LLMSkuDetails, len(objs))
+	mountedModelIds := make([]string, 0)
+	for i, sku := range skus {
+		res[i].SharableVirtualResourceDetails = virows[i]
+		res[i].LLMType = sku.LLMType
+		res[i].LLMSpec = sku.LLMSpec
+		res[i].Source = sku.Source
+		res[i].HuggingfaceRepoId = sku.HuggingfaceRepoId
+		res[i].HuggingfaceFilename = sku.HuggingfaceFilename
+		res[i].ModelScopeModelId = sku.ModelScopeModelId
+		res[i].ModelScopeFilePath = sku.ModelScopeFilePath
+		res[i].LocalPath = sku.LocalPath
+		res[i].PreferHosts = GetSkuPreferHosts(&sku)
+		res[i].Categories = sku.Categories
+		res[i].BackendVersion = sku.BackendVersion
+		res[i].BackendParameters = sku.BackendParameters
+		for _, v := range details {
+			if v.LLMSkuId == sku.Id {
+				res[i].LLMCapacity = v.LLMCapacity
+				break
+			}
+		}
+		if modelIds := sku.GetMountedModels(); len(modelIds) > 0 {
+			mountedModelIds = append(mountedModelIds, modelIds...)
+		}
+	}
+
+	// fetch mounted models
+	if len(mountedModelIds) > 0 {
+		instModels := make(map[string]SInstantModel)
+		err := db.FetchModelObjectsByIds(GetInstantModelManager(), "id", mountedModelIds, &instModels)
+		if err != nil {
+			log.Errorf("FetchModelObjectsByIds InstantModelManager fail %s", err)
+		} else {
+			for i, sku := range skus {
+				modelIds := sku.GetMountedModels()
+				res[i].VramClaimMb = EstimateVramClaimMbFromInstantModels(sku.LLMType, modelIds, instModels, effectiveMaxModelLen(&sku))
+				if len(modelIds) > 0 {
+					res[i].MountedModelDetails = make([]api.MountedModelInfo, 0)
+					for _, modelId := range modelIds {
+						if instModel, ok := instModels[modelId]; ok {
+							info := api.MountedModelInfo{
+								Id:       instModel.Id,
+								ModelId:  instModel.ModelId,
+								FullName: instModel.ModelName + ":" + instModel.ModelTag,
+							}
+							res[i].MountedModelDetails = append(res[i].MountedModelDetails, info)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		for i := range skus {
+			res[i].VramClaimMb = 0
+		}
+	}
+	{
+		images := make(map[string]SLLMImage)
+		err := db.FetchModelObjectsByIds(GetLLMImageManager(), "id", imageIds, &images)
+		if err == nil {
+			for i, sku := range skus {
+				if imgId := sku.GetLLMImageId(); imgId != "" {
+					if image, ok := images[imgId]; ok {
+						res[i].Image = image.Name
+						res[i].ImageLabel = image.ImageLabel
+						res[i].ImageName = image.ImageName
+						res[i].AppName = image.AppName
+					}
+				}
+			}
+		} else {
+			log.Errorf("FetchModelObjectsByIds LLMImageManager fail %s", err)
+		}
+	}
+
+	if len(templateIds) > 0 {
+		templates, err := fetchTemplates(ctx, userCred, templateIds)
+		if err == nil {
+			for i, sku := range skus {
+				if templ, ok := templates[(*sku.Volumes)[0].TemplateId]; ok {
+					res[i].Template = templ.Name
+				}
+			}
+		} else {
+			log.Errorf("fail to retrive image info %s", err)
+		}
+	}
+
+	return res
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+func skuCgroupLimitEnabled(enabled *bool) bool {
+	if enabled == nil {
+		return true
+	}
+	return *enabled
+}
+
+func applySkuCgroupLimitDefaults(input *api.LLMSkuCreateInput) {
+	if input == nil {
+		return
+	}
+	def := !api.IsLLMInferenceType(input.LLMType)
+	if input.EnableCgroupCpu == nil {
+		input.EnableCgroupCpu = boolPtr(def)
+	}
+	if input.EnableCgroupMemory == nil {
+		input.EnableCgroupMemory = boolPtr(def)
+	}
+}
+
+func (man *SLLMSkuManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.LLMSkuCreateInput) (*api.LLMSkuCreateInput, error) {
+	var err error
+	input.LLMSKuBaseCreateInput, err = man.SLLMSkuBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.LLMSKuBaseCreateInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SLLMSkuBaseManager.ValidateCreateData")
+	}
+	if !api.IsLLMContainerType(input.LLMType) && input.LLMType != string(api.LLM_CONTAINER_DIFY) {
+		return input, errors.Wrap(httperrors.ErrInputParameter, "llm_type must be one of "+strings.Join(api.LLM_CONTAINER_TYPES.List(), ","))
+	}
+	applySkuCgroupLimitDefaults(input)
+
+	drv, err := GetLLMContainerDriverWithError(api.LLMContainerType(input.LLMType))
+	if err != nil {
+		return input, errors.Wrap(err, "get container driver")
+	}
+	input, err = drv.ValidateLLMSkuCreateData(ctx, userCred, input)
+	if err != nil {
+		return input, errors.Wrap(err, "validate create input")
+	}
+	if isLocalPathSkuCreate(input) {
+		if err := ValidateLocalPathSkuCreate(input); err != nil {
+			return input, err
+		}
+		if err := ValidateLocalPathHamiDevicesRequireMemoryMb(input.Devices); err != nil {
+			return input, err
+		}
+		resolved, err := resolvePreferHosts(ctx, userCred, input.PreferHosts)
+		if err != nil {
+			return input, err
+		}
+		input.PreferHosts = resolved
+	}
+	importInput, err := resolveLLMSkuImport(input)
+	if err != nil {
+		return input, err
+	}
+	if importInput != nil {
+		input.Status = api.LLM_DEPLOYMENT_STATUS_IMPORTING_MODEL
+	} else {
+		input.Status = api.STATUS_READY
+	}
+	return input, nil
+}
+
+func (sku *SLLMSku) CustomizeCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
+	err := sku.SSharableVirtualResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
+	if err != nil {
+		return errors.Wrap(err, "SSharableVirtualResourceBase.CustomizeCreate")
+	}
+	return nil
+}
+
+func (sku *SLLMSku) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
+	sku.SSharableVirtualResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	input := api.LLMSkuCreateInput{}
+	if data == nil || data.Unmarshal(&input) != nil || input.ModelSpec == nil {
+		return
+	}
+	if err := sku.StartCreateTask(ctx, userCred, data); err != nil {
+		log.Errorf("SLLMSku.PostCreate start task failed: %s", err)
+		sku.SetStatus(ctx, userCred, api.LLM_DEPLOYMENT_STATUS_IMPORT_MODEL_FAILED, err.Error())
+	}
+}
+
+func (sku *SLLMSku) StartCreateTask(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) error {
+	params, _ := data.(*jsonutils.JSONDict)
+	if params == nil {
+		params = jsonutils.NewDict()
+	}
+	importInput := api.InstantModelImportInput{}
+	if err := params.Unmarshal(&importInput, "import_input"); err != nil {
+		createdInput := api.LLMSkuCreateInput{}
+		if err := params.Unmarshal(&createdInput); err != nil {
+			return errors.Wrap(err, "unmarshal LLMSkuCreateInput")
+		}
+		derived, err := resolveLLMSkuImport(&createdInput)
+		if err != nil {
+			return errors.Wrap(err, "resolve sku import")
+		}
+		if derived == nil {
+			return errors.Wrap(httperrors.ErrInputParameter, "missing model import input")
+		}
+		importInput = *derived
+		params.Set("import_input", jsonutils.Marshal(importInput))
+	}
+	task, err := taskman.TaskManager.NewTask(ctx, "LLMSkuCreateTask", sku, userCred, params, "", "", nil)
+	if err != nil {
+		return errors.Wrap(err, "NewTask LLMSkuCreateTask")
+	}
+	return task.ScheduleRun(nil)
+}
+
+// GetLLMImageId returns the primary image id for this SKU. Delegates to driver.
+func (sku *SLLMSku) GetLLMImageId() string {
+	return sku.GetLLMContainerDriver().GetPrimaryImageId(sku)
+}
+
+// GetMountedModels returns mounted model ids (from Ollama or Vllm spec). Delegates to instant-model driver; returns nil for drivers that do not support instant models (e.g. Dify).
+func (sku *SLLMSku) GetMountedModels() []string {
+	drv, err := GetLLMContainerInstantModelDriver(api.LLMContainerType(sku.LLMType))
+	if err != nil {
+		return nil
+	}
+	return drv.GetMountedModels(sku)
+}
+
+// EstimateVramClaimMb returns heuristic VRAM (MiB) from the largest mounted
+// InstantModel's weight_size_bytes, including KV reserve for effective
+// max_model_len. 0 means unknown / no mounted weights.
+func (sku *SLLMSku) EstimateVramClaimMb() int {
+	if sku == nil {
+		return 0
+	}
+	return EstimateVramClaimMbFromMountedModels(sku.LLMType, sku.GetMountedModels(), effectiveMaxModelLen(sku))
+}
+
+// EstimateModelVramMb returns weight+framework VRAM (MiB) without KV reserve.
+// Used as the numerator for auto gpu-memory-utilization; HAMI slice sizing
+// continues to use EstimateVramClaimMb (WithContext).
+func (sku *SLLMSku) EstimateModelVramMb() int {
+	if sku == nil {
+		return 0
+	}
+	return EstimateModelVramMbFromMountedModels(sku.LLMType, sku.GetMountedModels())
+}
+
+// effectiveMaxModelLen returns SKU-configured max-model-len, or the platform default.
+func effectiveMaxModelLen(sku *SLLMSku) int {
+	if sku == nil {
+		return api.LLM_DEFAULT_CONTEXT_TOKENS
+	}
+	keys := []string{"max-model-len"}
+	if val, ok := tokenLimitFromBackendParameters(sku.BackendParameters, keys); ok && val > 0 {
+		return int(val)
+	}
+	switch api.LLMContainerType(sku.LLMType) {
+	case api.LLM_CONTAINER_VLLM:
+		if sku.LLMSpec != nil && sku.LLMSpec.Vllm != nil {
+			for _, arg := range sku.LLMSpec.Vllm.CustomizedArgs {
+				if arg == nil || !runtimeArgKeyIn(arg.Key, keys) {
+					continue
+				}
+				if val, ok := parseTokenLimitValue(arg.Value); ok && val > 0 {
+					return int(val)
+				}
+			}
+		}
+	case api.LLM_CONTAINER_SGLANG:
+		if val, ok := sglangRuntimeIntArg(sku, keys); ok && val > 0 {
+			return int(val)
+		}
+	}
+	return api.LLM_DEFAULT_CONTEXT_TOKENS
+}
+
+func maxMountedInstantModelWeightBytes(modelIds []string) int64 {
+	var maxWeight int64
+	for _, id := range modelIds {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		obj, err := GetInstantModelManager().FetchById(id)
+		if err != nil {
+			continue
+		}
+		if w := obj.(*SInstantModel).WeightSizeBytes; w > maxWeight {
+			maxWeight = w
+		}
+	}
+	return maxWeight
+}
+
+// EstimateModelVramMbFromMountedModels estimates model VRAM without KV reserve.
+func EstimateModelVramMbFromMountedModels(llmType string, modelIds []string) int {
+	return vram.EstimateClaimMb(maxMountedInstantModelWeightBytes(modelIds), llmType)
+}
+
+// EstimateVramClaimMbFromMountedModels estimates VRAM from InstantModel ids.
+func EstimateVramClaimMbFromMountedModels(llmType string, modelIds []string, maxModelLen int) int {
+	return vram.EstimateClaimMbWithContext(maxMountedInstantModelWeightBytes(modelIds), llmType, maxModelLen)
+}
+
+// EstimateVramClaimMbFromInstantModels uses already-fetched InstantModel rows.
+func EstimateVramClaimMbFromInstantModels(llmType string, modelIds []string, models map[string]SInstantModel, maxModelLen int) int {
+	var maxWeight int64
+	for _, id := range modelIds {
+		if m, ok := models[id]; ok && m.WeightSizeBytes > maxWeight {
+			maxWeight = m.WeightSizeBytes
+		}
+	}
+	return vram.EstimateClaimMbWithContext(maxWeight, llmType, maxModelLen)
+}
+
+func (sku *SLLMSku) GetLLMContainerDriver() ILLMContainerDriver {
+	return GetLLMContainerDriver(api.LLMContainerType(sku.LLMType))
+}
+
+// buildSchedulableIsolatedDevices builds IsolatedDeviceConfig list for forecast
+// using the same path as pod create (GPU/NPU + SharingMode + MemoryMb).
+func buildSchedulableIsolatedDevices(devices *api.Devices, vramClaimMb int) ([]*computeapi.IsolatedDeviceConfig, int, error) {
+	isoDevs, err := BuildIsolatedDeviceConfigs(devices, vramClaimMb)
+	if err != nil {
+		return nil, 0, err
+	}
+	perDevMinMb := 0
+	if vramClaimMb > 0 && devices != nil && len(*devices) > 0 {
+		perDevMinMb = (vramClaimMb + len(*devices) - 1) / len(*devices)
+	}
+	for _, d := range isoDevs {
+		if d.MemoryMb > perDevMinMb {
+			perDevMinMb = d.MemoryMb
+		}
+	}
+	return isoDevs, perDevMinMb, nil
+}
+
+func skuForecastDisks(volumes *api.Volumes) []*computeapi.DiskConfig {
+	if volumes == nil || volumes.IsZero() {
+		return nil
+	}
+	disks := make([]*computeapi.DiskConfig, 0, len(*volumes))
+	for idx, volume := range *volumes {
+		disks = append(disks, &computeapi.DiskConfig{
+			DiskType: "data",
+			SizeMb:   volume.SizeMB,
+			Index:    idx,
+		})
+	}
+	return disks
+}
+
+// PerformSchedulableCheck is POST /llm_skus/{id}/schedulable-check.
+// Specs are read from the SKU (cpu/memory/volumes/devices). SKUs without
+// GPUs still run forecast for CPU/memory/disk. Isolated-device VRAM checks
+// apply only when devices are configured.
+func (sku *SLLMSku) PerformSchedulableCheck(
+	ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, _ api.LLMSchedulableCheckInput,
+) (*api.LLMSchedulableCheckOutput, error) {
+	gpuCount := 0
+	if sku.Devices != nil {
+		gpuCount = len(*sku.Devices)
+	}
+	out := &api.LLMSchedulableCheckOutput{
+		GpuCount: gpuCount,
+	}
+
+	var isoDevs []*computeapi.IsolatedDeviceConfig
+	if gpuCount > 0 {
+		vramClaimMb := sku.EstimateVramClaimMb()
+		out.VramClaimMb = vramClaimMb
+
+		var err error
+		var perDevMinMb int
+		isoDevs, perDevMinMb, err = buildSchedulableIsolatedDevices(sku.Devices, vramClaimMb)
+		if err != nil {
+			out.Reason = err.Error()
+			return out, nil
+		}
+		out.PerDevMinMb = perDevMinMb
+		if vramClaimMb <= 0 && perDevMinMb <= 0 {
+			out.Reason = "Auto VRAM calculation failed — mounted instant models have unknown weight (not yet backfilled)"
+			return out, nil
+		}
+	}
+
+	input := &schedulerapi.ScheduleInput{
+		ServerConfig: schedulerapi.ServerConfig{
+			ServerConfigs: &computeapi.ServerConfigs{
+				Hypervisor:      computeapi.HYPERVISOR_POD,
+				Count:           1,
+				IsolatedDevices: isoDevs,
+				Disks:           skuForecastDisks(sku.Volumes),
+			},
+			Ncpu:   sku.Cpu,
+			Memory: sku.Memory,
+		},
+	}
+
+	s := auth.GetAdminSession(ctx, "")
+	canCreate, raw, err := schedulermodules.SchedManager.DoScheduleForecast(s, input, 1)
+	if err != nil {
+		return nil, errors.Wrap(err, "scheduler forecast")
+	}
+
+	out.Schedulable = canCreate
+	out.Reason = "Scheduler forecast completed — see hosts for qualifying candidates"
+
+	candidates, _ := raw.GetArray("candidates")
+	out.TotalGpuHosts = len(candidates)
+	for _, c := range candidates {
+		hostID, _ := c.GetString("host_id")
+		hostName, _ := c.GetString("name")
+		out.Hosts = append(out.Hosts, api.LLMSchedulableHostInfo{
+			HostId:   hostID,
+			HostName: hostName,
+		})
+		if hostID != "" {
+			out.QualifiedHosts++
+		}
+	}
+
+	if !canCreate {
+		var reasons []string
+		notAllow, _ := raw.GetArray("not_allow_reasons")
+		for _, r := range notAllow {
+			if s, _ := r.GetString(); s != "" {
+				reasons = append(reasons, s)
+			}
+		}
+		if len(reasons) > 0 {
+			out.Reason = fmt.Sprintf("not schedulable: %s", reasons[0])
+		} else {
+			out.Reason = "not schedulable — no host satisfies all predicates"
+		}
+		fc, _ := raw.Get("filtered_candidates")
+		out.FilteredCandidates = fc
+	}
+
+	return out, nil
+}
+
+func ValidateLLMSkuReadyForUse(sku *SLLMSku) error {
+	if sku == nil {
+		return errors.Wrap(httperrors.ErrInputParameter, "empty llm_sku")
+	}
+	if sku.Status != api.STATUS_READY {
+		return errors.Wrapf(httperrors.ErrInvalidStatus, "llm_sku %s status is %s", sku.Name, sku.Status)
+	}
+	return nil
+}
+
+func (sku *SLLMSku) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.LLMSkuUpdateInput) (api.LLMSkuUpdateInput, error) {
+	var err error
+	input.LLMSkuBaseUpdateInput, err = sku.SLLMSkuBase.ValidateUpdateData(ctx, userCred, query, input.LLMSkuBaseUpdateInput)
+	if err != nil {
+		return input, errors.Wrap(err, "validate LLMSkuBaseUpdateInput")
+	}
+
+	if SkuHasLocalHostPathModel(sku) && input.Devices != nil {
+		if err := ValidateLocalPathHamiDevicesRequireMemoryMb(input.Devices); err != nil {
+			return input, err
+		}
+	}
+
+	if err := validateLocalPathSkuUpdatePreferHosts(ctx, userCred, sku, &input); err != nil {
+		return input, err
+	}
+
+	if sku.LLMSpec == nil {
+		return input, nil
+	}
+	drv := sku.GetLLMContainerDriver()
+	updateInput, err := drv.ValidateLLMSkuUpdateData(ctx, userCred, sku, &input)
+	if err != nil {
+		return input, errors.Wrap(err, "validate update spec")
+	}
+	return *updateInput, nil
+}
+
+func (sku *SLLMSku) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
+	count, err := GetLLMManager().Query().Equals("llm_sku_id", sku.Id).CountWithError()
+	if err != nil {
+		return errors.Wrap(err, "fetch llm")
+	}
+	if count > 0 {
+		return errors.Wrap(errors.ErrNotSupported, "This sku is currently in use by LLM")
+	}
+	return nil
+}
+
+func fetchTemplates(ctx context.Context, userCred mcclient.TokenCredential, templateIds []string) (map[string]imageapi.ImageDetails, error) {
+	s := auth.GetSession(ctx, userCred, "")
+	params := mcclientoptions.BaseListOptions{}
+	params.Id = templateIds
+	limit := len(templateIds)
+	params.Limit = &limit
+	params.Scope = "maxallowed"
+	results, err := imagemodules.Images.List(s, jsonutils.Marshal(params))
+	if err != nil {
+		return nil, errors.Wrap(err, "Images.List")
+	}
+	templates := make(map[string]imageapi.ImageDetails)
+	for i := range results.Data {
+		tmpl := imageapi.ImageDetails{}
+		err := results.Data[i].Unmarshal(&tmpl)
+		if err == nil {
+			templates[tmpl.Id] = tmpl
+		}
+	}
+	return templates, nil
+}

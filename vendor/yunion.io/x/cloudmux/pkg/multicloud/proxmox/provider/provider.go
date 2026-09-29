@@ -31,7 +31,7 @@ import (
 )
 
 type SProxmoxProviderFactory struct {
-	cloudprovider.SPrivateCloudBaseProviderFactory
+	cloudprovider.SPremiseBaseProviderFactory
 }
 
 func (self *SProxmoxProviderFactory) GetId() string {
@@ -159,18 +159,12 @@ func (self *SProxmoxProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SProxmoxProvider) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.client.GetIRegions()
+func (self *SProxmoxProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return nil, cloudprovider.ErrNotSupported
 }
 
 func (self *SProxmoxProvider) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	regions := self.GetIRegions()
-	for i := range regions {
-		if regions[i].GetGlobalId() == id {
-			return regions[i], nil
-		}
-	}
-	return nil, cloudprovider.ErrNotFound
+	return nil, cloudprovider.ErrNotSupported
 }
 
 func (self *SProxmoxProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) {
@@ -179,6 +173,10 @@ func (self *SProxmoxProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) 
 		Currency: "CNY",
 		Status:   api.CLOUD_PROVIDER_HEALTH_NORMAL,
 	}, cloudprovider.ErrNotSupported
+}
+
+func (self *SProxmoxProvider) GetOnPremiseIRegion() (cloudprovider.ICloudRegion, error) {
+	return self.client, nil
 }
 
 func (self *SProxmoxProvider) GetIProjects() ([]cloudprovider.ICloudProject, error) {
@@ -200,3 +198,4 @@ func (self *SProxmoxProvider) GetObjectCannedAcls(regionId string) []string {
 func (self *SProxmoxProvider) GetCapabilities() []string {
 	return self.client.GetCapabilities()
 }
+

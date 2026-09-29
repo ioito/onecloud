@@ -41,74 +41,21 @@ import (
 
 func init() {
 	cmd := shell.NewResourceCmd(&modules.Disks)
+	cmd.List(&compute_options.DiskListOptions{})
+	cmd.Show(&compute_options.DiskShowOptions{})
+	cmd.Perform("public", &compute_options.DiskIdOptions{})
+	cmd.Perform("private", &compute_options.DiskIdOptions{})
+	cmd.Perform("syncstatus", &compute_options.DiskIdOptions{})
+	cmd.Perform("change-owner-candidate-domains", &compute_options.DiskIdOptions{})
+	cmd.Perform("disk-cancel-delete", &compute_options.DiskIdOptions{})
 	cmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
+	cmd.Perform("rebuild", &compute_options.DiskRebuildOptions{})
+	cmd.Perform("migrate", &compute_options.DiskMigrateOptions{})
+	cmd.Perform("reset-template", &compute_options.DiskResetTemplateOptions{})
+	cmd.Perform("change-billing-type", new(compute_options.DiskChangeBillingTypeOptions))
+	cmd.Perform("change-storage-type", &compute_options.DiskChangeStorageTypeOptions{})
 
-	type DiskListOptions struct {
-		options.BaseListOptions
-		Unused        *bool  `help:"Show unused disks"`
-		Share         *bool  `help:"Show Share storage disks"`
-		Local         *bool  `help:"Show Local storage disks"`
-		Guest         string `help:"Guest ID or name"`
-		GuestStatus   string `help:"Guest Status"`
-		OrderByServer string `help:"Order By Server"`
-		Storage       string `help:"Storage ID or name"`
-		Type          string `help:"Disk type" choices:"sys|data|swap|volume"`
-		CloudType     string `help:"Public cloud or private cloud" choices:"Public|Private"`
-
-		OrderByGuestCount string `help:"Order By Guest Count"`
-
-		BillingType string `help:"billing type" choices:"postpaid|prepaid"`
-
-		SnapshotpolicyId string `help:"snapshotpolicy id"`
-	}
-	R(&DiskListOptions{}, "disk-list", "List virtual disks", func(s *mcclient.ClientSession, opts *DiskListOptions) error {
-		params, err := options.ListStructToParams(opts)
-		if err != nil {
-			return err
-		}
-		if len(opts.CloudType) > 0 {
-			if opts.CloudType == "Public" {
-				params.Add(jsonutils.JSONTrue, "public_cloud")
-			} else if opts.CloudType == "Private" {
-				params.Add(jsonutils.JSONTrue, "private_cloud")
-			}
-		}
-
-		result, err := modules.Disks.List(s, params)
-		if err != nil {
-			return err
-		}
-		printList(result, modules.Disks.GetColumns(s))
-		return nil
-	})
-
-	type DiskDetailOptions struct {
-		ID string `help:"ID or Name of disk"`
-	}
-	R(&DiskDetailOptions{}, "disk-show", "Show details of disk", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
-		disk, e := modules.Disks.Get(s, args.ID, nil)
-		if e != nil {
-			return e
-		}
-		printObject(disk)
-		return nil
-	})
-	R(&DiskDetailOptions{}, "disk-cancel-delete", "Cancel pending delete disks", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
-		disk, e := modules.Disks.PerformAction(s, args.ID, "cancel-delete", nil)
-		if e != nil {
-			return e
-		}
-		printObject(disk)
-		return nil
-	})
-
-	type DiskDeleteOptions struct {
-		ID                    []string `help:"ID of disks to delete" metavar:"DISK"`
-		OverridePendingDelete bool     `help:"Delete disk directly instead of pending delete" short-token:"f"`
-		DeleteSnapshots       bool     `help:"Delete disk snapshots before delete disk"`
-	}
-
-	R(&DiskDeleteOptions{}, "disk-delete", "Delete a disk", func(s *mcclient.ClientSession, args *DiskDeleteOptions) error {
+	R(&compute_options.DiskDeleteOptions{}, "disk-delete", "Delete a disk", func(s *mcclient.ClientSession, args *compute_options.DiskDeleteOptions) error {
 		params := jsonutils.NewDict()
 		if args.OverridePendingDelete {
 			params.Add(jsonutils.JSONTrue, "override_pending_delete")
@@ -130,25 +77,7 @@ func init() {
 		return nil
 	})
 
-	R(&DiskDetailOptions{}, "disk-public", "Make a disk public", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
-		disk, e := modules.Disks.PerformAction(s, args.ID, "public", nil)
-		if e != nil {
-			return e
-		}
-		printObject(disk)
-		return nil
-	})
-
-	R(&DiskDetailOptions{}, "disk-private", "Make a disk private", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
-		disk, e := modules.Disks.PerformAction(s, args.ID, "private", nil)
-		if e != nil {
-			return e
-		}
-		printObject(disk)
-		return nil
-	})
-
-	R(&DiskDetailOptions{}, "disk-metadata", "Get metadata of a disk", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
+	R(&compute_options.DiskIdOptions{}, "disk-metadata", "Get metadata of a disk", func(s *mcclient.ClientSession, args *compute_options.DiskIdOptions) error {
 		meta, e := modules.Disks.GetMetadata(s, args.ID, nil)
 		if e != nil {
 			return e
@@ -157,23 +86,15 @@ func init() {
 		return nil
 	})
 
-	R(&DiskDetailOptions{}, "disk-syncstatus", "Sync status for disk", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
-		ret, e := modules.Disks.PerformAction(s, args.ID, "syncstatus", nil)
-		if e != nil {
-			return e
-		}
-		printObject(ret)
-		return nil
-	})
-
 	type DiskUpdateOptions struct {
 		ID           string `help:"ID or name of disk"`
 		Name         string `help:"New name of disk"`
 		Desc         string `help:"Description" metavar:"DESCRIPTION"`
-		AutoDelete   string `help:"enable/disable auto delete of disk" choices:"enable|disable"`
+		AutoDelete   string `help:"Set disk auto_delete (true/false or enable/disable)" choices:"true|false|enable|disable"`
 		AutoSnapshot string `help:"enable/disable auto snapshot of disk" choices:"enable|disable"`
-		DiskType     string `help:"Disk type" choices:"data|volume"`
+		DiskType     string `help:"Disk type" choices:"data|volume|sys"`
 		IsSsd        *bool  `help:"mark disk as ssd" negative:"no-is-ssd"`
+		AutoReset    *bool  `help:"Enable auto reset disk after guest shutdown"`
 	}
 	R(&DiskUpdateOptions{}, "disk-update", "Update property of a virtual disk", func(s *mcclient.ClientSession, args *DiskUpdateOptions) error {
 		params := jsonutils.NewDict()
@@ -184,7 +105,7 @@ func init() {
 			params.Add(jsonutils.NewString(args.Desc), "description")
 		}
 		if len(args.AutoDelete) > 0 {
-			if args.AutoDelete == "enable" {
+			if args.AutoDelete == "enable" || args.AutoDelete == "true" {
 				params.Add(jsonutils.JSONTrue, "auto_delete")
 			} else {
 				params.Add(jsonutils.JSONFalse, "auto_delete")
@@ -207,6 +128,10 @@ func init() {
 				params.Add(jsonutils.JSONFalse, "is_ssd")
 			}
 		}
+		if args.AutoReset != nil {
+			params.Add(jsonutils.NewBool(*args.AutoReset), "auto_reset")
+		}
+
 		if params.Size() == 0 {
 			return InvalidUpdateError()
 		}
@@ -242,11 +167,7 @@ func init() {
 		return nil
 	})
 
-	type DiskResizeOptions struct {
-		DISK string `help:"ID or name of disk"`
-		SIZE string `help:"Size of disk"`
-	}
-	R(&DiskResizeOptions{}, "disk-resize", "Resize a disk", func(s *mcclient.ClientSession, args *DiskResizeOptions) error {
+	R(&compute_options.DiskResizeOptions{}, "disk-resize", "Resize a disk", func(s *mcclient.ClientSession, args *compute_options.DiskResizeOptions) error {
 		params := jsonutils.NewDict()
 		params.Add(jsonutils.NewString(args.SIZE), "size")
 		disk, err := modules.Disks.PerformAction(s, args.DISK, "resize", params)
@@ -258,7 +179,7 @@ func init() {
 	})
 	type DiskResetOptions struct {
 		DISK      string `help:"ID or name of disk"`
-		SNAPSHOT  string `help:"snapshots ID of disk"`
+		SNAPSHOT  string `help:"Snapshot ID of disk"`
 		AutoStart bool   `help:"Autostart guest"`
 	}
 	R(&DiskResetOptions{}, "disk-reset", "Resize a disk", func(s *mcclient.ClientSession, args *DiskResetOptions) error {
@@ -314,9 +235,9 @@ func init() {
 
 	type DiskChangeOwnerOptions struct {
 		ID      string `help:"Disk to change owner" json:"-"`
-		PROJECT string `help:"Project ID or change" json:"tenant"`
+		PROJECT string `help:"Project ID or name" json:"tenant"`
 	}
-	R(&DiskChangeOwnerOptions{}, "disk-change-owner", "Change owner porject of a disk", func(s *mcclient.ClientSession, opts *DiskChangeOwnerOptions) error {
+	R(&DiskChangeOwnerOptions{}, "disk-change-owner", "Change owner project of a disk", func(s *mcclient.ClientSession, opts *DiskChangeOwnerOptions) error {
 		params, err := options.StructToParams(opts)
 		if err != nil {
 			return err
@@ -329,7 +250,7 @@ func init() {
 		return nil
 	})
 
-	R(&DiskDetailOptions{}, "disk-change-owner-candidate-domains", "Get change owner candidate domain list", func(s *mcclient.ClientSession, args *DiskDetailOptions) error {
+	R(&compute_options.DiskIdOptions{}, "disk-change-owner-candidate-domains", "Get change owner candidate domain list", func(s *mcclient.ClientSession, args *compute_options.DiskIdOptions) error {
 		result, err := modules.Disks.GetSpecific(s, args.ID, "change-owner-candidate-domains", nil)
 		if err != nil {
 			return err

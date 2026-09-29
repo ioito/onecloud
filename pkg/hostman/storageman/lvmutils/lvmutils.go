@@ -17,9 +17,14 @@ package lvmutils
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/util/procutils"
@@ -34,9 +39,8 @@ type LvNames struct {
 }
 
 func GetLvNames(vg string) ([]string, error) {
-	lvs, err := procutils.NewRemoteCommandAsFarAsPossible(
-		"lvm", "lvs", "--reportformat", "json", "-o", "lv_name", vg,
-	).Output()
+	cmd := fmt.Sprintf("lvm lvs --reportformat json -o lv_name %s 2>/dev/null", vg)
+	lvs, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
 	if err != nil {
 		return nil, errors.Wrap(err, "lvm lvs")
 	}
@@ -48,7 +52,7 @@ func GetLvNames(vg string) ([]string, error) {
 	if len(res.Report) != 1 {
 		return nil, errors.Errorf("unexpect res %v", res)
 	}
-	lvNames := make([]string, len(res.Report[0].LV))
+	lvNames := make([]string, 0, len(res.Report[0].LV))
 	for i := 0; i < len(res.Report[0].LV); i++ {
 		lvNames = append(lvNames, res.Report[0].LV[i].LVName)
 	}
@@ -64,9 +68,8 @@ type LvOrigin struct {
 }
 
 func GetLvOrigin(lvPath string) (string, error) {
-	lvs, err := procutils.NewRemoteCommandAsFarAsPossible(
-		"lvm", "lvs", "--reportformat", "json", "-o", "origin", lvPath,
-	).Output()
+	cmd := fmt.Sprintf("lvm lvs --reportformat json -o origin %s 2>/dev/null", lvPath)
+	lvs, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
 	if err != nil {
 		return "", errors.Wrap(err, "lvm lvs")
 	}
@@ -80,6 +83,76 @@ func GetLvOrigin(lvPath string) (string, error) {
 
 	}
 	return "", errors.Errorf("unexpect res %v", res)
+}
+
+type LvActive struct {
+	Report []struct {
+		LV []struct {
+			LvActive string `json:"lv_active"`
+		} `json:"lv"`
+	} `json:"report"`
+}
+
+func LvIsActivated(lvPath string) (bool, error) {
+	cmd := fmt.Sprintf("lvm lvs --reportformat json -o lv_active %s 2>/dev/null", lvPath)
+	lvs, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return false, errors.Wrap(err, "lvm lvs")
+	}
+	var res LvActive
+	err = json.Unmarshal(lvs, &res)
+	if err != nil {
+		return false, errors.Wrap(err, "unmarshal lvs")
+	}
+	if len(res.Report) == 1 && len(res.Report[0].LV) == 1 {
+		return res.Report[0].LV[0].LvActive == "active", nil
+
+	}
+	return false, errors.Errorf("unexpect res %v", res)
+}
+
+func LvDisplay(lvPath string) (string, error) {
+	cmd := fmt.Sprintf("lvm lvdisplay %s", lvPath)
+	res, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return "", errors.Wrap(err, "lvm lvdisplay")
+	}
+	return string(res), nil
+}
+
+func LVActive(lvPath string, share, exclusive bool) error {
+	opts := "-ay"
+	if share {
+		opts += "s"
+	} else if exclusive {
+		opts += "e"
+	}
+
+	cmd := fmt.Sprintf("lvm lvchange %s %s", opts, lvPath)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return errors.Wrapf(err, "lvchange %s %s failed %s", opts, lvPath, out)
+	}
+	return nil
+}
+
+func LVDeactivate(lvPath string) error {
+	opts := "-an"
+	cmd := fmt.Sprintf("lvm lvchange %s %s", opts, lvPath)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return errors.Wrapf(err, "lvchange %s %s failed %s", opts, lvPath, out)
+	}
+	return nil
+}
+
+func LvScan() error {
+	cmd := "lvm lvscan"
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return errors.Wrapf(err, "lvscan failed %s", out)
+	}
+	return nil
 }
 
 type VgProps struct {
@@ -98,12 +171,12 @@ type VgReports struct {
 	} `json:"report"`
 }
 
+// lvm units https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/logical_volume_manager_administration/report_units
 func GetVgProps(vg string) (*VgProps, error) {
-	out, err := procutils.NewRemoteCommandAsFarAsPossible(
-		"lvm", "vgs", "--reportformat", "json", "-o", "vg_free,vg_size,vg_extent_size", "--units=B", vg,
-	).Output()
+	cmd := fmt.Sprintf("lvm vgs --reportformat json -o vg_free,vg_size,vg_extent_size --units=B %s 2>/dev/null", vg)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
 	if err != nil {
-		return nil, errors.Wrapf(err, "exec lvm command: %s", out)
+		return nil, errors.Wrapf(err, "exec lvm command %s: %s", cmd, out)
 	}
 	var vgReports VgReports
 	err = json.Unmarshal(out, &vgReports)
@@ -183,6 +256,10 @@ func LvResize(vg, lvPath string, size int64) error {
 
 // @param: lvPath string: should like /dev/<vg>/<lv>
 func LvRemove(lvPath string) error {
+	if out, err := procutils.NewCommand("dd", "if=/dev/zero", fmt.Sprintf("of=%s", lvPath), "bs=10M", "count=16").Output(); err != nil {
+		log.Errorf("failed dd zero to lv %s: %s %s", lvPath, out, err)
+	}
+
 	out, err := procutils.NewRemoteCommandAsFarAsPossible("lvm", "lvremove", lvPath, "-y").Output()
 	if err != nil {
 		return errors.Wrapf(err, "LvRemove failed %s", out)
@@ -200,15 +277,117 @@ func DmRemove(dmPath string) error {
 }
 
 func DmCreate(lv1, lv2, dmName string) error {
-	var dmCreateScript = fmt.Sprintf(`
+	var dmCreateScript = `
 size1=$(blockdev --getsz $1)
 size2=$(blockdev --getsz $2)
 echo "0 $size1 linear $1 0
 $size1 $size2 linear $2 0" | dmsetup create $3
-`)
+`
 	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", dmCreateScript, "--", lv1, lv2, dmName).Output()
 	if err != nil {
 		return errors.Wrapf(err, "create device mapper failed %s", out)
 	}
 	return nil
+}
+
+func VgDisplay(vgName string) (string, error) {
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("lvm", "vgdisplay", vgName).Output()
+	if err != nil {
+		return "", errors.Wrapf(err, "vgdisplay %s failed %s: %s", vgName, out, err)
+	}
+	return string(out), nil
+}
+
+func VgActive(vgName string, active, autoActivation bool) error {
+	opts := "-ay"
+	if !active {
+		opts = "-an"
+	}
+	if active && autoActivation {
+		opts = "-aay"
+	}
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("lvm", "vgchange", opts, vgName).Output()
+	if err != nil {
+		return errors.Wrapf(err, "vgchange %s %s failed %s", opts, vgName, out)
+	}
+	return nil
+}
+
+func LvRename(vgName, oldName, newName string) error {
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("lvm", "lvrename", vgName, oldName, newName).Output()
+	if err != nil {
+		return errors.Wrapf(err, "lvrename vg: %s oldName: %s newName: %s failed: %s", vgName, oldName, newName, out)
+	}
+	return nil
+}
+
+func GetQcow2LvSize(sizeMb int64) int64 {
+	// 100G reserve 1M for qcow2 metadata
+	metaSize := sizeMb/1024/100 + 10
+	return sizeMb + metaSize
+}
+
+// get lvsize unit byte
+func GetLvSize(lvPath string) (int64, error) {
+	cmd := fmt.Sprintf("lvm lvs %s -o LV_SIZE --noheadings --units B --nosuffix 2>/dev/null", lvPath)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", "-c", cmd).Output()
+	if err != nil {
+		return -1, errors.Wrapf(err, "exec lvm command %s: %s", cmd, out)
+	}
+	strSize := strings.TrimSpace(string(out))
+	size, err := strconv.ParseInt(strSize, 10, 64)
+	if err != nil {
+		return -1, errors.Wrapf(err, "failed parse size %s", strSize)
+	}
+	return size, nil
+}
+
+func IsDeviceInUse(devPath string) (bool, error) {
+	fi, err := os.Stat(devPath)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", devPath, err)
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("cannot get raw stat")
+	}
+	targetDev := uint64(stat.Rdev)
+
+	procEntries, err := ioutil.ReadDir("/proc")
+	if err != nil {
+		return false, fmt.Errorf("read /proc: %w", err)
+	}
+
+	for _, entry := range procEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		_, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+
+		fdDir := filepath.Join("/proc", entry.Name(), "fd")
+		fds, err := ioutil.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			fdPath := filepath.Join(fdDir, fd.Name())
+			fdInfo, err := os.Stat(fdPath)
+			if err != nil {
+				continue
+			}
+			fdStat, ok := fdInfo.Sys().(*syscall.Stat_t)
+			if !ok {
+				continue
+			}
+			if uint64(fdStat.Rdev) == targetDev {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }

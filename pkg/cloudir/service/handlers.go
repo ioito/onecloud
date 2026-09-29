@@ -17,16 +17,20 @@ package service
 import (
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/etcd/handler"
 	"yunion.io/x/onecloud/pkg/cloudcommon/etcd/models"
 	"yunion.io/x/onecloud/pkg/cloudcommon/etcd/models/base"
+	"yunion.io/x/onecloud/pkg/cloudir/options"
 )
 
-func initHandlers(app *appsrv.Application) {
+func initHandlers(app *appsrv.Application, isSlave bool) {
+	app_common.ExportOptionsHandler(app, &options.Options)
+
 	for _, manager := range []base.IEtcdModelManager{
 		models.ServiceRegistryManager,
 	} {
 		handler := handler.NewEtcdModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 }

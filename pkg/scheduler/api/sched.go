@@ -108,7 +108,7 @@ func FetchSchedInfo(req *http.Request) (*SchedInfo, error) {
 			net.Domain = domainId
 		}
 		if net.Network != "" {
-			netObj, err := models.NetworkManager.FetchByIdOrName(data.UserCred, net.Network)
+			netObj, err := models.NetworkManager.FetchByIdOrName(req.Context(), data.UserCred, net.Network)
 			if err != nil {
 				return nil, errors.Wrapf(err, "fetch network %s", net.Network)
 			}
@@ -154,6 +154,17 @@ func NewSchedInfo(input *api.ScheduleInput) *SchedInfo {
 	preferCandidates := make([]string, 0)
 	if data.PreferHost != "" {
 		preferCandidates = append(preferCandidates, data.PreferHost)
+	}
+
+	if len(data.PreferRegion) > 0 && len(data.Provider) == 0 {
+		regionObj, _ := models.CloudregionManager.FetchById(data.PreferRegion)
+		if regionObj != nil {
+			region := regionObj.(*models.SCloudregion)
+			data.Provider = region.Provider
+		}
+	}
+	if len(data.Provider) == 0 {
+		data.Provider = computeapi.CLOUD_PROVIDER_ONECLOUD
 	}
 
 	if data.Backup {
@@ -209,14 +220,10 @@ func (data *SchedInfo) reviseData() {
 	data.Raw = input.JSON(input).String()
 }
 
-func (d *SchedInfo) SkipDirtyMarkHost() bool {
-	return d.IsContainer || d.Hypervisor == SchedTypeContainer
-}
-
 func (d *SchedInfo) GetCandidateHostTypes() []string {
 	switch d.Hypervisor {
-	case SchedTypeContainer:
-		return []string{HostTypeKubelet, HostHypervisorForKvm}
+	case computeapi.HYPERVISOR_POD:
+		return []string{computeapi.HOST_TYPE_CONTAINER, HostHypervisorForKvm}
 	default:
 		return []string{d.Hypervisor}
 	}

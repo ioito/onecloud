@@ -20,24 +20,26 @@ import (
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/errors"
 )
 
 type SDisk struct {
 	SResourceBase
 
-	storage      *SStorage
-	ZoneId       string
-	StorageId    string
-	DiskFormat   string
-	DiskSizeMb   int
-	IsAutoDelete bool
-	DiskType     string
-	FsFormat     string
-	Iops         int
-	Driver       string
-	CacheMode    string
-	Mountpoint   string
-	AccessPath   string
+	storage       *SStorage
+	ZoneId        string
+	StorageId     string
+	DiskFormat    string
+	DiskSizeMb    int
+	IsAutoDelete  bool
+	DiskType      string
+	FsFormat      string
+	Iops          int
+	Driver        string
+	CacheMode     string
+	Mountpoint    string
+	Preallocation string
+	AccessPath    string
 }
 
 func (self *SDisk) GetIStorage() (cloudprovider.ICloudStorage, error) {
@@ -98,6 +100,10 @@ func (self *SDisk) GetMountpoint() string {
 	return self.Mountpoint
 }
 
+func (self *SDisk) GetPreallocation() string {
+	return self.Preallocation
+}
+
 func (self *SDisk) GetAccessPath() string {
 	return self.AccessPath
 }
@@ -111,10 +117,6 @@ func (self *SDisk) CreateISnapshot(ctx context.Context, name string, desc string
 }
 
 func (self *SDisk) GetISnapshots() ([]cloudprovider.ICloudSnapshot, error) {
-	return nil, cloudprovider.ErrNotSupported
-}
-
-func (self *SDisk) GetExtSnapshotPolicyIds() ([]string, error) {
 	return nil, cloudprovider.ErrNotSupported
 }
 
@@ -132,4 +134,16 @@ func (self *SDisk) Rebuild(ctx context.Context) error {
 
 func (disk *SDisk) SetStorage(storage SStorage) {
 	disk.storage = &storage
+}
+
+func (disk *SDisk) ChangeStorage(ctx context.Context, opts *cloudprovider.ChangeStorageOptions) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "ChangeStorage")
+}
+
+func (disk *SDisk) GetDeviceName() string {
+	return ""
+}
+
+func (disk *SDisk) GetThroughput() int {
+	return 0
 }

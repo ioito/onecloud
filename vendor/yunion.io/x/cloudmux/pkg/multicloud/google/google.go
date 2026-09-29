@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
@@ -33,6 +32,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/stringutils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -144,18 +144,19 @@ func NewGoogleClient(cfg *GoogleClientConfig) (*SGoogleClient, error) {
 
 	httpClient := cfg.cpcfg.AdaptiveTimeoutHttpClient()
 	ts, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		service := strings.Split(req.URL.Host, ".")[0]
 		if service == "www" {
 			service = strings.Split(req.URL.Path, "/")[0]
 		}
 		method, path := req.Method, req.URL.Path
-		respCheck := func(resp *http.Response) {
+		respCheck := func(resp *http.Response) error {
 			if resp.StatusCode == 403 {
 				if cfg.cpcfg.UpdatePermission != nil {
 					cfg.cpcfg.UpdatePermission(service, fmt.Sprintf("%s %s", method, path))
 				}
 			}
+			return nil
 		}
 		if cfg.cpcfg.ReadOnly {
 			if req.Method == "GET" {
@@ -177,6 +178,18 @@ func (self *SGoogleClient) GetAccountId() string {
 	return self.clientEmail
 }
 
+func (self *SGoogleClient) GetGlobalRegion() *SGlobalRegion {
+	return &SGlobalRegion{
+		client:            self,
+		Description:       "global",
+		Kind:              "compute#region",
+		Name:              "global",
+		Status:            "UP",
+		SelfLink:          "",
+		CreationTimestamp: time.Time{},
+	}
+}
+
 func (self *SGoogleClient) fetchRegions() error {
 	regions := []SRegion{}
 	err := self.ecsListAll("regions", nil, &regions)
@@ -189,6 +202,8 @@ func (self *SGoogleClient) fetchRegions() error {
 		regions[i].client = self
 		self.iregions = append(self.iregions, &regions[i])
 	}
+	// add global region
+	self.iregions = append(self.iregions, self.GetGlobalRegion())
 
 	objectstoreCapability := []string{
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -304,7 +319,7 @@ func (self *SGoogleClient) ecsGet(resourceType, id string, retval interface{}) e
 			}
 		}
 	}
-	return errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SGoogleClient) ecsList(resource string, params map[string]string) (jsonutils.JSONObject, error) {
@@ -312,7 +327,9 @@ func (self *SGoogleClient) ecsList(resource string, params map[string]string) (j
 }
 
 func (self *SGoogleClient) _ecsList(method, resource string, params map[string]string) (jsonutils.JSONObject, error) {
-	resource = fmt.Sprintf("projects/%s/%s", self.projectId, resource)
+	if !strings.HasPrefix(resource, "projects/") {
+		resource = fmt.Sprintf("projects/%s/%s", self.projectId, resource)
+	}
 	return jsonRequest(self.client, httputils.THttpMethod(method), GOOGLE_COMPUTE_DOMAIN, GOOGLE_API_VERSION, resource, params, nil, self.debug)
 }
 
@@ -438,9 +455,13 @@ func (self *SGoogleClient) ecsPatch(resource string, action string, params map[s
 	return selfLink, nil
 }
 
-func (self *SGoogleClient) ecsDo(resource string, action string, params map[string]string, body jsonutils.JSONObject) (string, error) {
+func (self *SGoogleClient) ecsPost(resource string, action string, params map[string]string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	resource = fmt.Sprintf("%s/%s", resource, action)
-	resp, err := jsonRequest(self.client, "POST", GOOGLE_COMPUTE_DOMAIN, GOOGLE_API_VERSION, resource, params, body, self.debug)
+	return jsonRequest(self.client, "POST", GOOGLE_COMPUTE_DOMAIN, GOOGLE_API_VERSION, resource, params, body, self.debug)
+}
+
+func (self *SGoogleClient) ecsDo(resource string, action string, params map[string]string, body jsonutils.JSONObject) (string, error) {
+	resp, err := self.ecsPost(resource, action, params, body)
 	if err != nil {
 		return "", err
 	}
@@ -517,7 +538,8 @@ func (self *SGoogleClient) ecsInsert(resource string, body jsonutils.JSONObject,
 	if err != nil {
 		return errors.Wrap(err, "checkAndSetName")
 	}
-	resp, err := jsonRequest(self.client, "POST", GOOGLE_COMPUTE_DOMAIN, GOOGLE_API_VERSION, resource, nil, body, self.debug)
+	params := map[string]string{"requestId": stringutils.UUID4()}
+	resp, err := jsonRequest(self.client, "POST", GOOGLE_COMPUTE_DOMAIN, GOOGLE_API_VERSION, resource, params, body, self.debug)
 	if err != nil {
 		return err
 	}
@@ -544,7 +566,7 @@ func (self *SGoogleClient) storageUpload(resource string, header http.Header, bo
 		return nil, errors.Wrap(err, "rawRequest")
 	}
 	if resp.StatusCode >= 400 {
-		msg, _ := ioutil.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(resp.Body)
 		defer resp.Body.Close()
 		return nil, fmt.Errorf("StatusCode: %d %s", resp.StatusCode, string(msg))
 	}
@@ -557,7 +579,7 @@ func (self *SGoogleClient) storageUploadPart(resource string, header http.Header
 		return nil, errors.Wrap(err, "rawRequest")
 	}
 	if resp.StatusCode >= 400 {
-		msg, _ := ioutil.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(resp.Body)
 		defer resp.Body.Close()
 		return nil, fmt.Errorf("StatusCode: %d %s", resp.StatusCode, string(msg))
 	}
@@ -571,7 +593,7 @@ func (self *SGoogleClient) storageAbortUpload(resource string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		msg, _ := ioutil.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("StatusCode: %d %s", resp.StatusCode, string(msg))
 	}
 	return nil
@@ -584,7 +606,7 @@ func (self *SGoogleClient) storageDownload(resource string, header http.Header) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		msg, _ := ioutil.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("StatusCode: %d %s", resp.StatusCode, string(msg))
 	}
 	return resp.Body, err
@@ -937,6 +959,7 @@ func (client *SGoogleClient) GetSubAccounts() ([]cloudprovider.SSubAccount, erro
 		subAccount := cloudprovider.SSubAccount{}
 		subAccount.Name = project.Name
 		subAccount.Account = fmt.Sprintf("%s/%s", project.ProjectId, client.clientEmail)
+		subAccount.Id = project.ProjectId
 		subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
 		if project.LifecycleState != "ACTIVE" {
 			continue
@@ -949,14 +972,14 @@ func (client *SGoogleClient) GetSubAccounts() ([]cloudprovider.SSubAccount, erro
 func (self *SGoogleClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
 	for i := 0; i < len(self.iregions); i++ {
 		if self.iregions[i].GetGlobalId() == id {
-			return self.iregions[i].(*SRegion), nil
+			return self.iregions[i], nil
 		}
 	}
 	return nil, cloudprovider.ErrNotFound
 }
 
-func (self *SGoogleClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.iregions
+func (self *SGoogleClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return self.iregions, nil
 }
 
 func (self *SGoogleClient) fetchGlobalNetwork() ([]SGlobalNetwork, error) {
@@ -995,9 +1018,10 @@ func (self *SGoogleClient) GetIProjects() ([]cloudprovider.ICloudProject, error)
 
 func (self *SGoogleClient) GetCapabilities() []string {
 	caps := []string{
-		cloudprovider.CLOUD_CAPABILITY_PROJECT,
+		// cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -1006,6 +1030,7 @@ func (self *SGoogleClient) GetCapabilities() []string {
 		// cloudprovider.CLOUD_CAPABILITY_EVENT,
 		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_SNAPSHOT_POLICY + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

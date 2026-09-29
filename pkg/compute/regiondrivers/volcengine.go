@@ -35,25 +35,13 @@ func init() {
 	models.RegisterRegionDriver(&driver)
 }
 
-func (self *SVolcengineRegionDriver) IsSecurityGroupBelongVpc() bool {
-	return true
-}
-
-func (self *SVolcengineRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return false
-}
-
-func (self *SVolcengineRegionDriver) GenerateSecurityGroupName(name string) string {
-	return name
-}
-
 func (self *SVolcengineRegionDriver) GetProvider() string {
 	return api.CLOUD_PROVIDER_VOLCENGINE
 }
 
 func (self *SVolcengineRegionDriver) ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error) {
 	var cidrV = validators.NewIPv4PrefixValidator("cidr_block")
-	if err := cidrV.Validate(jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
+	if err := cidrV.Validate(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
 		return input, err
 	}
 	err := IsInPrivateIpRange(cidrV.Value.ToIPRange())
@@ -65,4 +53,31 @@ func (self *SVolcengineRegionDriver) ValidateCreateVpcData(ctx context.Context, 
 		return input, httperrors.NewInputParameterError("%s request the mask range should be less than or equal to 29", self.GetProvider())
 	}
 	return input, nil
+}
+
+func (self *SVolcengineRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	for i := range input.Rules {
+		if input.Rules[i].Priority == nil {
+			return nil, httperrors.NewMissingParameterError("priority")
+		}
+		if *input.Rules[i].Priority < 1 || *input.Rules[i].Priority > 100 {
+			return nil, httperrors.NewInputParameterError("invalid priority %d, range 1-100", *input.Rules[i].Priority)
+		}
+	}
+	return input, nil
+}
+
+func (self *SVolcengineRegionDriver) ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	if input.Priority == nil {
+		return nil, httperrors.NewMissingParameterError("priority")
+	}
+	if *input.Priority < 1 || *input.Priority > 100 {
+		return nil, httperrors.NewInputParameterError("invalid priority %d, range 1-100", *input.Priority)
+	}
+
+	return input, nil
+}
+
+func (self *SVolcengineRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	return nil, httperrors.NewNotSupportedError("updating security group rules is not supported")
 }

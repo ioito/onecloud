@@ -32,10 +32,8 @@ type SUnionQueryField struct {
 
 // Expression implementation of SUnionQueryField for IQueryField
 func (sqf *SUnionQueryField) Expression() string {
-	if len(sqf.alias) > 0 {
-		return fmt.Sprintf("`%s`.`%s` as `%s`", sqf.union.Alias(), sqf.name, sqf.alias)
-	}
-	return fmt.Sprintf("`%s`.`%s`", sqf.union.Alias(), sqf.name)
+	qChar := sqf.union.database().backend.QuoteChar()
+	return fmt.Sprintf("%s%s%s.%s%s%s", qChar, sqf.union.Alias(), qChar, qChar, sqf.name, qChar)
 }
 
 // Name implementation of SUnionQueryField for IQueryField
@@ -48,20 +46,36 @@ func (sqf *SUnionQueryField) Name() string {
 
 // Reference implementation of SUnionQueryField for IQueryField
 func (sqf *SUnionQueryField) Reference() string {
-	return fmt.Sprintf("`%s`.`%s`", sqf.union.Alias(), sqf.Name())
+	qChar := sqf.union.database().backend.QuoteChar()
+
+	return fmt.Sprintf("%s%s%s.%s%s%s", qChar, sqf.union.Alias(), qChar, qChar, sqf.Name(), qChar)
 }
 
 // Label implementation of SUnionQueryField for IQueryField
 func (sqf *SUnionQueryField) Label(label string) IQueryField {
 	if len(label) > 0 {
-		sqf.alias = label
+		nsqf := *sqf
+		nsqf.alias = label
+		return &nsqf
+	} else {
+		return sqf
 	}
-	return sqf
 }
 
 // Variables implementation of SUnionQueryField for IQueryField
 func (sqf *SUnionQueryField) Variables() []interface{} {
 	return nil
+}
+
+// ConvertFromValue implementation of SUnionQueryField for IQueryField
+func (sqf *SUnionQueryField) ConvertFromValue(val interface{}) interface{} {
+	for _, query := range sqf.union.queries {
+		field := query.Field(sqf.name)
+		if field != nil {
+			return field.ConvertFromValue(val)
+		}
+	}
+	return val
 }
 
 func (sqf *SUnionQueryField) database() *SDatabase {

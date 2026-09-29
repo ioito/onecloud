@@ -18,6 +18,10 @@ import "yunion.io/x/onecloud/pkg/apis"
 
 var KEYPAIR_SCHEMAS = []string{
 	KEYPAIRE_SCHEME_RSA,
+	// OpenSSH deprecated DSA keys
+	//KEYPAIRE_SCHEME_DSA,
+	KEYPAIRE_SCHEME_ECDSA,
+	KEYPAIRE_SCHEME_ED25519,
 }
 
 type KeypairCreateInput struct {
@@ -27,13 +31,13 @@ type KeypairCreateInput struct {
 	PublicKey string `json:"public_key"`
 
 	// swagger:ignore
-	PrivateKey string
+	PrivateKey string `json:"private_key"`
 
 	// swagger:ignore
-	Fingerprint string
+	Fingerprint string `json:"fingerprint"`
 
 	// 秘钥类型
-	// enum: RSA
+	// enum: ["RSA"]
 	// default: RSA
 	Scheme string `json:"scheme"`
 }

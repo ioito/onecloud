@@ -26,7 +26,7 @@ import (
 )
 
 type sSRIOVBaseDevice struct {
-	*sBaseDevice
+	*SBaseDevice
 }
 
 func ensureNumvfsEqualTotalvfs(devDir string) error {
@@ -70,9 +70,9 @@ func detectSRIOVDevice(vfBDF string) (*PCIDevice, error) {
 	return dev, nil
 }
 
-func newSRIOVBaseDevice(dev *PCIDevice, devType string) *sSRIOVBaseDevice {
+func newSRIOVBaseDevice(dev *PCIDevice, devType, sharingMode string) *sSRIOVBaseDevice {
 	return &sSRIOVBaseDevice{
-		sBaseDevice: newBaseDevice(dev, devType),
+		SBaseDevice: NewBaseDevice(dev, devType, sharingMode),
 	}
 }
 

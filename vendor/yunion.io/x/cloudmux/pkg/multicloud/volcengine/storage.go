@@ -54,26 +54,16 @@ func (storage *SStorage) GetIZone() cloudprovider.ICloudZone {
 }
 
 func (storage *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
-	disks := make([]SDisk, 0)
-	pageNumber := 1
-	storageType := storage.storageType
-	for {
-		parts, total, err := storage.zone.region.GetDisks("", storage.zone.GetId(), storageType, nil, pageNumber, 50)
-		if err != nil {
-			return nil, errors.Wrapf(err, "GetDisks")
-		}
-		disks = append(disks, parts...)
-		if len(parts) >= total {
-			break
-		}
-		pageNumber += 1
+	disks, err := storage.zone.region.GetDisks("", storage.zone.GetId(), storage.storageType, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetDisks")
 	}
-	idisks := make([]cloudprovider.ICloudDisk, len(disks))
+	ret := []cloudprovider.ICloudDisk{}
 	for i := 0; i < len(disks); i += 1 {
 		disks[i].storage = storage
-		idisks[i] = &disks[i]
+		ret = append(ret, &disks[i])
 	}
-	return idisks, nil
+	return ret, nil
 }
 
 func (storage *SStorage) GetStorageType() string {
@@ -98,11 +88,10 @@ func (storage *SStorage) GetStorageConf() jsonutils.JSONObject {
 }
 
 func (storage *SStorage) GetStatus() string {
+	if storage.storageType == api.STORAGE_VOLCENGINE_PTSSD {
+		return api.STORAGE_OFFLINE
+	}
 	return api.STORAGE_ONLINE
-}
-
-func (storage *SStorage) Refresh() error {
-	return nil
 }
 
 func (storage *SStorage) GetEnabled() bool {
@@ -113,14 +102,14 @@ func (storage *SStorage) GetIStoragecache() cloudprovider.ICloudStoragecache {
 	return storage.zone.region.getStoragecache()
 }
 
-func (storage *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
-	diskId, err := storage.zone.region.CreateDisk(storage.zone.ZoneId, storage.storageType, conf.Name, conf.SizeGb, conf.Desc, conf.ProjectId)
+func (storage *SStorage) CreateIDisk(opts *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
+	diskId, err := storage.zone.region.CreateDisk(storage.zone.ZoneId, storage.storageType, opts)
 	if err != nil {
 		log.Errorf("createDisk fail %s", err)
 		return nil, err
 	}
 	err = cloudprovider.Wait(5*time.Second, time.Minute, func() (bool, error) {
-		_, err := storage.zone.region.getDisk(diskId)
+		_, err := storage.zone.region.GetDisk(diskId)
 		if errors.Cause(err) == cloudprovider.ErrNotFound {
 			return false, nil
 		}
@@ -129,7 +118,7 @@ func (storage *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (clou
 	if err != nil {
 		return nil, errors.Wrapf(err, "cannot find disk after create")
 	}
-	disk, err := storage.zone.region.getDisk(diskId)
+	disk, err := storage.zone.region.GetDisk(diskId)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +127,7 @@ func (storage *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (clou
 }
 
 func (storage *SStorage) GetIDiskById(idStr string) (cloudprovider.ICloudDisk, error) {
-	disk, err := storage.zone.region.getDisk(idStr)
+	disk, err := storage.zone.region.GetDisk(idStr)
 	if err != nil {
 		return nil, err
 	}

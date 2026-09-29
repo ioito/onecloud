@@ -16,7 +16,6 @@ package compute
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"yunion.io/x/jsonutils"
@@ -24,7 +23,8 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/billing"
-	"yunion.io/x/onecloud/pkg/apis/cloudcommon/db"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
+	"yunion.io/x/onecloud/pkg/apis/host"
 	imageapi "yunion.io/x/onecloud/pkg/apis/image"
 	"yunion.io/x/onecloud/pkg/httperrors"
 )
@@ -59,12 +59,12 @@ type ServerListInput struct {
 	// 只列出还有备份机的主机
 	Backup *bool `json:"bakcup"`
 	// 列出指定类型的主机
-	// enum: normal,gpu,usb,backup
+	// enum: ["normal","gpu","usb","backup"]
 	ServerType []string `json:"server_type"`
 	// 列出管理安全组为指定安全组的主机
 	AdminSecgroup string `json:"admin_security"`
 	// 列出Hypervisor为指定值的主机
-	// enum: kvm,esxi,baremetal,aliyun,azure,aws,huawei,ucloud,zstack,openstack,google,ctyun,cloudpods,ecloud,jdcloud,remotefile`
+	// enum: ["kvm","esxi","baremetal","aliyun","azure","aws","huawei","ucloud","zstack","openstack","google","ctyun","cloudpods","ecloud","jdcloud","remotefile"]
 	Hypervisor []string `json:"hypervisor"`
 	// 列出绑定了弹性IP（EIP）的主机
 	WithEip *bool `json:"with_eip"`
@@ -73,15 +73,18 @@ type ServerListInput struct {
 	// 列出可绑定弹性IP的主机
 	EipAssociable *bool `json:"eip_associable"`
 	// 列出操作系统为指定值的主机
-	// enum: linux,windows,vmware
+	// enum: ["linux","windows","vmware"]
 	OsType []string `json:"os_type"`
+	// 操作系统发行版
+	OsDist []string `json:"os_dist"`
 
 	// 对列表结果按照磁盘大小进行排序
-	// enum: asc,desc
+	// enum: ["asc","desc"]
 	OrderByDisk string `json:"order_by_disk"`
 
 	OrderByIp string `json:"order_by_ip"`
 	// 根据ip查找机器
+	// swagger:ignore
 	IpAddr string `json:"ip_addr" yunion-deprecated-by:"ip_addrs"`
 	// 根据多个ip查找机器
 	IpAddrs []string `json:"ip_addrs"`
@@ -93,10 +96,11 @@ type ServerListInput struct {
 	AttachableServersForDisk string `json:"attachable_servers_for_disk"`
 	// Deprecated
 	// 列出可以挂载磁盘的主机
+	// swagger:ignore
 	Disk string `json:"disk" yunion-deprecated-by:"attachable_servers_for_disk"`
 
 	// 按主机资源类型进行排序
-	// enum: shared,prepaid,dedicated
+	// enum: ["shared","prepaid","dedicated"]
 	ResourceType string `json:"resource_type"`
 	// 返回该宿主机上的所有虚拟机，包括备份机
 	GetAllGuestsOnHost string `json:"get_all_guests_on_host"`
@@ -124,8 +128,26 @@ type ServerListInput struct {
 
 	InstanceType []string `json:"instance_type"`
 
+	// 根据镜像发行版排序
+	OrderByOsDist string `json:"order_by_os_dist"`
+
+	SnapshotpolicyId string `json:"snapshotpolicy_id"`
+
+	IsolatedDeviceId string `json:"isolated_device_id"`
+
 	// 是否调度到宿主机上
 	WithHost *bool `json:"with_host"`
+
+	// 根据是否绑定快照策略过滤
+	BindingSnapshotpolicy *bool `json:"binding_snapshotpolicy"`
+	// 根据虚机关联的磁盘是否绑定快照策略过滤
+	BindingDisksSnapshotpolicy *bool `json:"binding_disks_snapshotpolicy"`
+}
+
+// 主机快照策略绑定/设置接口入参
+type ServerSnapshotpolicyInput struct {
+	// 快照策略ID
+	SnapshotpolicyId string `json:"snapshotpolicy_id"`
 }
 
 func (input *ServerListInput) AfterUnmarshal() {
@@ -137,13 +159,13 @@ func (input *ServerListInput) AfterUnmarshal() {
 type ServerRebuildRootInput struct {
 	apis.Meta
 
-	// swagger: ignore
+	// swagger:ignore
 	Image string `json:"image" yunion-deprecated-by:"image_id"`
 	// 关机且停机不收费情况下不允许重装系统
 	// 镜像 id
 	// required: true
 	ImageId string `json:"image_id"`
-	// swagger: ignore
+	// swagger:ignore
 	// Keypair string `json:"keypair" yunion-deprecated-by:"keypair_id"`
 	// 秘钥Id
 	// KeypairId     string `json:"keypair_id"`
@@ -175,6 +197,11 @@ type ServerDetails struct {
 	// 磁盘概要
 	Disks string `json:"disks"`
 
+	// 主机快照策略数量
+	SnapshotpolicyCount int `json:"snapshotpolicy_count"`
+	// 磁盘快照策略数量
+	DisksSnapshotpolicyCount int `json:"disks_snapshotpolicy_count"`
+
 	// 磁盘详情
 	DisksInfo []GuestDiskInfo `json:"disks_info"`
 	// 虚拟机Ip列表
@@ -187,18 +214,11 @@ type ServerDetails struct {
 	// 系统管理员可见的安全组规则
 	AdminSecurityRules string `json:"admin_security_rules"`
 
-	// list
-	AttachTime time.Time `json:"attach_time"`
-
 	// common
 	IsPrepaidRecycle bool `json:"is_prepaid_recycle"`
 
-	// 备份主机所在宿主机名称
-	BackupHostName string `json:"backup_host_name"`
-	// 备份主机所在宿主机状态
-	BackupHostStatus string `json:"backup_host_status"`
-	// 主备机同步状态
-	BackupGuestSyncStatus string `json:"backup_guest_sync_status"`
+	// 主备机信息
+	BackupInfo
 
 	// 是否可以回收
 	CanRecycle bool `json:"can_recycle"`
@@ -226,6 +246,8 @@ type ServerDetails struct {
 	Macs string `json:"macs"`
 	// 网卡信息
 	Nics []GuestnetworkShortDesc `json:"nics"`
+	// 附属IP
+	SubIPs []string `json:"sub_ips"`
 
 	// 归属VPC
 	Vpc string `json:"vpc"`
@@ -239,6 +261,9 @@ type ServerDetails struct {
 	// 关联主安全组
 	Secgroup string `json:"secgroup"`
 
+	// 网卡级别安全组
+	NetworkSecgroups []GuestnetworkSecgroupShortDesc `json:"network_secgroups"`
+
 	// 浮动IP
 	Eip string `json:"eip"`
 	// 浮动IP类型
@@ -250,7 +275,9 @@ type ServerDetails struct {
 	// 直通设备（GPU）列表
 	IsolatedDevices []SIsolatedDevice `json:"isolated_devices"`
 	// 是否支持GPU
-	IsGpu bool `json:"is_gpu"`
+	IsGpu    bool   `json:"is_gpu"`
+	GpuModel string `json:"gpu_model"`
+	GpuCount string `json:"gpu_count"`
 
 	// Cdrom信息
 	Cdrom []Cdrom `json:"cdrom"`
@@ -266,6 +293,25 @@ type ServerDetails struct {
 
 	// 监控上报URL
 	MonitorUrl string `json:"monitor_url"`
+
+	// 容器描述信息
+	Containers []*PodContainerDesc `json:"containers"`
+}
+
+type BackupInfo struct {
+	// 备份主机所在宿主机名称
+	BackupHostName string `json:"backup_host_name"`
+	// 备份主机所在宿主机状态
+	BackupHostStatus string `json:"backup_host_status"`
+	// 主备机同步状态
+	BackupGuestSyncStatus string `json:"backup_guest_sync_status"`
+}
+
+type PodContainerDesc struct {
+	Id     string `json:"id"`
+	Name   string `json:"name"`
+	Image  string `json:"image"`
+	Status string `json:"status"`
 }
 
 type Floppy struct {
@@ -276,7 +322,24 @@ type Floppy struct {
 type Cdrom struct {
 	Ordinal   int    `json:"ordinal"`
 	Detail    string `json:"detail"`
+	Name      string `json:"name"`
 	BootIndex int8   `json:"boot_index"`
+}
+
+type IMetricResource interface {
+	GetMetricTags() map[string]string
+}
+
+func AppendMetricTags(ret map[string]string, res ...IMetricResource) map[string]string {
+	if ret == nil {
+		ret = map[string]string{}
+	}
+	for _, r := range res {
+		for k, v := range r.GetMetricTags() {
+			ret[k] = v
+		}
+	}
+	return ret
 }
 
 func (self ServerDetails) GetMetricTags() map[string]string {
@@ -287,6 +350,8 @@ func (self ServerDetails) GetMetricTags() map[string]string {
 		"paltform":            self.Hypervisor,
 		"host":                self.Host,
 		"host_id":             self.HostId,
+		"ips":                 self.IPs,
+		"vm_ip":               self.IPs,
 		"vm_id":               self.Id,
 		"vm_name":             self.Name,
 		"zone":                self.Zone,
@@ -307,15 +372,11 @@ func (self ServerDetails) GetMetricTags() map[string]string {
 		"account_id":          self.AccountId,
 		"external_id":         self.ExternalId,
 	}
-	for k, v := range self.Metadata {
-		if strings.HasPrefix(k, db.USER_TAG_PREFIX) {
-			if strings.Contains(k, "login_key") || strings.Contains(v, "=") {
-				continue
-			}
-			ret[k] = v
-		}
+	if len(self.HostAccessIp) > 0 {
+		ret["host_ip"] = self.HostAccessIp
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self ServerDetails) GetMetricPairs() map[string]string {
@@ -329,24 +390,27 @@ func (self ServerDetails) GetMetricPairs() map[string]string {
 
 // GuestDiskInfo describe the information of disk on the guest.
 type GuestDiskInfo struct {
-	Id          string `json:"id"`
-	Name        string `json:"name"`
-	FsFormat    string `json:"fs,omitempty"`
-	DiskType    string `json:"disk_type"`
-	Index       int8   `json:"index"`
-	BootIndex   int8   `json:"boot_index"`
-	SizeMb      int    `json:"size"`
-	DiskFormat  string `json:"disk_format"`
-	Driver      string `json:"driver"`
-	CacheMode   string `json:"cache_mode"`
-	AioMode     string `json:"aio_mode"`
-	MediumType  string `json:"medium_type"`
-	StorageType string `json:"storage_type"`
-	Iops        int    `json:"iops"`
-	Bps         int    `json:"bps"`
-	ImageId     string `json:"image_id,omitempty"`
-	Image       string `json:"image,omitemtpy"`
-	StorageId   string `json:"storage_id"`
+	Id            string `json:"id"`
+	Name          string `json:"name"`
+	FsFormat      string `json:"fs,omitempty"`
+	DiskType      string `json:"disk_type"`
+	Index         int8   `json:"index"`
+	BootIndex     int8   `json:"boot_index"`
+	SizeMb        int    `json:"size"`
+	DiskFormat    string `json:"disk_format"`
+	Driver        string `json:"driver"`
+	CacheMode     string `json:"cache_mode"`
+	AioMode       string `json:"aio_mode"`
+	AutoReset     bool   `json:"auto_reset"`
+	MediumType    string `json:"medium_type"`
+	StorageType   string `json:"storage_type"`
+	Iops          int    `json:"iops"`
+	Throughput    int    `json:"throughput"`
+	Bps           int    `json:"bps"`
+	ImageId       string `json:"image_id,omitempty"`
+	Image         string `json:"image,omitempty"`
+	StorageId     string `json:"storage_id"`
+	Preallocation string `json:"preallocation"`
 }
 
 func (self GuestDiskInfo) ShortDesc() string {
@@ -452,6 +516,35 @@ type ConvertToKvmInput struct {
 
 	// dest guest network configs
 	Networks []*NetworkConfig `json:"networks"`
+
+	// dest guest disk storage configs; length must equal guest disks when set
+	// support per-disk backend/storage/medium/schedtags; overrides sys/data disk prefers
+	Disks []*DiskConfig `json:"disks"`
+
+	// Prefer disk backend for system disk, e.g. local/lvm/slvm/nfs/rbd
+	SysDiskBackend string `json:"sys_disk_backend"`
+	// Prefer storage id or name for system disk
+	SysPreferStorage string `json:"sys_prefer_storage"`
+	// Prefer medium for system disk, e.g. rotate/ssd/hybrid
+	SysDiskMedium string `json:"sys_disk_medium"`
+	// Prefer disk schedtags for system disk
+	SysDiskSchedtags []*SchedtagConfig `json:"sys_disk_schedtags"`
+
+	// Prefer disk backend for data disks, e.g. local/lvm/slvm/nfs/rbd
+	DataDiskBackend string `json:"data_disk_backend"`
+	// Prefer storage id or name for data disks
+	DataPreferStorage string `json:"data_prefer_storage"`
+	// Prefer medium for data disks, e.g. rotate/ssd/hybrid
+	DataDiskMedium string `json:"data_disk_medium"`
+	// Prefer disk schedtags for data disks
+	DataDiskSchedtags []*SchedtagConfig `json:"data_disk_schedtags"`
+
+	// deploy telegraf after convert
+	DeployTelegraf bool `json:"deploy_telegraf"`
+}
+
+type BatchConvertToKvmCheckInput struct {
+	GuestIds []string `json:"guest_ids"`
 }
 
 type GuestSaveToTemplateInput struct {
@@ -467,7 +560,7 @@ type GuestSyncFixNicsInput struct {
 }
 
 type GuestMigrateInput struct {
-	// swagger: ignore
+	// swagger:ignore
 	PreferHost   string `json:"prefer_host" yunion-deprecated-by:"prefer_host_id"`
 	PreferHostId string `json:"prefer_host_id"`
 	AutoStart    bool   `json:"auto_start"`
@@ -475,7 +568,7 @@ type GuestMigrateInput struct {
 }
 
 type GuestLiveMigrateInput struct {
-	// swagger: ignore
+	// swagger:ignore
 	PreferHost string `json:"prefer_host" yunion-deprecated-by:"prefer_host_id"`
 	// 指定期望的迁移目标宿主机
 	PreferHostId string `json:"prefer_host_id"`
@@ -508,10 +601,30 @@ type GuestSetSecgroupInput struct {
 	SecgroupIds []string `json:"secgroup_ids"`
 }
 
+type GuestSetNetworkSecgroupInput struct {
+	// 安全组Id列表
+	// 实例必须处于运行,休眠或者关机状态
+	SecgroupIds []string `json:"secgroup_ids"`
+
+	// 虚机网卡 index 或者 mac 地址
+	NetworkIndex *int   `json:"network_index"`
+	MacAddr      string `json:"mac_addr"`
+}
+
 type GuestRevokeSecgroupInput struct {
 	// 安全组Id列表
 	// 实例必须处于运行,休眠或者关机状态
 	SecgroupIds []string `json:"secgroup_ids"`
+}
+
+type GuestRevokeNetworkSecgroupInput struct {
+	// 安全组Id列表
+	// 实例必须处于运行,休眠或者关机状态
+	SecgroupIds []string `json:"secgroup_ids"`
+
+	// 虚机网卡 index 或者 mac 地址
+	NetworkIndex *int   `json:"network_index"`
+	MacAddr      string `json:"mac_addr"`
 }
 
 type GuestAssignSecgroupInput struct {
@@ -543,6 +656,12 @@ type GuestAddSecgroupInput struct {
 	SecgroupIds []string `json:"secgroup_ids"`
 }
 
+type GuestNetworkAddSecgroupInput struct {
+	SecgroupIds []string `json:"secgroup_ids"`
+
+	NetworkIndex *int `json:"network_index"`
+}
+
 type ServerRemoteUpdateInput struct {
 	// 是否覆盖替换所有标签
 	ReplaceTags *bool `json:"replace_tags" help:"replace all remote tags"`
@@ -561,7 +680,7 @@ type ServerAssociateEipInput struct {
 
 type ServerCreateEipInput struct {
 	// 计费方式，traffic or bandwidth
-	ChargeType string `json:"charge_type"`
+	ChargeType billing_api.TNetChargeType `json:"charge_type"`
 
 	// Bandwidth
 	Bandwidth int64 `json:"bandwidth"`
@@ -593,35 +712,47 @@ type ServerStopInput struct {
 	// 是否强制关机
 	IsForce bool `json:"is_force"`
 
+	// 关机等待时间，如果不是强制关机，超过关机时间可能关机失败。linux默认则等待时间为60秒，windows 120秒
+	TimeoutSecs *int `json:"timeout_secs"`
+
 	// 是否关机停止计费, 若平台不支持停止计费，此参数无作用
+	// 若包年包月机器关机设置此参数，则先转换计费模式到按量计费，再关机不收费
 	// 目前仅阿里云，腾讯云此参数生效
 	StopCharging bool `json:"stop_charging"`
 }
 
+type ServerRestartInput struct {
+	// 是否强制关机
+	IsForce bool `json:"is_force"`
+
+	// 关机等待时间，如果不是强制关机，超过关机时间可能关机失败。linux默认则等待时间为60秒，windows 120秒
+	TimeoutSecs *int `json:"timeout_secs"`
+}
+
 type ServerSaveImageInput struct {
 	// 镜像名称
-	Name         string
-	GenerateName string
-	Notes        string
-	IsPublic     *bool
+	Name         string `json:"name"`
+	GenerateName string `json:"generate_name"`
+	Notes        string `json:"notes"`
+	IsPublic     *bool  `json:"is_public"`
 	// 镜像格式
-	Format string
+	Format string `json:"format"`
 
 	// 保存镜像后是否自动启动,若实例状态为运行中,则会先关闭实例
 	// 公有云若支持开机保存镜像，此参数则不生效
 	// default: false
-	AutoStart bool
-	// swagger: ignore
-	Restart bool
+	AutoStart bool `json:"auto_start"`
+	// swagger:ignore
+	Restart bool `json:"restart"`
 
-	// swagger: ignore
-	OsType string
+	// swagger:ignore
+	OsType string `json:"os_type"`
 
-	// swagger: ignore
-	OsArch string
+	// swagger:ignore
+	OsArch string `json:"os_arch"`
 
-	// swagger: ignore
-	ImageId string
+	// swagger:ignore
+	ImageId string `json:"image_id"`
 }
 
 type ServerSaveGuestImageInput struct {
@@ -634,23 +765,23 @@ type ServerSaveGuestImageInput struct {
 type ServerDeleteInput struct {
 	// 是否越过回收站直接删除
 	// default: false
-	OverridePendingDelete bool
+	OverridePendingDelete bool `json:"override_pending_delete"`
 
 	// 是否仅删除本地资源
 	// default: false
-	Purge bool
+	Purge bool `json:"purge"`
 
 	// 是否删除快照
 	// default: false
-	DeleteSnapshots bool
+	DeleteSnapshots bool `json:"delete_snapshots"`
 
 	// 是否删除关联的EIP
 	// default: false
-	DeleteEip bool
+	DeleteEip bool `json:"delete_eip"`
 
 	// 是否删除关联的数据盘
 	// default: false
-	DeleteDisks bool
+	DeleteDisks bool `json:"delete_disks"`
 }
 
 type ServerDetachnetworkInput struct {
@@ -660,23 +791,42 @@ type ServerDetachnetworkInput struct {
 	NetId string `json:"net_id"`
 	// 通过IP解绑网卡, 优先级高于mac
 	IpAddr string `json:"ip_addr"`
+	// 通过IP6 addr解绑网卡, 优先级高于mac
+	Ip6Addr string `json:"ip6_addr"`
 	// 通过Mac解绑网卡, 优先级低于ip_addr
 	Mac string `json:"mac"`
+	// 解绑后不立即同步配置
+	DisableSyncConfig *bool `json:"disable_sync_config"`
+	// 强制卸载，无论虚拟机的状态，仅更新数据库
+	Force *bool `json:"force"`
+}
+
+func (input ServerDetachnetworkInput) IsForce() bool {
+	return input.Force != nil && *input.Force
+}
+
+type ServerSetNetworkNumQueuesInput struct {
+	// 虚机网卡 mac addr
+	MacAddr string `json:"mac_addr"`
+	// 网卡队列数
+	NumQueues int `json:"num_queues"`
 }
 
 type ServerMigrateForecastInput struct {
 	PreferHostId string `json:"prefer_host_id"`
 	// Deprecated
+	// swagger:ignore
 	PreferHost      string `json:"prefer_host" yunion-deprecated-by:"prefer_host_id"`
 	LiveMigrate     bool   `json:"live_migrate"`
 	SkipCpuCheck    bool   `json:"skip_cpu_check"`
 	SkipKernelCheck bool   `json:"skip_kernel_check"`
 	ConvertToKvm    bool   `json:"convert_to_kvm"`
 	IsRescueMode    bool   `json:"is_rescue_mode"`
+	ResetCpuNumaPin bool   `json:"reset_cpu_numa_pin"`
 }
 
 type ServerResizeDiskInput struct {
-	// swagger: ignore
+	// swagger:ignore
 	Disk string `json:"disk" yunion-deprecated-by:"disk_id"`
 	// 磁盘Id
 	DiskId string `json:"disk_id"`
@@ -703,7 +853,7 @@ type ServerDeployInput struct {
 }
 
 type ServerDeployInputBase struct {
-	// swagger: ignore
+	// swagger:ignore
 	Keypair string `json:"keypair" yunion-deprecated-by:"keypair_id"`
 	// 秘钥Id
 	KeypairId string `json:"keypair_id"`
@@ -717,13 +867,20 @@ type ServerDeployInputBase struct {
 	ResetPassword bool `json:"reset_password"`
 	// 重置指定密码
 	Password string `json:"password"`
+	// 用户自定义启动脚本
+	// 支持 #cloud-config yaml 格式及shell脚本
+	// 支持特殊user data平台: Aliyun, Qcloud, Azure, Apsara, Ucloud
+	// required: false
+	UserData string `json:"user_data"`
+	// swagger:ignore
+	LoginAccount string `json:"login_account"`
 
-	// swagger: ignore
+	// swagger:ignore
 	Restart bool `json:"restart"`
 
-	// swagger: ignore
+	// swagger:ignore
 	DeployConfigs []*DeployConfig `json:"deploy_configs"`
-	// swagger: ignore
+	// swagger:ignore
 	DeployTelegraf bool `json:"deploy_telegraf"`
 }
 
@@ -749,20 +906,36 @@ type ServerChangeConfigInput struct {
 	// 关机且停机不收费情况下不允许调整配置
 	// 实例类型, 优先级高于vcpu_count和vmem_size
 	InstanceType string `json:"instance_type"`
-	// swagger: ignore
+	// swagger:ignore
 	Sku string `json:"sku" yunion-deprecated-by:"instance_type"`
-	// swagger: ignore
+	// swagger:ignore
 	Flavor string `json:"flavor" yunion-deprecated-by:"instance_type"`
 
+	// cpu卡槽数
+	// vmware 若开机调整配置时,需要保证调整前及调整后 vcpu_count / cpu_sockets 保持不变
+	// vmware开机调整配置同样需要注意 https://kb.vmware.com/s/article/2008405
+	CpuSockets *int `json:"cpu_sockets"`
+
 	// cpu大小
-	VcpuCount int `json:"vcpu_count"`
+	VcpuCount *int `json:"vcpu_count"`
+	// 任务分配CPU大小
+	ExtraCpuCount *int `json:"extra_cpu_count"`
 	// 内存大小, 1024M, 1G
 	VmemSize string `json:"vmem_size"`
+
+	// 是否允许强制关机
+	// 仅当虚拟机不支持开机调整配置, 或开机状态下降配(降低CPU/内存), 或ARM架构时时生效: 需指定为true以允许强制关机后再调整配置并启动;
+	// 若已支持开机变配, 即使传入该参数也不会强制关机
+	ForceStop bool `json:"force_stop"`
 
 	// 调整完配置后是否自动启动
 	AutoStart bool `json:"auto_start"`
 
+	// disks start from index 1, i.e. cannot change size of system disk(1st disk)
 	Disks []DiskConfig `json:"disks"`
+
+	SetTrafficLimits   []ServerNicTrafficLimit `json:"set_traffic_limits"`
+	ResetTrafficLimits []ServerNicTrafficLimit `json:"reset_traffic_limits"`
 }
 
 type ServerUpdateInput struct {
@@ -786,30 +959,38 @@ type ServerUpdateInput struct {
 
 	SshPort int `json:"ssh_port"`
 
-	// swagger: ignore
+	// swagger:ignore
 	ProgressMbps float32 `json:"progress_mbps"`
 }
 
 type GuestJsonDesc struct {
-	Name           string `json:"name"`
-	Hostname       string `json:"hostname"`
-	Description    string `json:"description"`
-	UUID           string `json:"uuid"`
-	Mem            int    `json:"mem"`
-	Cpu            int    `json:"cpu"`
-	Vga            string `json:"vga"`
-	Vdi            string `json:"vdi"`
-	Machine        string `json:"machine"`
-	Bios           string `json:"bios"`
-	BootOrder      string `json:"boot_order"`
-	SrcIpCheck     bool   `json:"src_ip_check"`
-	SrcMacCheck    bool   `json:"src_mac_check"`
-	IsMaster       *bool  `json:"is_master"`
-	IsSlave        *bool  `json:"is_slave"`
-	IsVolatileHost bool   `json:"is_volatile_host"`
-	HostId         string `json:"host_id"`
+	Name            string `json:"name"`
+	Hostname        string `json:"hostname"`
+	Description     string `json:"description"`
+	UUID            string `json:"uuid"`
+	Mem             int    `json:"mem"`
+	CpuSockets      int    `json:"cpu_sockets"`
+	Cpu             int    `json:"cpu"`
+	Vga             string `json:"vga"`
+	Vdi             string `json:"vdi"`
+	Machine         string `json:"machine"`
+	Bios            string `json:"bios"`
+	BootOrder       string `json:"boot_order"`
+	SrcIpCheck      bool   `json:"src_ip_check"`
+	SrcMacCheck     bool   `json:"src_mac_check"`
+	IsMaster        *bool  `json:"is_master"`
+	IsSlave         *bool  `json:"is_slave"`
+	IsVolatileHost  bool   `json:"is_volatile_host"`
+	ExternalImageId string `json:"external_image_id"`
+	HostId          string `json:"host_id"`
+	// 宿主机管理IP
+	HostAccessIp string `json:"host_access_ip"`
+	// 宿主机公网IP（如果有）
+	HostEIP string `json:"host_eip"`
 
 	IsolatedDevices []*IsolatedDeviceJsonDesc `json:"isolated_devices"`
+
+	CpuNumaPin []SCpuNumaPin `json:"cpu_numa_pin"`
 
 	Domain string `json:"domain"`
 
@@ -831,9 +1012,10 @@ type GuestJsonDesc struct {
 
 	NetworkRoles []string `json:"network_roles"`
 
-	Secgroups          []*SecgroupJsonDesc `json:"secgroups"`
-	SecurityRules      string              `json:"security_rules"`
-	AdminSecurityRules string              `json:"admin_security_rules"`
+	Secgroups          []*SecgroupJsonDesc         `json:"secgroups"`
+	SecurityRules      string                      `json:"security_rules"`
+	AdminSecurityRules string                      `json:"admin_security_rules"`
+	NicSecgroups       []*GuestnetworkSecgroupDesc `json:"nic_secgroups"`
 
 	ExtraOptions jsonutils.JSONObject `json:"extra_options"`
 
@@ -859,10 +1041,29 @@ type GuestJsonDesc struct {
 		InstanceSnapshotId string `json:"instance_snapshot_id"`
 		InstanceId         string `json:"instance_id"`
 	} `json:"instance_snapshot_info"`
+	EnableEsxiSwap bool `json:"enable_esxi_swap"`
 
 	EncryptKeyId string `json:"encrypt_key_id,omitempty"`
 
 	IsDaemon bool `json:"is_daemon"`
+
+	LightMode bool `json:"light_mode"`
+
+	Hypervisor string                `json:"hypervisor"`
+	Containers []*host.ContainerDesc `json:"containers"`
+}
+
+type SVCpuPin struct {
+	Vcpu int `json:"vcpu"`
+	Pcpu int `json:"pcpu"`
+}
+
+type SCpuNumaPin struct {
+	SizeMB *int `json:"size_mb"`
+	NodeId int  `json:"node_id"`
+
+	VcpuPin       []SVCpuPin `json:"vcpu_pin"`
+	ExtraCpuCount int        `json:"extra_cpu_count"`
 }
 
 type ServerSetBootIndexInput struct {
@@ -897,6 +1098,13 @@ type ServerChangeDiskStorageInput struct {
 	KeepOriginDisk  bool   `json:"keep_origin_disk"`
 }
 
+type ServerChangeDiskDriverInput struct {
+	DiskId    string `json:"disk_id"`
+	Driver    string `json:"driver"`
+	CacheMode string `json:"cache_mode"`
+	AioMode   string `json:"aio_mode"`
+}
+
 type ServerChangeDiskStorageInternalInput struct {
 	ServerChangeDiskStorageInput
 	StorageId      string             `json:"storage_id"`
@@ -908,6 +1116,13 @@ type ServerChangeDiskStorageInternalInput struct {
 	// clone progress
 	CompletedDiskCount int `json:"completed_disk_count"`
 	CloneDiskCount     int `json:"disk_count"`
+}
+
+type ServerCopyDiskToStorageInput struct {
+	KeepOriginDisk     bool `json:"keep_origin_disk"`
+	GuestRunning       bool `json:"guest_running"`
+	CompletedDiskCount int  `json:"completed_disk_count"`
+	CloneDiskCount     int  `json:"disk_count"`
 }
 
 type ServerSetExtraOptionInput struct {
@@ -954,6 +1169,10 @@ type ServerSnapshotAndCloneInput struct {
 
 	// ignore
 	InstanceSnapshotId string `json:"instance_snapshot_id"`
+
+	// Perfer clone destination host
+	// 指定期望的迁移目标宿主机
+	PreferHostId string `json:"prefer_host_id"`
 }
 
 type ServerInstanceSnapshot struct {
@@ -988,9 +1207,68 @@ type ServerGetCPUSetCoresResp struct {
 	HostUsedCores []int `json:"host_used_cores"`
 }
 
+type ServerGetNumaInfoInput struct{}
+
+type ServerGetNumaInfoResp struct {
+	CpuNumaPin              jsonutils.JSONObject `json:"cpu_numa_pin"`
+	IsolatedDevicesNumaNode []int8               `json:"isolated_devices_numa_node"`
+}
+
+type ServerGetHardwareInfoInput struct{}
+
+type ServerHardwareInfoMotherboard struct {
+	Manufacturer string `json:"manufacturer"`
+	Model        string `json:"model"`
+	OemName      string `json:"oem_name"`
+	SN           string `json:"sn"`
+	Version      string `json:"version"`
+}
+
+type ServerHardwareInfoCPU struct {
+	Model string `json:"model"`
+	Count int    `json:"count"`
+}
+
+type ServerHardwareInfoMemory struct {
+	SizeMB int `json:"size_mb"`
+}
+
+type ServerHardwareInfoDisk struct {
+	Id        string `json:"id"`
+	StorageId string `json:"storage_id"`
+	Model     string `json:"model"`
+	SizeMB    int    `json:"size_mb"`
+	// Disk's backend bandwidth. The unit is MB/s
+	Bandwidth float64 `json:"bandwidth"`
+}
+
+type ServerHardwareInfoGPUPCIEInfo struct {
+	Throughput string `json:"pcie_throughput"`
+	LaneWidth  int    `json:"pcie_lane_width"`
+}
+
+type ServerHardwareInfoGPU struct {
+	*IsolatedDeviceModelHardwareInfo
+
+	// isolate device id
+	Id string `json:"id"`
+	// GPU model name
+	Model string `json:"model"`
+	// PCIE information
+	PCIEInfo *IsolatedDevicePCIEInfo `json:"pcie_info"`
+}
+
+type ServerGetHardwareInfoResp struct {
+	Motherboard *ServerHardwareInfoMotherboard `json:"motherboard"`
+	CPU         *ServerHardwareInfoCPU         `json:"cpu"`
+	Memory      *ServerHardwareInfoMemory      `json:"memory"`
+	Disks       []*ServerHardwareInfoDisk      `json:"disk"`
+	GPUs        []*ServerHardwareInfoGPU       `json:"gpu"`
+}
+
 type ServerMonitorInput struct {
-	COMMAND string
-	QMP     bool
+	COMMAND string `json:"command"`
+	QMP     bool   `json:"qmp"`
 }
 
 type ServerQemuInfo struct {
@@ -1021,8 +1299,8 @@ type IfnameDetail struct {
 }
 
 type ServerQgaSetPasswordInput struct {
-	Username string
-	Password string
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type ServerQgaGuestInfoTaskInput struct {
@@ -1030,31 +1308,39 @@ type ServerQgaGuestInfoTaskInput struct {
 
 type ServerQgaSetNetworkInput struct {
 	ServerQgaTimeoutInput
-	Device  string
-	Ipmask  string
-	Gateway string
+	Device   string `json:"device"`
+	Ipmask   string `json:"ipmask"`
+	Gateway  string `json:"gateway"`
+	Ip6mask  string `json:"ip6mask"`
+	Gateway6 string `json:"gateway6"`
 }
 
 type ServerQgaGetNetworkInput struct {
 }
 
 type ServerQgaTimeoutInput struct {
-	// qga execute timeout millisecond
-	Timeout int
+	// qga execute timeout second
+	Timeout int `json:"timeout"`
 }
 
 type ServerQgaCommandInput struct {
 	ServerQgaTimeoutInput
-	Command string
+	Command string `json:"command"`
 }
 
 type ServerSetPasswordInput struct {
-	Username string
-	Password string
+	Username string `json:"username"`
+	Password string `json:"password"`
 
 	// deploy params
-	ResetPassword bool
-	AutoStart     bool
+	ResetPassword bool `json:"reset_password"`
+	AutoStart     bool `json:"auto_start"`
+}
+
+type ServerSetIsoInput struct {
+	CdromOrdinal int64  `json:"cdrom_ordinal"`
+	ImageId      string `json:"image_id"`
+	BootIndex    *int8  `json:"boot_index"`
 }
 
 type ServerInsertVfdInput struct {
@@ -1073,20 +1359,101 @@ type ServerSetLiveMigrateParamsInput struct {
 }
 
 type ServerNicTrafficLimit struct {
-	Mac            string `json:"mac"`
+	Mac string `json:"mac"`
+
 	RxTrafficLimit *int64 `json:"rx_traffic_limit"`
 	TxTrafficLimit *int64 `json:"tx_traffic_limit"`
+
+	BillingType billing_api.TBillingType   `json:"billing_type"`
+	ChargeType  billing_api.TNetChargeType `json:"charge_type"`
 }
 
-type GuestAddSubIpsInput struct {
-	Mac    string   `json:"mac"`
-	IpAddr string   `json:"ip_addr"`
+func (input ServerNicTrafficLimit) Validate(billingType billing_api.TBillingType, chargeType billing_api.TNetChargeType, txLimit, rxLimit int64) (ServerNicTrafficLimit, bool, error) {
+	var billingChange bool
+	if len(input.BillingType) > 0 && input.BillingType != billingType {
+		billingChange = true
+		billingType = input.BillingType
+	}
+	if len(input.ChargeType) > 0 && input.ChargeType != chargeType {
+		billingChange = true
+		chargeType = input.ChargeType
+	}
+
+	if billingChange {
+		if len(input.BillingType) == 0 {
+			input.BillingType = billingType
+		}
+		if len(input.ChargeType) == 0 {
+			input.ChargeType = chargeType
+		}
+	}
+
+	if billingType == billing_api.BILLING_TYPE_POSTPAID && chargeType == billing_api.NET_CHARGE_TYPE_BY_TRAFFIC {
+		if txLimit > 0 {
+			txLimit = 0
+			input.TxTrafficLimit = &txLimit
+		} else {
+			input.TxTrafficLimit = nil
+		}
+		if rxLimit > 0 {
+			rxLimit = 0
+			input.RxTrafficLimit = &rxLimit
+		} else {
+			input.RxTrafficLimit = nil
+		}
+	} else if billingType == billing_api.BILLING_TYPE_POSTPAID && chargeType == billing_api.NET_CHARGE_TYPE_BY_BANDWIDTH {
+		return input, billingChange, errors.Wrapf(httperrors.ErrNotImplemented, "billing type %s and charge type %s are not supported", input.BillingType, input.ChargeType)
+	} else if billingType == billing_api.BILLING_TYPE_PREPAID && chargeType == billing_api.NET_CHARGE_TYPE_BY_TRAFFIC {
+		if txLimit == 0 && input.TxTrafficLimit == nil {
+			return input, billingChange, errors.Wrapf(httperrors.ErrBadRequest, "tx traffic limit is required")
+		}
+		if rxLimit == 0 && input.RxTrafficLimit == nil {
+			return input, billingChange, errors.Wrapf(httperrors.ErrBadRequest, "rx traffic limit is required")
+		}
+		if input.TxTrafficLimit != nil && *input.TxTrafficLimit <= 0 {
+			return input, billingChange, errors.Wrapf(httperrors.ErrBadRequest, "tx traffic limit must be greater than 0")
+		}
+		if input.RxTrafficLimit != nil && *input.RxTrafficLimit <= 0 {
+			return input, billingChange, errors.Wrapf(httperrors.ErrBadRequest, "rx traffic limit must be greater than 0")
+		}
+	} else if billingType == billing_api.BILLING_TYPE_PREPAID && chargeType == billing_api.NET_CHARGE_TYPE_BY_BANDWIDTH {
+		if txLimit > 0 {
+			txLimit = 0
+			input.TxTrafficLimit = &txLimit
+		} else {
+			input.TxTrafficLimit = nil
+		}
+		if rxLimit > 0 {
+			rxLimit = 0
+			input.RxTrafficLimit = &rxLimit
+		} else {
+			input.RxTrafficLimit = nil
+		}
+	} else {
+		return input, billingChange, errors.Wrapf(httperrors.ErrBadRequest, "invalid billing type %s and charge type %s", input.BillingType, input.ChargeType)
+	}
+	return input, billingChange, nil
+}
+
+type GuestAddSubIpsInfo struct {
 	Count  int      `json:"count"`
 	SubIps []string `json:"sub_ips"`
 
 	Reserved bool `json:"reserved"`
 
 	AllocDir IPAllocationDirection `json:"alloc_dir"`
+}
+
+type GuestAddSubIpsInput struct {
+	ServerNetworkInfo
+
+	GuestAddSubIpsInfo
+}
+
+type GuestUpdateSubIpsInput struct {
+	GuestAddSubIpsInput
+
+	RemoveSubIps []string `json:"remove_sub_ips"`
 }
 
 type NetworkAddrConf struct {
@@ -1113,4 +1480,213 @@ type GuestPerformStartInput struct {
 	// 指定启动虚拟机的Qemu版本，可选值：2.12.1, 4.2.0
 	// 仅适用于KVM虚拟机
 	QemuVersion string `json:"qemu_version"`
+	// 按量机器自动转换为包年包月
+	AutoPrepaid bool `json:"auto_prepaid"`
+}
+
+type ServerSetOSInfoInput struct {
+	// OS type, e.g.: Linux, Windows
+	Type string `json:"type" help:"OS type, e.g.: Linux, Windows"`
+	// OS distribution, e.g.: CentOS, Ubuntu, Windows Server 2016 Datacenter
+	Distribution string `json:"distribution" help:"OS distribution, e.g.: CentOS, Ubuntu, Windows Server 2016 Datacenter"`
+	// OS version, e.g: 7.9, 22.04, 6.3
+	Version string `json:"version" help:"OS version, e.g.: 7.9, 22.04, 6.3"`
+	Arch    string `json:"arch" help:"OS arch, e.g.: x86_64, aarch64"`
+}
+
+type ServerNetworkInfo struct {
+	Index   int    `json:"index"`
+	Mac     string `json:"mac"`
+	IpAddr  string `json:"ip_addr"`
+	Ip6Addr string `json:"ip6_addr"`
+}
+
+type ServerChangeIpaddrInput struct {
+	ServerNetworkInfo
+
+	NetDesc string         `json:"net_desc"`
+	NetConf *NetworkConfig `json:"net_conf"`
+
+	Reserve *bool `json:"reserve"`
+
+	RestartNetwork *bool `json:"restart_network"`
+
+	NoSync *bool `json:"no_sync"`
+}
+
+type ServerChangeBandwidthInput struct {
+	ServerNetworkInfo
+
+	Bandwidth int `json:"bandwidth"`
+
+	TxBwLimit int `json:"tx_bw_limit"`
+	RxBwLimit int `json:"rx_bw_limit"`
+
+	NoSync *bool `json:"no_sync"`
+}
+
+// ServerSetPortMappingInput 设置服务器指定网卡的端口映射
+type ServerSetPortMappingInput struct {
+	ServerNetworkInfo
+	// 端口映射规则列表；传空数组表示清空该网卡的所有端口映射
+	PortMappings GuestPortMappings `json:"port_mappings"`
+}
+
+type ServerChangeConfigSpecs struct {
+	CpuSockets    int    `json:"cpu_sockets"`
+	VcpuCount     int    `json:"vcpu_count"`
+	ExtraCpuCount int    `json:"extra_cpu_count"`
+	VmemSize      int    `json:"vmem_size"`
+	InstanceType  string `json:"instance_type"`
+}
+
+type DiskResizeSpec struct {
+	DiskId    string `json:"disk_id"`
+	SizeMb    int    `json:"size_mb"`
+	OldSizeMb int    `json:"old_size_mb"`
+}
+
+type ServerChangeConfigSettings struct {
+	Old ServerChangeConfigSpecs `json:"old"`
+
+	ServerChangeConfigSpecs
+
+	InstanceTypeFamily string `json:"instance_type_family"`
+	// disks to resize
+	Resize []*DiskResizeSpec `json:"resize"`
+	// disks to create
+	Create []*DiskConfig `json:"create"`
+
+	AutoStart   bool `json:"auto_start"`
+	GuestOnline bool `json:"guest_online"`
+	// 需要强制关机后再调整配置(仅不支持在线变配/降配时为true), 并在完成后自动启动
+	ForceStop bool `json:"force_stop"`
+
+	// 设置虚拟网卡的流量上限
+	SetTrafficLimits []ServerNicTrafficLimit `json:"set_traffic_limits"`
+	// 重置虚拟网卡的流量上限，并且将网卡的流量归零
+	ResetTrafficLimits []ServerNicTrafficLimit `json:"reset_traffic_limits"`
+
+	SchedDesc jsonutils.JSONObject `json:"sched_desc"`
+}
+
+func (conf ServerChangeConfigSettings) CpuChanged() bool {
+	return conf.VcpuCount != conf.Old.VcpuCount
+}
+
+func (conf ServerChangeConfigSettings) CpuReduced() bool {
+	return conf.VcpuCount < conf.Old.VcpuCount
+}
+
+func (conf ServerChangeConfigSettings) AddedCpu() int {
+	addCpu := conf.VcpuCount - conf.Old.VcpuCount
+	if addCpu < 0 {
+		addCpu = 0
+	}
+	return addCpu
+}
+
+func (conf ServerChangeConfigSettings) ExtraCpuChanged() bool {
+	return conf.ExtraCpuCount != conf.Old.ExtraCpuCount
+}
+
+func (conf ServerChangeConfigSettings) ExtraCpuReduced() bool {
+	return conf.ExtraCpuCount < conf.Old.ExtraCpuCount
+}
+
+func (conf ServerChangeConfigSettings) AddedExtraCpu() int {
+	addCpu := conf.ExtraCpuCount - conf.Old.ExtraCpuCount
+	if addCpu < 0 {
+		addCpu = 0
+	}
+	return addCpu
+}
+
+func (conf ServerChangeConfigSettings) MemChanged() bool {
+	return conf.VmemSize != conf.Old.VmemSize
+}
+
+func (conf ServerChangeConfigSettings) MemReduced() bool {
+	return conf.VmemSize < conf.Old.VmemSize
+}
+
+func (conf ServerChangeConfigSettings) InstanceTypeChanged() bool {
+	return len(conf.InstanceType) > 0 && conf.InstanceType != conf.Old.InstanceType
+}
+
+func (conf ServerChangeConfigSettings) AddedMem() int {
+	addMem := conf.VmemSize - conf.Old.VmemSize
+	if addMem < 0 {
+		addMem = 0
+	}
+	return addMem
+}
+
+// ConfigReduced 是否为降配(降低CPU/内存)
+func (conf ServerChangeConfigSettings) ConfigReduced() bool {
+	return conf.CpuReduced() || conf.MemReduced() || conf.ExtraCpuReduced()
+}
+
+func (conf ServerChangeConfigSettings) AddedDisk() int {
+	var size int
+	for _, resize := range conf.Resize {
+		size += resize.SizeMb - resize.OldSizeMb
+	}
+	for _, create := range conf.Create {
+		size += create.SizeMb
+	}
+	return size
+}
+
+type ServerReleasedIsolatedDevice struct {
+	DevType       string `json:"dev_type"`
+	Model         string `json:"model"`
+	GpuType       string `json:"gpu_type"`
+	SharingMode   string `json:"sharing_mode"`
+	MemoryRequest int    `json:"memory_request"`
+}
+
+type ServerAttachIsolatedDeviceBase struct {
+	AutoStart     bool   `json:"auto_start"`
+	GpuType       string `json:"gpu_type"`
+	MemoryRequest *int   `json:"memory_request"`
+	SharingMode   string `json:"sharing_mode"`
+	Count         *int   `json:"count"`
+}
+
+type ServerAttachIsolatedDeviceInput struct {
+	ServerAttachIsolatedDeviceBase
+	Device string `json:"device"`
+	Model  string `json:"model"`
+}
+
+type ServerDetachIsolatedDeviceInputBase struct {
+	Device string `json:"device"`
+	Index  *int   `json:"index"`
+}
+type ServerDetachIsolatedDeviceInput struct {
+	Devices   []ServerDetachIsolatedDeviceInputBase `json:"devices"`
+	IsForce   bool                                  `json:"is_force"`
+	DetachAll bool                                  `json:"detach_all"`
+	AutoStart bool                                  `json:"auto_start"`
+}
+
+type ServerChangeBillingTypeInput struct {
+	// 仅在虚拟机开机或关机状态下调用
+	// enmu: [postpaid, prepaid]
+	// required: true
+	BillingType billing_api.TBillingType `json:"billing_type"`
+}
+
+type ServerPerformStatusInput struct {
+	apis.PerformStatusInput
+	Containers map[string]*ContainerPerformStatusInput `json:"containers"`
+}
+
+type ServerModificationType struct {
+	Name string `json:"name"`
+}
+
+type ServerModificationTypesOutput struct {
+	ModificationTypes []ServerModificationType `json:"modification_types"`
 }

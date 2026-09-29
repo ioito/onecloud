@@ -83,8 +83,8 @@ func init() {
 		SKeystoneCacheObjectManager: NewKeystoneCacheObjectManager(
 			STenant{},
 			"tenant_cache_tbl",
-			"tenant",
-			"tenants",
+			"tenant_cache",
+			"tenant_caches",
 		)}
 	// log.Debugf("Initialize tenant cache manager %s %s", TenantCacheManager.KeywordPlural(), TenantCacheManager)
 
@@ -191,6 +191,14 @@ func (t *STenant) IsExpired() bool {
 }
 
 func (manager *STenantCacheManager) FetchTenantByIdOrNameInDomain(ctx context.Context, idStr string, domainId string) (*STenant, error) {
+	if !stringutils2.IsUtf8(idStr) {
+		t, err := manager.FetchTenantById(ctx, idStr)
+		if t != nil {
+			return t, nil
+		} else if err != nil && errors.Cause(err) != sql.ErrNoRows {
+			return nil, errors.Wrap(err, "FetchTenantById")
+		}
+	}
 	return manager.fetchTenant(ctx, idStr, domainId, false, false, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 		if stringutils2.IsUtf8(idStr) {
 			return q.Equals("name", idStr)
@@ -383,6 +391,9 @@ func (manager *STenantCacheManager) Save(ctx context.Context, item SCachedTenant
 		}
 	} else {
 		objm, err := NewModelObject(manager)
+		if err != nil {
+			return nil, err
+		}
 		obj := objm.(*STenant)
 		obj.Id = item.Id
 		obj.Name = item.Name

@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -71,6 +71,9 @@ const (
 	QCLOUD_DNS_API_VERSION       = "2021-03-23"
 	QCLOUD_STS_API_VERSION       = "2018-08-13"
 	QCLOUD_TAG_API_VERSION       = "2018-08-13"
+	QCLOUD_WAF_API_VERSION       = "2018-01-25"
+	QCLOUD_ORG_API_VERSION       = "2021-03-31"
+	QCLOUD_CWP_API_VERSION       = "2018-02-28"
 )
 
 type QcloudClientConfig struct {
@@ -78,6 +81,7 @@ type QcloudClientConfig struct {
 
 	secretId  string
 	secretKey string
+	accountId string
 	appId     string
 
 	debug bool
@@ -96,8 +100,8 @@ func (cfg *QcloudClientConfig) CloudproviderConfig(cpcfg cloudprovider.ProviderC
 	return cfg
 }
 
-func (cfg *QcloudClientConfig) AppId(appId string) *QcloudClientConfig {
-	cfg.appId = appId
+func (cfg *QcloudClientConfig) AccountId(accountId string) *QcloudClientConfig {
+	cfg.accountId = accountId
 	return cfg
 }
 
@@ -108,8 +112,11 @@ func (cfg *QcloudClientConfig) Debug(debug bool) *QcloudClientConfig {
 
 type SQcloudClient struct {
 	*QcloudClientConfig
-	ownerId   string
-	ownerName string
+	masterAccountId string
+	masterAppId     string
+	ownerId         string
+	ownerName       string
+	appId           string
 
 	iregions []cloudprovider.ICloudRegion
 	ibuckets []cloudprovider.ICloudBucket
@@ -119,7 +126,16 @@ func NewQcloudClient(cfg *QcloudClientConfig) (*SQcloudClient, error) {
 	client := SQcloudClient{
 		QcloudClientConfig: cfg,
 	}
-	err := client.fetchRegions()
+	caller, err := client.GetCallerIdentity()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetCallerIdentity")
+	}
+	client.masterAppId, err = client.GetAppId()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetAppId")
+	}
+	client.masterAccountId = caller.AccountId
+	err = client.fetchRegions()
 	if err != nil {
 		return nil, errors.Wrap(err, "fetchRegions")
 	}
@@ -157,6 +173,11 @@ func vpcRequest(client *common.Client, apiName string, params map[string]string,
 	return _jsonRequest(client, domain, QCLOUD_API_VERSION, apiName, params, updateFunc, debug, true)
 }
 
+func orgRequest(client *common.Client, apiName string, params map[string]string, updateFunc func(string, string), debug bool) (jsonutils.JSONObject, error) {
+	domain := "organization.tencentcloudapi.com"
+	return _jsonRequest(client, domain, QCLOUD_ORG_API_VERSION, apiName, params, updateFunc, debug, true)
+}
+
 func auditRequest(client *common.Client, apiName string, params map[string]string, updateFunc func(string, string), debug bool) (jsonutils.JSONObject, error) {
 	domain := apiDomain("cloudaudit", params)
 	return _jsonRequest(client, domain, QCLOUD_AUDIT_API_VERSION, apiName, params, updateFunc, debug, true)
@@ -171,6 +192,18 @@ func cbsRequest(client *common.Client, apiName string, params map[string]string,
 func esRequest(client *common.Client, apiName string, params map[string]string, updateFunc func(string, string), debug bool) (jsonutils.JSONObject, error) {
 	domain := apiDomain("es", params)
 	return _jsonRequest(client, domain, QCLOUD_ES_API_VERSION, apiName, params, updateFunc, debug, true)
+}
+
+// waf
+func wafRequest(client *common.Client, apiName string, params map[string]string, updateFunc func(string, string), debug bool) (jsonutils.JSONObject, error) {
+	domain := apiDomain("waf", params)
+	return _jsonRequest(client, domain, QCLOUD_WAF_API_VERSION, apiName, params, updateFunc, debug, true)
+}
+
+// cwp 主机安全
+func cwpRequest(client *common.Client, apiName string, params map[string]string, updateFunc func(string, string), debug bool) (jsonutils.JSONObject, error) {
+	domain := apiDomain("cwp", params)
+	return _jsonRequest(client, domain, QCLOUD_CWP_API_VERSION, apiName, params, updateFunc, debug, true)
 }
 
 // kafka
@@ -339,23 +372,27 @@ func _baseJsonRequest(client *common.Client, req tchttp.Request, resp qcloudResp
 					"InvalidParameter.PermissionDenied",
 					"AuthFailure",
 				}) {
-				return nil, errors.Wrapf(cloudprovider.ErrNoPermission, err.Error())
+				return nil, errors.Wrapf(cloudprovider.ErrNoPermission, "%s", err.Error())
 			}
 			if utils.IsInStringArray(e.Code, []string{
 				"AuthFailure.SecretIdNotFound",
 				"AuthFailure.SignatureFailure",
 			}) {
-				return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, err.Error())
+				return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", err.Error())
 			}
 			if utils.IsInStringArray(e.Code, []string{
 				"InvalidParameter.RoleNotExist",
 				"ResourceNotFound",
 				"FailedOperation.CertificateNotFound",
+				"ResourceNotFound.OrganizationNotExist",
 			}) {
-				return nil, errors.Wrapf(cloudprovider.ErrNotFound, err.Error())
+				return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", err.Error())
 			}
 
-			if e.Code == "UnsupportedRegion" {
+			if utils.IsInStringArray(e.Code, []string{
+				"InvalidParameterValue.ZoneNotSupported",
+				"UnsupportedRegion",
+			}) {
 				return nil, cloudprovider.ErrNotSupported
 			}
 			if e.Code == "InvalidParameterValue" && apiName == "GetMonitorData" && strings.Contains(e.Message, "the instance has been destroyed") {
@@ -428,37 +465,65 @@ func (client *SQcloudClient) getDefaultClient(params map[string]string) (*common
 	return client.getSdkClient(regionId)
 }
 
+func (client *SQcloudClient) isSubAccount() bool {
+	return len(client.accountId) > 0 &&
+		client.accountId != client.masterAccountId && len(client.masterAccountId) > 0 &&
+		client.accountId != client.masterAppId && len(client.masterAppId) > 0
+}
+
 func (client *SQcloudClient) getSdkClient(regionId string) (*common.Client, error) {
 	cli, err := common.NewClientWithSecretId(client.secretId, client.secretKey, regionId)
 	if err != nil {
 		return nil, err
 	}
+	if client.isSubAccount() {
+		arn := fmt.Sprintf("qcs::cam::uin/%s:roleName/%s", client.accountId, "OrganizationAccessControlRole")
+		sts := common.DefaultRoleArnProvider(client.secretId, client.secretKey, arn)
+		cli, err = cli.WithProvider(sts)
+		if err != nil {
+			return nil, errors.Wrapf(err, "WithProvider")
+		}
+	}
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
 	ts, _ := httpClient.Transport.(*http.Transport)
-	cli.WithHttpTransport(cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
-		body, err := ioutil.ReadAll(req.Body)
+	cli.WithHttpTransport(cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
+		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			return nil, errors.Wrapf(err, "ioutil.ReadAll")
 		}
-		req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		req.Body = io.NopCloser(bytes.NewBuffer(body))
 		params, err := url.ParseQuery(string(body))
 		if err != nil {
 			return nil, errors.Wrapf(err, "ParseQuery(%s)", string(body))
 		}
 		service := strings.Split(req.URL.Host, ".")[0]
 		action := params.Get("Action")
-		respCheck := func(resp *http.Response) {
-			if client.cpcfg.UpdatePermission != nil {
+		respCheck := func(resp *http.Response) error {
+			if resp.ContentLength <= 0 {
+				return nil
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return errors.Wrapf(err, "ioutil.ReadAll")
+			}
+			resp.Body = io.NopCloser(bytes.NewBuffer(body))
+			obj, _ := jsonutils.Parse(body)
+			code := ""
+			if obj != nil {
+				code, _ = obj.GetString("Response", "Error", "Code")
+			}
+			if client.cpcfg.UpdatePermission != nil && code == "UnauthorizedOperation" {
 				client.cpcfg.UpdatePermission(service, action)
 			}
+			return nil
 		}
 		if client.cpcfg.ReadOnly {
-			for _, prefix := range []string{"Get", "List", "Describe"} {
+			for _, prefix := range []string{"Get", "List", "Describe", "LookUpEvents"} {
 				if strings.HasPrefix(action, prefix) {
 					return respCheck, nil
 				}
 			}
-			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s", action)
 		}
 		return respCheck, nil
 	}))
@@ -479,6 +544,14 @@ func (client *SQcloudClient) vpcRequest(apiName string, params map[string]string
 		return nil, err
 	}
 	return vpcRequest(cli, apiName, params, client.cpcfg.UpdatePermission, client.debug)
+}
+
+func (client *SQcloudClient) orgRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cli, err := client.getDefaultClient(params)
+	if err != nil {
+		return nil, err
+	}
+	return orgRequest(cli, apiName, params, client.cpcfg.UpdatePermission, client.debug)
 }
 
 func (client *SQcloudClient) auditRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
@@ -533,6 +606,24 @@ func (client *SQcloudClient) esRequest(apiName string, params map[string]string)
 	}
 
 	return esRequest(cli, apiName, params, client.cpcfg.UpdatePermission, client.debug)
+}
+
+func (client *SQcloudClient) wafRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cli, err := client.getDefaultClient(params)
+	if err != nil {
+		return nil, err
+	}
+
+	return wafRequest(cli, apiName, params, client.cpcfg.UpdatePermission, client.debug)
+}
+
+func (client *SQcloudClient) cwpRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cli, err := client.getDefaultClient(params)
+	if err != nil {
+		return nil, err
+	}
+
+	return cwpRequest(cli, apiName, params, client.cpcfg.UpdatePermission, client.debug)
 }
 
 func (client *SQcloudClient) kafkaRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
@@ -703,14 +794,15 @@ func (client *SQcloudClient) getCosClient(bucket *SBucket) (*cos.Client, error) 
 					RequestBody:    client.debug,
 					ResponseHeader: client.debug,
 					ResponseBody:   client.debug,
-					Transport: cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+					Transport: cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 						method, path := req.Method, req.URL.Path
-						respCheck := func(resp *http.Response) {
+						respCheck := func(resp *http.Response) error {
 							if resp.StatusCode == 403 {
 								if client.cpcfg.UpdatePermission != nil {
 									client.cpcfg.UpdatePermission("cos", fmt.Sprintf("%s %s", method, path))
 								}
 							}
+							return nil
 						}
 						if client.cpcfg.ReadOnly {
 							if req.Method == "GET" || req.Method == "HEAD" {
@@ -732,6 +824,9 @@ func (self *SQcloudClient) invalidateIBuckets() {
 }
 
 func (self *SQcloudClient) getIBuckets() ([]cloudprovider.ICloudBucket, error) {
+	if self.isSubAccount() {
+		return nil, fmt.Errorf("cos not support sub account sync")
+	}
 	if self.ibuckets == nil {
 		err := self.fetchBuckets()
 		if err != nil {
@@ -765,6 +860,23 @@ func (client *SQcloudClient) verifyAppId() error {
 	return errors.Wrap(err, "Head")
 }
 
+func (client *SQcloudClient) getOwnerName() string {
+	if len(client.ownerName) > 0 {
+		return client.ownerName
+	}
+	coscli, err := client.getCosClient(nil)
+	if err != nil {
+		return ""
+	}
+	s, _, err := coscli.Service.Get(context.Background())
+	if err != nil {
+		return ""
+	}
+	client.ownerId = s.Owner.ID
+	client.ownerName = s.Owner.DisplayName
+	return client.ownerName
+}
+
 func (client *SQcloudClient) fetchBuckets() error {
 	coscli, err := client.getCosClient(nil)
 	if err != nil {
@@ -783,12 +895,13 @@ func (client *SQcloudClient) fetchBuckets() error {
 		createAt, _ := timeutils.ParseTimeStr(bInfo.CreationDate)
 		slashPos := strings.LastIndexByte(bInfo.Name, '-')
 		appId := bInfo.Name[slashPos+1:]
-		if appId != client.appId {
-			log.Errorf("[%s %s] Inconsistent appId: %s expect %s", bInfo.Name, bInfo.Region, appId, client.appId)
+		_appId, _ := client.GetAppId()
+		if appId != _appId {
+			log.Errorf("[%s %s] Inconsistent appId: %s expect %s", bInfo.Name, bInfo.Region, appId, _appId)
 		}
 		name := bInfo.Name[:slashPos]
 		region, err := client.getIRegionByRegionId(bInfo.Region)
-		var zone cloudprovider.ICloudZone
+		var zone *SZone = nil
 		if err != nil {
 			log.Errorf("fail to find region %s", bInfo.Region)
 			// possibly a zone, try zone
@@ -805,10 +918,12 @@ func (client *SQcloudClient) fetchBuckets() error {
 				continue
 			}
 			zoneId := bInfo.Region
-			zone, _ = region.(*SRegion).getZoneById(bInfo.Region)
-			if zone != nil {
-				zoneId = zone.GetId()
+			zone, err = region.(*SRegion).getZoneById(bInfo.Region)
+			if err != nil {
+				log.Errorf("fail to find zone %s", zoneId)
+				continue
 			}
+			zoneId = zone.GetId()
 			log.Debugf("find zonal bucket %s", zoneId)
 		}
 		b := SBucket{
@@ -819,7 +934,7 @@ func (client *SQcloudClient) fetchBuckets() error {
 			CreateDate: createAt,
 		}
 		if zone != nil {
-			b.zone = zone.(*SZone)
+			b.zone = zone
 		}
 		ret = append(ret, &b)
 	}
@@ -828,19 +943,33 @@ func (client *SQcloudClient) fetchBuckets() error {
 }
 
 func (client *SQcloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
-	err := client.fetchRegions()
-	if err != nil {
+	nodes, err := client.DescribeOrganizationMembers()
+	if err != nil && errors.Cause(err) != cloudprovider.ErrNotFound && errors.Cause(err) != cloudprovider.ErrNoPermission {
 		return nil, err
 	}
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = client.GetAccountId()
 	subAccount.Name = client.cpcfg.Name
 	subAccount.Account = client.secretId
-	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
-	subAccount.DefaultProjectId = "0"
-	if len(client.appId) > 0 {
+	if len(client.appId) > 0 { // 兼容旧版本账号，避免订阅删除
 		subAccount.Account = fmt.Sprintf("%s/%s", client.secretId, client.appId)
 	}
-	return []cloudprovider.SSubAccount{subAccount}, nil
+	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
+	subAccount.DefaultProjectId = "0"
+	ret := []cloudprovider.SSubAccount{subAccount}
+	for _, node := range nodes {
+		uin := fmt.Sprintf("%d", node.MemberUin)
+		if len(subAccount.Id) > 0 && uin != subAccount.Id {
+			account := cloudprovider.SSubAccount{}
+			account.Id = uin
+			account.Name = node.Name
+			account.Account = fmt.Sprintf("%s/%s", client.secretId, uin)
+			account.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
+			account.DefaultProjectId = "0"
+			ret = append(ret, account)
+		}
+	}
+	return ret, nil
 }
 
 func (self *SQcloudClient) GetAccountId() string {
@@ -857,8 +986,8 @@ func (client *SQcloudClient) GetIamLoginUrl() string {
 	return fmt.Sprintf("https://cloud.tencent.com/login/subAccount")
 }
 
-func (client *SQcloudClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return client.iregions
+func (client *SQcloudClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return client.iregions, nil
 }
 
 func (client *SQcloudClient) getDefaultRegion() (*SRegion, error) {
@@ -933,9 +1062,13 @@ func (client *SQcloudClient) GetIStorageById(id string) (cloudprovider.ICloudSto
 }
 
 type SAccountBalance struct {
-	Balance  float64
-	Uin      int64
-	Currency string
+	Balance            float64
+	Uin                int64
+	Currency           string
+	CashAccountBalance float64
+	CreditAmount       float64
+	CreditBalance      float64
+	FreezeAmount       float64
 }
 
 func (client *SQcloudClient) QueryAccountBalance() (*SAccountBalance, error) {
@@ -951,11 +1084,55 @@ func (client *SQcloudClient) QueryAccountBalance() (*SAccountBalance, error) {
 	if err != nil {
 		return nil, err
 	}
-	balance.Balance = balance.Balance / 100.0
+	amount := balance.Balance / 100.0
+	if balance.CreditAmount > 0 {
+		amount = (balance.CashAccountBalance + balance.CreditAmount + balance.Balance - balance.FreezeAmount) / 100.0
+	}
+	balance.Balance = amount
 	if balance.Uin >= 200000000000 {
 		balance.Currency = "USD"
 	}
 	return balance, nil
+}
+
+type SBillSummary struct {
+	Ready         int                `json:"Ready"`
+	SummaryDetail []SBillSummaryItem `json:"SummaryDetail"`
+	TotalAmount   float64            `json:"TotalAmount"`
+}
+
+type SBillSummaryItem struct {
+	Business           []jsonutils.JSONObject `json:"Business"`
+	CashPayAmount      float64                `json:"CashPayAmount"`
+	GroupKey           string                 `json:"GroupKey"`
+	GroupValue         string                 `json:"GroupValue"`
+	IncentivePayAmount float64                `json:"IncentivePayAmount"`
+	RealTotalCost      float64                `json:"RealTotalCost"`
+	TotalCost          float64                `json:"TotalCost"`
+	TransferPayAmount  float64                `json:"TransferPayAmount"`
+	VoucherPayAmount   float64                `json:"VoucherPayAmount"`
+}
+
+func (client *SQcloudClient) DescribeBillSummary(month string, uin string) (*SBillSummary, error) {
+	params := make(map[string]string)
+	params["Month"] = month
+	params["GroupType"] = "business"
+	if len(uin) > 0 {
+		params["Uin"] = uin
+	}
+	body, err := client.billingRequest("DescribeBillSummary", params)
+	if err != nil {
+		return nil, errors.Wrapf(err, "DescribeBillSummary")
+	}
+	summary := SBillSummary{}
+	err = body.Unmarshal(&summary)
+	if err != nil {
+		return nil, errors.Wrapf(err, "body.Unmarshal")
+	}
+	for _, item := range summary.SummaryDetail {
+		summary.TotalAmount += item.RealTotalCost
+	}
+	return &summary, nil
 }
 
 func (client *SQcloudClient) GetIProjects() ([]cloudprovider.ICloudProject, error) {
@@ -979,14 +1156,40 @@ func (client *SQcloudClient) GetIProjects() ([]cloudprovider.ICloudProject, erro
 	return iprojects, nil
 }
 
-func (self *SQcloudClient) GetCapabilities() []string {
+func (client *SQcloudClient) GetAppId() (string, error) {
+	if len(client.appId) > 0 {
+		return client.appId, nil
+	}
+	resp, err := client.camRequest("GetUserAppId", map[string]string{})
+	if err != nil {
+		return "", errors.Wrapf(err, "GetUserAppId")
+	}
+	client.appId, err = resp.GetString("AppId")
+	return client.appId, err
+}
+
+func (self *SQcloudClient) GetISSLCertificates() ([]cloudprovider.ICloudSSLCertificate, error) {
+	rs, err := self.GetCertificates("", "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]cloudprovider.ICloudSSLCertificate, 0)
+	for i := range rs {
+		rs[i].client = self
+		result = append(result, &rs[i])
+	}
+	return result, nil
+}
+
+func (client *SQcloudClient) GetCapabilities() []string {
 	caps := []string{
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
-		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
 		cloudprovider.CLOUD_CAPABILITY_RDS,
 		cloudprovider.CLOUD_CAPABILITY_CACHE,
 		cloudprovider.CLOUD_CAPABILITY_EVENT,
@@ -1000,6 +1203,14 @@ func (self *SQcloudClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_KAFKA + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_CDN + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_CONTAINER + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_CERT,
+		cloudprovider.CLOUD_CAPABILITY_NAT + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_SNAPSHOT_POLICY,
+		cloudprovider.CLOUD_CAPABILITY_WAF + cloudprovider.READ_ONLY_SUFFIX,
+	}
+	// 官方cos sdk 未支持sts
+	if !client.isSubAccount() {
+		caps = append(caps, cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE)
 	}
 	return caps
 }

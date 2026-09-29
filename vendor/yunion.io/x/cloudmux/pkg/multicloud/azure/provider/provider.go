@@ -64,14 +64,6 @@ func (self *SAzureProviderFactory) IsSupportPrepaidResources() bool {
 	return false
 }
 
-func (self *SAzureProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SAzureProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
 func (self *SAzureProviderFactory) ValidateCreateCloudaccountData(ctx context.Context, input cloudprovider.SCloudaccountCredential) (cloudprovider.SCloudaccount, error) {
 	output := cloudprovider.SCloudaccount{}
 	if len(input.DirectoryId) == 0 {
@@ -160,7 +152,7 @@ type SAzureProvider struct {
 }
 
 func (self *SAzureProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(azure.AZURE_API_VERSION), "api_version")
@@ -183,7 +175,7 @@ func (self *SAzureProvider) GetIamLoginUrl() string {
 	return self.client.GetIamLoginUrl()
 }
 
-func (self *SAzureProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAzureProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -270,12 +262,8 @@ func (self *SAzureProvider) GetEnrollmentAccounts() ([]cloudprovider.SEnrollment
 	return self.client.GetEnrollmentAccounts()
 }
 
-func (self *SAzureProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SAzureProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SAzureProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SAzureProvider) CreateSubscription(input cloudprovider.SubscriptionCreateInput) error {

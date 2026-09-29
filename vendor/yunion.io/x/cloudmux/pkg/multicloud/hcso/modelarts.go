@@ -32,6 +32,7 @@ import (
 type SModelartsPool struct {
 	region *SRegion
 	multicloud.SResourceBase
+	multicloud.SBillingBase
 
 	Metadata     SModelartsPoolMetadata `json:"metadata"`
 	Spec         SModelartsPoolSpec     `json:"spec"`
@@ -290,10 +291,6 @@ type SModelartsDataPoints struct {
 type ModelartsStatistics struct {
 	Statistic string
 	Value     float64
-}
-
-func (self *SHuaweiClient) GetPoolNetworks(poolName string) (jsonutils.JSONObject, error) {
-	return self.modelartsPoolNetworkList(nil)
 }
 
 func (self *SHuaweiClient) CreatePoolNetworks(cidr string) (jsonutils.JSONObject, error) {

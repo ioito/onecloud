@@ -17,6 +17,9 @@ package regiondrivers
 import (
 	"context"
 	"database/sql"
+	"strings"
+
+	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/compute/models"
@@ -33,14 +36,6 @@ func init() {
 	models.RegisterRegionDriver(&driver)
 }
 
-func (self *SZStackRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return true
-}
-
-func (self *SZStackRegionDriver) GenerateSecurityGroupName(name string) string {
-	return name
-}
-
 func (self *SZStackRegionDriver) GetProvider() string {
 	return api.CLOUD_PROVIDER_ZSTACK
 }
@@ -49,7 +44,7 @@ func (self *SZStackRegionDriver) ValidateCreateEipData(ctx context.Context, user
 	if len(input.NetworkId) == 0 {
 		return httperrors.NewMissingParameterError("network_id")
 	}
-	_network, err := models.NetworkManager.FetchByIdOrName(userCred, input.NetworkId)
+	_network, err := models.NetworkManager.FetchByIdOrName(ctx, userCred, input.NetworkId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return httperrors.NewResourceNotFoundError2("network", input.NetworkId)
@@ -72,4 +67,36 @@ func (self *SZStackRegionDriver) ValidateCreateEipData(ctx context.Context, user
 		return httperrors.NewUnsupportOperationError("network %s(%s) does not belong to %s", network.Name, network.Id, self.GetProvider())
 	}
 	return nil
+}
+
+func (self *SZStackRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	for i := range input.Rules {
+		rule := input.Rules[i]
+		if len(rule.Ports) > 0 && strings.Contains(input.Rules[i].Ports, ",") {
+			return nil, httperrors.NewInputParameterError("invalid ports %s", input.Rules[i].Ports)
+		}
+	}
+	return self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupInput(ctx, userCred, input)
+}
+
+func (self *SZStackRegionDriver) ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	rule := input
+	if len(rule.Ports) > 0 && strings.Contains(input.Ports, ",") {
+		return nil, httperrors.NewInputParameterError("invalid ports %s", input.Ports)
+	}
+
+	return self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupRuleInput(ctx, userCred, input)
+}
+
+func (self *SZStackRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	if input.Ports != nil && strings.Contains(*input.Ports, ",") {
+		return nil, httperrors.NewInputParameterError("invalid ports %s", *input.Ports)
+	}
+	return self.SManagedVirtualizationRegionDriver.ValidateUpdateSecurityGroupRuleInput(ctx, userCred, input)
+}
+
+func (self *SZStackRegionDriver) GetSecurityGroupFilter(vpc *models.SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error) {
+	return func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Equals("cloudregion_id", vpc.CloudregionId)
+	}, nil
 }

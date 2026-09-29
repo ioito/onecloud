@@ -20,7 +20,6 @@ import (
 	"golang.org/x/text/language"
 
 	comapi "yunion.io/x/onecloud/pkg/apis/compute"
-	"yunion.io/x/onecloud/pkg/apis/notify"
 	api "yunion.io/x/onecloud/pkg/apis/notify"
 	schapi "yunion.io/x/onecloud/pkg/apis/scheduledtask"
 	"yunion.io/x/onecloud/pkg/i18n"
@@ -79,8 +78,8 @@ func init() {
 	stI18nTable.Set(schapi.ST_RESOURCE_OPERATION_START, i18n.NewTableEntry().EN("start").CN("开机"))
 	stI18nTable.Set(schapi.ST_RESOURCE_OPERATION_SYNC, i18n.NewTableEntry().EN("sync").CN("同步"))
 
-	specFieldTrans[notify.TOPIC_RESOURCE_SCALINGPOLICY] = spI18nTable
-	specFieldTrans[notify.TOPIC_RESOURCE_SCHEDULEDTASK] = stI18nTable
+	specFieldTrans[api.TOPIC_RESOURCE_SCALINGPOLICY] = spI18nTable
+	specFieldTrans[api.TOPIC_RESOURCE_SCHEDULEDTASK] = stI18nTable
 }
 
 var (
@@ -295,6 +294,11 @@ func init() {
 			"操作日志",
 		},
 		sI18nElme{
+			api.TOPIC_RESOURCE_PROJECT,
+			"project",
+			"项目",
+		},
+		sI18nElme{
 			api.TOPIC_RESOURCE_CLOUDPODS_COMPONENT,
 			"cloudpods component",
 			"cloudpods服务组件",
@@ -303,6 +307,21 @@ func init() {
 			api.TOPIC_RESOURCE_USER,
 			"user",
 			"用户",
+		},
+		sI18nElme{
+			api.TOPIC_RESOURCE_CLOUDPHONE,
+			"cloudphone",
+			"云手机",
+		},
+		sI18nElme{
+			api.TOPIC_RESOURCE_ACCOUNT_STATUS,
+			"account",
+			"云账号",
+		},
+		sI18nElme{
+			api.TOPIC_RESOURCE_SERVICE,
+			"service",
+			"服务",
 		},
 		sI18nElme{
 			string(api.ActionCreate),
@@ -380,6 +399,16 @@ func init() {
 			"离线",
 		},
 		sI18nElme{
+			string(api.ActionHostDown),
+			"host_down",
+			"宿主机宕机",
+		},
+		sI18nElme{
+			string(api.ActionHostDownAutoMigrate),
+			"host_down_auto_migrate",
+			"宿主机宕机自动迁移",
+		},
+		sI18nElme{
 			string(api.ActionSystemException),
 			"exception",
 			"异常",
@@ -393,6 +422,117 @@ func init() {
 			string(api.ResultSucceed),
 			"successfully",
 			"成功",
+		},
+		sI18nElme{
+			string(api.ActionAttach),
+			"attach",
+			"挂载",
+		},
+		sI18nElme{
+			string(api.ActionDetach),
+			"detach",
+			"卸载",
+		},
+		sI18nElme{
+			string(api.ActionCreateBackupServer),
+			"add_backup_server",
+			"添加主机备份",
+		},
+		sI18nElme{
+			string(api.ActionStart),
+			"start",
+			"开机",
+		},
+		sI18nElme{
+			string(api.ActionStop),
+			"stop",
+			"关机",
+		},
+		sI18nElme{
+			string(api.ActionRestart),
+			"restart",
+			"重启",
+		},
+		sI18nElme{
+			string(api.ActionReset),
+			"reset",
+			"重置",
+		},
+		sI18nElme{
+			string(api.ActionChangeIpaddr),
+			"change_ipaddr",
+			"修改IP地址",
+		},
+		sI18nElme{
+			string(api.ActionChecksumTest),
+			"checksum_test",
+			"一致性检查",
+		},
+		sI18nElme{
+			string(api.ActionCleanData),
+			"clean_data",
+			"清理数据",
+		},
+		sI18nElme{
+			string(api.ActionDelBackupServer),
+			"delete_backup_server",
+			"删除主机备份",
+		},
+		sI18nElme{
+			string(api.ActionMysqlOutOfSync),
+			"mysql_out_of_sync",
+			"数据库不一致",
+		},
+		sI18nElme{
+			string(api.ActionNetOutOfSync),
+			"net_out_of_sync",
+			"网络拓扑不一致",
+		},
+		sI18nElme{
+			string(api.ActionServerPanicked),
+			"server_panicked",
+			"主机崩溃",
+		},
+		sI18nElme{
+			string(api.ActionServiceAbnormal),
+			"service_abnormal",
+			"服务异常",
+		},
+		sI18nElme{
+			string(api.ActionPasswordExpireSoon),
+			"password_expire_soon",
+			"密码即将过期",
+		},
+		sI18nElme{
+			string(api.ActionSystemPanic),
+			"panic",
+			"系统崩溃",
+		},
+		sI18nElme{
+			string(api.ActionExceedCount),
+			"exceed_count",
+			"超过数量",
+		},
+		sI18nElme{
+			string(api.ActionIsolatedDeviceCreate),
+			"isolated_device_create",
+			"新增透传设备",
+		},
+		sI18nElme{
+			string(api.ActionIsolatedDeviceUpdate),
+			"isolated_device_update",
+			"修改透传设备",
+		},
+		sI18nElme{
+			string(api.ActionIsolatedDeviceDelete),
+			"isolated_device_delete",
+			"删除透传设备",
+		},
+
+		sI18nElme{
+			string(api.ActionStatusChanged),
+			"status_changed",
+			"状态变更",
 		},
 	)
 }

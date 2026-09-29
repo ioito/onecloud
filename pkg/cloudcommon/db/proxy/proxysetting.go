@@ -34,6 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/ctx"
 )
 
 type SProxySettingManager struct {
@@ -224,7 +225,7 @@ func (man *SProxySettingManager) InitializeData() error {
 	ps.Description = "Connect directly"
 	ps.IsPublic = true
 	ps.PublicScope = string(rbacscope.ScopeSystem)
-	if err := man.TableSpec().Insert(context.Background(), ps); err != nil {
+	if err := man.TableSpec().Insert(ctx.CtxWithTime(), ps); err != nil {
 		return err
 	}
 	return nil
@@ -236,8 +237,8 @@ func RegisterReferrer(man db.IModelManager) {
 	referrersMen = append(referrersMen, man)
 }
 
-func ValidateProxySettingResourceInput(userCred mcclient.TokenCredential, input proxyapi.ProxySettingResourceInput) (*SProxySetting, proxyapi.ProxySettingResourceInput, error) {
-	m, err := ProxySettingManager.FetchByIdOrName(userCred, input.ProxySettingId)
+func ValidateProxySettingResourceInput(ctx context.Context, userCred mcclient.TokenCredential, input proxyapi.ProxySettingResourceInput) (*SProxySetting, proxyapi.ProxySettingResourceInput, error) {
+	m, err := ProxySettingManager.FetchByIdOrName(ctx, userCred, input.ProxySettingId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", ProxySettingManager.Keyword(), input.ProxySettingId)

@@ -119,8 +119,8 @@ func (self *SInCloudSphereGuestDriver) GetAttachDiskStatus() ([]string, error) {
 	return []string{api.VM_READY}, nil
 }
 
-func (self *SInCloudSphereGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
+func (self *SInCloudSphereGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return true, nil
 }
 
 func (self *SInCloudSphereGuestDriver) GetRebuildRootStatus() ([]string, error) {
@@ -137,16 +137,16 @@ func (self *SInCloudSphereGuestDriver) ValidateCreateData(ctx context.Context, u
 		return nil, err
 	}
 	if len(input.Networks) > 2 {
-		return nil, httperrors.NewInputParameterError("cannot support more than 1 nic")
+		return nil, httperrors.NewInputParameterError("multiple NICs are not supported")
 	}
 	if len(input.Eip) > 0 || input.EipBw > 0 {
-		return nil, httperrors.NewUnsupportOperationError("%s not support create virtual machine with eip", self.GetHypervisor())
+		return nil, httperrors.NewUnsupportOperationError("%s does not support creating virtual machine with eip", self.GetHypervisor())
 	}
 	return input, nil
 }
 
 func (self *SInCloudSphereGuestDriver) ValidateCreateEip(ctx context.Context, userCred mcclient.TokenCredential, input api.ServerCreateEipInput) error {
-	return httperrors.NewInputParameterError("%s not support create eip", self.GetHypervisor())
+	return httperrors.NewInputParameterError("%s does not support creating eip", self.GetHypervisor())
 }
 
 func (self *SInCloudSphereGuestDriver) IsSupportEip() bool {

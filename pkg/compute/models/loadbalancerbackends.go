@@ -16,6 +16,7 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -39,6 +40,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=loadbalancerbackend
+// +onecloud:swagger-gen-model-plural=loadbalancerbackends
 type SLoadbalancerBackendManager struct {
 	SLoadbalancerLogSkipper
 	db.SStatusStandaloneResourceBaseManager
@@ -96,12 +99,12 @@ func (manager *SLoadbalancerBackendManager) FetchOwnerId(ctx context.Context, da
 		if err != nil {
 			return nil, errors.Wrapf(err, "db.FetchById(LoadbalancerBackendGroupManager, %s)", lbbgId)
 		}
-		return lbbg.(*SLoadbalancer).GetOwnerId(), nil
+		return lbbg.(*SLoadbalancerBackendGroup).GetOwnerId(), nil
 	}
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (man *SLoadbalancerBackendManager) FilterByOwner(q *sqlchemy.SQuery, manager db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (man *SLoadbalancerBackendManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, manager db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId != nil {
 		sq := LoadbalancerBackendGroupManager.Query("id")
 		lb := LoadbalancerManager.Query().SubQuery()
@@ -139,7 +142,7 @@ func (man *SLoadbalancerBackendManager) ListItemFilter(
 	}
 
 	data := jsonutils.Marshal(query).(*jsonutils.JSONDict)
-	q, err = validators.ApplyModelFilters(q, data, []*validators.ModelFilterOptions{
+	q, err = validators.ApplyModelFilters(ctx, q, data, []*validators.ModelFilterOptions{
 		{Key: "backend", ModelKeyword: "server", OwnerId: userCred}, // NOTE extend this when new backend_type was added
 	})
 	if err != nil {
@@ -250,7 +253,7 @@ func (man *SLoadbalancerBackendManager) ValidateBackendVpc(lb *SLoadbalancer, gu
 func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential,
 	ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject,
 	input *api.LoadbalancerBackendCreateInput) (*api.LoadbalancerBackendCreateInput, error) {
-	lbbgObj, err := validators.ValidateModel(userCred, LoadbalancerBackendGroupManager, &input.BackendGroupId)
+	lbbgObj, err := validators.ValidateModel(ctx, userCred, LoadbalancerBackendGroupManager, &input.BackendGroupId)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +277,7 @@ func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, 
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetLoadbalancer")
 	}
-	if len(input.BackendId) == 0 {
+	if len(input.BackendId) == 0 && input.BackendType != api.LB_BACKEND_ADDRESS {
 		return nil, httperrors.NewMissingParameterError("backend_id")
 	}
 	region, err := lb.GetRegion()
@@ -284,7 +287,7 @@ func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, 
 	baseName := ""
 	switch input.BackendType {
 	case api.LB_BACKEND_GUEST:
-		guestObj, err := validators.ValidateModel(userCred, GuestManager, &input.BackendId)
+		guestObj, err := validators.ValidateModel(ctx, userCred, GuestManager, &input.BackendId)
 		if err != nil {
 			return nil, err
 		}
@@ -307,8 +310,8 @@ func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, 
 				host.Name, host.ZoneId, lb.Name, lb.ZoneId)
 		}
 		if len(lb.ManagerId) == 0 {
-			if !utils.IsInStringArray(host.HostType, []string{api.HOST_TYPE_HYPERVISOR, api.HOST_TYPE_ESXI}) {
-				return nil, httperrors.NewInputParameterError("host type of host %q (%s) should be either hypervisor or esxi",
+			if !utils.IsInStringArray(host.HostType, []string{api.HOST_TYPE_HYPERVISOR, api.HOST_TYPE_ESXI, api.HOST_TYPE_BAREMETAL}) {
+				return nil, httperrors.NewInputParameterError("host type of host %q (%s) should be either hypervisor, baremetal or esxi",
 					host.Name, host.HostType)
 			}
 		} else if host.ManagerId != lb.ManagerId {
@@ -316,7 +319,7 @@ func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, 
 				host.Name, host.ManagerId, lb.Name, lb.ManagerId)
 		}
 	case api.LB_BACKEND_HOST:
-		hostObj, err := validators.ValidateModel(userCred, HostManager, &input.BackendId)
+		hostObj, err := validators.ValidateModel(ctx, userCred, HostManager, &input.BackendId)
 		if err != nil {
 			return nil, err
 		}
@@ -345,6 +348,11 @@ func (man *SLoadbalancerBackendManager) ValidateCreateData(ctx context.Context, 
 		}
 		input.Address = input.BackendId
 		baseName = input.Address
+
+	case api.LB_BACKEND_ADDRESS:
+		if len(input.Address) == 0 {
+			return nil, httperrors.NewMissingParameterError("address")
+		}
 	default:
 		return input, httperrors.NewInputParameterError("invalid backend_type %s", input.BackendType)
 	}
@@ -417,25 +425,27 @@ func (lbb *SLoadbalancerBackend) ValidateUpdateData(ctx context.Context, userCre
 
 func (lbb *SLoadbalancerBackend) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	lbb.SStatusStandaloneResourceBase.PostUpdate(ctx, userCred, query, data)
-	if data.Contains("port") || data.Contains("weight") {
-		lbb.StartLoadBalancerBackendSyncTask(ctx, userCred, "")
+	if data.Contains("port") || data.Contains("weight") || data.Contains("enabled") {
+		params := data.(*jsonutils.JSONDict)
+		if !params.Contains("enabled") {
+			params.Add(jsonutils.NewBool(lbb.Status == api.LB_STATUS_ENABLED), "enabled")
+		}
+		lbb.StartLoadBalancerBackendSyncTask(ctx, userCred, params, "")
 	}
 }
 
-func (lbb *SLoadbalancerBackend) StartLoadBalancerBackendSyncTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	params := jsonutils.NewDict()
-	lbb.SetStatus(userCred, api.LB_SYNC_CONF, "")
+func (lbb *SLoadbalancerBackend) StartLoadBalancerBackendSyncTask(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict, parentTaskId string) error {
+	lbb.SetStatus(ctx, userCred, api.LB_SYNC_CONF, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "LoadbalancerBackendSyncTask", lbb, userCred, params, parentTaskId, "", nil)
 	if err != nil {
 		return err
 	}
-	task.ScheduleRun(nil)
-	return nil
+	return task.ScheduleRun(nil)
 }
 
 func (lbb *SLoadbalancerBackend) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	lbb.SStatusStandaloneResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
-	lbb.SetStatus(userCred, api.LB_CREATING, "")
+	lbb.SetStatus(ctx, userCred, api.LB_CREATING, "")
 	err := lbb.StartLoadBalancerBackendCreateTask(ctx, userCred, "")
 	if err != nil {
 		log.Errorf("Failed to create loadbalancer backend error: %v", err)
@@ -514,7 +524,7 @@ func (lbb *SLoadbalancerBackend) PerformPurge(ctx context.Context, userCred mccl
 }
 
 func (lbb *SLoadbalancerBackend) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	lbb.SetStatus(userCred, api.LB_STATUS_DELETING, "")
+	lbb.SetStatus(ctx, userCred, api.LB_STATUS_DELETING, "")
 	return lbb.StartLoadBalancerBackendDeleteTask(ctx, userCred, jsonutils.NewDict(), "")
 }
 
@@ -581,7 +591,6 @@ func (lbbg *SLoadbalancerBackendGroup) SyncLoadbalancerBackends(ctx context.Cont
 }
 
 func (lbb *SLoadbalancerBackend) constructFieldsFromCloudLoadbalancerBackend(ext cloudprovider.ICloudLoadbalancerBackend, managerId string) error {
-	// lbb.Name = extLoadbalancerBackend.GetName()
 	lbb.Status = ext.GetStatus()
 
 	lbb.Weight = ext.GetWeight()
@@ -590,25 +599,30 @@ func (lbb *SLoadbalancerBackend) constructFieldsFromCloudLoadbalancerBackend(ext
 	lbb.BackendType = ext.GetBackendType()
 	lbb.BackendRole = ext.GetBackendRole()
 
-	if lbb.BackendType == api.LB_BACKEND_IP {
-		lbb.Address = ext.GetIpAddress()
-	} else {
+	ipAddr := ext.GetIpAddress()
+	if len(lbb.Address) == 0 || ipAddr != lbb.Address {
+		lbb.Address = ipAddr
+	}
+
+	if lbb.BackendType == api.LB_BACKEND_GUEST {
 		instance, err := db.FetchByExternalIdAndManagerId(GuestManager, ext.GetBackendId(), func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 			sq := HostManager.Query().SubQuery()
 			return q.Join(sq, sqlchemy.Equals(sq.Field("id"), q.Field("host_id"))).Filter(sqlchemy.Equals(sq.Field("manager_id"), managerId))
 		})
 		if err != nil {
+			// 部分弹性伸缩组实例未同步, 忽略找不到实例错误
+			if errors.Cause(err) == sql.ErrNoRows {
+				return nil
+			}
 			return errors.Wrapf(err, "FetchByExternalIdAndManagerId %s", ext.GetBackendId())
 		}
 
 		guest := instance.(*SGuest)
 
 		lbb.BackendId = guest.Id
-		address, err := guest.GetAddress()
-		if err != nil {
-			return err
+		if len(lbb.Address) == 0 {
+			lbb.Address, _ = guest.GetAddress()
 		}
-		lbb.Address = address
 	}
 
 	return nil
@@ -620,7 +634,7 @@ func (lbb *SLoadbalancerBackend) syncRemove(ctx context.Context, userCred mcclie
 
 	err := lbb.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		lbb.SetStatus(userCred, api.LB_STATUS_UNKNOWN, "sync to delete")
+		lbb.SetStatus(ctx, userCred, api.LB_STATUS_UNKNOWN, "sync to delete")
 		return errors.Wrapf(err, "ValidateDeleteCondition")
 	}
 	return lbb.RealDelete(ctx, userCred)
@@ -633,7 +647,6 @@ func (lbb *SLoadbalancerBackend) SyncWithCloudLoadbalancerBackend(ctx context.Co
 	if err != nil {
 		return err
 	}
-	syncMetadata(ctx, userCred, lbb, ext)
 	db.OpsLog.LogSyncUpdate(lbb, diff, userCred)
 	return nil
 }
@@ -655,7 +668,6 @@ func (lbbg *SLoadbalancerBackendGroup) newFromCloudLoadbalancerBackend(ctx conte
 	if err != nil {
 		return nil, errors.Wrapf(err, "Insert")
 	}
-	syncMetadata(ctx, userCred, lbb, ext)
 	db.OpsLog.LogEvent(lbb, db.ACT_CREATE, lbb.GetShortDesc(ctx), userCred)
 	return lbb, nil
 }

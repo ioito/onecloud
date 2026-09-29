@@ -23,9 +23,11 @@ import (
 	"github.com/cheggaaa/pb/v3"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/printutils"
 
 	"yunion.io/x/onecloud/cmd/climc/shell"
+	imageapi "yunion.io/x/onecloud/pkg/apis/image"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/image"
@@ -34,7 +36,7 @@ import (
 )
 
 type ImageOptionalOptions struct {
-	Format             string   `help:"Image format" choices:"raw|qcow2|iso|vmdk|docker|vhd"`
+	Format             string   `help:"Image format" choices:"raw|qcow2|iso|vmdk|docker|vhd|tgz"`
 	Protected          bool     `help:"Prevent image from being deleted"`
 	Unprotected        bool     `help:"Allow image to be deleted"`
 	Standard           bool     `help:"Mark image as a standard image"`
@@ -52,16 +54,19 @@ type ImageOptionalOptions struct {
 	OsDist             string   `help:"Distribution name of OS" metavar:"OS_DISTRIBUTION"`
 	OsVersion          string   `help:"Version of OS"`
 	OsCodename         string   `help:"Codename of OS"`
-	OsArch             string   `help:"Os hardware architecture" choices:"x86|x86_64|aarch32|aarch64"`
+	OsArch             string   `help:"Os hardware architecture" choices:"x86|x86_64|aarch32|aarch64|riscv32|riscv64"`
 	OsLang             string   `help:"OS Language" choices:"zh_CN|en_US"`
-	Preference         int64    `help:"Disk preferences"`
+	Preference         int64    `help:"Image disk preference weight"`
 	Notes              string   `help:"Notes about the image"`
 	Hypervisor         []string `help:"Prefer hypervisor type" choices:"kvm|esxi|baremetal|container|openstack|ctyun"`
-	DiskDriver         string   `help:"Perfer disk driver" choices:"virtio|scsi|pvscsi|ide|sata"`
+	DiskDriver         string   `help:"Prefer disk driver" choices:"virtio|scsi|pvscsi|ide|sata"`
 	NetDriver          string   `help:"Preferred network driver" choices:"virtio|e1000|vmxnet3"`
 	DisableUsbKbd      bool     `help:"Disable usb keyboard on this image(for hypervisor kvm)"`
 	BootMode           string   `help:"UEFI support" choices:"UEFI|BIOS"`
 	VdiProtocol        string   `help:"VDI protocol" choices:"vnc|spice"`
+	// for container usage
+	UsedByPostOverlay bool     `help:"Used by container post-overlay"`
+	InternalPathMap   []string `help:"Internal path map, e.g. 'com.taobao.taobao/10.42.12/data/data/com.taobao.taobao:/data/data/com.taobao.taobao'"`
 }
 
 func addImageOptionalOptions(s *mcclient.ClientSession, params *jsonutils.JSONDict, args ImageOptionalOptions) error {
@@ -106,50 +111,65 @@ func addImageOptionalOptions(s *mcclient.ClientSession, params *jsonutils.JSONDi
 		}
 		params.Add(jsonutils.NewString(projectId), "owner")
 	}
+	keyProperties := "properties"
 	if len(args.OsType) > 0 {
-		params.Add(jsonutils.NewString(args.OsType), "properties", "os_type")
+		params.Add(jsonutils.NewString(args.OsType), keyProperties, "os_type")
 	}
 	if len(args.OsDist) > 0 {
-		params.Add(jsonutils.NewString(args.OsDist), "properties", "os_distribution")
+		params.Add(jsonutils.NewString(args.OsDist), keyProperties, "os_distribution")
 	}
 	if len(args.OsVersion) > 0 {
-		params.Add(jsonutils.NewString(args.OsVersion), "properties", "os_version")
+		params.Add(jsonutils.NewString(args.OsVersion), keyProperties, "os_version")
 	}
 	if len(args.OsCodename) > 0 {
-		params.Add(jsonutils.NewString(args.OsCodename), "properties", "os_codename")
+		params.Add(jsonutils.NewString(args.OsCodename), keyProperties, "os_codename")
 	}
 	if len(args.OsArch) > 0 {
-		params.Add(jsonutils.NewString(args.OsArch), "properties", "os_arch")
+		params.Add(jsonutils.NewString(args.OsArch), keyProperties, "os_arch")
 		params.Add(jsonutils.NewString(args.OsArch), "os_arch")
 	}
 	if len(args.OsLang) > 0 {
-		params.Add(jsonutils.NewString(args.OsLang), "properties", "os_language")
+		params.Add(jsonutils.NewString(args.OsLang), keyProperties, "os_language")
 	}
 	if args.Preference > 0 {
 		params.Add(jsonutils.NewString(fmt.Sprintf("%d", args.Preference)), "properties", "preference")
 	}
 	if len(args.Notes) > 0 {
-		params.Add(jsonutils.NewString(args.Notes), "properties", "notes")
+		params.Add(jsonutils.NewString(args.Notes), keyProperties, "notes")
 	}
 	if len(args.DiskDriver) > 0 {
-		params.Add(jsonutils.NewString(args.DiskDriver), "properties", "disk_driver")
+		params.Add(jsonutils.NewString(args.DiskDriver), keyProperties, "disk_driver")
 	}
 	if len(args.NetDriver) > 0 {
-		params.Add(jsonutils.NewString(args.NetDriver), "properties", "net_driver")
+		params.Add(jsonutils.NewString(args.NetDriver), keyProperties, "net_driver")
 	}
 	if len(args.Hypervisor) > 0 {
 		params.Add(jsonutils.NewString(strings.Join(args.Hypervisor, ",")), "properties", "hypervisor")
 	}
 	if args.DisableUsbKbd {
-		params.Add(jsonutils.NewString("true"), "properties", "disable_usb_kbd")
+		params.Add(jsonutils.NewString("true"), keyProperties, "disable_usb_kbd")
 	}
 	if args.BootMode == "UEFI" {
-		params.Add(jsonutils.JSONTrue, "properties", "uefi_support")
+		params.Add(jsonutils.JSONTrue, keyProperties, "uefi_support")
 	} else if args.BootMode == "BIOS" {
-		params.Add(jsonutils.JSONFalse, "properties", "uefi_support")
+		params.Add(jsonutils.JSONFalse, keyProperties, "uefi_support")
 	}
 	if len(args.VdiProtocol) > 0 {
-		params.Add(jsonutils.NewString(args.VdiProtocol), "properties", "vdi_protocol")
+		params.Add(jsonutils.NewString(args.VdiProtocol), keyProperties, "vdi_protocol")
+	}
+	if args.UsedByPostOverlay {
+		params.Add(jsonutils.NewString("true"), keyProperties, imageapi.IMAGE_USED_BY_POST_OVERLAY)
+	}
+	if len(args.InternalPathMap) > 0 {
+		dirMap := make(map[string]string)
+		for _, dir := range args.InternalPathMap {
+			parts := strings.Split(dir, ":")
+			if len(parts) != 2 {
+				return errors.Errorf("internal dir format error: %s", dir)
+			}
+			dirMap[parts[0]] = parts[1]
+		}
+		params.Add(jsonutils.NewString(jsonutils.Marshal(dirMap).String()), keyProperties, imageapi.IMAGE_INTERNAL_PATH_MAP)
 	}
 	return nil
 }

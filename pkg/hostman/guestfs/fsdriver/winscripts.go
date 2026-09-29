@@ -17,7 +17,7 @@ package fsdriver
 const WinScriptChangePassword = `
 
 $username = $args[0]
-$passwd = $args[1]
+$passwd = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($args[1]))
 $loghash = $args[2]
 $logpath = $args[3]
 Function ChangePassword($u, $p) {
@@ -473,11 +473,14 @@ function mtw_mount_disk() {
 }
 
 function mtw_extend_c() {
-    cmd_lines = [
+    mtw_execute_diskpart([
+        'select volume c',
+        'extend',
+    ]);
+    mtw_execute_diskpart([
         'select volume c',
         'extend filesystem',
-    ];
-    mtw_execute_diskpart(cmd_lines);
+    ]);
     mtw_append_debug(["extend c"], ["success"]);
 }
 

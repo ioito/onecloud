@@ -1,0 +1,343 @@
+package llm
+
+import (
+	"reflect"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/gotypes"
+	"yunion.io/x/pkg/util/sets"
+
+	"yunion.io/x/onecloud/pkg/apis"
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+)
+
+var (
+	LLM_SKU_BASE_NETWORK_TYPES = sets.NewString(
+		string(computeapi.NETWORK_TYPE_HOSTLOCAL),
+		string(computeapi.NETWORK_TYPE_GUEST),
+	)
+)
+
+func IsLLMSkuBaseNetworkType(t string) bool {
+	return LLM_SKU_BASE_NETWORK_TYPES.Has(t)
+}
+
+type HostInfo struct {
+	HostId       string `json:"host_id"`
+	Host         string `json:"host"`
+	HostAccessIp string `json:"host_access_ip"`
+	HostEIP      string `json:"host_eip"`
+}
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(&PortMappings{}), func() gotypes.ISerializable {
+		return &PortMappings{}
+	})
+	gotypes.RegisterSerializable(reflect.TypeOf(&Devices{}), func() gotypes.ISerializable {
+		return &Devices{}
+	})
+	gotypes.RegisterSerializable(reflect.TypeOf(&PortMappingEnvs{}), func() gotypes.ISerializable {
+		return &PortMappingEnvs{}
+	})
+	gotypes.RegisterSerializable(reflect.TypeOf(&Envs{}), func() gotypes.ISerializable {
+		return &Envs{}
+	})
+}
+
+type PortMappingEnv struct {
+	Key       string `json:"key"`
+	ValueFrom string `json:"value_from"`
+}
+
+type PortMappingEnvs []PortMappingEnv
+
+func (pm PortMappingEnvs) String() string {
+	return jsonutils.Marshal(pm).String()
+}
+
+func (pm PortMappingEnvs) IsZero() bool {
+	return len(pm) == 0
+}
+
+type PortMapping struct {
+	Protocol        string                           `json:"protocol" yaml:"protocol"`
+	ContainerPort   int                              `json:"container_port" yaml:"container_port"`
+	RemoteIps       []string                         `json:"remote_ips" yaml:"remote_ips,omitempty"`
+	FirstPortOffset *int                             `json:"first_port_offset" yaml:"first_port_offset,omitempty"`
+	Envs            []computeapi.GuestPortMappingEnv `json:"envs" yaml:"envs,omitempty"`
+}
+
+type PortMappings []PortMapping
+
+func (s PortMappings) String() string {
+	return jsonutils.Marshal(s).String()
+}
+
+func (s PortMappings) IsZero() bool {
+	return len(s) == 0
+}
+
+type Device struct {
+	DevType     string `json:"dev_type"`
+	SharingMode string `json:"sharing_mode,omitempty"`
+	Vendor      string `json:"vendor,omitempty"`
+	Model       string `json:"model"`
+	DevicePath  string `json:"device_path"`
+	// MemoryMb is optional per-device VRAM (MiB) for HAMI. When > 0 it is used
+	// as MemoryMb/MemoryRequest on pod create; otherwise claim is split evenly.
+	MemoryMb    int `json:"memory_mb,omitempty"`
+	SmUtilLimit int `json:"sm_util_limit,omitempty"`
+}
+
+type Devices []Device
+
+func (s Devices) String() string {
+	return jsonutils.Marshal(s).String()
+}
+
+func (s Devices) IsZero() bool {
+	return len(s) == 0
+}
+
+type Env struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type Envs []Env
+
+func (s Envs) String() string {
+	return jsonutils.Marshal(s).String()
+}
+
+func (s Envs) IsZero() bool {
+	return len(s) == 0
+}
+
+type LLMSkuDetails struct {
+	apis.SharableVirtualResourceDetails
+	// 当前大模型套餐包含的实例个数。
+	LLMCapacity int    `json:"llm_capacity"`
+	Image       string `json:"image"`
+	ImageLabel  string `json:"image_label"`
+	ImageName   string `json:"image_name"`
+	AppName     string `json:"app_name"`
+
+	MountedModelDetails []MountedModelInfo `json:"mounted_model_details"`
+
+	Template string `json:"template"`
+
+	// LLMType 为 SKU 类型（ollama/vllm/dify），与 llm_spec 一起带出
+	LLMType string `json:"llm_type"`
+	// LLMSpec 从 SKU 持久化字段带出，保证 list/show 与 create 一致
+	LLMSpec *LLMSpec `json:"llm_spec,omitempty"`
+
+	// Model source
+	Source              string   `json:"source"`
+	HuggingfaceRepoId   string   `json:"huggingface_repo_id"`
+	HuggingfaceFilename string   `json:"huggingface_filename"`
+	ModelScopeModelId   string   `json:"model_scope_model_id"`
+	ModelScopeFilePath  string   `json:"model_scope_file_path"`
+	LocalPath           string   `json:"local_path"`
+	PreferHosts         []string `json:"prefer_hosts,omitempty"`
+	// Model categories
+	Categories []string `json:"categories,omitempty"`
+	// Inference backend version and parameters
+	BackendVersion    string   `json:"backend_version"`
+	BackendParameters []string `json:"backend_parameters,omitempty"`
+
+	// VramClaimMb is computed from mounted InstantModel weight_size_bytes
+	// (EstimateClaimMb). Not persisted on the SKU row.
+	VramClaimMb int `json:"vram_claim_mb"`
+}
+
+type MountedAppResourceDetails struct {
+	MountedModels []string `json:"mounted_models"`
+}
+
+type LLMSKuBaseCreateInput struct {
+	apis.SharableVirtualResourceCreateInput
+
+	Cpu       int `json:"cpu"`
+	Memory    int `json:"memory"`
+	Bandwidth int `json:"bandwidth"`
+
+	// EnableCgroupCpu enables CPU CFS quota on the pod/container. Inference SKUs default to false.
+	EnableCgroupCpu *bool `json:"enable_cgroup_cpu"`
+	// EnableCgroupMemory enables memory hard limit on the pod/container. Inference SKUs default to false.
+	EnableCgroupMemory *bool `json:"enable_cgroup_memory"`
+
+	Volumes      *Volumes          `json:"volumes"`
+	HostPaths    *HostPaths        `json:"host_paths"`
+	PortMappings *PortMappings     `json:"port_mappings"`
+	Devices      *Devices          `json:"devices"`
+	Envs         *Envs             `json:"envs"`
+	Properties   map[string]string `json:"properties"`
+}
+
+type LLMSkuBaseUpdateInput struct {
+	apis.SharableVirtualResourceBaseUpdateInput
+
+	Cpu    *int `json:"cpu"`
+	Memory *int `json:"memory"`
+
+	EnableCgroupCpu    *bool `json:"enable_cgroup_cpu"`
+	EnableCgroupMemory *bool `json:"enable_cgroup_memory"`
+
+	// RequstSyncImage *bool `json:"request_sync_image"`
+
+	DiskSize    *int       `json:"disk_size" yunion-deprecated-by:"disk_size_mb"`
+	DiskSizeMB  *int       `json:"disk_size_mb"`
+	TemplateId  *string    `json:"template_id"`
+	StorageType *string    `json:"storage_type"`
+	Volumes     *Volumes   `json:"volumes"`
+	HostPaths   *HostPaths `json:"host_paths"`
+
+	Bandwidth    *int              `json:"bandwidth"`
+	PortMappings *PortMappings     `json:"port_mappings"`
+	Devices      *Devices          `json:"devices"`
+	Envs         *Envs             `json:"envs"`
+	Properties   map[string]string `json:"properties"`
+}
+
+type LLMSkuListInput struct {
+	apis.SharableVirtualResourceListInput
+	MountedModelResourceListInput
+
+	LLMType    string   `json:"llm_type"`
+	LLMTypes   []string `json:"llm_types"`
+	Source     string   `json:"source"`
+	Categories string   `json:"categories"`
+}
+
+type LLMSkuCreateInput struct {
+	LLMSKuBaseCreateInput
+	MountedModelResourceCreateInput
+
+	LLMImageId string `json:"llm_image_id"`
+	LLMType    string `json:"llm_type"`
+	// ModelSpec is the normalized model import input used by SKU import flows.
+	// Catalog/model-set imports should expand the selected model spec into this
+	// shape before creating the SKU.
+	ModelSpec *InstantModelImportInput `json:"model_spec,omitempty"`
+
+	// LLMSpec:
+	// - ollama/vllm: backend builds llm_spec from llm_image_id + mounted_models; for vllm preferred model should be set in llm_spec.vllm.preferred_model.
+	// - dify: client must send llm_spec with type "dify" and dify payload.
+	LLMSpec *LLMSpec `json:"llm_spec,omitempty"`
+
+	// Model source
+	Source              string   `json:"source"`
+	HuggingfaceRepoId   string   `json:"huggingface_repo_id"`
+	HuggingfaceFilename string   `json:"huggingface_filename"`
+	ModelScopeModelId   string   `json:"model_scope_model_id"`
+	ModelScopeFilePath  string   `json:"model_scope_file_path"`
+	LocalPath           string   `json:"local_path"`
+	PreferHosts         []string `json:"prefer_hosts,omitempty"`
+	// Model categories
+	Categories []string `json:"categories"`
+	// Inference backend version and parameters
+	BackendVersion    string   `json:"backend_version"`
+	BackendParameters []string `json:"backend_parameters"`
+}
+
+type LLMSkuUpdateInput struct {
+	LLMSkuBaseUpdateInput
+	MountedModelResourceUpdateInput
+
+	LLMImageId string `json:"llm_image_id"`
+
+	// LLMSpec:
+	// - dify: send full spec to update image ids.
+	// - ollama/vllm: backend may build from llm_image_id/mounted_models; for vllm preferred model should be set in llm_spec.vllm.preferred_model.
+	LLMSpec *LLMSpec `json:"llm_spec,omitempty"`
+
+	// Model source
+	Source              *string `json:"source,omitempty"`
+	HuggingfaceRepoId   *string `json:"huggingface_repo_id,omitempty"`
+	HuggingfaceFilename *string `json:"huggingface_filename,omitempty"`
+	ModelScopeModelId   *string `json:"model_scope_model_id,omitempty"`
+	ModelScopeFilePath  *string `json:"model_scope_file_path,omitempty"`
+	LocalPath           *string `json:"local_path,omitempty"`
+	// PreferHosts updates SKU prefer_hosts. Omitted means unchanged; an explicit
+	// value is required for local_path SKUs and rejected otherwise.
+	PreferHosts []string `json:"prefer_hosts"`
+	// Model categories
+	Categories *[]string `json:"categories,omitempty"`
+	// Inference backend version and parameters
+	BackendVersion    *string   `json:"backend_version,omitempty"`
+	BackendParameters *[]string `json:"backend_parameters,omitempty"`
+}
+
+// LLMSkuCloneInput is the body for POST /llm_skus/{id}/clone.
+// Specs are copied from the source SKU; the caller supplies a new name.
+type LLMSkuCloneInput struct {
+	Name         string `json:"name"`
+	GenerateName string `json:"generate_name"`
+	Description  string `json:"description"`
+}
+
+// type LLMModelSyncImageRequestTaskInput struct {
+// 	Request bool `json:"request"`
+// }
+
+// type DifySkulListInput struct {
+// 	apis.SharableVirtualResourceListInput
+// 	MountedModelResourceListInput
+// }
+
+// type DifySkuCreateInput struct {
+// 	LLMSKuBaseCreateInput
+
+// 	PostgresImageId     string `json:"postgres_image_id"`
+// 	RedisImageId        string `json:"redis_image_id"`
+// 	NginxImageId        string `json:"nginx_image_id"`
+// 	DifyApiImageId      string `json:"dify_api_image_id"`
+// 	DifyPluginImageId   string `json:"dify_plugin_image_id"`
+// 	DifyWebImageId      string `json:"dify_web_image_id"`
+// 	DifySandboxImageId  string `json:"dify_sandbox_image_id"`
+// 	DifySSRFImageId     string `json:"dify_ssrf_image_id"`
+// 	DifyWeaviateImageId string `json:"dify_weaviate_image_id"`
+// }
+
+// type DifySkuUpdateInput struct {
+// 	LLMSkuBaseUpdateInput
+
+// 	PostgresImageId     string `json:"postgres_image_id"`
+// 	RedisImageId        string `json:"redis_image_id"`
+// 	NginxImageId        string `json:"nginx_image_id"`
+// 	DifyApiImageId      string `json:"dify_api_image_id"`
+// 	DifyPluginImageId   string `json:"dify_plugin_image_id"`
+// 	DifyWebImageId      string `json:"dify_web_image_id"`
+// 	DifySandboxImageId  string `json:"dify_sandbox_image_id"`
+// 	DifySSRFImageId     string `json:"dify_ssrf_image_id"`
+// 	DifyWeaviateImageId string `json:"dify_weaviate_image_id"`
+// }
+
+// LLMSchedulableCheckInput is the body for
+// POST /llm_skus/{id}/schedulable-check. Specs come from the SKU; the body is empty.
+type LLMSchedulableCheckInput struct{}
+
+// LLMSchedulableHostInfo describes GPU availability on one candidate host.
+type LLMSchedulableHostInfo struct {
+	HostId        string `json:"host_id"`
+	HostName      string `json:"host_name"`
+	GpuAvailable  int    `json:"gpu_available"`
+	BestGpuVramMb int    `json:"best_gpu_vram_mb"`
+	BestGpuModel  string `json:"best_gpu_model,omitempty"`
+}
+
+// LLMSchedulableCheckOutput mirrors GPUStack's ModelEvaluationResult:
+// a yes/no verdict plus per-host detail so the caller can surface a
+// meaningful message ("not enough VRAM on any host", "host X qualifies", …).
+type LLMSchedulableCheckOutput struct {
+	Schedulable        bool                     `json:"schedulable"`
+	VramClaimMb        int                      `json:"vram_claim_mb"`
+	PerDevMinMb        int                      `json:"per_dev_min_mb"`
+	GpuCount           int                      `json:"gpu_count"`
+	Reason             string                   `json:"reason,omitempty"`
+	FilteredCandidates jsonutils.JSONObject     `json:"filtered_candidates,omitempty"`
+	Hosts              []LLMSchedulableHostInfo `json:"hosts,omitempty"`
+	TotalGpuHosts      int                      `json:"total_gpu_hosts"`
+	QualifiedHosts     int                      `json:"qualified_hosts"`
+}

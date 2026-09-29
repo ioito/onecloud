@@ -15,12 +15,16 @@
 package options
 
 import (
+	"strings"
+
+	"yunion.io/x/log"
+
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/cloudcommon/pending_delete"
 )
 
 type SImageOptions struct {
-	common_options.HostCommonOptions
+	common_options.HostCommonOptions `"s3_bucket_name->default":"onecloud-images" "s3_bucket_lifecycle_keep_day->default":"0"`
 
 	common_options.DBOptions
 
@@ -40,17 +44,27 @@ type SImageOptions struct {
 
 	TorrentClientPath string `help:"path to torrent executable" default:"/opt/yunion/bin/torrent"`
 
+	DefaultImageServiceHomeDir string `help:"Default image service home dir" default:"/opt/cloud/workspace/data/glance"`
+
 	// DeployServerSocketPath string `help:"Deploy server listen socket path" default:"/var/run/onecloud/deploy.sock"`
 
-	StorageDriver string `help:"image backend storage" default:"local" choices:"s3|local"`
+	StorageDriver string `help:"image backend storage" default:"local" choices:"s3|local|nfs"`
 
-	S3AccessKey        string `help:"s3 access key"`
-	S3SecretKey        string `help:"s3 secret key"`
-	S3Endpoint         string `help:"s3 endpoint"`
-	S3UseSSL           bool   `help:"s3 access use ssl"`
-	S3BucketName       string `help:"s3 bucket name" default:"onecloud-images"`
 	S3MountPoint       string `help:"s3fs mount point" default:"/opt/cloud/workspace/data/glance/s3images"`
 	S3CheckImageStatus bool   `help:"Enable s3 check image status"`
+	S3SignVersion      string `help:"signing version"`
+	S3UploadPartSizeMb int64  `help:"s3 upload part size in MB, default to 50MB" default:"50"`
+	S3UploadParallel   int    `help:"s3 upload parallel count" default:"4"`
+
+	S3DirectDownload bool `help:"enable s3 direct download" default:"false"`
+
+	NfsStorageId    string `help:"region nfs storage id or name used as glance filesystem backend"`
+	NfsMountOptions string `help:"nfs mount options for glance filesystem backend"`
+	NfsMountPoint   string `help:"nfs mount point" default:"/opt/cloud/workspace/data/glance/nfsimages"`
+
+	ImageStreamWorkerCount int `help:"Image stream worker count" default:"10"`
+
+	VerifyImageStatusIntervalMinutes int `help:"verify image status periodically, default 15 minutes" default:"15"`
 }
 
 var (
@@ -77,4 +91,25 @@ func OnOptionsChange(oldO, newO interface{}) bool {
 	}
 
 	return changed
+}
+
+func (opt SImageOptions) HasValidS3Options() bool {
+	msg := []string{}
+	if len(opt.S3Endpoint) <= 0 {
+		msg = append(msg, "s3_endpoint is required")
+	}
+	if len(opt.S3AccessKey) <= 0 {
+		msg = append(msg, "s3_access_key is required")
+	}
+	if len(opt.S3SecretKey) <= 0 {
+		msg = append(msg, "s3_secret_key is required")
+	}
+	if len(opt.S3BucketName) <= 0 {
+		msg = append(msg, "s3_bucket_name is required")
+	}
+	if len(msg) > 0 {
+		log.Errorf("invalid s3 options: %s", strings.Join(msg, ", "))
+		return false
+	}
+	return true
 }

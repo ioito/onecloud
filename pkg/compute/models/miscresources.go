@@ -189,9 +189,10 @@ func (self *SMiscResource) SyncWithCloudMiscResource(ctx context.Context, userCr
 	if err != nil {
 		return err
 	}
-
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
-	SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider.Id)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
+	SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -228,8 +229,8 @@ func (self *SCloudregion) newFromCloudMiscResource(ctx context.Context, userCred
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, &misc, ext)
-	SyncCloudProject(ctx, userCred, &misc, provider.GetOwnerId(), ext, provider.Id)
+	syncVirtualResourceMetadata(ctx, userCred, &misc, ext, false)
+	SyncCloudProject(ctx, userCred, &misc, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(&misc, db.ACT_CREATE, misc.GetShortDesc(ctx), userCred)
 
@@ -321,6 +322,15 @@ func (manager *SMiscResourceManager) QueryDistinctExtraField(q *sqlchemy.SQuery,
 		return q, nil
 	}
 
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SMiscResourceManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
 	return q, httperrors.ErrNotFound
 }
 

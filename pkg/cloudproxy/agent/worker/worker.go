@@ -25,6 +25,7 @@ import (
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apihelper"
@@ -35,6 +36,7 @@ import (
 	agentssh "yunion.io/x/onecloud/pkg/cloudproxy/agent/ssh"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	cloudproxy_modules "yunion.io/x/onecloud/pkg/mcclient/modules/cloudproxy"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/yunionconf"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
 	ssh_util "yunion.io/x/onecloud/pkg/util/ssh"
 )
@@ -118,7 +120,7 @@ func (w *Worker) initProxyAgent_(ctx context.Context) error {
 	)
 	if agentDetail.BindAddr == "" || !bindAddrExist(bindAddr) {
 		var err error
-		bindAddr, err = netutils2.MyIP()
+		bindAddr, err = netutils2.MyIPSmart()
 		if err != nil {
 			return errors.Wrap(err, "find bind Addr")
 		}
@@ -207,6 +209,7 @@ func (w *Worker) Start(ctx context.Context) {
 func (w *Worker) run(ctx context.Context, mss *agentmodels.ModelSets) (err error) {
 	defer func() {
 		if panicVal := recover(); panicVal != nil {
+			yunionconf.BugReport.SendBugReport(context.Background(), version.GetShortString(), string(debug.Stack()), errors.Errorf("%s", panicVal))
 			if panicErr, ok := panicVal.(runtime.Error); ok {
 				err = errors.Wrap(panicErr, string(debug.Stack()))
 			} else if panicErr, ok := panicVal.(error); ok {

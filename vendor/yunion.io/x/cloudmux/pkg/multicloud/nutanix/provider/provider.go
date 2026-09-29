@@ -143,6 +143,10 @@ type SNutanixProvider struct {
 	client *nutanix.SNutanixClient
 }
 
+func (self *SNutanixProvider) GetCloudRegionExternalIdPrefix() string {
+	return self.client.GetCloudRegionExternalIdPrefix()
+}
+
 func (self *SNutanixProvider) GetSysInfo() (jsonutils.JSONObject, error) {
 	return jsonutils.NewDict(), nil
 }
@@ -159,12 +163,15 @@ func (self *SNutanixProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SNutanixProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SNutanixProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
 func (self *SNutanixProvider) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	regions := self.GetIRegions()
+	regions, err := self.GetIRegions()
+	if err != nil {
+		return nil, err
+	}
 	for i := range regions {
 		if regions[i].GetGlobalId() == id {
 			return regions[i], nil
@@ -183,7 +190,6 @@ func (self *SNutanixProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) 
 
 func (self *SNutanixProvider) GetIProjects() ([]cloudprovider.ICloudProject, error) {
 	return []cloudprovider.ICloudProject{}, nil
-	//return self.client.GetIProjects()
 }
 
 func (self *SNutanixProvider) GetStorageClasses(regionId string) []string {

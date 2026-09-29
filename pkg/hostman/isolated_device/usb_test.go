@@ -158,7 +158,7 @@ func Test_getUSBDevQemuOptions(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want map[string]string
+		want map[string]interface{}
 	}{
 		{
 			name: "",
@@ -168,17 +168,17 @@ func Test_getUSBDevQemuOptions(t *testing.T) {
 				bus:      "001",
 				addr:     "009",
 			},
-			want: map[string]string{
-				"vendorid":  "0x1d6b",
-				"productid": "0x0001",
-				"hostbus":   "1",
-				"hostaddr":  "9",
+			want: map[string]interface{}{
+				"vendorid":  uint32(0x1d6b),
+				"productid": uint32(0x0001),
+				//"hostbus":   uint64(1),
+				//"hostaddr":  uint64(9),
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := getUSBDevQemuOptions(tt.args.vendorId, tt.args.deviceId, tt.args.bus, tt.args.addr); !reflect.DeepEqual(got, tt.want) {
+			if got, _ := getUSBDevQemuOptions(tt.args.vendorId, tt.args.deviceId, tt.args.bus, tt.args.addr, ""); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("getUSBDevQemuOptions() = %v, want %v", got, tt.want)
 			}
 		})

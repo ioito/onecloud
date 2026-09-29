@@ -23,15 +23,21 @@ import (
 )
 
 type StorageUsage struct {
-	HostCount     int
-	DiskCount     int
-	SnapshotCount int
-	Used          int64
-	Wasted        int64
+	HostCount     int   `json:"host_count"`
+	DiskCount     int   `json:"disk_count"`
+	SnapshotCount int   `json:"snapshot_count"`
+	Used          int64 `json:"used"`
+	Wasted        int64 `json:"wasted"`
 }
 
 func (self StorageUsage) IsZero() bool {
 	return self.HostCount+self.DiskCount+self.SnapshotCount == 0
+}
+
+type StorageHardwareInfo struct {
+	Model     *string `json:"model"`
+	Vendor    *string `json:"vendor"`
+	Bandwidth float64 `json:"bandwidth" help:"Bandwidth of the device, and the unit is GB/s"`
 }
 
 type StorageCreateInput struct {
@@ -54,12 +60,12 @@ type StorageCreateInput struct {
 	// local: 本地存储
 	// rbd: ceph块存储, ceph存储创建时仅会检测是否重复创建，不会具体检测认证参数是否合法，只有挂载存储时
 	// 计算节点会验证参数，若挂载失败，宿主机和存储不会关联，可以通过查看存储日志查找挂载失败原因
-	// enum: local, rbd, nfs, gpfs
+	// enum: ["local", "rbd", "nfs", "gpfs"]
 	// required: true
 	StorageType string `json:"storage_type"`
 
 	// 存储介质类型
-	// enum: rotate, ssd, hybird
+	// enum: ["rotate", "ssd", "hybird"]
 	// required: true
 	// default: ssd
 	MediumType string `json:"medium_type"`
@@ -71,15 +77,21 @@ type StorageCreateInput struct {
 	// example: 192.168.222.3,192.168.222.4,192.168.222.99
 	RbdMonHost string `json:"rbd_mon_host"`
 
+	// enable ceph messenger v2
+	EnableMessengerV2 *bool `json:"enable_messenger_v2"`
+
+	// rbd storage auto cache glance images
+	AutoCacheImages *bool `json:"auto_cache_images"`
+
 	// swagger:ignore
-	MonHost string
+	MonHost string `json:"mon_host"`
 
 	// ceph使用的pool, storage_type为 rbd 时,此参数为必传项
 	// example: rbd
 	RbdPool string `json:"rbd_pool"`
 
 	// swagger:ignore
-	Pool string
+	Pool string `json:"pool"`
 
 	// ceph集群密码,若ceph集群开启cephx认证,此参数必传
 	// 可在ceph集群主机的/etc/ceph/ceph.client.admin.keyring文件中找到
@@ -87,12 +99,12 @@ type StorageCreateInput struct {
 	RbdKey string `json:"rbd_key"`
 
 	// swagger:ignore
-	Key string
+	Key string `json:"key"`
 
 	RbdTimeoutInput
 
 	// swagger:ignore
-	ClientMountTimeout int
+	ClientMountTimeout int `json:"client_mount_timeout"`
 
 	// swagger:ignore
 	StorageConf *jsonutils.JSONDict
@@ -104,6 +116,14 @@ type StorageCreateInput struct {
 	// 网络文件系统共享目录, storage_type 为 nfs 时, 此参数必传
 	// example: /nfs_root/
 	NfsSharedDir string `json:"nfs_shared_dir"`
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	// CLVM VG Name
+	CLVMVgName string `json:"clvm_vg_name"`
+	// SLVM VG Name
+	SLVMVgName string `json:"slvm_vg_name"`
+	Lvmlockd   bool   `json:"lvmlockd"`
 }
 
 type RbdTimeoutInput struct {
@@ -112,14 +132,14 @@ type RbdTimeoutInput struct {
 	RbdRadosMonOpTimeout int `json:"rbd_rados_mon_op_timeout"`
 
 	// swagger:ignore
-	RadosMonOpTimeout int
+	RadosMonOpTimeout int `json:"rados_mon_op_timeout"`
 
 	// ceph osd 操作超时时间, 单位秒
 	// default: 1200
 	RbdRadosOsdOpTimeout int `json:"rbd_rados_osd_op_timeout"`
 
 	// swagger:ignore
-	RadosOsdOpTimeout int
+	RadosOsdOpTimeout int `json:"rados_osd_op_timeout"`
 
 	// ceph CephFS挂载超时时间, 单位秒
 	// default: 120
@@ -140,10 +160,10 @@ type SStorageCapacityInfo struct {
 }
 
 type StorageHost struct {
-	Id         string
-	Name       string
-	Status     string
-	HostStatus string
+	Id         string `json:"id"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	HostStatus string `json:"host_status"`
 }
 
 type StorageDetails struct {
@@ -165,6 +185,9 @@ type StorageDetails struct {
 
 	// 超分比
 	CommitBound float32 `json:"commit_bound"`
+
+	// master host name
+	MasterHostName string `json:"master_host_name"`
 }
 
 func (self StorageDetails) GetMetricTags() map[string]string {
@@ -177,7 +200,7 @@ func (self StorageDetails) GetMetricTags() map[string]string {
 		"project_domain": self.ProjectDomain,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo)
 }
 
 func (self StorageDetails) GetMetricPairs() map[string]string {
@@ -224,10 +247,35 @@ type StorageUpdateInput struct {
 	// example: AQDigB9dtnDAKhAAxS6X4zi4BPR/lIle4nf4Dw==
 	RbdKey string `json:"rbd_key"`
 
+	// enable ceph messenger v2
+	EnableMessengerV2 *bool `json:"enable_messenger_v2"`
+	// rbd storage auto cache glance images
+	AutoCacheImages *bool `json:"auto_cache_images"`
+
 	RbdTimeoutInput
 
 	// swagger:ignore
-	StorageConf *jsonutils.JSONDict
+	StorageConf *jsonutils.JSONDict `json:"storage_conf"`
 
-	UpdateStorageConf bool
+	UpdateStorageConf bool `json:"update_storage_conf"`
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	MasterHost   string               `json:"master_host"`
+}
+
+type RbdStorageConf struct {
+	RadosMonOpTimeout  int `json:"rados_mon_op_timeout"`
+	RadosOsdOpTimeout  int `json:"rados_osd_op_timeout"`
+	ClientMountTimeout int `json:"client_mount_timeout"`
+
+	MonHost           string `json:"mon_host"`
+	Pool              string `json:"pool"`
+	Key               string `json:"key"`
+	EnableMessengerV2 bool   `json:"enable_messenger_v2"`
+	AutoCacheImages   bool   `json:"auto_cache_images"`
+}
+
+type StorageSetCmtBoundInput struct {
+	Cmtbound *float32
 }

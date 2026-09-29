@@ -49,24 +49,6 @@ type KeypairListInput struct {
 	Fingerprint []string `json:"fingerprint"`
 }
 
-type CachedimageListInput struct {
-	apis.SharableVirtualResourceListInput
-	apis.ExternalizedResourceBaseListInput
-
-	ManagedResourceListInput
-	ZonalFilterListInput
-
-	// 镜像类型，可能值为: system(公有云公共镜像), customized(自定义镜像)
-	// example: system
-	ImageType []string `json:"image_type"`
-
-	// filter by host schedtag
-	HostSchedtagId string `json:"host_schedtag_id"`
-
-	// valid cachedimage
-	Valid *bool `json:"valid"`
-}
-
 type ExternalProjectListInput struct {
 	apis.VirtualResourceListInput
 	apis.ExternalizedResourceBaseListInput
@@ -158,12 +140,19 @@ type ServiceCatalogListInput struct {
 
 type SnapshotPolicyListInput struct {
 	apis.VirtualResourceListInput
+	apis.ExternalizedResourceBaseListInput
+	ManagedResourceListInput
+	RegionalFilterListInput
 
 	// 按绑定的磁盘数量排序
 	// pattern:asc|desc
 	OrderByBindDiskCount string `json:"order_by_bind_disk_count"`
-	// 是否启用？
-	IsActivated *bool `json:"is_activated"`
+	OrderBySnapshotCount string `json:"order_by_snapshot_count"`
+	// 按类型过滤
+	// example: disk, server
+	Type string `json:"type"`
+
+	ResourceId []string `json:"resource_id"`
 }
 
 type HostnameInput struct {

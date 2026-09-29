@@ -15,10 +15,8 @@
 package service
 
 import (
-	"context"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"strconv"
@@ -36,23 +34,22 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
-	"yunion.io/x/onecloud/pkg/webconsole"
 	"yunion.io/x/onecloud/pkg/webconsole/models"
 	o "yunion.io/x/onecloud/pkg/webconsole/options"
 	"yunion.io/x/onecloud/pkg/webconsole/server"
 )
-
-func ensureBinExists(binPath string) {
-	if _, err := os.Stat(binPath); os.IsNotExist(err) {
-		log.Fatalf("Binary %s not exists", binPath)
-	}
-}
 
 func StartService() {
 
 	opts := &o.Options
 	commonOpts := &o.Options.CommonOptions
 	common_options.ParseOptions(opts, os.Args, "webconsole.conf", api.SERVICE_TYPE)
+
+	app_common.InitAuth(commonOpts, func() {
+		log.Infof("Auth complete")
+	})
+
+	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, o.OnOptionsChange)
 
 	if opts.ApiServer == "" {
 		log.Fatalf("--api-server must specified")
@@ -61,16 +58,6 @@ func StartService() {
 	if err != nil {
 		log.Fatalf("invalid --api-server %s", opts.ApiServer)
 	}
-
-	for _, binPath := range []string{opts.IpmitoolPath} {
-		ensureBinExists(binPath)
-	}
-
-	app_common.InitAuth(commonOpts, func() {
-		log.Infof("Auth complete")
-	})
-
-	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, o.OnOptionsChange)
 
 	registerSigTraps()
 	start()
@@ -90,7 +77,7 @@ func start() {
 
 	cloudcommon.InitDB(dbOpts)
 
-	webconsole.InitHandlers(app)
+	initHandlers(app, baseOpts.IsSlaveNode)
 
 	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
 
@@ -98,35 +85,36 @@ func start() {
 	root.UseEncodedPath()
 
 	// api handler
-	root.PathPrefix(webconsole.ApiPathPrefix).Handler(app)
+	root.PathPrefix(ApiPathPrefix).Handler(app)
 
 	srv := server.NewConnectionServer()
 	// websocket command text console handler
-	root.Handle(webconsole.ConnectPathPrefix, srv)
+	root.Handle(ConnectPathPrefix, srv)
 
 	// websockify graphic console handler
-	root.Handle(webconsole.WebsockifyPathPrefix, srv)
+	root.Handle(WebsockifyPathPrefix, srv)
 
 	// websocketproxy handler
-	root.Handle(webconsole.WebsocketProxyPathPrefix, srv)
+	root.Handle(WebsocketProxyPathPrefix, srv)
 
 	// misc handler
-	addMiscHandlers(app, root)
+	appsrv.AddMiscHandlersToMuxRouter(app, root, o.Options.EnableAppProfiling)
 
-	cron := cronman.InitCronJobManager(true, o.Options.CronJobWorkerCount)
+	if !baseOpts.IsSlaveNode {
+		cron := cronman.InitCronJobManager(true, o.Options.CronJobWorkerCount, o.Options.TimeZone)
 
-	cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
+		cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
 
-	cron.Start()
-	defer cron.Stop()
+		cron.Start()
+		defer cron.Stop()
+	}
 
 	addr := net.JoinHostPort(o.Options.Address, strconv.Itoa(o.Options.Port))
 	log.Infof("Start listen on %s", addr)
 	if o.Options.EnableSsl {
-		err := http.ListenAndServeTLS(addr,
-			o.Options.SslCertfile,
-			o.Options.SslKeyfile,
-			root)
+		srv := appsrv.InitHTTPServer(app, addr)
+		srv.Handler = root
+		err := srv.ListenAndServeTLS(o.Options.SslCertfile, o.Options.SslKeyfile)
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("%v", err)
 		}
@@ -136,21 +124,4 @@ func start() {
 			log.Fatalf("%v", err)
 		}
 	}
-}
-
-func addMiscHandlers(app *appsrv.Application, root *mux.Router) {
-	adapterF := func(appHandleFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			appHandleFunc(app.GetContext(), w, r)
-		}
-	}
-
-	// ref: pkg/appsrv/appsrv:addDefaultHandlers
-	root.HandleFunc("/version", adapterF(appsrv.VersionHandler))
-	root.HandleFunc("/stats", adapterF(appsrv.StatisticHandler))
-	root.HandleFunc("/ping", adapterF(appsrv.PingHandler))
-	root.HandleFunc("/worker_stats", adapterF(appsrv.WorkerStatsHandler))
-
-	// pprof handler
-	root.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
 }

@@ -23,11 +23,12 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/ansibleserver/options"
 	"yunion.io/x/onecloud/pkg/apis"
-	api "yunion.io/x/onecloud/pkg/apis/ansible"
+	api "yunion.io/x/onecloud/pkg/apis/ansibleserver"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -43,6 +44,7 @@ import (
 
 type SAnsiblePlaybook struct {
 	db.SVirtualResourceBase
+	db.SEnabledResourceBase `enabled->default:"" enabled->nullable:"true"`
 
 	Playbook  *ansible.Playbook `length:"text" nullable:"false" create:"required" get:"user" update:"user"`
 	Output    string            `length:"medium" get:"user"`
@@ -52,6 +54,7 @@ type SAnsiblePlaybook struct {
 
 type SAnsiblePlaybookManager struct {
 	db.SVirtualResourceBaseManager
+	db.SEnabledResourceBaseManager
 
 	sessions    ansible.SessionManager
 	sessionsMux *sync.Mutex
@@ -73,9 +76,44 @@ func init() {
 	AnsiblePlaybookManager.SetVirtualObject(AnsiblePlaybookManager)
 }
 
+// requireSystemAdmin is required to enable a playbook.
+func requireSystemAdmin(userCred mcclient.TokenCredential) error {
+	if userCred == nil || !userCred.HasSystemAdminPrivilege() {
+		return httperrors.NewForbiddenError("enabling ansible playbook requires system admin privilege")
+	}
+	return nil
+}
+
+// applyPlaybookEnabledByCred sets enabled on create/update: system admin
+// defaults to enabled, others are always disabled.
+func applyPlaybookEnabledByCred(userCred mcclient.TokenCredential, data *jsonutils.JSONDict) {
+	if userCred != nil && userCred.HasSystemAdminPrivilege() {
+		if !data.Contains("enabled") {
+			data.Set("enabled", jsonutils.JSONTrue)
+		}
+		return
+	}
+	data.Set("enabled", jsonutils.JSONFalse)
+}
+
+func ensurePlaybookEnabled(enabled bool) error {
+	if !enabled {
+		return httperrors.NewForbiddenError("playbook is not enabled")
+	}
+	return nil
+}
+
+func (man *SAnsiblePlaybookManager) ListItemFilter(ctx context.Context, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query api.AnsiblePlaybookListInput) (*sqlchemy.SQuery, error) {
+	q, err := man.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, query.VirtualResourceListInput)
+	if err != nil {
+		return nil, err
+	}
+	return man.SEnabledResourceBaseManager.ListItemFilter(ctx, q, userCred, query.EnabledResourceBaseListInput)
+}
+
 func (man *SAnsiblePlaybookManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	pbV := NewAnsiblePlaybookValidator("playbook", userCred)
-	if err := pbV.Validate(data); err != nil {
+	if err := pbV.Validate(ctx, data); err != nil {
 		return nil, err
 	}
 	data.Set("status", jsonutils.NewString(api.AnsiblePlaybookStatusInit))
@@ -90,11 +128,15 @@ func (man *SAnsiblePlaybookManager) ValidateCreateData(ctx context.Context, user
 		return nil, err
 	}
 	data.Update(jsonutils.Marshal(input))
+	applyPlaybookEnabledByCred(userCred, data)
 	return data, nil
 }
 
 func (apb *SAnsiblePlaybook) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	apb.SVirtualResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	if !apb.GetEnabled() {
+		return
+	}
 	err := apb.runPlaybook(ctx, userCred)
 	if err != nil {
 		log.Errorf("postCreate: runPlaybook: %v", err)
@@ -118,6 +160,28 @@ func (man *SAnsiblePlaybookManager) InitializeData() error {
 			log.Errorf("set playbook %s(%s) to unknown state: %v", pb.Name, pb.Id, err)
 		}
 	}
+	if err := man.eanbleExistingPlaybooks(); err != nil {
+		return errors.Wrap(err, "enable existing playbooks")
+	}
+	return nil
+}
+
+func (man *SAnsiblePlaybookManager) eanbleExistingPlaybooks() error {
+	pbs := []SAnsiblePlaybookV2{}
+	q := AnsiblePlaybookV2Manager.Query().IsNull("enabled")
+	if err := db.FetchModelObjects(AnsiblePlaybookV2Manager, q, &pbs); err != nil {
+		return errors.Wrap(err, "fetch running playbooks")
+	}
+	for i := 0; i < len(pbs); i++ {
+		pb := &pbs[i]
+		_, err := db.Update(pb, func() error {
+			pb.Enabled = tristate.True
+			return nil
+		})
+		if err != nil {
+			log.Errorf("enable playbook %s(%s): %v", pb.Name, pb.Id, err)
+		}
+	}
 	return nil
 }
 
@@ -137,20 +201,47 @@ func (apb *SAnsiblePlaybook) ValidateUpdateCondition(ctx context.Context) error 
 
 func (apb *SAnsiblePlaybook) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	pbV := NewAnsiblePlaybookValidator("playbook", userCred)
-	if err := pbV.Validate(data); err != nil {
+	if err := pbV.Validate(ctx, data); err != nil {
 		return nil, err
 	}
 	apb.Playbook = pbV.Playbook // Update as a whole
 	data.Set("status", jsonutils.NewString(api.AnsiblePlaybookStatusInit))
+	applyPlaybookEnabledByCred(userCred, data)
+	if enabled, err := data.Bool("enabled"); err == nil {
+		apb.SetEnabled(enabled)
+	}
 	return data, nil
 }
 
 func (apb *SAnsiblePlaybook) PostUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	apb.SVirtualResourceBase.PostUpdate(ctx, userCred, query, data)
+	if !apb.GetEnabled() {
+		return
+	}
 	err := apb.runPlaybook(ctx, userCred)
 	if err != nil {
 		log.Errorf("postUpdate: runPlaybook: %v", err)
 	}
+}
+
+func (apb *SAnsiblePlaybook) PerformEnable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformEnableInput) (jsonutils.JSONObject, error) {
+	if err := requireSystemAdmin(userCred); err != nil {
+		return nil, err
+	}
+	if err := ansible.ValidatePlaybook(apb.Playbook); err != nil {
+		return nil, httperrors.NewInputParameterError("%s", err.Error())
+	}
+	if err := db.EnabledPerformEnable(apb, ctx, userCred, true); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (apb *SAnsiblePlaybook) PerformDisable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformDisableInput) (jsonutils.JSONObject, error) {
+	if err := db.EnabledPerformEnable(apb, ctx, userCred, false); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func (apb *SAnsiblePlaybook) PerformRun(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -176,14 +267,20 @@ func (apb *SAnsiblePlaybook) runPlaybook(ctx context.Context, userCred mcclient.
 	if man.sessions.Has(apb.Id) {
 		return fmt.Errorf("playbook is already running")
 	}
+	if err := ensurePlaybookEnabled(apb.GetEnabled()); err != nil {
+		return err
+	}
 
 	// init private key
 	pb := apb.Playbook.Copy()
-	if len(pb.PrivateKey) == 0 {
-		if k, err := compute.Sshkeypairs.FetchPrivateKey(ctx, userCred); err != nil {
-			return err
+	if err := ansible.ValidatePlaybook(pb); err != nil {
+		return err
+	}
+	if len(pb.PrivateKeys) == 0 {
+		if keys, err := compute.Sshkeypairs.FetchProjectPrivateKeys(ctx, userCred); err != nil {
+			return errors.Wrap(err, "unable to fetch private keys")
 		} else {
-			pb.PrivateKey = []byte(k)
+			pb.PrivateKeys = keys
 		}
 	}
 	// init tmpdir clean policy

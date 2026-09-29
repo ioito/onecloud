@@ -16,6 +16,7 @@ package guestman
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io/ioutil"
 	"path"
@@ -31,13 +32,14 @@ import (
 	"yunion.io/x/pkg/util/netutils"
 
 	"yunion.io/x/onecloud/pkg/apis/compute"
-	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 )
+
+const defaultLibvirtLiveConfigPath = "/var/run/libvirt/qemu"
 
 func (m *SGuestManager) GuestCreateFromLibvirt(
 	ctx context.Context, params interface{},
@@ -67,18 +69,13 @@ func (m *SGuestManager) GuestCreateFromLibvirt(
 		}
 		disksPath.Set(disk.DiskId, jsonutils.NewString(iDisk.GetPath()))
 	}
-	guest, _ := m.GetServer(createConfig.Sid)
-	if err := guest.SaveSourceDesc(createConfig.GuestDesc); err != nil {
-		return nil, err
-	}
-	guest.Desc = new(desc.SGuestDesc)
-	jsonutils.Marshal(createConfig.GuestDesc).Unmarshal(guest.Desc)
-	if err := guest.SaveLiveDesc(guest.Desc); err != nil {
+	guest, _ := m.GetKVMServer(createConfig.Sid)
+	if err := SaveDesc(guest, createConfig.GuestDesc); err != nil {
 		return nil, err
 	}
 
 	if len(createConfig.MonitorPath) > 0 {
-		if pid := findGuestProcessPid(guest.getOriginId(), "[q]emu-kvm"); len(pid) > 0 {
+		if pid := findGuestProcessPid(guest.getOriginId()); len(pid) > 0 {
 			fileutils2.FilePutContents(guest.GetPidFilePath(), pid, false)
 			guest.StartMonitorWithImportGuestSocketFile(ctx, createConfig.MonitorPath, nil)
 			stopScript := guest.generateStopScript(nil)
@@ -93,9 +90,9 @@ func (m *SGuestManager) GuestCreateFromLibvirt(
 	return ret, nil
 }
 
-func findGuestProcessPid(originId, sufix string) string {
+func findGuestProcessPid(originId string) string {
 	output, err := procutils.NewCommand(
-		"sh", "-c", fmt.Sprintf("ps -A -o pid,args | grep [q]emu | grep %s | grep %s", originId, sufix)).Output()
+		"sh", "-c", fmt.Sprintf("ps -A -o pid,args | grep [q]emu | grep %s", originId)).Output()
 	if err != nil {
 		log.Errorf("find guest %s error: %s", originId, output)
 		return ""
@@ -151,7 +148,9 @@ func IsMacInGuestConfig(guestConfig *compute.SImportGuestDesc, mac string) bool 
 }
 
 func setAttributeFromLibvirtConfig(
-	guestConfig *compute.SImportGuestDesc, libvirtConfig *compute.SLibvirtHostConfig,
+	guestConfig *compute.SImportGuestDesc,
+	libvirtConfig *compute.SLibvirtHostConfig,
+	monitorPath string,
 ) (int, error) {
 	var Matched = true
 	for i, server := range libvirtConfig.Servers {
@@ -171,7 +170,9 @@ func setAttributeFromLibvirtConfig(
 				guestConfig.Nics[idx].Ip = macMap[netutils.FormatMacAddr(nic.Mac)]
 			}
 			log.Infof("config monitor path is %s, guest config id %s", libvirtConfig.MonitorPath, guestConfig.Id)
-			if len(libvirtConfig.MonitorPath) > 0 {
+			if len(monitorPath) > 0 {
+				guestConfig.MonitorPath = monitorPath
+			} else if len(libvirtConfig.MonitorPath) > 0 {
 				files, _ := ioutil.ReadDir(libvirtConfig.MonitorPath)
 				for i := 0; i < len(files); i++ {
 					if files[i].Mode().IsDir() &&
@@ -227,12 +228,28 @@ func (m *SGuestManager) GenerateDescFromXml(libvirtConfig *compute.SLibvirtHostC
 			log.Errorf("Unmarshal xml file %s error %s", xmlPath, err)
 			continue
 		}
+		log.Infof("import domain uuid %s", domain.UUID)
+		var monitorPath string
+		if len(domain.UUID) > 0 {
+			domainXmlFileName := fmt.Sprintf("%s.xml", domain.UUID)
+			domainXmlFilePath := path.Join(defaultLibvirtLiveConfigPath, domainXmlFileName)
+			if _, err := procutils.RemoteStat(domainXmlFilePath); err == nil {
+				log.Infof("import domain live xml path %s", domainXmlFilePath)
+				domStatus, err := m.getLibvirtLiveConfig(domainXmlFilePath)
+				if err == nil {
+					monitorPath = domStatus.Monitor.Path
+				} else {
+					log.Errorf("failed getLibvirtLiveConfig %s: %s", domainXmlFilePath, err)
+				}
+			}
+		}
+
 		guestConfig, err := m.LibvirtDomainToGuestDesc(domain)
 		if err != nil {
 			log.Errorf("Parse libvirt domain failed %s", err)
 			continue
 		}
-		if idx, err := setAttributeFromLibvirtConfig(guestConfig, libvirtConfig); err != nil {
+		if idx, err := setAttributeFromLibvirtConfig(guestConfig, libvirtConfig, monitorPath); err != nil {
 			log.Errorf("Import guest %s error %s", guestConfig.Id, err)
 			continue
 		} else {
@@ -245,6 +262,32 @@ func (m *SGuestManager) GenerateDescFromXml(libvirtConfig *compute.SLibvirtHostC
 	ret.Set("servers_not_match", jsonutils.Marshal(libvirtConfig.Servers))
 	ret.Set("servers_matched", jsonutils.Marshal(libvirtServers))
 	return ret, nil
+}
+
+type SMonitor struct {
+	XMLName xml.Name `xml:"monitor"`
+	Path    string   `xml:"path,attr"`
+}
+
+type SDomainStatus struct {
+	XMLName xml.Name `xml:"domstatus"`
+	Pid     int      `xml:"pid,attr"`
+	Monitor SMonitor `xml:"monitor"`
+}
+
+func (m *SGuestManager) getLibvirtLiveConfig(domainXmlFilePath string) (*SDomainStatus, error) {
+	liveXmlContent, err := procutils.NewRemoteCommandAsFarAsPossible("cat", domainXmlFilePath).Output()
+	if err != nil {
+		return nil, errors.Errorf("Read file %s failed: %s %s", domainXmlFilePath, liveXmlContent, err)
+	}
+
+	// guest running
+	domainLive := &SDomainStatus{}
+	err = xml.Unmarshal(liveXmlContent, domainLive)
+	if err != nil {
+		return nil, errors.Errorf("failed unmarshal live xml")
+	}
+	return domainLive, nil
 }
 
 // Read key infomation from domain xml

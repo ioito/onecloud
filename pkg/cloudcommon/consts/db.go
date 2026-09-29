@@ -14,8 +14,100 @@
 
 package consts
 
+import "yunion.io/x/log"
+
 var (
 	QueryOffsetOptimization = false
 
 	OpsLogWithClickhouse = false
+
+	defaultDBDialect string
+
+	defaultDBConnectionString string
+
+	defaultDBChecksumHashAlgorithm string
+
+	taskWorkerCount      int
+	localTaskWorkerCount int
+
+	taskArchiveThresholdHours int
+
+	taskArchiveBatchLimit int
+
+	enableChangeOwnerAutoRename = false
+
+	enableDefaultPolicy = true
 )
+
+func SetDefaultPolicy(enable bool) {
+	enableDefaultPolicy = enable
+}
+
+func IsEnableDefaultPolicy() bool {
+	return enableDefaultPolicy == true
+}
+
+func SetDefaultDB(dialect, connStr string) {
+	defaultDBDialect = dialect
+	defaultDBConnectionString = connStr
+}
+
+func DefaultDBDialect() string {
+	return defaultDBDialect
+}
+
+func DefaultDBConnStr() string {
+	return defaultDBConnectionString
+}
+
+func SetDefaultDBChecksumHashAlgorithm(alg string) {
+	log.Infof("Set default DB checksum hash algorithm: %s", alg)
+	defaultDBChecksumHashAlgorithm = alg
+}
+
+func DefaultDBChecksumHashAlgorithm() string {
+	if len(defaultDBChecksumHashAlgorithm) > 0 {
+		return defaultDBChecksumHashAlgorithm
+	}
+	return "sha256"
+}
+
+func SetTaskWorkerCount(cnt int) {
+	taskWorkerCount = cnt
+}
+
+func SetLocalTaskWorkerCount(cnt int) {
+	localTaskWorkerCount = cnt
+}
+
+func SetChangeOwnerAutoRename(enable bool) {
+	enableChangeOwnerAutoRename = enable
+}
+
+func GetChangeOwnerAutoRename() bool {
+	return enableChangeOwnerAutoRename
+}
+
+func SetTaskArchiveThresholdHours(hours int) {
+	taskArchiveThresholdHours = hours
+}
+
+func SetTaskArchiveBatchLimit(limit int) {
+	taskArchiveBatchLimit = limit
+}
+
+func TaskWorkerCount() int {
+	return taskWorkerCount
+}
+
+func LocalTaskWorkerCount() int {
+	return localTaskWorkerCount
+}
+
+func TaskArchiveThresholdHours() int {
+	return taskArchiveThresholdHours
+}
+
+func TaskArchiveBatchLimit() int {
+	return taskArchiveBatchLimit
+}

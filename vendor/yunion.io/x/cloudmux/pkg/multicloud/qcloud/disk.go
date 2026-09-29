@@ -149,17 +149,19 @@ func (self *SDisk) GetId() string {
 	return self.DiskId
 }
 
-func (self *SRegion) DeleteDisk(diskId string) error {
+func (self *SRegion) DeleteDisk(diskIds []string) error {
 	params := make(map[string]string)
 	params["Region"] = self.Region
-	params["DiskIds.0"] = diskId
+	for idx, id := range diskIds {
+		params[fmt.Sprintf("DiskIds.%d", idx)] = id
+	}
 
 	_, err := self.cbsRequest("TerminateDisks", params)
 	return err
 }
 
 func (self *SDisk) Delete(ctx context.Context) error {
-	return self.storage.zone.region.DeleteDisk(self.DiskId)
+	return self.storage.zone.region.DeleteDisk([]string{self.DiskId})
 }
 
 func (self *SRegion) ResizeDisk(ctx context.Context, diskId string, sizeGb int64) error {
@@ -310,6 +312,10 @@ func (self *SDisk) GetExpiredAt() time.Time {
 	return self.DeadlineTime.Add(time.Hour * -8)
 }
 
+func (self *SDisk) SetTags(tags map[string]string, replace bool) error {
+	return self.storage.zone.region.SetResourceTags("cvm", "volume", []string{self.DiskId}, tags, replace)
+}
+
 func (self *SDisk) GetISnapshot(snapshotId string) (cloudprovider.ICloudSnapshot, error) {
 	snapshots, total, err := self.storage.zone.region.GetSnapshots("", "", "", []string{snapshotId}, 0, 1)
 	if err != nil {
@@ -342,10 +348,6 @@ func (self *SDisk) GetISnapshots() ([]cloudprovider.ICloudSnapshot, error) {
 	return isnapshots, nil
 }
 
-func (self *SDisk) GetExtSnapshotPolicyIds() ([]string, error) {
-	return self.storage.zone.region.GetSnapshotIdByDiskId(self.GetId())
-}
-
 func (self *SDisk) GetTemplateId() string {
 	//return self.ImageId
 	return ""
@@ -368,23 +370,30 @@ func (self *SDisk) Reset(ctx context.Context, snapshotId string) (string, error)
 	return "", self.storage.zone.region.ResetDisk(self.DiskId, snapshotId)
 }
 
-func (self *SRegion) CreateDisk(zoneId string, category string, name string, sizeGb int, desc string, projectId string) (string, error) {
+func (self *SRegion) CreateDisk(zoneId string, category string, opts *cloudprovider.DiskCreateConfig) (string, error) {
 	params := make(map[string]string)
 	params["Region"] = self.Region
 	params["DiskType"] = category
 	params["DiskChargeType"] = "POSTPAID_BY_HOUR"
 	// [TencentCloudSDKError] Code=InvalidParameter, Message=DiskName: vdisk_stress-testvm-qcloud-1_1560117118026502729, length is 48, out of range [0,20] (e11d6c4007e4), RequestId=a8409994-0357-42e9-b028-e11d6c4007e4
-	if len(name) > 20 {
-		name = name[:20]
+	if len(opts.Name) > 20 {
+		opts.Name = opts.Name[:20]
 	}
-	params["DiskName"] = name
+	params["DiskName"] = opts.Name
 	params["Placement.Zone"] = zoneId
-	if len(projectId) > 0 {
-		params["Placement.ProjectId"] = projectId
+	if len(opts.ProjectId) > 0 {
+		params["Placement.ProjectId"] = opts.ProjectId
 	}
 	//params["Encrypted"] = "false"
-	params["DiskSize"] = fmt.Sprintf("%d", sizeGb)
+	params["DiskSize"] = fmt.Sprintf("%d", opts.SizeGb)
 	params["ClientToken"] = utils.GenRequestId(20)
+
+	tagIdx := 0
+	for k, v := range opts.Tags {
+		params[fmt.Sprintf("Tags.%d.Key", tagIdx)] = k
+		params[fmt.Sprintf("Tags.%d.Value", tagIdx)] = v
+		tagIdx += 1
+	}
 
 	body, err := self.cbsRequest("CreateDisks", params)
 	if err != nil {

@@ -113,7 +113,7 @@ type SDynamicschedtag struct {
 	Enabled tristate.TriState `default:"true" create:"optional" list:"user" update:"user"`
 }
 
-func validateDynamicSchedtagInputData(data *jsonutils.JSONDict, create bool) error {
+func validateDynamicSchedtagInputData(ctx context.Context, data *jsonutils.JSONDict, create bool) error {
 	condStr := jsonutils.GetAnyString(data, []string{"condition"})
 	if len(condStr) == 0 && create {
 		return httperrors.NewMissingParameterError("condition")
@@ -127,7 +127,7 @@ func validateDynamicSchedtagInputData(data *jsonutils.JSONDict, create bool) err
 		return httperrors.NewMissingParameterError("schedtag_id")
 	}
 	if len(schedStr) > 0 {
-		schedObj, err := SchedtagManager.FetchByIdOrName(nil, schedStr)
+		schedObj, err := SchedtagManager.FetchByIdOrName(ctx, nil, schedStr)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return httperrors.NewResourceNotFoundError("schedtag %s not found", schedStr)
@@ -144,14 +144,14 @@ func validateDynamicSchedtagInputData(data *jsonutils.JSONDict, create bool) err
 }
 
 func (manager *SDynamicschedtagManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	err := validateDynamicSchedtagInputData(data, true)
+	err := validateDynamicSchedtagInputData(ctx, data, true)
 	if err != nil {
 		return nil, err
 	}
 	input := apis.StandaloneResourceCreateInput{}
 	err = data.Unmarshal(&input)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
+		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput failed %s", err)
 	}
 	input, err = manager.SStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
@@ -162,7 +162,7 @@ func (manager *SDynamicschedtagManager) ValidateCreateData(ctx context.Context, 
 }
 
 func (self *SDynamicschedtag) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	err := validateDynamicSchedtagInputData(data, false)
+	err := validateDynamicSchedtagInputData(ctx, data, false)
 	if err != nil {
 		return nil, err
 	}
@@ -229,18 +229,18 @@ func (self *SDynamicschedtag) PerformEvaluate(ctx context.Context, userCred mccl
 
 	objectMan := DynamicschedtagManager.StandaloneResourcesManager[resType]
 	if objectMan == nil {
-		return nil, httperrors.NewResourceNotFoundError("Resource type %s not support", resType)
+		return nil, httperrors.NewResourceNotFoundError("resource type %s is not supported", resType)
 	}
 	virtObjectMan := DynamicschedtagManager.VirtualResourcesManager[virtType]
 	if virtObjectMan == nil {
-		return nil, httperrors.NewResourceNotFoundError("Virtual resource type %s not support", virtType)
+		return nil, httperrors.NewResourceNotFoundError("virtual resource type %s is not supported", virtType)
 	}
 
-	object, err := FetchDynamicResourceObject(objectMan, userCred, objectId)
+	object, err := FetchDynamicResourceObject(ctx, objectMan, userCred, objectId)
 	if err != nil {
 		return nil, err
 	}
-	virtObject, err := FetchDynamicResourceObject(virtObjectMan, userCred, virtObjId)
+	virtObject, err := FetchDynamicResourceObject(ctx, virtObjectMan, userCred, virtObjId)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +271,8 @@ func (self *SDynamicschedtag) PerformEvaluate(ctx context.Context, userCred mccl
 	return result, nil
 }
 
-func FetchDynamicResourceObject(man IDynamicResourceManager, userCred mcclient.TokenCredential, idOrName string) (IDynamicResource, error) {
-	obj, err := man.FetchByIdOrName(userCred, idOrName)
+func FetchDynamicResourceObject(ctx context.Context, man IDynamicResourceManager, userCred mcclient.TokenCredential, idOrName string) (IDynamicResource, error) {
+	obj, err := man.FetchByIdOrName(ctx, userCred, idOrName)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("%s %s not found", man.Keyword(), idOrName)

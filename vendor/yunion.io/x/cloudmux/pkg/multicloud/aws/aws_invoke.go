@@ -17,6 +17,7 @@ package aws
 import (
 	"io/ioutil"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -29,6 +30,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 )
 
 // eks only
@@ -53,6 +55,34 @@ func (self *SAwsClient) invoke(regionId, serviceName, serviceId, apiVersion stri
 		metadata.TargetPrefix = "AWSPriceListService"
 		metadata.JSONVersion = "1.1"
 	}
+	if serviceName == ECS_SERVICE_NAME {
+		metadata.TargetPrefix = "AmazonEC2ContainerServiceV20141113"
+		metadata.JSONVersion = "1.1"
+	}
+	if serviceName == KINESIS_SERVICE_NAME {
+		metadata.TargetPrefix = "Kinesis_20131202"
+		metadata.JSONVersion = "1.1"
+	}
+	if serviceName == DYNAMODB_SERVICE_NAME {
+		metadata.TargetPrefix = "DynamoDB_20120810"
+		metadata.JSONVersion = "1.0"
+	}
+	if serviceName == ORG_SERVICE_NAME {
+		metadata.TargetPrefix = "AWSOrganizationsV20161128"
+		metadata.JSONVersion = "1.1"
+	}
+	if serviceName == CLOUD_TRAIL_SERVICE_NAME {
+		metadata.TargetPrefix = "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101"
+		metadata.JSONVersion = "1.1"
+	}
+	if serviceName == CE_SERVICE_NAME {
+		metadata.TargetPrefix = "AWSInsightsIndexService"
+		metadata.JSONVersion = "1.1"
+	}
+	if serviceName == WAF_SERVICE_NAME {
+		metadata.TargetPrefix = "AWSWAF_20190729"
+		metadata.JSONVersion = "1.1"
+	}
 
 	if self.debug {
 		logLevel := aws.LogLevelType(uint(aws.LogDebugWithRequestErrors) + uint(aws.LogDebugWithHTTPBody))
@@ -71,7 +101,7 @@ func (self *SAwsClient) invoke(regionId, serviceName, serviceId, apiVersion stri
 
 func jsonInvoke(cli *client.Client, apiName, path string, params map[string]interface{}, retval interface{}, debug bool) error {
 	method := "POST"
-	for _, key := range []string{"List", "Describe"} {
+	for _, key := range []string{"List", "Describe", "Get"} {
 		if strings.HasPrefix(apiName, key) {
 			method = "GET"
 			break
@@ -88,6 +118,19 @@ func jsonInvoke(cli *client.Client, apiName, path string, params map[string]inte
 			}
 		}
 	}
+	if utils.IsInStringArray(cli.ServiceName, []string{
+		ECS_SERVICE_NAME,
+		KINESIS_SERVICE_NAME,
+		DYNAMODB_SERVICE_NAME,
+		PRICING_SERVICE_NAME,
+		ORG_SERVICE_NAME,
+		CLOUD_TRAIL_SERVICE_NAME,
+		CE_SERVICE_NAME,
+		WAF_SERVICE_NAME,
+	}) {
+		method = "POST"
+	}
+
 	op := &request.Operation{
 		Name:       apiName,
 		HTTPMethod: method,
@@ -100,15 +143,35 @@ func jsonInvoke(cli *client.Client, apiName, path string, params map[string]inte
 		},
 	}
 
+	isQuery := false
+	for _, prefix := range []string{"List", "Describe", "Get"} {
+		if strings.HasPrefix(apiName, prefix) {
+			isQuery = true
+			break
+		}
+	}
+	var err error
+
+	retry := 1
+	if isQuery {
+		retry = 3
+	}
 	req := cli.NewRequest(op, params, retval)
-	err := req.Send()
-	if err != nil {
+	for i := 0; i < retry; i++ {
+		err = req.Send()
+		if err == nil {
+			return nil
+		}
 		if e, ok := err.(awserr.RequestFailure); ok && e.StatusCode() == 404 {
 			return cloudprovider.ErrNotFound
 		}
+		if isHTTPReqErrorRetryable(err) {
+			time.Sleep(time.Second * 10)
+			continue
+		}
 		return err
 	}
-	return nil
+	return err
 }
 
 var JsonBuildHandler = request.NamedHandler{
@@ -206,7 +269,7 @@ func UnmarshalJsonError(r *request.Request) {
 	}
 
 	if r.HTTPResponse.StatusCode == 404 {
-		r.Error = errors.Wrapf(cloudprovider.ErrNotFound, string(result))
+		r.Error = errors.Wrapf(cloudprovider.ErrNotFound, "%s", string(result))
 		return
 	}
 
@@ -223,7 +286,7 @@ func UnmarshalJsonError(r *request.Request) {
 	respErr := &sAwsInvokeError{}
 	err = obj.Unmarshal(respErr)
 	if err != nil {
-		r.Error = errors.Wrapf(err, obj.String())
+		r.Error = errors.Wrapf(err, "%s", obj.String())
 		return
 	}
 

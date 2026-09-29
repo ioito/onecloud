@@ -23,6 +23,7 @@ const (
 	ErrServerTypeIsNotMatch = `server type is not match`
 	ErrExitIsNotMatch       = `exit is not match`
 	ErrWireIsNotMatch       = `wire is not match`
+	ErrNotSupportIpv6       = `not support ipv6`
 
 	ErrNoPorts               = `no ports`
 	ErrNotOwner              = `not owner`
@@ -44,6 +45,8 @@ const (
 	ErrBaremetalHasAlreadyBeenOccupied        = `baremetal has already been occupied`
 	ErrPrepaidHostOccupied                    = `prepaid host occupied`
 	ErrHostCpuArchitectureNotMatch            = `host cpu architecture not match`
+	ErrHostKvmVcpuMaxNotEnough                = `host kvm vcpu max not enough`
+	ErrHostQemuVersionNotMatch                = `host qemu version not match`
 
 	ErrUnknown = `unknown error`
 )

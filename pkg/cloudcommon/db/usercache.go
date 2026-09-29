@@ -55,7 +55,7 @@ var UserCacheManager *SUserCacheManager
 
 func init() {
 	UserCacheManager = &SUserCacheManager{
-		NewKeystoneCacheObjectManager(SUser{}, "users_cache_tbl", "user", "users")}
+		NewKeystoneCacheObjectManager(SUser{}, "users_cache_tbl", "user_cache", "user_caches")}
 	// log.Debugf("initialize user cache manager %s", UserCacheManager.KeywordPlural())
 	UserCacheManager.SetVirtualObject(UserCacheManager)
 
@@ -177,6 +177,9 @@ func (manager *SUserCacheManager) Save(ctx context.Context, idStr string, name s
 		}
 	} else {
 		objm, err := NewModelObject(manager)
+		if err != nil {
+			return nil, err
+		}
 		obj := objm.(*SUser)
 		obj.Id = idStr
 		obj.Name = name

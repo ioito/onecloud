@@ -15,9 +15,10 @@
 package huawei
 
 import (
+	"net/url"
 	"strings"
 
-	"yunion.io/x/pkg/utils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -127,35 +128,47 @@ func (port *Port) GetICloudInterfaceAddresses() ([]cloudprovider.ICloudInterface
 	return address, nil
 }
 
+// 华为云端口API device_owner 变化会导致子网ip重复同步，故忽略弹性网卡同步
 func (region *SRegion) GetINetworkInterfaces() ([]cloudprovider.ICloudNetworkInterface, error) {
-	ports, err := region.GetPorts("")
+	return []cloudprovider.ICloudNetworkInterface{}, nil
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=ShowPort
+func (self *SRegion) GetPort(id string) (*Port, error) {
+	resp, err := self.list(SERVICE_VPC, "ports/"+id, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "get port")
+	}
+	port := &Port{}
+	err = resp.Unmarshal(port, "port")
 	if err != nil {
 		return nil, err
 	}
-	ret := []cloudprovider.ICloudNetworkInterface{}
-	for i := 0; i < len(ports); i++ {
-		if len(ports[i].DeviceID) == 0 || !utils.IsInStringArray(ports[i].DeviceOwner, []string{"compute:CCI", "compute:nova", "neutron:LOADBALANCERV2"}) {
-			ports[i].region = region
-			ret = append(ret, &ports[i])
+	return port, nil
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=ListPorts
+func (self *SRegion) GetPorts(instanceId string) ([]Port, error) {
+	ret := []Port{}
+	query := url.Values{}
+	if len(instanceId) > 0 {
+		query.Set("device_id", instanceId)
+	}
+	for {
+		resp, err := self.list(SERVICE_VPC, "ports", query)
+		if err != nil {
+			return nil, err
 		}
+		part := []Port{}
+		err = resp.Unmarshal(&part, "ports")
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, part...)
+		if len(part) == 0 {
+			break
+		}
+		query.Set("marker", part[len(part)-1].ID)
 	}
 	return ret, nil
-}
-
-func (self *SRegion) GetPort(portId string) (Port, error) {
-	port := Port{}
-	err := DoGet(self.ecsClient.Port.Get, portId, nil, &port)
-	return port, err
-}
-
-// https://support.huaweicloud.com/api-vpc/zh-cn_topic_0133195888.html
-func (self *SRegion) GetPorts(instanceId string) ([]Port, error) {
-	ports := make([]Port, 0)
-	querys := map[string]string{}
-	if len(instanceId) > 0 {
-		querys["device_id"] = instanceId
-	}
-
-	err := doListAllWithMarker(self.ecsClient.Port.List, querys, &ports)
-	return ports, err
 }

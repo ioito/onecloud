@@ -33,6 +33,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -146,7 +147,7 @@ type SSchedtag struct {
 	ResourceType    string `width:"16" charset:"ascii" nullable:"true" list:"user" create:"required"`                                 // Column(VARCHAR(16, charset='ascii'), nullable=True, default='')
 }
 
-func (m *SSchedtagManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (m *SSchedtagManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId == nil {
 		return q
 	}
@@ -219,6 +220,40 @@ func (manager *SSchedtagManager) ListItemFilter(
 		q = q.Join(hostSchedtagSubq, sqlchemy.Equals(q.Field("id"), hostSchedtagSubq.Field("schedtag_id")))
 	}
 
+	if len(query.ZoneId) > 0 {
+		var err error
+
+		storagesQ := StorageManager.Query("id")
+		storagesQ, err = StorageManager.SZoneResourceBaseManager.ListItemFilter(ctx, storagesQ, userCred, api.ZonalFilterListInput{ZonalFilterListBase: api.ZonalFilterListBase{ZoneIds: query.ZoneId}})
+		if err != nil {
+			return nil, errors.Wrap(err, "StorageManager.SZoneResourceBaseManager.ListItemFilter")
+		}
+		storagesSubQ := storagesQ.SubQuery()
+		storageSchedtagQ := StorageschedtagManager.Query("schedtag_id")
+		storageSchedtagQ = storageSchedtagQ.Join(storagesSubQ, sqlchemy.Equals(storageSchedtagQ.Field("storage_id"), storagesSubQ.Field("id")))
+
+		networksQ := NetworkManager.Query("id")
+		networksQ, err = NetworkManager.SWireResourceBaseManager.ListItemFilter(ctx, networksQ, userCred, api.WireFilterListInput{ZonalFilterListBase: api.ZonalFilterListBase{ZoneIds: query.ZoneId}})
+		if err != nil {
+			return nil, errors.Wrap(err, "NetworkManager.SWireResourceBaseManager.ListItemFilter")
+		}
+		networksSubQ := networksQ.SubQuery()
+		networkSchedtagQ := NetworkschedtagManager.Query("schedtag_id")
+		networkSchedtagQ = networkSchedtagQ.Join(networksSubQ, sqlchemy.Equals(networkSchedtagQ.Field("network_id"), networksSubQ.Field("id")))
+
+		hostQ := HostManager.Query("id")
+		hostQ, err = HostManager.SZoneResourceBaseManager.ListItemFilter(ctx, hostQ, userCred, api.ZonalFilterListInput{ZonalFilterListBase: api.ZonalFilterListBase{ZoneIds: query.ZoneId}})
+		if err != nil {
+			return nil, errors.Wrap(err, "HostManager.SZoneResourceBaseManager.ListItemFilter")
+		}
+		hostSubQ := hostQ.SubQuery()
+		hostSchedtagQ := HostschedtagManager.Query("schedtag_id")
+		hostSchedtagQ = hostSchedtagQ.Join(hostSubQ, sqlchemy.Equals(hostSchedtagQ.Field("host_id"), hostSubQ.Field("id")))
+
+		unionSchedtagQ := sqlchemy.Union(storageSchedtagQ, networkSchedtagQ, hostSchedtagQ).Query().SubQuery()
+		q = q.In("id", unionSchedtagQ)
+	}
+
 	return q, nil
 }
 
@@ -256,10 +291,10 @@ func (manager *SSchedtagManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fie
 	return q, httperrors.ErrNotFound
 }
 
-func (manager *SSchedtagManager) ValidateSchedtags(userCred mcclient.TokenCredential, schedtags []*api.SchedtagConfig) ([]*api.SchedtagConfig, error) {
+func (manager *SSchedtagManager) ValidateSchedtags(ctx context.Context, userCred mcclient.TokenCredential, schedtags []*api.SchedtagConfig) ([]*api.SchedtagConfig, error) {
 	ret := make([]*api.SchedtagConfig, len(schedtags))
 	for idx, tag := range schedtags {
-		schedtagObj, err := manager.FetchByIdOrName(userCred, tag.Id)
+		schedtagObj, err := manager.FetchByIdOrName(ctx, userCred, tag.Id)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError("Invalid schedtag %s", tag.Id)
@@ -301,7 +336,7 @@ func (manager *SSchedtagManager) ValidateCreateData(ctx context.Context, userCre
 		input.ResourceType = HostManager.KeywordPlural()
 	}
 	if !utils.IsInStringArray(input.ResourceType, manager.GetResourceTypes()) {
-		return nil, httperrors.NewInputParameterError("Not support resource_type %s", input.ResourceType)
+		return nil, httperrors.NewInputParameterError("resource type %s is not supported", input.ResourceType)
 	}
 
 	var err error
@@ -359,24 +394,24 @@ func (self *SSchedtag) ValidateUpdateData(ctx context.Context, userCred mcclient
 func (self *SSchedtag) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
 	cnt, err := self.GetObjectCount()
 	if err != nil {
-		return httperrors.NewInternalServerError("GetObjectCount fail %s", err)
+		return httperrors.NewInternalServerError("GetObjectCount failed %s", err)
 	}
 	if cnt > 0 {
 		return httperrors.NewNotEmptyError("Tag is associated with %s", self.ResourceType)
 	}
 	cnt, err = self.getDynamicSchedtagCount()
 	if err != nil {
-		return httperrors.NewInternalServerError("getDynamicSchedtagCount fail %s", err)
+		return httperrors.NewInternalServerError("getDynamicSchedtagCount failed %s", err)
 	}
 	if cnt > 0 {
 		return httperrors.NewNotEmptyError("tag has dynamic rules")
 	}
 	cnt, err = self.getSchedPoliciesCount()
 	if err != nil {
-		return httperrors.NewInternalServerError("getSchedPoliciesCount fail %s", err)
+		return httperrors.NewInternalServerError("getSchedPoliciesCount failed %s", err)
 	}
 	if cnt > 0 {
-		return httperrors.NewNotEmptyError("tag is associate with sched policies")
+		return httperrors.NewNotEmptyError("tag is associated with scheduling policies")
 	}
 	return self.SStandaloneResourceBase.ValidateDeleteCondition(ctx, nil)
 }
@@ -564,7 +599,7 @@ func PerformSetResourceSchedtag(obj IModelWithSchedtag, ctx context.Context, use
 	setTagsId := []string{}
 	for idx := 0; idx < len(schedtags); idx++ {
 		schedtagIdent, _ := schedtags[idx].GetString()
-		tag, err := SchedtagManager.FetchByIdOrName(userCred, schedtagIdent)
+		tag, err := SchedtagManager.FetchByIdOrName(ctx, userCred, schedtagIdent)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewNotFoundError("Schedtag %s not found", schedtagIdent)
@@ -603,6 +638,7 @@ func PerformSetResourceSchedtag(obj IModelWithSchedtag, ctx context.Context, use
 	if err := obj.ClearSchedDescCache(); err != nil {
 		log.Errorf("Resource %s/%s ClearSchedDescCache error: %v", obj.Keyword(), obj.GetId(), err)
 	}
+	logclient.AddActionLogWithContext(ctx, obj, logclient.ACT_SET_SCHED_TAG, nil, userCred, true)
 	return nil, nil
 }
 
@@ -668,7 +704,7 @@ func (s *SSchedtag) PerformSetResource(ctx context.Context, userCred mcclient.To
 	// get need set resource ids
 	for i := 0; i < len(input.ResourceIds); i++ {
 		resId := input.ResourceIds[i]
-		res, err := resMan.FetchByIdOrName(userCred, resId)
+		res, err := resMan.FetchByIdOrName(ctx, userCred, resId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewNotFoundError("Resource %s %s not found", s.ResourceType, resId)

@@ -37,6 +37,8 @@ type SnapshotCreateInput struct {
 	// swagger:ignore
 	Size int `json:"size"`
 	// swagger:ignore
+	VirtualSize int `json:"virtual_size"`
+	// swagger:ignore
 	DiskType string `json:"disk_type"`
 	// swagger:ignore
 	CloudregionId string `json:"cloudregion_id"`
@@ -58,8 +60,6 @@ type SnapshotListInput struct {
 
 	StorageShareFilterListInput
 
-	// filter snapshot that is fake deleted
-	FakeDeleted *bool `json:"fake_deleted"`
 	// filter by disk type
 	DiskType string `json:"disk_type"`
 	// filter instance snapshot
@@ -68,11 +68,16 @@ type SnapshotListInput struct {
 	DiskFilterListInputBase
 	StorageFilterListInputBase
 
-	OutOfChain *bool    `json:"out_of_chain"`
-	OsType     []string `json:"os_type"`
+	OsType []string `json:"os_type"`
 
 	// list server snapshots
 	ServerId string `json:"server_id"`
+
+	// 未关联任何磁盘
+	Unused bool `json:"unused"`
+
+	// 按存储过滤
+	StorageId string `json:"storage_id"`
 
 	// 按虚拟机名称排序
 	// pattern:asc|desc
@@ -92,6 +97,8 @@ type SnapshotDetails struct {
 
 	// 存储类型
 	StorageType string `json:"storage_type"`
+	// 存储名称
+	Storage string `json:"storage"`
 	// 磁盘状态
 	DiskStatus string `json:"disk_status"`
 	// 云主机名称
@@ -107,4 +114,9 @@ type SnapshotDetails struct {
 }
 
 type SnapshotSyncstatusInput struct {
+}
+
+type SnapshotDeleteDiskSnapshotsInput struct {
+	// 磁盘ID
+	DiskId string `json:"disk_id"`
 }

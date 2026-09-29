@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
@@ -109,6 +110,7 @@ func (model *SDomainLevelResourceBase) CustomizeCreate(ctx context.Context, user
 	return model.SStandaloneResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 
+// 更改项目
 func (model *SDomainLevelResourceBase) PerformChangeOwner(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformChangeDomainOwnerInput) (jsonutils.JSONObject, error) {
 	if !consts.GetNonDefaultDomainProjects() {
 		return nil, errors.Wrap(httperrors.ErrForbidden, "not allow to change owner of domain resource if non_default_domain_projects is turned off")
@@ -124,6 +126,9 @@ func (model *SDomainLevelResourceBase) PerformChangeOwner(ctx context.Context, u
 	ownerId, err := manager.FetchOwnerId(ctx, data)
 	if err != nil {
 		return nil, httperrors.NewGeneralError(err)
+	}
+	if gotypes.IsNil(ownerId) {
+		return nil, httperrors.NewMissingParameterError("domain_id")
 	}
 	if len(ownerId.GetProjectDomainId()) == 0 {
 		return nil, httperrors.NewInputParameterError("missing new domain")
@@ -153,7 +158,7 @@ func (model *SDomainLevelResourceBase) PerformChangeOwner(ctx context.Context, u
 	}
 
 	q := manager.Query().Equals("name", model.GetName())
-	q = manager.FilterByOwner(q, manager, userCred, ownerId, manager.NamespaceScope())
+	q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, manager.NamespaceScope())
 	q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
 	q = q.NotEquals("id", model.GetId())
 	cnt, err := q.CountWithError()
@@ -286,6 +291,7 @@ func (model *SDomainLevelResourceBase) ValidateUpdateData(
 	return input, nil
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SDomainLevelResourceBase) GetDetailsChangeOwnerCandidateDomains(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (apis.ChangeOwnerCandidateDomainsOutput, error) {
 	return IOwnerResourceBaseModelGetChangeOwnerCandidateDomains(model.GetIDomainLevelModel())
 }
@@ -302,6 +308,7 @@ func (manager *SDomainLevelResourceBaseManager) ListItemExportKeys(ctx context.C
 	return q, nil
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SDomainLevelResourceBaseManager) GetPropertyDomainTagValuePairs(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -317,6 +324,7 @@ func (manager *SDomainLevelResourceBaseManager) GetPropertyDomainTagValuePairs(
 	)
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SDomainLevelResourceBaseManager) GetPropertyDomainTagValueTree(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -326,6 +334,7 @@ func (manager *SDomainLevelResourceBaseManager) GetPropertyDomainTagValueTree(
 		manager.GetIDomainLevelModelManager(),
 		"domain",
 		"domain_id",
+		"",
 		ctx,
 		userCred,
 		query,

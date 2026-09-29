@@ -15,7 +15,10 @@
 package compute
 
 import (
+	"errors"
+
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 )
 
 type SElasticipCreateInput struct {
@@ -59,8 +62,8 @@ type SElasticipCreateInput struct {
 	// |ZStack      | traffic                |
 	// |OpenStack   | traffic                |
 	// default: traffic
-	// enum: traffic, bandwidth
-	ChargeType string `json:"charge_type"`
+	// enum: ["traffic", "bandwidth"]
+	ChargeType billing_api.TNetChargeType `json:"charge_type"`
 
 	Mode string `json:"mode"`
 
@@ -94,6 +97,9 @@ type ElasticipDetails struct {
 
 	// 绑定资源名称
 	AssociateName string `json:"associate_name"`
+
+	// 虚拟机内网IP
+	ServerPrivateIp string `json:"server_private_ip"`
 }
 
 func (self ElasticipDetails) GetMetricTags() map[string]string {
@@ -113,7 +119,7 @@ func (self ElasticipDetails) GetMetricTags() map[string]string {
 		"ip_addr":        self.IpAddr,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 type ElasticipSyncstatusInput struct {
@@ -147,4 +153,27 @@ type ElasticDissociateInput struct {
 type ElasticipRemoteUpdateInput struct {
 	// 是否覆盖替换所有标签
 	ReplaceTags *bool `json:"replace_tags" help:"replace all remote tags"`
+}
+
+type ElasticipChangeBandwidthInput struct {
+	// 带宽限制，单位mbps
+	// swagger:ignore
+	// Deprecated
+	Bandwidth int64 `json:"bandwidth" yunion-deprecated-by:"bandwidth_mb"`
+	// 带宽限制，单位mbps
+	BandwidthMb int64 `json:"bandwidth_mb"`
+	// 下行带宽限制，单位mbps
+	RxBwLimitMb int64 `json:"rx_bw_limit_mb"`
+	// 上行带宽限制，单位mbps
+	TxBwLimitMb int64 `json:"tx_bw_limit_mb"`
+}
+
+func (input ElasticipChangeBandwidthInput) Validate() error {
+	if input.BandwidthMb <= 0 && input.RxBwLimitMb <= 0 {
+		return errors.New("bandwidth_mb or rx_bw_limit_mb must be greater than 0")
+	}
+	if input.BandwidthMb <= 0 && input.TxBwLimitMb <= 0 {
+		return errors.New("bandwidth_mb or tx_bw_limit_mb must be greater than 0")
+	}
+	return nil
 }

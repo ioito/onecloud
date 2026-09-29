@@ -16,16 +16,20 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -40,6 +44,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=dnsrecord
+// +onecloud:swagger-gen-model-plural=dnsrecords
 type SDnsRecordManager struct {
 	db.SEnabledStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -70,11 +76,16 @@ type SDnsRecord struct {
 	DnsValue   string `width:"256" charset:"ascii" nullable:"false" list:"user" update:"user" create:"required"`
 	TTL        int64  `nullable:"false" list:"user" update:"user" create:"required" json:"ttl"`
 	MxPriority int64  `nullable:"false" list:"user" update:"user" create:"optional"`
+	// cloudflare 特有
+	Proxied tristate.TriState `default:"false" list:"user" create:"optional"`
 
 	// 解析线路类型
 	PolicyType string `width:"36" charset:"ascii" nullable:"false" list:"user" update:"user" create:"optional"`
 	// 解析线路
 	PolicyValue string `width:"256" charset:"ascii" nullable:"false" list:"user" update:"user" create:"optional"`
+
+	// 目前存储阿里云GTM设置地址及AWS TrafficPolicy端点地址, 仅支持同步
+	ExtraAddresses []string `width:"512" charset:"utf8" nullable:"true" list:"user"`
 }
 
 func (manager *SDnsRecordManager) EnableGenerateName() bool {
@@ -100,7 +111,7 @@ func (manager *SDnsRecordManager) ValidateCreateData(
 		return nil, httperrors.NewInputParameterError("invalid record name %s", input.Name)
 	}
 
-	_, err = validators.ValidateModel(userCred, DnsZoneManager, &input.DnsZoneId)
+	_, err = validators.ValidateModel(ctx, userCred, DnsZoneManager, &input.DnsZoneId)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +170,7 @@ func (self *SDnsRecord) StartCreateTask(ctx context.Context, userCred mcclient.T
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.DNS_RECORDSET_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DNS_RECORDSET_STATUS_CREATING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -234,18 +245,22 @@ func (self *SDnsRecord) RealDelete(ctx context.Context, userCred mcclient.TokenC
 }
 
 type sRecordUniqValues struct {
-	DnsZoneId string
-	DnsType   string
-	DnsName   string
-	DnsValue  string
+	DnsZoneId   string
+	DnsType     string
+	DnsName     string
+	DnsValue    string
+	PolicyType  string
+	PolicyValue string
 }
 
 func (self *SDnsRecord) GetUniqValues() jsonutils.JSONObject {
 	return jsonutils.Marshal(sRecordUniqValues{
-		DnsZoneId: self.DnsZoneId,
-		DnsName:   self.Name,
-		DnsType:   self.DnsType,
-		DnsValue:  self.DnsValue,
+		DnsZoneId:   self.DnsZoneId,
+		DnsName:     self.Name,
+		DnsType:     self.DnsType,
+		DnsValue:    self.DnsValue,
+		PolicyType:  self.PolicyType,
+		PolicyValue: self.PolicyValue,
 	})
 }
 
@@ -270,6 +285,12 @@ func (manager *SDnsRecordManager) FilterByUniqValues(q *sqlchemy.SQuery, values 
 	if len(uniq.DnsValue) > 0 {
 		q = q.Equals("dns_value", uniq.DnsValue)
 	}
+	if len(uniq.PolicyType) > 0 {
+		q = q.Equals("policy_type", uniq.PolicyType)
+	}
+	if len(uniq.PolicyValue) > 0 {
+		q = q.Equals("policy_value", uniq.PolicyValue)
+	}
 
 	return q
 }
@@ -286,9 +307,9 @@ func (manager *SDnsRecordManager) FetchOwnerId(ctx context.Context, data jsonuti
 	return db.FetchDomainInfo(ctx, data)
 }
 
-func (manager *SDnsRecordManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SDnsRecordManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	sq := DnsZoneManager.Query("id")
-	sq = db.SharableManagerFilterByOwner(DnsZoneManager, sq, userCred, owner, scope)
+	sq = db.SharableManagerFilterByOwner(ctx, DnsZoneManager, sq, userCred, owner, scope)
 	return q.In("dns_zone_id", sq.SubQuery())
 }
 
@@ -329,7 +350,7 @@ func (self *SDnsRecord) StartDeleteTask(ctx context.Context, userCred mcclient.T
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -405,7 +426,7 @@ func (self *SDnsRecord) StartUpdateTask(ctx context.Context, userCred mcclient.T
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_SYNC_STATUS, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_SYNC_STATUS, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -482,6 +503,7 @@ func (self *SDnsRecord) syncWithDnsRecord(ctx context.Context, userCred mcclient
 	diff, err := db.Update(self, func() error {
 		self.Name = ext.GetDnsName()
 		self.Enabled = tristate.NewFromBool(ext.GetEnabled())
+		self.Proxied = tristate.NewFromBool(ext.IsProxied())
 		self.Status = ext.GetStatus()
 		self.TTL = ext.GetTTL()
 		self.MxPriority = ext.GetMxPriority()
@@ -489,6 +511,12 @@ func (self *SDnsRecord) syncWithDnsRecord(ctx context.Context, userCred mcclient
 		self.DnsValue = ext.GetDnsValue()
 		self.PolicyType = string(ext.GetPolicyType())
 		self.PolicyValue = string(ext.GetPolicyValue())
+		extraAddresses, err := ext.GetExtraAddresses()
+		if err != nil {
+			log.Errorf("GetExtraAddresses for record %s error: %v", self.Name, err)
+			return nil
+		}
+		self.ExtraAddresses = extraAddresses
 		return nil
 	})
 	if err != nil {
@@ -510,6 +538,7 @@ func (self *SDnsZone) newFromCloudDnsRecord(ctx context.Context, userCred mcclie
 	record.Name = ext.GetDnsName()
 	record.Status = ext.GetStatus()
 	record.Enabled = tristate.NewFromBool(ext.GetEnabled())
+	record.Proxied = tristate.NewFromBool(ext.IsProxied())
 	record.TTL = ext.GetTTL()
 	record.MxPriority = ext.GetMxPriority()
 	record.DnsType = string(ext.GetDnsType())
@@ -517,6 +546,7 @@ func (self *SDnsZone) newFromCloudDnsRecord(ctx context.Context, userCred mcclie
 	record.ExternalId = ext.GetGlobalId()
 	record.PolicyType = string(ext.GetPolicyType())
 	record.PolicyValue = string(ext.GetPolicyValue())
+	record.ExtraAddresses, _ = ext.GetExtraAddresses()
 
 	err := DnsRecordManager.TableSpec().Insert(ctx, record)
 	if err != nil {
@@ -531,7 +561,34 @@ func (self *SDnsZone) newFromCloudDnsRecord(ctx context.Context, userCred mcclie
 	return nil
 }
 
-func (man *SDnsRecordManager) QueryDns(projectId, name, kind string) (*SDnsRecord, error) {
+type sDnsResolveResults []api.SDnsResolveResult
+
+func (a sDnsResolveResults) Len() int      { return len(a) }
+func (a sDnsResolveResults) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a sDnsResolveResults) Less(i, j int) bool {
+	partsI := strings.Split(a[i].DnsName, ".")
+	partsJ := strings.Split(a[j].DnsName, ".")
+	if len(partsI) > len(partsJ) {
+		return true
+	} else if len(partsI) < len(partsJ) {
+		return false
+	}
+	if len(partsI) > 0 && partsI[0] != partsJ[0] {
+		if partsI[0] == "*" {
+			return false
+		} else if partsJ[0] == "*" {
+			return true
+		}
+	}
+	if a[i].DnsName < a[j].DnsName {
+		return true
+	} else if a[i].DnsName > a[j].DnsName {
+		return false
+	}
+	return false
+}
+
+func (man *SDnsRecordManager) QueryPtr(projectId, ip string) ([]api.SDnsResolveResult, error) {
 	zonesQ := DnsZoneManager.Query().IsNullOrEmpty("manager_id").IsTrue("enabled")
 	if len(projectId) == 0 {
 		zonesQ = zonesQ.IsTrue("is_public")
@@ -542,7 +599,47 @@ func (man *SDnsRecordManager) QueryDns(projectId, name, kind string) (*SDnsRecor
 		))
 	}
 	zones := zonesQ.SubQuery()
-	recQ := DnsRecordManager.Query()
+	recQ := DnsRecordManager.Query().IsTrue("enabled")
+	if regutils.MatchIP6Addr(ip) {
+		recQ = recQ.Equals("dns_type", "AAAA")
+	} else {
+		recQ = recQ.Equals("dns_type", "A")
+	}
+	recSQ := recQ.SubQuery()
+
+	rec := recSQ.Query(
+		recSQ.Field("dns_value"),
+		recSQ.Field("ttl"),
+		sqlchemy.CONCAT("dns_name", recSQ.Field("name"), sqlchemy.NewStringField("."), zones.Field("name")),
+	).Join(zones, sqlchemy.Equals(recSQ.Field("dns_zone_id"), zones.Field("id")))
+
+	sq := rec.SubQuery()
+
+	q := sq.Query().Equals("dns_value", ip)
+
+	results := make([]api.SDnsResolveResult, 0)
+	err := q.All(&results)
+	if err != nil && errors.Cause(err) != sql.ErrNoRows {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+
+	return results, nil
+}
+
+func (man *SDnsRecordManager) QueryDns(projectId, name, kind string) ([]api.SDnsResolveResult, error) {
+	name = strings.TrimSuffix(name, ".")
+
+	zonesQ := DnsZoneManager.Query().IsNullOrEmpty("manager_id").IsTrue("enabled")
+	if len(projectId) == 0 {
+		zonesQ = zonesQ.IsTrue("is_public")
+	} else {
+		zonesQ = zonesQ.Filter(sqlchemy.OR(
+			sqlchemy.IsTrue(zonesQ.Field("is_public")),
+			sqlchemy.Equals(zonesQ.Field("tenant_id"), projectId),
+		))
+	}
+	zones := zonesQ.SubQuery()
+	recQ := DnsRecordManager.Query().IsTrue("enabled")
 	if len(kind) > 0 {
 		recQ = recQ.Equals("dns_type", kind)
 	}
@@ -551,12 +648,13 @@ func (man *SDnsRecordManager) QueryDns(projectId, name, kind string) (*SDnsRecor
 	rec := recSQ.Query(
 		recSQ.Field("dns_value"),
 		recSQ.Field("ttl"),
-		sqlchemy.CONCAT("dns", recSQ.Field("name"), sqlchemy.NewStringField("."), zones.Field("name")).Label("dns_name"),
+		sqlchemy.CONCAT("dns_name", recSQ.Field("name"), sqlchemy.NewStringField("."), zones.Field("name")),
 	).Join(zones, sqlchemy.Equals(recSQ.Field("dns_zone_id"), zones.Field("id")))
 
 	sq := rec.SubQuery()
 
 	filters := sqlchemy.OR(
+		// example match
 		sqlchemy.Equals(sq.Field("dns_name"), name),
 		// support *.example.com resolve
 		sqlchemy.Equals(sq.Field("dns_name"), "*."+name),
@@ -564,19 +662,41 @@ func (man *SDnsRecordManager) QueryDns(projectId, name, kind string) (*SDnsRecor
 
 	strs := strings.Split(name, ".")
 	if len(strs) > 2 {
-		strs[0] = "*"
 		filters = sqlchemy.OR(
+			// example match
 			sqlchemy.Equals(sq.Field("dns_name"), name),
-			// support *.example.com resolve
+			// root match, support resolve example.com to *.example.com
 			sqlchemy.Equals(sq.Field("dns_name"), "*."+name),
-			sqlchemy.Equals(sq.Field("dns_name"), strings.Join(strs, ".")),
+			// support resolve office.example.com to *.example.com
+			sqlchemy.Equals(sq.Field("dns_name"), "*."+strings.Join(strs[1:], ".")),
+			// support resolve saml.office.example.com to office.example.com
+			sqlchemy.Equals(sq.Field("dns_name"), strings.Join(strs[1:], ".")),
 		)
 	}
 
-	q := sq.Query().Filter(filters).Desc(sq.Field("dns_name"))
+	q := sq.Query().Filter(filters)
 
-	ret := &SDnsRecord{}
-	return ret, q.First(ret)
+	results := make([]api.SDnsResolveResult, 0)
+	err := q.All(&results)
+	if err != nil && errors.Cause(err) != sql.ErrNoRows {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+
+	if len(results) == 0 {
+		return results, nil
+	}
+
+	sort.Sort(sDnsResolveResults(results))
+	ret := make([]api.SDnsResolveResult, 0, len(results))
+	for i := range results {
+		if i == 0 || results[i].DnsName == ret[0].DnsName {
+			ret = append(ret, results[i])
+		} else {
+			break
+		}
+	}
+
+	return ret, nil
 }
 
 func (self *SDnsRecord) IsCNAME() bool {
@@ -605,7 +725,7 @@ func (self *SDnsRecord) StartSetEnabledTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_SYNC_STATUS, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_SYNC_STATUS, "")
 	return task.ScheduleRun(nil)
 }
 

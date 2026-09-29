@@ -23,10 +23,14 @@ import (
 type LoadbalancerCertificateDetails struct {
 	apis.SharableVirtualResourceDetails
 	SLoadbalancerCertificate
+	ManagedResourceInfo
+	CloudregionResourceInfo
 
-	LbListenerCount int `json:"lb_listener_count"`
-	// 证书内容是否完整
-	IsComplete bool `json:"is_complete"`
+	LoadbalancerCertificateUsage
+}
+
+type LoadbalancerCertificateUsage struct {
+	ListenerCount int `json:"lb_listener_count"`
 }
 
 type LoadbalancerCertificateResourceInfo struct {
@@ -69,22 +73,25 @@ type LoadbalancerCertificateListInput struct {
 type LoadbalancerCertificateCreateInput struct {
 	apis.SharableVirtualResourceCreateInput
 
+	CloudregionResourceInput
+	CloudproviderResourceInput
+
 	Certificate string `json:"certificate"`
 	PrivateKey  string `json:"private_key"`
-	// swagger: ignore
+	// swagger:ignore
 	Fingerprint string `json:"fingerprint"`
-	// swagger: ignore
+	// swagger:ignore
 	PublicKeyAlgorithm string `json:"public_key_algorithm"`
-	// swagger: ignore
+	// swagger:ignore
 	PublicKeyBitLen int `json:"public_key_bit_len"`
-	// swagger: ignore
+	// swagger:ignore
 	SignatureAlgorithm string `json:"signature_algorithm"`
-	// swagger: ignore
+	// swagger:ignore
 	NotBefore time.Time `json:"not_before"`
-	// swagger: ignore
+	// swagger:ignore
 	NotAfter time.Time `json:"not_after"`
-	// swagger: ignore
+	// swagger:ignore
 	CommonName string `json:"common_name"`
-	// swagger: ignore
+	// swagger:ignore
 	SubjectAlternativeNames string `json:"subject_alternative_names"`
 }

@@ -35,11 +35,11 @@ type SSecurityGroup struct {
 	Id                string
 	VMNum             int
 	Origin            string
-	VpcName           string
-	VpcId             string
-	CreationTime      time.Time
-	Description       string
-	ProjectId         string
+	//VpcName           string
+	//VpcId             string
+	CreationTime time.Time
+	Description  string
+	ProjectId    string
 
 	SecurityGroupRuleList []SSecurityGroupRule
 }
@@ -61,7 +61,7 @@ func (self *SSecurityGroup) GetGlobalId() string {
 }
 
 func (self *SSecurityGroup) GetStatus() string {
-	return ""
+	return api.SECGROUP_STATUS_READY
 }
 
 func (self *SSecurityGroup) Refresh() error {
@@ -69,6 +69,7 @@ func (self *SSecurityGroup) Refresh() error {
 	if err != nil {
 		return err
 	}
+	self.SecurityGroupRuleList = nil
 	return jsonutils.Update(self, sec)
 }
 
@@ -76,43 +77,21 @@ func (self *SSecurityGroup) GetDescription() string {
 	return self.Description
 }
 
-func compatibleSecurityGroupRule(r SSecurityGroupRule) bool {
-	// 忽略IPV6
-	if r.Ethertype != "IPv4" {
-		return false
-	}
-	if len(r.DestCidrIP) == 0 {
-		return false
-	}
-	if !utils.IsInStringArray(r.Protocol, []string{"ANY", "TCP", "UDP", "ICMP"}) {
-		return false
-	}
-	return true
+func (self *SSecurityGroup) GetTags() (map[string]string, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "GetTags")
 }
 
-func (self *SSecurityGroup) GetRules() ([]cloudprovider.SecurityRule, error) {
-	rules := make([]cloudprovider.SecurityRule, 0)
-	for _, r := range self.SecurityGroupRuleList {
-		if !compatibleSecurityGroupRule(r) {
-			continue
-		}
-
-		rule, err := r.toRule()
-		if err != nil {
-			return nil, err
-		}
-
-		rules = append(rules, rule)
+func (self *SSecurityGroup) GetRules() ([]cloudprovider.ISecurityGroupRule, error) {
+	rules := make([]cloudprovider.ISecurityGroupRule, 0)
+	for i := range self.SecurityGroupRuleList {
+		self.SecurityGroupRuleList[i].secgroup = self
+		rules = append(rules, &self.SecurityGroupRuleList[i])
 	}
-
 	return rules, nil
 }
 
 func (self *SSecurityGroup) GetVpcId() string {
-	if len(self.VpcId) == 0 {
-		return api.NORMAL_VPC_ID
-	}
-	return self.VpcId
+	return ""
 }
 
 func (self *SRegion) GetSecurityGroup(id string) (*SSecurityGroup, error) {
@@ -127,14 +106,11 @@ func (self *SRegion) GetSecurityGroup(id string) (*SSecurityGroup, error) {
 	return ret, resp.Unmarshal(ret, "returnObj")
 }
 
-func (self *SRegion) GetSecurityGroups(vpcId string) ([]SSecurityGroup, error) {
+func (self *SRegion) GetSecurityGroups() ([]SSecurityGroup, error) {
 	pageNo := 1
 	params := map[string]interface{}{
 		"pageNo":   pageNo,
 		"pageSize": 50,
-	}
-	if len(vpcId) > 0 {
-		params["vpcID"] = vpcId
 	}
 	ret := []SSecurityGroup{}
 	for {
@@ -160,6 +136,40 @@ func (self *SRegion) GetSecurityGroups(vpcId string) ([]SSecurityGroup, error) {
 	return ret, nil
 }
 
+func (self *SSecurityGroup) CreateRule(opts *cloudprovider.SecurityGroupRuleCreateOptions) (cloudprovider.ISecurityGroupRule, error) {
+	ruleIds := []string{}
+	for _, rule := range self.SecurityGroupRuleList {
+		if !utils.IsInStringArray(rule.Id, ruleIds) {
+			ruleIds = append(ruleIds, rule.Id)
+		}
+	}
+	err := self.region.CreateSecurityGroupRule(self.Id, opts)
+	if err != nil {
+		return nil, errors.Wrapf(err, "CreateSecurityGroupRule")
+	}
+	for i := 0; i < 3; i++ {
+		err := self.Refresh()
+		if err != nil {
+			return nil, errors.Wrapf(err, "Refresh")
+		}
+		for i := range self.SecurityGroupRuleList {
+			if !utils.IsInStringArray(self.SecurityGroupRuleList[i].Id, ruleIds) {
+				if self.SecurityGroupRuleList[i].GetDirection() == opts.Direction &&
+					self.SecurityGroupRuleList[i].GetProtocol() == opts.Protocol &&
+					self.SecurityGroupRuleList[i].GetPriority() == opts.Priority &&
+					self.SecurityGroupRuleList[i].GetPorts() == opts.Ports &&
+					self.SecurityGroupRuleList[i].DestCidrIP == opts.CIDR &&
+					self.SecurityGroupRuleList[i].GetAction() == opts.Action {
+					self.SecurityGroupRuleList[i].secgroup = self
+					return &self.SecurityGroupRuleList[i], nil
+				}
+			}
+		}
+		time.Sleep(time.Second * 3)
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "after created")
+}
+
 func (self *SRegion) CreateSecurityGroup(opts *cloudprovider.SecurityGroupCreateInput) (*SSecurityGroup, error) {
 	params := map[string]interface{}{
 		"clientToken": utils.GenRequestId(20),
@@ -174,18 +184,6 @@ func (self *SRegion) CreateSecurityGroup(opts *cloudprovider.SecurityGroupCreate
 	id, err := resp.GetString("returnObj", "securityGroupID")
 	if err != nil {
 		return nil, errors.Wrapf(err, "get secgroup id")
-	}
-	for _, r := range opts.InRules {
-		err := self.CreateSecurityGroupRule(id, r.SecurityRule)
-		if err != nil {
-			return nil, errors.Wrapf(err, "CreateRule")
-		}
-	}
-	for _, r := range opts.OutRules {
-		err := self.CreateSecurityGroupRule(id, r.SecurityRule)
-		if err != nil {
-			return nil, errors.Wrapf(err, "CreateRule")
-		}
 	}
 	return self.GetSecurityGroup(id)
 }

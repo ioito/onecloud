@@ -59,6 +59,10 @@ func (set Networks) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set Networks) IncludeDetails() bool {
+	return false
+}
+
 func (set LoadbalancerNetworks) ModelManager() modulebase.IBaseManager {
 	return &modules.Loadbalancernetworks
 }
@@ -80,6 +84,10 @@ func (set LoadbalancerNetworks) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set LoadbalancerNetworks) IncludeDetails() bool {
+	return false
 }
 
 func (set LoadbalancerNetworks) JoinLoadbalancers(entries Loadbalancers) bool {
@@ -148,6 +156,10 @@ func (set Loadbalancers) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set Loadbalancers) IncludeDetails() bool {
+	return false
 }
 
 func (ms Loadbalancers) JoinListeners(subEntries LoadbalancerListeners) bool {
@@ -225,6 +237,10 @@ func (set LoadbalancerListeners) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set LoadbalancerListeners) IncludeDetails() bool {
+	return false
+}
+
 func (ms LoadbalancerListeners) JoinListenerRules(subEntries LoadbalancerListenerRules) bool {
 	for _, m := range ms {
 		m.rules = LoadbalancerListenerRules{}
@@ -270,6 +286,24 @@ func (set LoadbalancerListenerRules) ModelManager() modulebase.IBaseManager {
 	return &modules.LoadbalancerListenerRules
 }
 
+func (ms LoadbalancerListenerRules) JoinCertificates(subEntries LoadbalancerCertificates) bool {
+	correct := true
+	for _, m := range ms {
+		m.certificate = nil
+		if m.CertificateId != "" {
+			subEntry, ok := subEntries[m.CertificateId]
+			if !ok {
+				log.Warningf("loadbalancerlistener id %s: cannot find certificate id %s",
+					m.Id, m.CertificateId)
+				correct = false
+				continue
+			}
+			m.certificate = subEntry
+		}
+	}
+	return correct
+}
+
 func (set LoadbalancerListenerRules) NewModel() db.IModel {
 	return &models.SLoadbalancerListenerRule{}
 }
@@ -291,6 +325,10 @@ func (set LoadbalancerListenerRules) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set LoadbalancerListenerRules) IncludeDetails() bool {
+	return false
 }
 
 type OrderedLoadbalancerListenerRuleList []*LoadbalancerListenerRule
@@ -357,6 +395,10 @@ func (set LoadbalancerBackendGroups) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set LoadbalancerBackendGroups) IncludeDetails() bool {
+	return false
+}
+
 func (ms LoadbalancerBackendGroups) JoinBackends(subEntries LoadbalancerBackends) bool {
 	for _, m := range ms {
 		m.Backends = LoadbalancerBackends{}
@@ -407,6 +449,10 @@ func (set LoadbalancerBackends) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set LoadbalancerBackends) IncludeDetails() bool {
+	return false
+}
+
 func (set LoadbalancerAcls) ModelManager() modulebase.IBaseManager {
 	return &modules.LoadbalancerAcls
 }
@@ -433,6 +479,10 @@ func (set LoadbalancerAcls) Copy() apihelper.IModelSet {
 	return setCopy
 }
 
+func (set LoadbalancerAcls) IncludeDetails() bool {
+	return false
+}
+
 func (set LoadbalancerCertificates) ModelManager() modulebase.IBaseManager {
 	return &modules.LoadbalancerCertificates
 }
@@ -457,4 +507,8 @@ func (set LoadbalancerCertificates) Copy() apihelper.IModelSet {
 		setCopy[id] = el.Copy()
 	}
 	return setCopy
+}
+
+func (set LoadbalancerCertificates) IncludeDetails() bool {
+	return false
 }

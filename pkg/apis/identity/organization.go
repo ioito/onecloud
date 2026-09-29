@@ -15,11 +15,13 @@
 package identity
 
 import (
+	"fmt"
 	"strings"
 
 	"yunion.io/x/jsonutils"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
 const (
@@ -77,14 +79,14 @@ type OrganizationCreateInput struct {
 
 	Type TOrgType `json:"type"`
 
-	// swagger: ignore
+	// swagger:ignore
 	Level int `json:"level,omitzero"`
 
 	// key
 	Key []string `json:"key"`
 
 	// keys
-	// swagger: ignore
+	// swagger:ignore
 	Keys string `json:"keys"`
 }
 
@@ -115,15 +117,15 @@ type OrganizationPerformAddLevelsInput struct {
 }
 
 type OrganizationPerformAddNodeInput struct {
-	Tags        map[string]string
-	Weight      int
-	Description string
+	Tags        map[string]string `json:"tags"`
+	Weight      int               `json:"weight"`
+	Description string            `json:"description"`
 }
 
 type OrganizationPerformSyncInput struct {
-	ResourceType string
+	ResourceType string `json:"resource_type"`
 
-	Reset *bool
+	Reset *bool `json:"reset"`
 }
 
 type OrganizationNodePerformBindInput struct {
@@ -137,7 +139,9 @@ func IsValidLabel(val string) bool {
 }
 
 func trimLabel(label string) string {
-	return strings.Trim(label, OrganizationLabelSeparator+" ")
+	label = strings.Trim(label, OrganizationLabelSeparator+" ")
+	label = strings.ReplaceAll(label, "/", "\\/")
+	return label
 }
 
 func JoinLabels(seg ...string) string {
@@ -159,7 +163,12 @@ func SplitLabel(label string) []string {
 	for _, p := range parts {
 		p = trimLabel(p)
 		if len(p) > 0 {
-			ret = append(ret, p)
+			if len(ret) > 0 && strings.HasSuffix(ret[len(ret)-1], "\\") {
+				pref := ret[len(ret)-1]
+				ret[len(ret)-1] = fmt.Sprintf("%s/%s", pref[:len(pref)-1], p)
+			} else {
+				ret = append(ret, p)
+			}
 		}
 	}
 	return ret
@@ -179,16 +188,45 @@ type OrganizationNodeListInput struct {
 	OrgType TOrgType `json:"org_type"`
 
 	Level int `json:"level"`
+
+	// domain tags filter imposed by policy
+	PolicyDomainTags tagutils.TTagSetList `json:"policy_domain_tags"`
+	// project tags filter imposed by policy
+	PolicyProjectTags tagutils.TTagSetList `json:"policy_project_tags"`
+	// object tags filter imposed by policy
+	PolicyObjectTags tagutils.TTagSetList `json:"policy_object_tags"`
 }
 
 type SProjectOrganization struct {
-	Id    string
-	Name  string
-	Keys  []string
-	Nodes []SProjectOrganizationNode
+	Id    string                     `json:"id"`
+	Name  string                     `json:"name"`
+	Keys  []string                   `json:"keys"`
+	Nodes []SProjectOrganizationNode `json:"nodes"`
 }
 
 type SProjectOrganizationNode struct {
-	Id     string
-	Labels []string
+	Id     string   `json:"id"`
+	Labels []string `json:"labels"`
+}
+
+type SOrganizationNodeDetails struct {
+	apis.StandaloneResourceDetails
+
+	SOrganizationNode
+
+	Tags tagutils.TTagSet `json:"tags"`
+
+	Organization string `json:"organization"`
+
+	Type TOrgType `json:"type"`
+}
+
+type SOrganizationDetails struct {
+	EnabledIdentityBaseResourceDetails
+	apis.SharableResourceBaseInfo
+
+	SOrganization
+}
+
+type OrganizationPerformCleanInput struct {
 }

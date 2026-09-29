@@ -16,32 +16,43 @@ package deployserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 
 	execlient "yunion.io/x/executor/client"
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/utils"
 
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
+	commonconsts "yunion.io/x/onecloud/pkg/cloudcommon/consts"
+	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/cloudcommon/service"
 	"yunion.io/x/onecloud/pkg/hostman/diskutils"
+	"yunion.io/x/onecloud/pkg/hostman/diskutils/fsutils"
 	"yunion.io/x/onecloud/pkg/hostman/diskutils/libguestfs"
 	"yunion.io/x/onecloud/pkg/hostman/diskutils/nbd"
-	"yunion.io/x/onecloud/pkg/hostman/guestfs"
+	"yunion.io/x/onecloud/pkg/hostman/diskutils/qemu_kvm"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
+	"yunion.io/x/onecloud/pkg/hostman/guestman/arch"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/consts"
+	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/uefi"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/seclib2"
-	"yunion.io/x/onecloud/pkg/util/sysutils"
 	"yunion.io/x/onecloud/pkg/util/winutils"
 )
 
@@ -93,29 +104,20 @@ func (*DeployerServer) DeployGuestFs(ctx context.Context, req *deployapi.DeployP
 	}
 	defer disk.Cleanup()
 
-	if err := disk.Connect(); err != nil {
+	if err := disk.Connect(req.GuestDesc); err != nil {
 		log.Errorf("Failed to connect %s disk: %s", req.GuestDesc.Hypervisor, err)
 		return new(deployapi.DeployGuestFsResponse), errors.Wrap(err, "Connect")
 	}
 	defer disk.Disconnect()
-	root, err := disk.MountRootfs()
-	if err != nil {
-		if errors.Cause(err) == errors.ErrNotFound && req.DeployInfo.IsInit {
-			// if init deploy, ignore no partition error
-			return new(deployapi.DeployGuestFsResponse), nil
-		}
-		log.Errorf("Failed mounting rootfs for %s disk: %s", req.GuestDesc.Hypervisor, err)
-		return new(deployapi.DeployGuestFsResponse), err
-	}
-	defer disk.UmountRootfs(root)
-	ret, err := guestfs.DoDeployGuestFs(root, req.GuestDesc, req.DeployInfo)
-	if err != nil {
-		return new(deployapi.DeployGuestFsResponse), err
-	}
+
+	ret, err := disk.DeployGuestfs(req)
 	if ret == nil {
-		return new(deployapi.DeployGuestFsResponse), nil
+		ret = new(deployapi.DeployGuestFsResponse)
 	}
-	return ret, nil
+	if err != nil {
+		log.Errorf("failed deploy guest fs: %s", err)
+	}
+	return ret, err
 }
 
 func (*DeployerServer) ResizeFs(ctx context.Context, req *deployapi.ResizeFsParams) (res *deployapi.Empty, err error) {
@@ -130,7 +132,16 @@ func (*DeployerServer) ResizeFs(ctx context.Context, req *deployapi.ResizeFsPara
 			res, err = nil, errors.Error(msg)
 		}
 	}()
-	log.Infof("********* Resize fs on %#v", apiDiskInfo(req.DiskInfo))
+
+	log.Infof("********* Resize fs on %#v", req.DiskInfo)
+	if strings.HasPrefix(req.DiskInfo.Path, "/dev/loop") {
+		// HACK: container loop device, do resize locally
+		if err := fsutils.ResizeDiskFs(req.DiskInfo.Path, 0, true); err != nil {
+			return new(deployapi.Empty), errors.Wrap(err, "fsutils.ResizeDiskFs")
+		}
+		return new(deployapi.Empty), nil
+	}
+
 	disk, err := diskutils.GetIDisk(diskutils.DiskParams{
 		Hypervisor: req.Hypervisor,
 		DiskInfo:   apiDiskInfo(req.GetDiskInfo()),
@@ -140,44 +151,17 @@ func (*DeployerServer) ResizeFs(ctx context.Context, req *deployapi.ResizeFsPara
 		return new(deployapi.Empty), errors.Wrap(err, "GetIDisk fail")
 	}
 	defer disk.Cleanup()
-	if err := disk.Connect(); err != nil {
+
+	var diskId string
+	if req.DiskInfo != nil {
+		diskId = req.DiskInfo.DiskId
+	}
+	if err := disk.ConnectWithDiskId(req.GuestDesc, diskId); err != nil {
 		return new(deployapi.Empty), errors.Wrap(err, "disk connect failed")
 	}
 	defer disk.Disconnect()
 
-	unmount := func(root fsdriver.IRootFsDriver) error {
-		err := disk.UmountRootfs(root)
-		if err != nil {
-			return errors.Wrap(err, "unmount rootfs")
-		}
-		return nil
-	}
-
-	root, err := disk.MountRootfs()
-	if err != nil {
-		if errors.Cause(err) == errors.ErrNotFound {
-			return new(deployapi.Empty), nil
-		}
-		return new(deployapi.Empty), errors.Wrapf(err, "disk.MountRootfs")
-	}
-	if !root.IsResizeFsPartitionSupport() {
-		err := unmount(root)
-		if err != nil {
-			return new(deployapi.Empty), err
-		}
-		return new(deployapi.Empty), errors.ErrNotSupported
-	}
-
-	// must umount rootfs before resize partition
-	err = unmount(root)
-	if err != nil {
-		return new(deployapi.Empty), err
-	}
-	err = disk.ResizePartition()
-	if err != nil {
-		return new(deployapi.Empty), errors.Wrap(err, "resize disk partition")
-	}
-	return new(deployapi.Empty), nil
+	return disk.ResizeFs(req)
 }
 
 func (*DeployerServer) FormatFs(ctx context.Context, req *deployapi.FormatFsParams) (*deployapi.Empty, error) {
@@ -188,16 +172,9 @@ func (*DeployerServer) FormatFs(ctx context.Context, req *deployapi.FormatFsPara
 	}
 	defer gd.Cleanup()
 
-	if err := gd.Connect(); err == nil {
+	if err := gd.Connect(nil); err == nil {
 		defer gd.Disconnect()
-		if err := gd.MakePartition(req.FsFormat); err == nil {
-			err = gd.FormatPartition(req.FsFormat, req.Uuid)
-			if err != nil {
-				return new(deployapi.Empty), errors.Wrap(err, "FormatPartition")
-			}
-		} else {
-			return new(deployapi.Empty), errors.Wrap(err, "MakePartition")
-		}
+		return gd.FormatFs(req)
 	} else {
 		log.Errorf("failed connect kvm disk %#v: %s", apiDiskInfo(req.DiskInfo), err)
 	}
@@ -206,75 +183,20 @@ func (*DeployerServer) FormatFs(ctx context.Context, req *deployapi.FormatFsPara
 
 func (*DeployerServer) SaveToGlance(ctx context.Context, req *deployapi.SaveToGlanceParams) (*deployapi.SaveToGlanceResponse, error) {
 	log.Infof("********* %#v save to glance", apiDiskInfo(req.DiskInfo))
-	var (
-		osInfo  string
-		relInfo *deployapi.ReleaseInfo
-	)
+
 	kvmDisk, err := diskutils.NewKVMGuestDisk(apiDiskInfo(req.GetDiskInfo()), DeployOption.ImageDeployDriver, false)
 	if err != nil {
 		return new(deployapi.SaveToGlanceResponse), errors.Wrap(err, "NewKVMGuestDisk")
 	}
 	defer kvmDisk.Cleanup()
 
-	ret := &deployapi.SaveToGlanceResponse{
-		OsInfo:      osInfo,
-		ReleaseInfo: relInfo,
-	}
-
-	err = kvmDisk.Connect()
+	err = kvmDisk.Connect(nil)
 	if err != nil {
-		return ret, errors.Wrapf(err, "kvmDisk.Connect %#v", apiDiskInfo(req.DiskInfo))
+		return new(deployapi.SaveToGlanceResponse), errors.Wrapf(err, "kvmDisk.Connect %#v", apiDiskInfo(req.DiskInfo))
 	}
 	defer kvmDisk.Disconnect()
 
-	root, err := kvmDisk.MountKvmRootfs()
-	if err != nil {
-		if errors.Cause(err) == errors.ErrNotFound {
-			return ret, nil
-		}
-		return ret, errors.Wrapf(err, "MountKvmRootfs")
-	}
-	defer kvmDisk.UmountKvmRootfs(root)
-
-	osInfo = root.GetOs()
-	relInfo = root.GetReleaseInfo(root.GetPartition())
-	if req.Compress {
-		err = root.PrepareFsForTemplate(root.GetPartition())
-		if err != nil {
-			log.Errorf("PrepareFsForTemplate %s", err)
-		}
-	}
-	if req.Compress {
-		kvmDisk.Zerofree()
-	}
-	return ret, err
-}
-
-func (*DeployerServer) getImageInfo(kvmDisk *diskutils.SKVMGuestDisk) (*deployapi.ImageInfo, error) {
-	// Fsck is executed during mount
-	rootfs, err := kvmDisk.MountKvmRootfs()
-	if err != nil {
-		if errors.Cause(err) == errors.ErrNotFound {
-			return new(deployapi.ImageInfo), nil
-		}
-		return new(deployapi.ImageInfo), errors.Wrapf(err, "kvmDisk.MountKvmRootfs")
-	}
-	partition := rootfs.GetPartition()
-	imageInfo := &deployapi.ImageInfo{
-		OsInfo:               rootfs.GetReleaseInfo(partition),
-		OsType:               rootfs.GetOs(),
-		IsLvmPartition:       kvmDisk.IsLVMPartition(),
-		IsReadonly:           partition.IsReadonly(),
-		IsInstalledCloudInit: rootfs.IsCloudinitInstall(),
-	}
-	kvmDisk.UmountKvmRootfs(rootfs)
-
-	// In case of deploy driver is guestfish, we can't mount
-	// multi partition concurrent, so we need umount rootfs first
-	imageInfo.IsUefiSupport = kvmDisk.DetectIsUEFISupport(rootfs)
-	imageInfo.PhysicalPartitionType = partition.GetPhysicalPartitionType()
-	log.Infof("ProbeImageInfo response %s", imageInfo)
-	return imageInfo, nil
+	return kvmDisk.SaveToGlance(req)
 }
 
 func (s *DeployerServer) ProbeImageInfo(ctx context.Context, req *deployapi.ProbeImageInfoPramas) (*deployapi.ImageInfo, error) {
@@ -285,13 +207,13 @@ func (s *DeployerServer) ProbeImageInfo(ctx context.Context, req *deployapi.Prob
 	}
 	defer kvmDisk.Cleanup()
 
-	if err := kvmDisk.Connect(); err != nil {
+	if err := kvmDisk.Connect(nil); err != nil {
 		log.Errorf("Failed to connect kvm disk %#v: %s", apiDiskInfo(req.DiskInfo), err)
 		return new(deployapi.ImageInfo), errors.Wrap(err, "Disk connector failed to connect image")
 	}
 	defer kvmDisk.Disconnect()
 
-	return s.getImageInfo(kvmDisk)
+	return kvmDisk.ProbeImageInfo(req)
 }
 
 var connectedEsxiDisks = map[string]*diskutils.VDDKDisk{}
@@ -350,6 +272,75 @@ func (*DeployerServer) DisconnectEsxiDisks(
 	return new(deployapi.Empty), nil
 }
 
+func (*DeployerServer) SetOvmfBootOrder(ctx context.Context, req *deployapi.OvmfBootOrderParams) (*deployapi.Empty, error) {
+	log.Infof("Request SetOvmfBootOrder of %s", req.OvmfVarsPath)
+	if !fileutils2.Exists(req.OvmfVarsPath) {
+		return new(deployapi.Empty), errors.Errorf("ovmf %s not found", req.OvmfVarsPath)
+	}
+
+	// parse boot entry from ovmf vars
+	bootEntries, bootOrder, ovmfJsonTmpPath, err := uefi.ParseUefiVars(req.OvmfVarsPath)
+	if err != nil {
+		return new(deployapi.Empty), errors.Wrapf(err, "failed parse uefi vars %s", req.OvmfVarsPath)
+	}
+
+	sort.Slice(req.Devs, func(i, j int) bool {
+		return req.Devs[i].AttachOrder < req.Devs[j].AttachOrder
+	})
+	bootEntryIdx := map[string]*deployapi.BootDevices{}
+	bootentryOrder := map[int32]string{}
+	findBootentry := func(dev *deployapi.BootDevices) {
+		for x, bootEntry := range bootEntries {
+			if _, ok := bootEntryIdx[bootEntry.ID]; ok {
+				continue
+			}
+			log.Errorf("bootentry %v type %v", x, bootEntry.GetType())
+			if bootEntry.GetType() == uefi.OvmfDevicePathType(dev.DevType) {
+				bootEntryIdx[bootEntry.ID] = dev
+				bootentryOrder[dev.BootOrder] = bootEntry.ID
+				break
+			}
+		}
+	}
+	for i := range req.Devs {
+		findBootentry(req.Devs[i])
+	}
+	sort.Slice(req.Devs, func(i, j int) bool {
+		return req.Devs[i].BootOrder < req.Devs[j].BootOrder
+	})
+	newBootOrder := []uint16{}
+	for i := range req.Devs {
+		bentry, ok := bootentryOrder[req.Devs[i].BootOrder]
+		if !ok {
+			continue
+		}
+		order, err := uefi.ParseBootentryToBootorder(bentry)
+		if err != nil {
+			log.Errorf("failed ParseBootentryToBootorder %s %s", bentry, err)
+			continue
+		}
+		newBootOrder = append(newBootOrder, order)
+	}
+	for i := range bootOrder {
+		if utils.IsInArray(bootOrder[i], newBootOrder) {
+			continue
+		}
+		newBootOrder = append(newBootOrder, bootOrder[i])
+	}
+
+	if err := uefi.UpdateBootOrderInJson(ovmfJsonTmpPath, newBootOrder); err != nil {
+		log.Errorf("failed UpdateBootOrderInJson %s", err)
+		return new(deployapi.Empty), errors.Wrapf(err, "failed UpdateBootOrderInJson %v", newBootOrder)
+	}
+	out, err := uefi.ApplyJsonToVars(ovmfJsonTmpPath, req.OvmfVarsPath, req.OvmfVarsPath)
+	if err != nil {
+		log.Errorf("failed ApplyJsonToVars %s %s", out, err)
+		return new(deployapi.Empty), errors.Wrapf(err, "failed ApplyJsonToVars %v", out)
+	}
+
+	return new(deployapi.Empty), nil
+}
+
 type SDeployService struct {
 	*service.SServiceBase
 
@@ -363,6 +354,22 @@ func NewDeployService() *SDeployService {
 }
 
 func (s *SDeployService) RunService() {
+	if DeployOption.DeployAction != "" {
+		res, err := StartLocalDeploy(DeployOption.DeployAction)
+		if err != nil {
+			if e := fileutils2.FilePutContents("/error", err.Error(), false); e != nil {
+				log.Errorf("failed put errors to file: %s", e)
+			}
+		}
+		if res != nil {
+			resStr, _ := json.Marshal(res)
+			if e := fileutils2.FilePutContents("/response", string(resStr), false); e != nil {
+				log.Errorf("failed put response to file: %s", e)
+			}
+		}
+		return
+	}
+
 	s.grpcServer = grpc.NewServer()
 	deployapi.RegisterDeployAgentServer(s.grpcServer, &DeployerServer{})
 	if fileutils2.Exists(DeployOption.DeployServerSocketPath) {
@@ -396,33 +403,124 @@ func (s *SDeployService) FixPathEnv() error {
 	return os.Setenv("PATH", strings.Join(paths, ":"))
 }
 
+func InitEnvCommon() error {
+	commonconsts.SetAllowVmSELinux(DeployOption.AllowVmSELinux)
+
+	fsutils.SetExt4UsageTypeThresholds(
+		int64(DeployOption.Ext4LargefileSizeGb)*1024*1024*1024,
+		int64(DeployOption.Ext4HugefileSizeGb)*1024*1024*1024,
+	)
+	if err := fsdriver.Init(DeployOption.CloudrootDir); err != nil {
+		return errors.Wrap(err, "init fsdriver")
+	}
+
+	netutils.SetPrivatePrefixes(DeployOption.CustomizedPrivatePrefixes)
+	return nil
+}
+
 func (s *SDeployService) PrepareEnv() error {
+	if !fileutils2.Exists(DeployOption.DeployTempDir) {
+		err := os.MkdirAll(DeployOption.DeployTempDir, 0755)
+		if err != nil {
+			return errors.Errorf("fail to create %s: %s", DeployOption.DeployTempDir, err)
+		}
+	}
+	commonconsts.SetDeployTempDir(DeployOption.DeployTempDir)
+
+	if err := InitEnvCommon(); err != nil {
+		return err
+	}
+
 	if err := s.FixPathEnv(); err != nil {
 		return err
 	}
-	output, err := procutils.NewRemoteCommandAsFarAsPossible("rmmod", "nbd").Output()
-	if err != nil {
-		log.Errorf("rmmod error: %s", output)
-	}
-	output, err = procutils.NewRemoteCommandAsFarAsPossible("modprobe", "nbd", "max_part=16").Output()
-	if err != nil {
-		return fmt.Errorf("Failed to activate nbd device: %s", output)
-	}
-	err = nbd.Init()
-	if err != nil {
-		return err
+
+	if DeployOption.ImageDeployDriver == consts.DEPLOY_DRIVER_LIBGUESTFS {
+		if err := libguestfs.Init(3); err != nil {
+			log.Fatalln(err)
+		}
 	}
 
-	// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-bdi
-	for i := 0; i < 16; i++ {
-		nbdBdi := fmt.Sprintf("/sys/block/nbd%d/bdi/", i)
-		sysutils.SetSysConfig(nbdBdi+"max_ratio", "0")
-		sysutils.SetSysConfig(nbdBdi+"min_ratio", "0")
+	if DeployOption.ImageDeployDriver != consts.DEPLOY_DRIVER_QEMU_KVM {
+		if err := nbd.Init(); err != nil {
+			return errors.Wrap(err, "nbd.Init")
+		}
+	} else {
+		cpuArch, err := procutils.NewCommand("uname", "-m").Output()
+		if err != nil {
+			return errors.Wrap(err, "get cpu architecture")
+		}
+		cpuArchStr := strings.TrimSpace(string(cpuArch))
+
+		// prepare for yunionos don't have but necessary files
+		out, err := procutils.NewCommand("mkdir", "-p", "/opt/yunion/bin/bundles").Output()
+		if err != nil {
+			return errors.Wrapf(err, "cp files failed %s", out)
+		}
+		copyFiles := map[string]string{
+			"/usr/bin/chntpw.static":         "/opt/yunion/bin/chntpw.static",
+			"/usr/bin/.chntpw.static.bin":    "/opt/yunion/bin/.chntpw.static.bin",
+			"/usr/bin/bundles/chntpw.static": "/opt/yunion/bin/bundles/chntpw.static",
+			"/usr/bin/growpart":              "/opt/yunion/bin/growpart",
+			"/usr/bin/zerofree":              "/opt/yunion/bin/zerofree",
+		}
+		// x86_64 or aarch64
+		switch cpuArchStr {
+		case qemu_kvm.OS_ARCH_AARCH64:
+			copyFiles["/yunionos/aarch64/qemu-ga"] = fsdriver.QGA_BINARY_PATH
+		case arch.Arch_x86_64:
+			copyFiles["/yunionos/x86_64/qemu-ga"] = fsdriver.QGA_BINARY_PATH
+			copyFiles["/yunionos/x86_64/qemu-ga-x86_64.msi"] = fsdriver.QGA_WIN_MSI_INSTALLER_PATH
+		case "riscv64":
+			copyFiles["/yunionos/riscv64/qemu-ga"] = fsdriver.QGA_BINARY_PATH
+		}
+
+		for k, v := range copyFiles {
+			out, err = procutils.NewCommand("cp", "-rf", k, v).Output()
+			if err != nil {
+				return errors.Wrapf(err, "cp files failed %s", out)
+			}
+		}
+
+		{
+			newOptions := DeployOption
+			newOptions.CommonConfigFile = ""
+			// save runtime options to /opt/yunion/host.conf
+			conf := jsonutils.Marshal(newOptions).YAMLString()
+			log.Debugf("deploy options: %s", conf)
+			err := ioutil.WriteFile("/opt/yunion/host.conf", []byte(conf), 0600)
+			if err != nil {
+				return errors.Wrapf(err, "save host.conf failed %s", out)
+			}
+		}
+
+		err = procutils.NewCommand("mkdir", "-p", qemu_kvm.RUN_ON_HOST_ROOT_PATH).Run()
+		if err != nil {
+			return errors.Wrap(err, "Failed to mkdir RUN_ON_HOST_ROOT_PATH: %s")
+		}
+
+		mkisofsArgs := []string{"-l", "-J", "-L", "-R", "-r", "-v", "-hide-rr-moved", "-o", qemu_kvm.DEPLOY_ISO, "-graft-points", "vmware-vddk=/opt/vmware-vddk", "yunion=/opt/yunion"}
+		out, err = procutils.NewCommand("mkisofs", mkisofsArgs...).Output()
+		if err != nil {
+			return errors.Wrapf(err, "mkisofs failed %s", out)
+		}
+
+		err = qemu_kvm.InitQemuDeployManager(
+			cpuArchStr,
+			DeployOption.DefaultQemuVersion,
+			DeployOption.EnableRemoteExecutor,
+			DeployOption.HugepagesOption == "native",
+			DeployOption.HugepageSizeMb*1024,
+			DeployOption.DeployGuestMemSizeMb,
+			DeployOption.DeployConcurrent,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// create /dev/lvm_remote
-	err = s.checkLvmRemote()
-	if err != nil {
+	if err := s.checkLvmRemote(); err != nil {
 		return errors.Wrap(err, "unable to checkLvmRemote")
 	}
 
@@ -454,28 +552,6 @@ func (s *SDeployService) checkLvmRemote() error {
 }
 
 func (s *SDeployService) InitService() {
-	log.Infof("exec socket path: %s", DeployOption.ExecutorSocketPath)
-	if DeployOption.EnableRemoteExecutor {
-		execlient.Init(DeployOption.ExecutorSocketPath)
-		execlient.SetTimeoutSeconds(DeployOption.ExecutorConnectTimeoutSeconds)
-		procutils.SetRemoteExecutor()
-	}
-
-	if err := s.PrepareEnv(); err != nil {
-		log.Fatalln(err)
-	}
-	if err := fsdriver.Init(DeployOption.PrivatePrefixes, DeployOption.CloudrootDir); err != nil {
-		log.Fatalln(err)
-	}
-	if DeployOption.ImageDeployDriver == consts.DEPLOY_DRIVER_LIBGUESTFS {
-		if err := libguestfs.Init(3); err != nil {
-			log.Fatalln(err)
-		}
-	}
-	s.O = &DeployOption.BaseOptions
-	if len(DeployOption.DeployServerSocketPath) == 0 {
-		log.Fatalf("missing deploy server socket path")
-	}
 	s.SignalTrap(func() {
 		for {
 			if len(connectedEsxiDisks) > 0 {
@@ -490,6 +566,36 @@ func (s *SDeployService) InitService() {
 			}
 		}
 	})
+
+	optionsInit()
+
+	if len(DeployOption.DeployAction) > 0 {
+		if err := LocalInitEnv(); err != nil {
+			log.Fatalf("local init env %s", err)
+		}
+		return
+	}
+
+	if DeployOption.EnableRemoteExecutor {
+		log.Infof("exec socket path: %s", DeployOption.ExecutorSocketPath)
+		execlient.Init(DeployOption.ExecutorSocketPath)
+		execlient.SetTimeoutSeconds(DeployOption.ExecutorConnectTimeoutSeconds)
+		procutils.SetRemoteExecutor()
+	}
+
+	app_common.InitAuth(&DeployOption.CommonOptions, func() {
+		log.Infof("Auth complete!!")
+	})
+	common_options.StartOptionManager(&DeployOption.CommonOptions, DeployOption.ConfigSyncPeriodSeconds, "", "", common_options.OnCommonOptionsChange)
+
+	if err := s.PrepareEnv(); err != nil {
+		log.Fatalln(err)
+	}
+
+	s.O = &DeployOption.BaseOptions
+	if len(DeployOption.DeployServerSocketPath) == 0 {
+		log.Fatalf("missing deploy server socket path")
+	}
 }
 
 func (s *SDeployService) OnExitService() {}

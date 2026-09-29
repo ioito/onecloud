@@ -37,11 +37,13 @@ func initContainerRegistry() {
 	cmd.Create(new(o.RegistryCreateOptions))
 	cmd.Get("images", new(o.RegistryGetImagesOptions))
 	cmd.Get("image-tags", new(o.RegistryGetImageTagsOptions))
+	cmd.BatchPerform("public", new(o.RegistryPublicOptions))
+	cmd.Perform("private", new(o.RegistryGetOptions))
 
 	type UploadOptions struct {
 		REGISTRY string `help:"The name or id of registry" json:"-"`
 		FILE     string `help:"The container tar image" json:"-"`
-		Name     string `help:"Override image name" json:"name`
+		Name     string `help:"Override image name" json:"name"`
 		Tag      string `help:"Override image tag" json:"tag"`
 	}
 	R(new(UploadOptions), "k8s-container-registry-upload-image", "Upload a docker image", func(s *mcclient.ClientSession, args *UploadOptions) error {
@@ -99,6 +101,9 @@ func initContainerRegistry() {
 				Username: args.Username,
 				Password: args.Password,
 			})
+			if err != nil {
+				return errors.Wrap(err, "download image by manager")
+			}
 		}
 		output := args.Output
 		if output == "" && fileName != "" {

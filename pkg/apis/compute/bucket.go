@@ -16,10 +16,13 @@ package compute
 
 import (
 	"net/http"
+	"reflect"
+	"time"
 
 	"yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/utils"
 
@@ -51,6 +54,8 @@ type BucketCreateInput struct {
 	CloudproviderResourceInput
 
 	StorageClass string `json:"storage_class"`
+
+	EnablePerfMon *bool `json:"enable_perf_mon"`
 }
 
 type BucketDetails struct {
@@ -64,32 +69,34 @@ type BucketDetails struct {
 	AccessUrls []cloudprovider.SBucketAccessUrl `json:"access_urls"`
 }
 
-func (self BucketDetails) GetMetricTags() map[string]string {
+func (bucket BucketDetails) GetMetricTags() map[string]string {
 	ret := map[string]string{
-		"id":             self.Id,
-		"brand":          self.Brand,
-		"cloudregion":    self.Cloudregion,
-		"cloudregion_id": self.CloudregionId,
-		"domain_id":      self.DomainId,
-		"oss_id":         self.Id,
-		"oss_name":       self.Name,
-		"project_domain": self.ProjectDomain,
-		"region_ext_id":  self.RegionExtId,
-		"status":         self.Status,
-		"tenant":         self.Project,
-		"tenant_id":      self.ProjectId,
-		"external_id":    self.ExternalId,
+		"id":             bucket.Id,
+		"brand":          bucket.Brand,
+		"cloudregion":    bucket.Cloudregion,
+		"cloudregion_id": bucket.CloudregionId,
+		"domain_id":      bucket.DomainId,
+		"oss_id":         bucket.Id,
+		"oss_name":       bucket.Name,
+		"project_domain": bucket.ProjectDomain,
+		"region_ext_id":  bucket.RegionExtId,
+		"status":         bucket.Status,
+		"tenant":         bucket.Project,
+		"tenant_id":      bucket.ProjectId,
+		"account":        bucket.Account,
+		"account_id":     bucket.AccountId,
+		"external_id":    bucket.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, bucket.MetadataResourceInfo, bucket.ProjectizedResourceInfo)
 }
 
-func (self BucketDetails) GetMetricPairs() map[string]string {
+func (bucket BucketDetails) GetMetricPairs() map[string]string {
 	ret := map[string]string{}
 	return ret
 }
 
 type BucketObjectsActionInput struct {
-	Key []string
+	Key []string `json:"key"`
 }
 
 type BucketAclInput struct {
@@ -146,6 +153,8 @@ type BucketSyncstatusInput struct {
 
 type BucketUpdateInput struct {
 	apis.SharableVirtualResourceBaseUpdateInput
+
+	EnablePerfMon *bool `json:"enable_perf_mon"`
 }
 
 type BucketPerformTempUrlInput struct {
@@ -211,25 +220,25 @@ type BucketGetObjectsOutput struct {
 }
 
 type BucketWebsiteRoutingRule struct {
-	ConditionErrorCode string
-	ConditionPrefix    string
+	ConditionErrorCode string `json:"condition_error_code"`
+	ConditionPrefix    string `json:"condition_prefix"`
 
-	RedirectProtocol         string
-	RedirectReplaceKey       string
-	RedirectReplaceKeyPrefix string
+	RedirectProtocol         string `json:"redirect_protocol"`
+	RedirectReplaceKey       string `json:"redirect_replace_key"`
+	RedirectReplaceKeyPrefix string `json:"redirect_replace_key_prefix"`
 }
 
 type BucketWebsiteConf struct {
 	// 主页
-	Index string
+	Index string `json:"index"`
 	// 错误时返回的文档
-	ErrorDocument string
+	ErrorDocument string `json:"error_document"`
 	// http或https
-	Protocol string
+	Protocol string `json:"protocol"`
 
-	Rules []BucketWebsiteRoutingRule
+	Rules []BucketWebsiteRoutingRule `json:"rules"`
 	// 访问网站url
-	Url string
+	Url string `json:"url"`
 }
 
 func (input *BucketWebsiteConf) Validate() error {
@@ -246,14 +255,14 @@ func (input *BucketWebsiteConf) Validate() error {
 }
 
 type BucketCORSRule struct {
-	AllowedMethods []string
+	AllowedMethods []string `json:"allowed_methods"`
 	// 允许的源站，可以是*
-	AllowedOrigins []string
-	AllowedHeaders []string
-	MaxAgeSeconds  int
-	ExposeHeaders  []string
+	AllowedOrigins []string `json:"allowed_origins"`
+	AllowedHeaders []string `json:"allowed_headers"`
+	MaxAgeSeconds  int      `json:"max_age_seconds"`
+	ExposeHeaders  []string `json:"expose_headers"`
 	// 规则区别标识
-	Id string
+	Id string `json:"id"`
 }
 
 type BucketCORSRules struct {
@@ -261,11 +270,11 @@ type BucketCORSRules struct {
 }
 
 type BucketCORSRuleDeleteInput struct {
-	Id []string
+	Id []string `json:"id"`
 }
 
 type BucketPolicy struct {
-	Data []BucketPolicyStatement
+	Data []BucketPolicyStatement `json:"data"`
 }
 
 type BucketPolicyStatement struct {
@@ -281,30 +290,30 @@ type BucketPolicyStatement struct {
 	Condition map[string]map[string]interface{} `json:"Condition,omitempty"`
 
 	// 解析字段，主账号id:子账号id
-	PrincipalId []string
+	PrincipalId []string `json:"principal_id"`
 	// map[主账号id:子账号id]子账号name
-	PrincipalNames map[string]string
+	PrincipalNames map[string]string `json:"principal_names"`
 
 	// Read|ReadWrite|FullControl
-	CannedAction string
+	CannedAction string `json:"canned_action"`
 	// 资源路径
-	ResourcePath []string
+	ResourcePath []string `json:"resource_path"`
 	// 根据index 生成
-	Id string
+	Id string `json:"id"`
 }
 
 type BucketPolicyStatementInput struct {
 	// 主账号id:子账号id
-	PrincipalId []string
+	PrincipalId []string `json:"principal_id"`
 	// Read|ReadWrite|FullControl
-	CannedAction string
+	CannedAction string `json:"canned_action"`
 	// Allow|Deny
-	Effect string
+	Effect string `json:"effect"`
 	// 被授权的资源地址,/*
-	ResourcePath []string
+	ResourcePath []string `json:"resource_path"`
 	// ip 条件
-	IpEquals    []string
-	IpNotEquals []string
+	IpEquals    []string `json:"ip_equals"`
+	IpNotEquals []string `json:"ip_not_equals"`
 }
 
 func (input *BucketPolicyStatementInput) Validate() error {
@@ -329,7 +338,7 @@ func (input *BucketPolicyStatementInput) Validate() error {
 }
 
 type BucketPolicyDeleteInput struct {
-	Id []string
+	Id []string `json:"id"`
 }
 
 func (input *BucketCORSRules) Validate() error {
@@ -347,11 +356,11 @@ func (input *BucketCORSRules) Validate() error {
 type BucketRefererConf struct {
 	// Referer Type
 	// enmu: Black-List, White-List
-	RefererType string
+	RefererType string `json:"referer_type"`
 	// 域名列表
-	DomainList []string
+	DomainList []string `json:"domain_list"`
 	// 是否允许空referer 访问
-	AllowEmptyRefer bool
+	AllowEmptyRefer bool `json:"allow_empty_refer"`
 
 	// 是否开启
 	Enabled bool `json:"enabled"`
@@ -359,4 +368,36 @@ type BucketRefererConf struct {
 
 func (input *BucketRefererConf) Validate() error {
 	return nil
+}
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(&SBackupStorageAccessInfo{}), func() gotypes.ISerializable {
+		return &SBackupStorageAccessInfo{}
+	})
+}
+
+type BucketProbeResult struct {
+	UploadTime   time.Duration `json:"upload_time"`
+	DownloadTime time.Duration `json:"download_time"`
+	DeleteTime   time.Duration `json:"delete_time"`
+}
+
+func (result BucketProbeResult) UploadDelayMs() float64 {
+	return float64(result.UploadTime) / float64(time.Millisecond)
+}
+
+func (result BucketProbeResult) DownloadDelayMs() float64 {
+	return float64(result.DownloadTime) / float64(time.Millisecond)
+}
+
+func (result BucketProbeResult) DeleteDelayMs() float64 {
+	return float64(result.DeleteTime) / float64(time.Millisecond)
+}
+
+func (result BucketProbeResult) UploadThroughputMbps(sizeMBytes int) float64 {
+	return float64(sizeMBytes) * 8 / float64(result.UploadTime.Seconds())
+}
+
+func (result BucketProbeResult) DownloadThroughputMbps(sizeMBytes int) float64 {
+	return float64(sizeMBytes) * 8 / float64(result.DownloadTime.Seconds())
 }

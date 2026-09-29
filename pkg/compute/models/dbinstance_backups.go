@@ -25,6 +25,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/sqlchemy"
 
@@ -37,6 +38,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=dbinstancebackup
+// +onecloud:swagger-gen-model-plural=dbinstancebackups
 type SDBInstanceBackupManager struct {
 	db.SVirtualResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -198,6 +201,15 @@ func (manager *SDBInstanceBackupManager) QueryDistinctExtraField(q *sqlchemy.SQu
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SDBInstanceBackupManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (manager *SDBInstanceBackupManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.DBInstanceBackupCreateInput) (*jsonutils.JSONDict, error) {
 	for _, instance := range []string{input.DBInstance, input.DBInstanceId} {
 		if len(instance) > 0 {
@@ -208,7 +220,7 @@ func (manager *SDBInstanceBackupManager) ValidateCreateData(ctx context.Context,
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -228,7 +240,7 @@ func (manager *SDBInstanceBackupManager) ValidateCreateData(ctx context.Context,
 	input.ManagerId = provider.Id
 
 	if instance.Status != api.DBINSTANCE_RUNNING {
-		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s require status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
+		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s; required status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
 	}
 	region, err := instance.GetRegion()
 	if err != nil {
@@ -266,8 +278,8 @@ func (self *SDBInstanceBackup) StartDBInstanceBackupCreateTask(ctx context.Conte
 	if err != nil {
 		return errors.Wrap(err, "GetDBInstance")
 	}
-	instance.SetStatus(userCred, api.DBINSTANCE_BACKING_UP, "")
-	self.SetStatus(userCred, api.DBINSTANCE_BACKUP_CREATING, "")
+	instance.SetStatus(ctx, userCred, api.DBINSTANCE_BACKING_UP, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_BACKUP_CREATING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -336,7 +348,7 @@ func (self *SDBInstanceBackup) PerformSyncstatus(ctx context.Context, userCred m
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("DBInstance backup has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("DBInstance backup has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, self, "DBInstanceBackupSyncstatusTask", "")
@@ -465,6 +477,9 @@ func (self *SDBInstanceBackup) SyncWithCloudDBInstanceBackup(
 		if dbinstanceId := extBackup.GetDBInstanceId(); len(dbinstanceId) > 0 {
 			//有可能云上删除了实例，未删除备份
 			_instance, err := db.FetchByExternalIdAndManagerId(DBInstanceManager, dbinstanceId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+				if len(self.CloudregionId) > 0 {
+					q = q.Equals("cloudregion_id", self.CloudregionId)
+				}
 				return q.Equals("manager_id", provider.Id)
 			})
 			if err == sql.ErrNoRows {
@@ -484,7 +499,7 @@ func (self *SDBInstanceBackup) SyncWithCloudDBInstanceBackup(
 	}
 
 	if len(self.ProjectId) == 0 {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), extBackup, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), extBackup, provider)
 	}
 
 	return nil
@@ -515,6 +530,9 @@ func (manager *SDBInstanceBackupManager) newFromCloudDBInstanceBackup(
 
 	if dbinstanceId := extBackup.GetDBInstanceId(); len(dbinstanceId) > 0 {
 		_dbinstance, err := db.FetchByExternalIdAndManagerId(DBInstanceManager, dbinstanceId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+			if !gotypes.IsNil(region) {
+				q = q.Equals("cloudregion_id", region.Id)
+			}
 			return q.Equals("manager_id", provider.Id)
 		})
 		if err != nil {
@@ -543,7 +561,7 @@ func (manager *SDBInstanceBackupManager) newFromCloudDBInstanceBackup(
 	}
 
 	if len(backup.ProjectId) == 0 {
-		SyncCloudProject(ctx, userCred, &backup, provider.GetOwnerId(), extBackup, provider.Id)
+		SyncCloudProject(ctx, userCred, &backup, provider.GetOwnerId(), extBackup, provider)
 	}
 
 	return nil
@@ -563,7 +581,7 @@ func (self *SDBInstanceBackup) CustomizeDelete(ctx context.Context, userCred mcc
 }
 
 func (self *SDBInstanceBackup) StartDBInstanceBackupDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_BACKUP_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_BACKUP_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceBackupDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err

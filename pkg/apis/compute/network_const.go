@@ -20,20 +20,21 @@ import (
 	"yunion.io/x/cloudmux/pkg/apis/compute"
 )
 
-const (
-	DefaultDNSServers = "223.5.5.5,223.6.6.6"
-)
+type TNetworkType string
 
 const (
 	// # DEFAULT_BANDWIDTH = options.default_bandwidth
-	MAX_BANDWIDTH = 100000
 
-	NETWORK_TYPE_GUEST     = compute.NETWORK_TYPE_GUEST
-	NETWORK_TYPE_BAREMETAL = "baremetal"
-	NETWORK_TYPE_CONTAINER = "container"
-	NETWORK_TYPE_PXE       = "pxe"
-	NETWORK_TYPE_IPMI      = "ipmi"
-	NETWORK_TYPE_EIP       = "eip"
+	// in mbps, maximal is 100Tbps
+	MAX_BANDWIDTH = 100000000
+
+	NETWORK_TYPE_GUEST     = TNetworkType(compute.NETWORK_TYPE_GUEST)
+	NETWORK_TYPE_BAREMETAL = TNetworkType("baremetal")
+	NETWORK_TYPE_CONTAINER = TNetworkType("container")
+	NETWORK_TYPE_PXE       = TNetworkType("pxe")
+	NETWORK_TYPE_IPMI      = TNetworkType("ipmi")
+	NETWORK_TYPE_EIP       = TNetworkType("eip")
+	NETWORK_TYPE_HOSTLOCAL = TNetworkType("hostlocal")
 
 	STATIC_ALLOC = "static"
 
@@ -61,13 +62,14 @@ const (
 )
 
 var (
-	ALL_NETWORK_TYPES = []string{
+	ALL_NETWORK_TYPES = []TNetworkType{
 		NETWORK_TYPE_GUEST,
 		NETWORK_TYPE_BAREMETAL,
 		NETWORK_TYPE_CONTAINER,
 		NETWORK_TYPE_PXE,
 		NETWORK_TYPE_IPMI,
 		NETWORK_TYPE_EIP,
+		NETWORK_TYPE_HOSTLOCAL,
 	}
 
 	REGIONAL_NETWORK_PROVIDERS = []string{
@@ -77,6 +79,7 @@ var (
 		CLOUD_PROVIDER_HCS,
 		CLOUD_PROVIDER_CTYUN,
 		CLOUD_PROVIDER_UCLOUD,
+		CLOUD_PROVIDER_ROCKBASE,
 		CLOUD_PROVIDER_GOOGLE,
 		CLOUD_PROVIDER_OPENSTACK,
 		CLOUD_PROVIDER_JDCLOUD,
@@ -84,24 +87,34 @@ var (
 	}
 )
 
+func IsInNetworkTypes(netType TNetworkType, types []TNetworkType) bool {
+	for _, t := range types {
+		if t == netType {
+			return true
+		}
+	}
+	return false
+}
+
 type IPAllocationDirection string
 
 const (
 	IPAllocationStepdown IPAllocationDirection = "stepdown"
 	IPAllocationStepup   IPAllocationDirection = "stepup"
-	IPAllocationRadnom   IPAllocationDirection = "random"
+	IPAllocationRandom   IPAllocationDirection = "random"
 	IPAllocationNone     IPAllocationDirection = "none"
 	IPAllocationDefault                        = ""
 )
 
 type SNetworkUsedAddress struct {
-	IpAddr        string
-	MacAddr       string
-	Owner         string
-	OwnerId       string
-	OwnerStatus   string
-	OwnerType     string
-	AssociateId   string
-	AssociateType string
-	CreatedAt     time.Time
+	IpAddr        string    `json:"ip_addr"`
+	Ip6Addr       string    `json:"ip6_addr"`
+	MacAddr       string    `json:"mac_addr"`
+	Owner         string    `json:"owner"`
+	OwnerId       string    `json:"owner_id"`
+	OwnerStatus   string    `json:"owner_status"`
+	OwnerType     string    `json:"owner_type"`
+	AssociateId   string    `json:"associate_id"`
+	AssociateType string    `json:"associate_type"`
+	CreatedAt     time.Time `json:"created_at"`
 }

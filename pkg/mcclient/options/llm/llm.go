@@ -1,0 +1,326 @@
+package llm
+
+import (
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/cloudcommon/cmdline"
+	"yunion.io/x/onecloud/pkg/mcclient/options"
+)
+
+type LLMBaseListOptions struct {
+	options.BaseListOptions
+	Host      string   `help:"filter by host"`
+	LLMStatus []string `help:"filter by server status"`
+
+	NetworkType string `help:"filter by network type"`
+	NetworkId   string `help:"filter by network id"`
+
+	ListenPort int    `help:"filter by listen port"`
+	PublicIp   string `help:"filter by public ip"`
+	VolumeId   string `help:"filter by volume id"`
+	Unused     *bool  `help:"filter by unused"`
+	Used       *bool  `help:"filter by used"`
+}
+
+type LLMListOptions struct {
+	LLMBaseListOptions
+
+	LlmSku   string   `help:"filter by llm sku"`
+	LlmImage string   `help:"filter by llm image"`
+	LLMTypes []string `help:"filter by llm types"`
+}
+
+func (o *LLMListOptions) Params() (jsonutils.JSONObject, error) {
+	params, err := options.ListStructToParams(o)
+	if err != nil {
+		return nil, err
+	}
+	if o.Used != nil {
+		params.Set("unused", jsonutils.JSONFalse)
+	}
+	return params, nil
+}
+
+type LLMShowOptions struct {
+	options.BaseShowOptions
+}
+
+func (o *LLMShowOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type LLMBaseCreateOptions struct {
+	options.BaseCreateOptions
+
+	AutoStart  bool
+	ProjectId  string
+	PreferHost string
+
+	Net []string `help:"Network descriptions"`
+
+	BandwidthMb int
+
+	Count int `default:"1" help:"batch create count" json:"-"`
+}
+
+type LLMCreateOptions struct {
+	LLMBaseCreateOptions
+
+	LLM_SKU_ID     string   `help:"llm sku id or name" json:"llm_sku_id"`
+	PreferredModel string   `help:"vLLM preferred model dir name under models path (e.g. Qwen/Qwen2-7B)" json:"-"`
+	VllmArg        []string `help:"vLLM args in format key=value; use key= for flags without values" json:"-"`
+
+	SGLangPreferredModel string   `token:"sglang-preferred-model" help:"SGLang preferred model dir name under models path (e.g. Qwen/Qwen2-7B)" json:"-"`
+	SGLangArg            []string `token:"sglang-arg" help:"SGLang args in format key=value; use key= for flags without values" json:"-"`
+
+	HermesLLMId         string `token:"hermes-llm-id" help:"target vLLM/SGLang/Ollama LLM id/name for Hermes; resolves llm_spec.hermes_agent.llm_url/model" json:"-"`
+	HermesLLMUrl        string `token:"hermes-llm-url" help:"OpenAI-compatible base URL for Hermes, e.g. http://host:8000/v1" json:"-"`
+	HermesModel         string `token:"hermes-model" help:"model name for Hermes" json:"-"`
+	HermesApiKey        string `token:"hermes-api-key" help:"API key for Hermes custom provider; defaults to EMPTY when omitted" json:"-"`
+	HermesContextLength int    `token:"hermes-context-length" help:"Hermes model.context_length" json:"-"`
+}
+
+func (o *LLMCreateOptions) Params() (jsonutils.JSONObject, error) {
+	params := jsonutils.Marshal(o).(*jsonutils.JSONDict)
+
+	if len(o.Net) > 0 {
+		nets := make([]*computeapi.NetworkConfig, 0)
+		for i, n := range o.Net {
+			net, err := cmdline.ParseNetworkConfig(n, i)
+			if err != nil {
+				return nil, errors.Wrapf(err, "parse network config %s", n)
+			}
+			nets = append(nets, net)
+		}
+		params.Add(jsonutils.Marshal(nets), "nets")
+	}
+
+	vllmSpec, err := newVLLMSpecFromArgs(o.PreferredModel, o.VllmArg)
+	if err != nil {
+		return nil, err
+	}
+	sglangSpec, err := newSGLangSpecFromArgs(o.SGLangPreferredModel, o.SGLangArg)
+	if err != nil {
+		return nil, err
+	}
+	hermesSpec, err := newHermesAgentSpecFromArgs(o.HermesLLMId, o.HermesLLMUrl, o.HermesModel, o.HermesApiKey, o.HermesContextLength)
+	if err != nil {
+		return nil, err
+	}
+	specCount := 0
+	if vllmSpec != nil {
+		specCount++
+	}
+	if sglangSpec != nil {
+		specCount++
+	}
+	if hermesSpec != nil {
+		specCount++
+	}
+	if specCount > 1 {
+		return nil, errors.Error("cannot specify multiple llm spec args")
+	}
+	if vllmSpec != nil {
+		spec := &api.LLMSpec{Ollama: nil, Vllm: vllmSpec, Dify: nil}
+		params.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+	if sglangSpec != nil {
+		spec := &api.LLMSpec{SGLang: sglangSpec}
+		params.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+	if hermesSpec != nil {
+		spec := &api.LLMSpec{HermesAgent: hermesSpec}
+		params.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+
+	return params, nil
+}
+
+func (o *LLMCreateOptions) GetCountParam() int {
+	return o.Count
+}
+
+type LLMUpdateOptions struct {
+	options.BaseIdOptions
+
+	PreferredModel string   `help:"vLLM preferred model dir name under models path (e.g. Qwen/Qwen2-7B); takes effect after pod recreate" json:"-"`
+	VllmArg        []string `help:"vLLM args in format key=value; use key= for flags without values" json:"-"`
+
+	SGLangPreferredModel string   `token:"sglang-preferred-model" help:"SGLang preferred model dir name under models path (e.g. Qwen/Qwen2-7B); takes effect after pod recreate" json:"-"`
+	SGLangArg            []string `token:"sglang-arg" help:"SGLang args in format key=value; use key= for flags without values" json:"-"`
+
+	HermesLLMId         string `token:"hermes-llm-id" help:"target vLLM/SGLang/Ollama LLM id/name for Hermes; resolves llm_spec.hermes_agent.llm_url/model; takes effect after pod recreate" json:"-"`
+	HermesLLMUrl        string `token:"hermes-llm-url" help:"OpenAI-compatible base URL for Hermes, e.g. http://host:8000/v1; takes effect after pod recreate" json:"-"`
+	HermesModel         string `token:"hermes-model" help:"model name for Hermes; takes effect after pod recreate" json:"-"`
+	HermesApiKey        string `token:"hermes-api-key" help:"API key for Hermes custom provider; defaults to EMPTY when omitted" json:"-"`
+	HermesContextLength int    `token:"hermes-context-length" help:"Hermes model.context_length; takes effect after pod recreate" json:"-"`
+}
+
+func (o *LLMUpdateOptions) GetId() string {
+	return o.ID
+}
+
+func (o *LLMUpdateOptions) Params() (jsonutils.JSONObject, error) {
+	dict, err := options.StructToParams(o)
+	if err != nil {
+		return nil, err
+	}
+	vllmSpec, err := newVLLMSpecFromArgs(o.PreferredModel, o.VllmArg)
+	if err != nil {
+		return nil, err
+	}
+	sglangSpec, err := newSGLangSpecFromArgs(o.SGLangPreferredModel, o.SGLangArg)
+	if err != nil {
+		return nil, err
+	}
+	hermesSpec, err := newHermesAgentSpecFromArgs(o.HermesLLMId, o.HermesLLMUrl, o.HermesModel, o.HermesApiKey, o.HermesContextLength)
+	if err != nil {
+		return nil, err
+	}
+	specCount := 0
+	if vllmSpec != nil {
+		specCount++
+	}
+	if sglangSpec != nil {
+		specCount++
+	}
+	if hermesSpec != nil {
+		specCount++
+	}
+	if specCount > 1 {
+		return nil, errors.Error("cannot specify multiple llm spec args")
+	}
+	if vllmSpec != nil {
+		spec := &api.LLMSpec{Ollama: nil, Vllm: vllmSpec, Dify: nil}
+		dict.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+	if sglangSpec != nil {
+		spec := &api.LLMSpec{SGLang: sglangSpec}
+		dict.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+	if hermesSpec != nil {
+		spec := &api.LLMSpec{HermesAgent: hermesSpec}
+		dict.Set("llm_spec", jsonutils.Marshal(spec))
+	}
+	return dict, nil
+}
+
+type LLMDeleteOptions struct {
+	options.BaseIdOptions
+}
+
+func (o *LLMDeleteOptions) GetId() string {
+	return o.ID
+}
+
+func (o *LLMDeleteOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type LLMStartOptions struct {
+	options.BaseIdsOptions
+}
+
+func (o *LLMStartOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type LLMRestartOptions struct {
+	options.BaseIdsOptions
+}
+
+func (o *LLMRestartOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type LLMStopOptions struct {
+	options.BaseIdsOptions
+}
+
+func (o *LLMStopOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type LLMIdOptions struct {
+	ID string `help:"llm id" json:"-"`
+}
+
+func (opts *LLMIdOptions) GetId() string {
+	return opts.ID
+}
+
+func (opts *LLMIdOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
+type LLMAvailableNetworkOptions struct {
+	NetworkType string `help:"network server_type filter, e.g. guest|hostlocal"`
+	VpcId       string `help:"vpc id filter"`
+}
+
+func (opts *LLMAvailableNetworkOptions) GetId() string {
+	return ""
+}
+
+func (opts *LLMAvailableNetworkOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(opts)
+}
+
+type LLMProviderModelsOptions struct {
+	URL          string `help:"provider url, e.g. http://127.0.0.1:11434 or http://127.0.0.1:8000" json:"url"`
+	ProviderType string `help:"provider type, use openai for OpenAI-compatible endpoints such as vllm" json:"provider_type" choices:"ollama|openai"`
+}
+
+func (opts *LLMProviderModelsOptions) GetId() string {
+	return ""
+}
+
+func (opts *LLMProviderModelsOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(opts)
+}
+
+type LLMSaveInstantModelOptions struct {
+	LLMIdOptions
+
+	MODEL_ID string   `help:"llm model id, e.g. 500a1f067a9f"`
+	Name     string   `help:"model full name, e.g. qwen3:8b; kept for compatibility" json:"-"`
+	SaveName string   `help:"instant model resource name" json:"-"`
+	Mount    []string `help:"model file or directory path to package; repeat to package multiple ComfyUI files together" json:"-"`
+
+	AutoRestart bool
+}
+
+func (opts *LLMSaveInstantModelOptions) Params() (jsonutils.JSONObject, error) {
+	input := api.LLMSaveInstantModelInput{
+		ModelId:       opts.MODEL_ID,
+		Name:          opts.SaveName,
+		ModelFullName: opts.Name,
+		Mounts:        opts.Mount,
+		// AutoRestart: opts.AutoRestart,
+	}
+	return jsonutils.Marshal(input), nil
+}
+
+type LLMQuickModelsOptions struct {
+	LLMIdOptions
+
+	MODEL []string `help:"model id of instant model, e.g. qwen3:0.6b-251202 or 7f72b5a1-4049-43db-8e91-8dee736ae1ac"`
+
+	Method string `help:"install or uninstall" choices:"install|uninstall"`
+}
+
+func (opts *LLMQuickModelsOptions) Params() (jsonutils.JSONObject, error) {
+	params := api.LLMPerformQuickModelsInput{}
+	for _, mdl := range opts.MODEL {
+		params.Models = append(params.Models, api.ModelInfo{
+			Id: mdl,
+		})
+	}
+	if len(opts.Method) > 0 {
+		params.Method = api.TQuickModelMethod(opts.Method)
+	}
+	return jsonutils.Marshal(params), nil
+}

@@ -44,6 +44,8 @@ type GroupRelation struct {
 	Scope    string `json:"scope"`
 }
 
+type HostPathRequirement = apis.HostPathRequirement
+
 type ServerConfig struct {
 	*compute.ServerConfigs
 
@@ -52,6 +54,7 @@ type ServerConfig struct {
 	Name        string `json:"name"`
 	GuestStatus string `json:"guest_status"`
 	Cdrom       string `json:"cdrom"`
+	Bios        string `json:"bios"`
 
 	// owner project id
 	Project string `json:"project_id"`
@@ -78,28 +81,41 @@ type ScheduleInput struct {
 	ServerConfig
 
 	// HostId used by migrate
-	HostId       string `json:"host_id"`
-	LiveMigrate  bool   `json:"live_migrate"`
-	SkipCpuCheck *bool  `json:"skip_cpu_check"`
-	CpuDesc      string `json:"cpu_desc"`
-	CpuMicrocode string `json:"cpu_microcode"`
-	CpuMode      string `json:"cpu_mode"`
-	OsArch       string `json:"os_arch"`
+	HostId          string `json:"host_id"`
+	LiveMigrate     bool   `json:"live_migrate"`
+	SkipCpuCheck    *bool  `json:"skip_cpu_check"`
+	CpuDesc         string `json:"cpu_desc"`
+	CpuMicrocode    string `json:"cpu_microcode"`
+	CpuMode         string `json:"cpu_mode"`
+	OsArch          string `json:"os_arch"`
+	ResetCpuNumaPin bool   `json:"reset_cpu_numa_pin"`
+	QemuVersion     string `json:"qemu_version"`
+
+	ExtraCpuCount   int           `json:"extra_cpu_count"`
+	CpuNumaPin      []SCpuNumaPin `json:"cpu_numa_pin"`
+	PreferNumaNodes []int         `json:"prefer_numa_nodes"`
+
+	// GuestIds
+	GuestIds []string `json:"guest_ids"`
 
 	HostMemPageSizeKB int    `json:"host_mem_page_size"`
 	SkipKernelCheck   *bool  `json:"skip_kernel_check"`
 	TargetHostKernel  string `json:"target_host_kernel"`
 
+	FakeCreateFromBmImport bool `json:"fake_create_from_bm_import"`
+
 	// In the migrate and create backup cases
 	// we don't need reallocate network
 	ReuseNetwork bool `json:"reuse_network"`
 
-	// Change config
-	ChangeConfig bool
-	// guest who change config has isolated device
-	HasIsolatedDevice bool
+	HostPathRequirements []HostPathRequirement `json:"host_path_requirements,omitempty"`
 
-	PendingUsages []jsonutils.JSONObject
+	// Change config
+	ChangeConfig bool `json:"change_config"`
+	// guest who change config has isolated device
+	HasIsolatedDevice bool `json:"has_isolated_device"`
+
+	PendingUsages []jsonutils.JSONObject `json:"pending_usages"`
 }
 
 func (input ScheduleInput) ToConditionInput() *jsonutils.JSONDict {
@@ -120,9 +136,9 @@ type CandidateDiskV2 struct {
 }
 
 type CandidateStorage struct {
-	Id           string
-	Name         string
-	FreeCapacity int64
+	Id           string `json:"id"`
+	Name         string `json:"name"`
+	FreeCapacity int64  `json:"free_capacity"`
 }
 
 type CandidateNet struct {
@@ -130,12 +146,83 @@ type CandidateNet struct {
 	NetworkIds []string `json:"network_ids"`
 }
 
+type SFreeNumaCpuMem struct {
+	FreeCpuCount       int  `json:"free_cpu_count"`
+	MemSize            int  `json:"mem_size"`
+	EnableNumaAllocate bool `json:"enable_numa_allocate"`
+
+	CpuCount int `json:"cpu_count"`
+	NodeId   int `json:"node_id"`
+}
+
+type SortedFreeNumaCpuMam []*SFreeNumaCpuMem
+
+func (pq SortedFreeNumaCpuMam) Len() int { return len(pq) }
+
+func (pq SortedFreeNumaCpuMam) Less(i, j int) bool {
+	if pq[i].EnableNumaAllocate {
+		return pq[i].MemSize > pq[j].MemSize
+	} else {
+		return pq[i].FreeCpuCount > pq[j].FreeCpuCount
+	}
+}
+
+func (pq SortedFreeNumaCpuMam) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+}
+
+func NodesFreeMemSizeEnough(nodeCount, memSize int, cpuNumaFree []*SFreeNumaCpuMem) bool {
+	if !cpuNumaFree[0].EnableNumaAllocate {
+		return true
+	}
+
+	var freeMem = 0
+	var leastFree = memSize / nodeCount
+	for i := 0; i < nodeCount; i++ {
+		if cpuNumaFree[i].MemSize < leastFree {
+			return false
+		}
+		freeMem += cpuNumaFree[i].MemSize
+	}
+	return freeMem >= memSize
+}
+
+func NodesFreeCpuEnough(nodeCount, vcpuCount int, cpuNumaFree []*SFreeNumaCpuMem) bool {
+	var freeCpu = 0
+	var leaseCpu = vcpuCount / nodeCount
+
+	//if vcpuCount > nodeCount*cpuNumaFree[0].CpuCount {
+	//	return false
+	//}
+
+	for i := 0; i < nodeCount; i++ {
+		if cpuNumaFree[i].FreeCpuCount < leaseCpu {
+			return false
+		}
+		freeCpu += cpuNumaFree[i].FreeCpuCount
+	}
+	return freeCpu >= vcpuCount
+}
+
+type SCpuPin struct {
+	Vcpu int `json:"vcpu"`
+	Pcpu int `json:"pcpu"`
+}
+
+type SCpuNumaPin struct {
+	CpuPin        []int `json:"cpu_pin"`
+	NodeId        int   `json:"node_id"`
+	MemSizeMB     *int  `json:"mem_size_mb"`
+	ExtraCpuCount int   `json:"extra_cpu_count"`
+}
+
 type CandidateResource struct {
-	SessionId string           `json:"session_id"`
-	HostId    string           `json:"host_id"`
-	Name      string           `json:"name"`
-	Disks     []*CandidateDisk `json:"disks"`
-	Nets      []*CandidateNet  `json:"nets"`
+	SessionId  string           `json:"session_id"`
+	HostId     string           `json:"host_id"`
+	Name       string           `json:"name"`
+	CpuNumaPin []SCpuNumaPin    `json:"cpu_numa_pin"`
+	Disks      []*CandidateDisk `json:"disks"`
+	Nets       []*CandidateNet  `json:"nets"`
 
 	// used by backup schedule
 	BackupCandidate *CandidateResource `json:"backup_candidate"`

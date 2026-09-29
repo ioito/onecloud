@@ -28,47 +28,57 @@ type SNatGateway struct {
 	QcloudTags
 	vpc *SVpc
 
-	NatId            string  `json:"natId"`
-	NatName          string  `json:"natName"`
-	ProductionStatus float32 `json:"productionStatus"`
-	State            float32 `json:"state"`
-	UnVpcId          string  `json:"unVpcId"`
-	VpcId            float32 `json:"vpcId"`
-	VpcName          string  `json:"vpcName"`
-	Zone             string  `json:"zone"`
+	State          string
+	VpcId          string
+	Zone           string
+	NatGatewayName string
+	NatGatewayId   string
 
-	Bandwidth     float32   `json:"bandwidth"`
+	Bandwidth     string    `json:"bandwidth"`
 	CreateTime    time.Time `json:"createTime"`
-	EipCount      float32   `json:"eipCount"`
+	EipCount      string    `json:"eipCount"`
 	MaxConcurrent float32   `json:"maxConcurrent"`
+
+	PublicIpAddressSet []struct {
+		AddressId string
+	}
+	SourceIpTranslationNatRuleSet          []SSTable
+	DestinationIpPortTranslationNatRuleSet []SDTable
 }
 
 func (nat *SNatGateway) GetName() string {
-	if len(nat.NatName) > 0 {
-		return nat.NatName
+	if len(nat.NatGatewayName) > 0 {
+		return nat.NatGatewayName
 	}
-	return nat.NatId
+	return nat.NatGatewayId
 }
 
 func (nat *SNatGateway) GetId() string {
-	return nat.NatId
+	return nat.NatGatewayId
 }
 
 func (nat *SNatGateway) GetGlobalId() string {
-	return nat.NatId
+	return nat.NatGatewayId
 }
 
 func (self *SNatGateway) GetINetworkId() string {
 	return ""
 }
 
+func (self *SNatGateway) GetNetworkType() string {
+	return api.NAT_NETWORK_TYPE_INTERNET
+}
+
 func (nat *SNatGateway) GetStatus() string {
-	// NAT网关状态，0:运行中, 1:不可用, 2:欠费停服
-	switch int(nat.State) {
-	case 0:
+	switch nat.State {
+	case "PENDING":
+		return api.NAT_STATUS_ALLOCATE
+	case "AVAILABLE":
 		return api.NAT_STAUTS_AVAILABLE
-	case 1, 2:
-		return api.NAT_STATUS_UNKNOWN
+	case "UPDATING":
+		return api.NAT_STATUS_DEPLOYING
+	case "DELETING":
+		return api.NAT_STATUS_DELETING
 	default:
 		return api.NAT_STATUS_UNKNOWN
 	}
@@ -89,7 +99,7 @@ func (nat *SNatGateway) GetNatSpec() string {
 func (nat *SNatGateway) GetIEips() ([]cloudprovider.ICloudEIP, error) {
 	eips := []SEipAddress{}
 	for {
-		part, total, err := nat.vpc.region.GetEips("", nat.NatId, len(eips), 50)
+		part, total, err := nat.vpc.region.GetEips("", nat.GetId(), len(eips), 50)
 		if err != nil {
 			return nil, err
 		}
@@ -107,34 +117,28 @@ func (nat *SNatGateway) GetIEips() ([]cloudprovider.ICloudEIP, error) {
 }
 
 func (nat *SNatGateway) GetINatSTable() ([]cloudprovider.ICloudNatSEntry, error) {
-	return []cloudprovider.ICloudNatSEntry{}, nil
+	ret := []cloudprovider.ICloudNatSEntry{}
+	for i := 0; i < len(nat.SourceIpTranslationNatRuleSet); i++ {
+		nat.SourceIpTranslationNatRuleSet[i].nat = nat
+		ret = append(ret, &nat.SourceIpTranslationNatRuleSet[i])
+	}
+	return ret, nil
 }
 
 func (nat *SNatGateway) GetINatDTable() ([]cloudprovider.ICloudNatDEntry, error) {
-	tables := []SDTable{}
-	for {
-		part, total, err := nat.vpc.region.GetDTables(nat.NatId, len(tables), 50)
-		if err != nil {
-			return nil, err
-		}
-		tables = append(tables, part...)
-		if len(tables) >= total || len(part) == 0 {
-			break
-		}
+	ret := []cloudprovider.ICloudNatDEntry{}
+	for i := 0; i < len(nat.DestinationIpPortTranslationNatRuleSet); i++ {
+		nat.DestinationIpPortTranslationNatRuleSet[i].nat = nat
+		ret = append(ret, &nat.DestinationIpPortTranslationNatRuleSet[i])
 	}
-	itables := []cloudprovider.ICloudNatDEntry{}
-	for i := 0; i < len(tables); i++ {
-		tables[i].nat = nat
-		itables = append(itables, &tables[i])
-	}
-	return itables, nil
+	return ret, nil
 }
 
-func (nat *SNatGateway) GetINatDEntryByID(id string) (cloudprovider.ICloudNatDEntry, error) {
+func (nat *SNatGateway) GetINatDEntryById(id string) (cloudprovider.ICloudNatDEntry, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
-func (nat *SNatGateway) GetINatSEntryByID(id string) (cloudprovider.ICloudNatSEntry, error) {
+func (nat *SNatGateway) GetINatSEntryById(id string) (cloudprovider.ICloudNatSEntry, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 

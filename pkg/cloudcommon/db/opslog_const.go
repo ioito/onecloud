@@ -51,6 +51,8 @@ const (
 	ACT_BACKUP_START        = "backup_start"
 	ACT_BACKUP_START_FAILED = "backup_start_fail"
 
+	ACT_SET_RELEASE_TIME = "set_release_time"
+
 	ACT_FREEZE      = "freeze"
 	ACT_FREEZE_FAIL = "freeze_fail"
 	ACT_UNFREEZE    = "unfreeze"
@@ -73,6 +75,8 @@ const (
 	ACT_MIGRATING    = "migrating"
 	ACT_MIGRATE      = "migrate"
 	ACT_MIGRATE_FAIL = "migrate_fail"
+
+	ACT_RESET_CPU_NUMA_PIN = "reset_cpu_numa_pin"
 
 	ACT_VM_CONVERT      = "vm_convert"
 	ACT_VM_CONVERTING   = "vm_converting"
@@ -163,6 +167,9 @@ const (
 	ACT_SET_USER_PASSWORD      = "set_user_password"
 	ACT_SET_USER_PASSWORD_FAIL = "set_user_password_fail"
 
+	ACT_SYNC_OS_INFO      = "sync_os_info"
+	ACT_SYNC_OS_INFO_FAIL = "sync_os_info_fail"
+
 	ACT_VM_IO_THROTTLE      = "io_throttle"
 	ACT_VM_IO_THROTTLE_FAIL = "io_throttle_fail"
 
@@ -245,6 +252,7 @@ const (
 	ACT_GUEST_CPUSET_REMOVE      = "guest_cpuset_remove"
 	ACT_GUEST_CPUSET_REMOVE_FAIL = "guest_cpuset_remove_fail"
 
+	ACT_CHANGE_IPADDR    = "change_ipaddr"
 	ACT_CHANGE_BANDWIDTH = "eip_change_bandwidth"
 	ACT_EIP_CONVERT_FAIL = "eip_convert_fail"
 
@@ -260,8 +268,10 @@ const (
 	ACT_GUEST_CREATE_FROM_IMPORT_SUCC    = "guest_create_from_import_succ"
 	ACT_GUEST_CREATE_FROM_IMPORT_FAIL    = "guest_create_from_import_fail"
 	ACT_GUEST_PANICKED                   = "guest_panicked"
+	ACT_GUEST_SCREEN_DUMP                = "guest_screen_dump"
 	ACT_HOST_MAINTENANCE                 = "host_maintenance"
 	ACT_HOST_DOWN                        = "host_down"
+	ACT_HOST_DOWN_AUTO_MIGRATE           = "host_down_auto_migrate"
 
 	ACT_UPLOAD_OBJECT  = "upload_obj"
 	ACT_DELETE_OBJECT  = "delete_obj"
@@ -319,7 +329,58 @@ const (
 
 	ACT_SYNC_TRAFFIC_LIMIT      = "sync_traffic_limit"
 	ACT_SYNC_TRAFFIC_LIMIT_FAIL = "sync_traffic_limit_fail"
+	ACT_BIND                    = "bind"
+	ACT_UNBIND                  = "unbind"
 
-	ACT_BIND   = "bind"
-	ACT_UNBIND = "unbind"
+	ACT_START_RESCUE        = "start_rescue"
+	ACT_STOP_RESCUE         = "stop_rescue"
+	ACT_START_RESCUE_FAILED = "start_rescue_failed"
+	ACT_STOP_RESCUE_FAILED  = "stop_rescue_failed"
+
+	ACT_RE_BILLING = "re_billing"
+
+	ACT_CLONE        = "clone"
+	ACT_CLONE_FAILED = "clone_failed"
+
+	ACT_REBUILD        = "rebuild"
+	ACT_REBUILD_FAILED = "rebuild_failed"
+
+	ACT_SET_COMMIT_BOUND = "set_commit_bound"
 )
+
+const (
+	ACT_HOST_DMESG = "host_dmesg"
+
+	LOGLEVEL_EMERG   = "emerg"
+	LOGLEVEL_ALERT   = "alert"
+	LOGLEVEL_CRIT    = "crit"
+	LOGLEVEL_ERR     = "err"
+	LOGLEVEL_WARNING = "warning"
+	LOGLEVEL_NOTICE  = "notice"
+	LOGLEVEL_INFO    = "info"
+	LOGLEVEL_DEBUG   = "debug"
+	LOGLEVEL_UNKNOWN = "unknown"
+)
+
+func LogLevelToString(logLevel int) string {
+	switch logLevel {
+	case 0:
+		return LOGLEVEL_EMERG
+	case 1:
+		return LOGLEVEL_ALERT
+	case 2:
+		return LOGLEVEL_CRIT
+	case 3:
+		return LOGLEVEL_ERR
+	case 4:
+		return LOGLEVEL_WARNING
+	case 5:
+		return LOGLEVEL_NOTICE
+	case 6:
+		return LOGLEVEL_INFO
+	case 7:
+		return LOGLEVEL_DEBUG
+	default:
+		return LOGLEVEL_UNKNOWN
+	}
+}

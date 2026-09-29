@@ -106,7 +106,7 @@ func (self *SOIDCDriverClass) ValidateConfig(ctx context.Context, userCred mccli
 	if !unique {
 		return tconf, errors.Wrapf(httperrors.ErrDuplicateResource, "client_id %s has been registered", conf.ClientId)
 	}
-	conf.SIdpAttributeOptions, err = utils.ValidateConfig(conf.SIdpAttributeOptions, userCred)
+	conf.SIdpAttributeOptions, err = utils.ValidateConfig(ctx, conf.SIdpAttributeOptions, userCred)
 	if err != nil {
 		return tconf, errors.Wrap(err, "ValidateConfig")
 	}
@@ -121,6 +121,20 @@ func (self *SOIDCDriverClass) ValidateConfig(ctx context.Context, userCred mccli
 	}
 	tconf[api.IdentityDriverOIDC] = nconf
 	return tconf, nil
+}
+
+func (self *SOIDCDriverClass) AttributeNames(template string) (map[string]string, error) {
+	switch template {
+	case api.IdpTemplateDex:
+		return DexOIDCTemplate.AttributeNames, nil
+	case api.IdpTemplateGithub:
+		return GithubOIDCTemplate.AttributeNames, nil
+	case api.IdpTemplateAzureOAuth2:
+		return AzureADTemplate.AttributeNames, nil
+	case api.IdpTemplateGoogle:
+		return GoogleOIDCTemplate.AttributeNames, nil
+	}
+	return nil, nil
 }
 
 func init() {

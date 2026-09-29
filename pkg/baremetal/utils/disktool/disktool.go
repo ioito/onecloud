@@ -17,8 +17,10 @@ package disktool
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
@@ -224,10 +226,11 @@ type DiskPartitions struct {
 	rotate     bool
 	desc       string
 	label      string
+	pciPath    string
 	partitions []*Partition
 }
 
-func newDiskPartitions(driver string, adapter int, raidConfig string, sizeMB int64, blockSize int64, diskType string, tool *PartitionTool) *DiskPartitions {
+func newDiskPartitions(driver string, adapter int, raidConfig string, sizeMB int64, blockSize int64, diskType string, softRaidIdx *int, tool *PartitionTool) *DiskPartitions {
 	ps := new(DiskPartitions)
 	ps.driver = driver
 	ps.adapter = adapter
@@ -237,7 +240,30 @@ func newDiskPartitions(driver string, adapter int, raidConfig string, sizeMB int
 	ps.blockSize = blockSize
 	ps.diskType = diskType
 	ps.partitions = make([]*Partition, 0)
+
+	// soft raid, mdadm
+	if softRaidIdx != nil {
+		ps.GetMdadmInfo(softRaidIdx)
+	}
 	return ps
+}
+
+func (ps *DiskPartitions) GetMdadmInfo(softRaidIdx *int) {
+	devLinkName := fmt.Sprintf("/dev/md/md%d", *softRaidIdx)
+	devLinkNickname := fmt.Sprintf("/dev/md/md%d_0", *softRaidIdx)
+	cmd := fmt.Sprintf("readlink -f $(test -e %s && echo %s || echo %s)", devLinkName, devLinkName, devLinkNickname)
+	out, err := ps.tool.Run(cmd)
+	if err != nil || len(out) == 0 {
+		log.Errorf("failed readlink of %s: %s", devLinkName, err)
+		return
+	}
+
+	ps.dev = strings.TrimSpace(out[0])
+	ps.devName = ps.dev
+	uuid, sectors := ps.tool.GetMdadmUuidAndSector(ps.dev)
+	ps.pciPath = uuid
+	ps.sectors = sectors
+	ps.blockSize = 512
 }
 
 func (p *DiskPartitions) IsRaidDriver() bool {
@@ -253,7 +279,13 @@ func (p *DiskPartitions) GetDev() string {
 	return p.dev
 }
 
-func (p *DiskPartitions) SetInfo(info *types.SDiskInfo) *DiskPartitions {
+func getPCIPathPrefix(input string) string {
+	input = strings.TrimSpace(input)
+	parts := strings.Split(input, "/")
+	return strings.Join(parts[0:len(parts)-2], "/")
+}
+
+func (p *DiskPartitions) SetInfo(info *types.SDiskInfo) (*DiskPartitions, error) {
 	p.dev = fmt.Sprintf("/dev/%s", info.Dev)
 	p.devName = info.Dev
 	p.sectors = info.Sector
@@ -262,7 +294,17 @@ func (p *DiskPartitions) SetInfo(info *types.SDiskInfo) *DiskPartitions {
 	if p.blockSize == 4096 {
 		p.sectors = (p.sectors >> 3)
 	}
-	return p
+
+	// /sys/block/sda => /sys/devices/pci0000:00/0000:00:04.0/virtio1/host0/target0:0:0/0:0:0:0/block/sda
+	// /sys/block/nvme1n1 => /sys/devices/pci0000:00/0000:00:1a.0/0000:03:00.0/nvme/nvme1/nvme1n1
+	outputs, err := p.Run(fmt.Sprintf("readlink -f /sys/block/%s", info.Dev))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read device %s pci path", p.dev)
+	}
+	if len(outputs) > 0 {
+		p.pciPath = getPCIPathPrefix(outputs[0])
+	}
+	return p, nil
 }
 
 func (p *DiskPartitions) ReInitInfo() error {
@@ -273,7 +315,9 @@ func (p *DiskPartitions) ReInitInfo() error {
 	}
 	for _, disk := range sysutils.ParseDiskInfo(lines, p.driver) {
 		if disk.Dev == p.GetDevName() {
-			p.SetInfo(disk)
+			if _, err := p.SetInfo(disk); err != nil {
+				return errors.Wrapf(err, "set info of disk %v", disk)
+			}
 		}
 	}
 	return p.RetrievePartitionInfo()
@@ -304,7 +348,7 @@ func (ps *DiskPartitions) IsReady() bool {
 
 func (ps *DiskPartitions) GetDevName() string {
 	devName := ps.devName
-	if !ps.IsRaidDriver() || ps.raidConfig == baremetal.DISK_CONF_NONE {
+	if ps.raidConfig == baremetal.DISK_CONF_NONE {
 		return devName
 	}
 	raidDrv, err := raiddrivers.GetDriverWithInit(ps.driver, ps.tool.runner.Term())
@@ -324,6 +368,10 @@ func (ps *DiskPartitions) GetDevName() string {
 	}
 	devName = strings.TrimLeft(lv.BlockDev, "/dev/")
 	return devName
+}
+
+func (ps *DiskPartitions) GetPCIPath() string {
+	return ps.pciPath
 }
 
 func (ps *DiskPartitions) RetrievePartitionInfo() error {
@@ -666,12 +714,13 @@ func (tool *PartitionTool) parseLsDisk(lines []string, driver string) {
 
 func (tool *PartitionTool) FetchDiskConfs(diskConfs []baremetal.DiskConfiguration) *PartitionTool {
 	for _, d := range diskConfs {
-		disk := newDiskPartitions(d.Driver, d.Adapter, d.RaidConfig, d.Size, d.Block, d.DiskType, tool)
+		disk := newDiskPartitions(d.Driver, d.Adapter, d.RaidConfig, d.Size, d.Block, d.DiskType, d.SoftRaidIdx, tool)
 		tool.disks = append(tool.disks, disk)
+		isSoftRaid := d.RaidConfig != baremetal.DISK_CONF_NONE
 		var key string
-		if d.Driver == baremetal.DISK_DRIVER_LINUX {
+		if d.Driver == baremetal.DISK_DRIVER_LINUX && !isSoftRaid {
 			key = NONRAID_DRIVER
-		} else if d.Driver == baremetal.DISK_DRIVER_PCIE {
+		} else if d.Driver == baremetal.DISK_DRIVER_PCIE && !isSoftRaid {
 			key = PCIE_DRIVER
 		} else {
 			key = RAID_DRVIER
@@ -684,6 +733,56 @@ func (tool *PartitionTool) FetchDiskConfs(diskConfs []baremetal.DiskConfiguratio
 	return tool
 }
 
+func (tool *PartitionTool) reorderRootDisk(matcher *api.BaremetalRootDiskMatcher) {
+	isDiskMatch := func(disk *DiskPartitions, matcher *api.BaremetalRootDiskMatcher) bool {
+		if matcher.Device != "" {
+			if disk.dev == matcher.Device {
+				return true
+			}
+			if disk.devName == matcher.Device {
+				return true
+			}
+		}
+		if matcher.SizeMB > 0 {
+			if disk.sizeMB == matcher.SizeMB {
+				return true
+			}
+		}
+		if matcher.SizeMBRange != nil {
+			if disk.sizeMB >= matcher.SizeMBRange.Start && disk.sizeMB <= matcher.SizeMBRange.End {
+				return true
+			}
+		}
+		if matcher.PCIPath != "" {
+			if disk.pciPath == matcher.PCIPath {
+				return true
+			}
+		}
+		return false
+	}
+
+	var rootDiskStr string
+	var rootDiskIdx = 0
+
+	for idx, disk := range tool.disks {
+		if isDiskMatch(disk, matcher) {
+			rootDiskIdx = idx
+			rootDiskStr = disk.String()
+			break
+		}
+	}
+	log.Infof("Select %d %q as root disk by matcher: %s", rootDiskIdx, rootDiskStr, jsonutils.Marshal(matcher))
+	newDisks := make([]*DiskPartitions, 0)
+	newDisks = append(newDisks, tool.disks[rootDiskIdx])
+	for idx := range tool.disks {
+		if idx == rootDiskIdx {
+			continue
+		}
+		newDisks = append(newDisks, tool.disks[idx])
+	}
+	tool.disks = newDisks
+}
+
 func (tool *PartitionTool) IsAllDisksReady() bool {
 	for idx, d := range tool.disks {
 		if !d.IsReady() {
@@ -694,7 +793,42 @@ func (tool *PartitionTool) IsAllDisksReady() bool {
 	return true
 }
 
-func (tool *PartitionTool) RetrieveDiskInfo() error {
+func (tool *PartitionTool) GetMdadmUuidAndSector(devPath string) (string, int64) {
+	var uuid string
+	var sectorsRet int64
+	// get md uuid as pci path
+	cmd := fmt.Sprintf("/sbin/mdadm --detail %s | grep UUID", devPath)
+	output, err := tool.Run(cmd)
+	if err == nil && len(output) > 0 {
+		uuidSeg := output[0]
+		segs := strings.SplitN(strings.TrimSpace(uuidSeg), ":", 2)
+		if len(segs) == 2 {
+			uuid = strings.TrimSpace(segs[1])
+		}
+	}
+
+	// get block size
+	cmd = fmt.Sprintf("blockdev --getsz %s 2>/dev/null || echo 0", devPath)
+	output, err = tool.Run(cmd)
+	if err == nil && len(output) > 0 {
+		if sectors, err := strconv.ParseInt(strings.TrimSpace(output[0]), 10, 64); err == nil {
+			sectorsRet = sectors
+		}
+	}
+	return uuid, sectorsRet
+}
+
+func (tool *PartitionTool) RetrieveDiskInfo(rootMatcher *api.BaremetalRootDiskMatcher) error {
+	for _, disk := range tool.disks {
+		if baremetal.DISK_DRIVERS_SOFT_RAID.Has(disk.driver) && disk.raidConfig != baremetal.DISK_CONF_NONE {
+			log.Infof("Soft raid mdadm set diskinfo dev %s", disk.dev)
+			uuid, sectors := tool.GetMdadmUuidAndSector(disk.dev)
+			disk.pciPath = uuid
+			disk.sectors = sectors
+			disk.blockSize = 512
+		}
+	}
+
 	for _, driver := range []string{RAID_DRVIER, NONRAID_DRIVER, PCIE_DRIVER} {
 		cmd := fmt.Sprintf("/lib/mos/lsdisk --%s", driver)
 		ret, err := tool.Run(cmd)
@@ -702,6 +836,10 @@ func (tool *PartitionTool) RetrieveDiskInfo() error {
 			return err
 		}
 		tool.parseLsDisk(ret, driver)
+	}
+	// reorder tool.disks
+	if rootMatcher != nil {
+		tool.reorderRootDisk(rootMatcher)
 	}
 	return nil
 }
@@ -788,10 +926,10 @@ func newSSHPartitionTool(term *ssh.Client) *SSHPartitionTool {
 	return tool
 }
 
-func NewSSHPartitionTool(term *ssh.Client, layouts []baremetal.Layout) (*SSHPartitionTool, error) {
+func NewSSHPartitionTool(term *ssh.Client, layouts []baremetal.Layout, rootMatcher *api.BaremetalRootDiskMatcher) (*SSHPartitionTool, error) {
 	tool := newSSHPartitionTool(term)
 	tool.FetchDiskConfs(baremetal.GetDiskConfigurations(layouts))
-	if err := tool.RetrieveDiskInfo(); err != nil {
+	if err := tool.RetrieveDiskInfo(rootMatcher); err != nil {
 		return nil, errors.Wrapf(err, "RetrieveDiskInfo")
 	}
 	return tool, nil

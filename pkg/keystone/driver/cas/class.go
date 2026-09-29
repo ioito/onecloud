@@ -81,7 +81,7 @@ func (self *SCASDriverClass) ValidateConfig(ctx context.Context, userCred mcclie
 	if !unique {
 		return tconf, errors.Wrapf(httperrors.ErrDuplicateResource, "cas_server_url %s has been registered", conf.CASServerURL)
 	}
-	conf.SIdpAttributeOptions, err = utils.ValidateConfig(conf.SIdpAttributeOptions, userCred)
+	conf.SIdpAttributeOptions, err = utils.ValidateConfig(ctx, conf.SIdpAttributeOptions, userCred)
 	if err != nil {
 		return tconf, errors.Wrap(err, "ValidateConfig")
 	}
@@ -96,6 +96,12 @@ func (self *SCASDriverClass) ValidateConfig(ctx context.Context, userCred mcclie
 	}
 	tconf[api.IdentityDriverCAS] = nconf
 	return tconf, nil
+}
+
+func (self *SCASDriverClass) AttributeNames(template string) (map[string]string, error) {
+	return map[string]string{
+		"cas:user": "User name in CAS",
+	}, nil
 }
 
 func init() {

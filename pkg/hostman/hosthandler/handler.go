@@ -23,11 +23,14 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/utils"
 
+	hostapi "yunion.io/x/onecloud/pkg/apis/host"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
+	"yunion.io/x/onecloud/pkg/hostman/hostpath"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -45,6 +48,7 @@ func AddHostHandler(prefix string, app *appsrv.Application) {
 		for action, f := range map[string]actionFunc{
 			"sync":                          hostSync,
 			"probe-isolated-devices":        hostProbeIsolatedDevices,
+			"check-host-paths":              hostCheckHostPaths,
 			"shutdown-servers-on-host-down": setOnHostDown,
 			"restart-host-agent":            hostRestart,
 		} {
@@ -79,7 +83,7 @@ func hostActions(f actionFunc) appsrv.FilterHandler {
 		res, err := f(ctx, sid, body)
 		if err != nil {
 			hostutils.Response(ctx, w, err)
-		} else if res != nil {
+		} else if !gotypes.IsNil(res) {
 			hostutils.Response(ctx, w, res)
 		} else {
 			hostutils.ResponseOk(ctx, w)
@@ -104,4 +108,12 @@ func hostRestart(ctx context.Context, hostId string, body jsonutils.JSONObject) 
 
 func hostProbeIsolatedDevices(ctx context.Context, hostId string, body jsonutils.JSONObject) (interface{}, error) {
 	return hostinfo.Instance().ProbeSyncIsolatedDevices(hostId, body)
+}
+
+func hostCheckHostPaths(ctx context.Context, hostId string, body jsonutils.JSONObject) (interface{}, error) {
+	input := hostapi.HostPathCheckInput{}
+	if err := body.Unmarshal(&input); err != nil {
+		return nil, err
+	}
+	return hostpath.Check(input)
 }

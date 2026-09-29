@@ -36,22 +36,36 @@ const (
 	SERVICE_TYPE_CLOUDMON          = "cloudmon"
 	SERVICE_TYPE_VPCAGENT          = "vpcagent"
 
-	SERVICE_TYPE_ETCD     = "etcd"
-	SERVICE_TYPE_INFLUXDB = "influxdb"
+	SERVICE_TYPE_ETCD             = "etcd"
+	SERVICE_TYPE_INFLUXDB         = "influxdb"
+	SERVICE_TYPE_NTP              = "ntp"
+	SERVICE_TYPE_VICTORIA_METRICS = "victoria-metrics"
 
 	SERVICE_TYPE_SCHEDULEDTASK = "scheduledtask"
 
 	SERVICE_TYPE_APIMAP = "apimap"
 
+	SERVICE_TYPE_LLM     = "llm"
+	SERVICE_TYPE_AIPROXY = "aiproxy"
+
 	STATUS_UPDATE_TAGS        = "update_tags"
 	STATUS_UPDATE_TAGS_FAILED = "update_tags_fail"
+
+	STATUS_START_SYNC_STATUS = "start_sync_status"
 
 	STATUS_SYNC_STATUS   = "sync_status"
 	STATUS_DELETING      = "deleting"
 	STATUS_DELETE_FAILED = "delete_failed"
+	STATUS_CHANGE_CONFIG = "change_config"
 	STATUS_UNKNOWN       = "unknown"
 	STATUS_CREATING      = "creating"
+	STATUS_AVAILABLE     = "available"
 	STATUS_CREATE_FAILED = "create_failed"
+	STATUS_UPDATE_FAILED = "update_failed"
+
+	// 更改计费模式
+	STATUS_CHANGE_BILLING_TYPE        = "change_billing_type"
+	STATUS_CHANGE_BILLING_TYPE_FAILED = "change_billing_type_failed"
 
 	CLOUD_TAG_PREFIX     = "ext:"
 	USER_TAG_PREFIX      = "user:"
@@ -64,7 +78,7 @@ const (
 	SKU_STATUS_AVAILABLE = "available"
 	SKU_STATUS_SOLDOUT   = "soldout"
 
-	MetaServiceMonitorAgentUrl = "http://169.254.169.254/monitor"
+	MetaServiceMonitorAgentUrl = "http://%s/monitor"
 )
 
 var (
@@ -81,6 +95,7 @@ var (
 		SERVICE_TYPE_CLOUDEVENT,
 		SERVICE_TYPE_ANSIBLE,
 		SERVICE_TYPE_INFLUXDB,
+		SERVICE_TYPE_VICTORIA_METRICS,
 		SERVICE_TYPE_APIMAP,
 		SERVICE_TYPE_LOG,
 		"autoupdate",
@@ -100,9 +115,34 @@ var (
 		"apigateway",
 		"yunionapi",
 		"billing",
-		"etcd",
+		SERVICE_TYPE_ETCD,
 		"itsm",
-		"ntp",
+		SERVICE_TYPE_NTP,
+		"kafka",
+	}
+
+	EXTERNAL_SERVICES = []string{
+		SERVICE_TYPE_OFFLINE_CLOUDMETA,
+		SERVICE_TYPE_CLOUDMETA,
+		SERVICE_TYPE_SCHEDULER,
+		SERVICE_TYPE_VNCPROXY,
+		SERVICE_TYPE_ETCD,
+		SERVICE_TYPE_INFLUXDB,
+		SERVICE_TYPE_INFLUXDB,
+		SERVICE_TYPE_VICTORIA_METRICS,
+		SERVICE_TYPE_LOG,
+		"s3gateway",
+		SERVICE_TYPE_AIPROXY,
+		"common",
+		"websocket",
+		"echarts-ssr",
+		"cloudwatcher",
+		"cloudnet",
+		"repo",
+		SERVICE_TYPE_ETCD,
+		"itsm",
+		SERVICE_TYPE_NTP,
+		"kafka",
 	}
 )
 
@@ -112,14 +152,19 @@ const (
 )
 
 const (
-	OS_ARCH_X86 = "x86"
-	OS_ARCH_ARM = "arm"
+	OS_ARCH_ALL = "all"
+
+	OS_ARCH_X86   = "x86"
+	OS_ARCH_ARM   = "arm"
+	OS_ARCH_RISCV = "riscv"
 
 	OS_ARCH_I386    = "i386"
 	OS_ARCH_X86_32  = "x86_32"
 	OS_ARCH_X86_64  = "x86_64"
 	OS_ARCH_AARCH32 = "aarch32"
 	OS_ARCH_AARCH64 = "aarch64"
+	OS_ARCH_RISCV32 = "riscv32"
+	OS_ARCH_RISCV64 = "riscv64"
 )
 
 var (
@@ -134,8 +179,45 @@ var (
 		OS_ARCH_AARCH32,
 		OS_ARCH_AARCH64,
 	}
+	ARCH_RISCV = []string{
+		OS_ARCH_RISCV,
+		OS_ARCH_RISCV32,
+		OS_ARCH_RISCV64,
+	}
 )
 
 func IsARM(osArch string) bool {
 	return utils.IsInStringArray(osArch, ARCH_ARM)
+}
+
+func IsX86(osArch string) bool {
+	return utils.IsInStringArray(osArch, ARCH_X86)
+}
+
+func IsRISCV(osArch string) bool {
+	return utils.IsInStringArray(osArch, ARCH_RISCV)
+}
+
+func IsIllegalSearchDomain(domain string) bool {
+	switch domain {
+	case "cloud.onecloud.io":
+		return true
+	}
+	return false
+}
+
+func IsSameArch(arch1, arch2 string) bool {
+	if arch1 == arch2 {
+		return true
+	}
+	if IsARM(arch1) && IsARM(arch2) {
+		return true
+	}
+	if IsX86(arch1) && IsX86(arch2) {
+		return true
+	}
+	if IsRISCV(arch1) && IsRISCV(arch2) {
+		return true
+	}
+	return false
 }

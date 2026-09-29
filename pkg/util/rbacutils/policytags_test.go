@@ -17,6 +17,8 @@ package rbacutils
 import (
 	"testing"
 
+	"yunion.io/x/jsonutils"
+
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
@@ -47,10 +49,12 @@ func TestSPolicy_Contains(t *testing.T) {
 					},
 				},
 				DomainTags: nil,
-				ProjectTags: tagutils.TTagSet{
-					tagutils.STag{
-						Key:   "project",
-						Value: "a",
+				ProjectTags: tagutils.TTagSetList{
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "project",
+							Value: "a",
+						},
 					},
 				},
 				ObjectTags: nil,
@@ -80,14 +84,16 @@ func TestSPolicy_Contains(t *testing.T) {
 					},
 				},
 				DomainTags: nil,
-				ProjectTags: tagutils.TTagSet{
-					tagutils.STag{
-						Key:   "project",
-						Value: "a",
-					},
-					tagutils.STag{
-						Key:   "env",
-						Value: "test",
+				ProjectTags: tagutils.TTagSetList{
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "project",
+							Value: "a",
+						},
+						tagutils.STag{
+							Key:   "env",
+							Value: "test",
+						},
 					},
 				},
 				ObjectTags: nil,
@@ -108,10 +114,12 @@ func TestSPolicy_Contains(t *testing.T) {
 					},
 				},
 				DomainTags: nil,
-				ProjectTags: tagutils.TTagSet{
-					tagutils.STag{
-						Key:   "project",
-						Value: "a",
+				ProjectTags: tagutils.TTagSetList{
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "project",
+							Value: "a",
+						},
 					},
 				},
 				ObjectTags: nil,
@@ -128,6 +136,92 @@ func TestSPolicy_Contains(t *testing.T) {
 		got = c.p2.Contains(c.p1)
 		if got != c.p2cp1 {
 			t.Errorf("[%d] p2 contains p1 want %v got %v", i, c.p2cp1, got)
+		}
+	}
+}
+
+func TestDecodePolicy(t *testing.T) {
+	cases := []struct {
+		policy SPolicy
+	}{
+		{
+			policy: SPolicy{
+				Rules: TPolicy{
+					SRbacRule{
+						Service:  WILD_MATCH,
+						Resource: WILD_MATCH,
+						Action:   WILD_MATCH,
+						Result:   Allow,
+					},
+				},
+			},
+		},
+		{
+			policy: SPolicy{
+				Rules: TPolicy{
+					SRbacRule{
+						Service:  WILD_MATCH,
+						Resource: WILD_MATCH,
+						Action:   WILD_MATCH,
+						Result:   Allow,
+					},
+				},
+				ProjectTags: tagutils.TTagSetList{
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "user:部门",
+							Value: "技术",
+						},
+						tagutils.STag{
+							Key:   "user:环境",
+							Value: "UAT",
+						},
+					},
+				},
+			},
+		},
+		{
+			policy: SPolicy{
+				Rules: TPolicy{
+					SRbacRule{
+						Service:  WILD_MATCH,
+						Resource: WILD_MATCH,
+						Action:   WILD_MATCH,
+						Result:   Allow,
+					},
+				},
+				ProjectTags: tagutils.TTagSetList{
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "user:部门",
+							Value: "技术",
+						},
+						tagutils.STag{
+							Key:   "user:环境",
+							Value: "UAT",
+						},
+					},
+					tagutils.TTagSet{
+						tagutils.STag{
+							Key:   "org:部门",
+							Value: "技术",
+						},
+						tagutils.STag{
+							Key:   "org:环境",
+							Value: "UAT",
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, c := range cases {
+		json := c.policy.Encode()
+		got, err := DecodePolicy(json)
+		if err != nil {
+			t.Errorf("DecodePolicy fail %s", err)
+		} else if jsonutils.Marshal(c.policy).String() != jsonutils.Marshal(got).String() {
+			t.Errorf("want %s got %s", jsonutils.Marshal(c.policy), jsonutils.Marshal(got))
 		}
 	}
 }

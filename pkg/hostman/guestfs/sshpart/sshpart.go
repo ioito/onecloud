@@ -16,6 +16,7 @@ package sshpart
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"regexp"
@@ -37,20 +38,20 @@ import (
 )
 
 type SSHPartition struct {
-	term      *ssh.Client
+	term      ISSHClient // *ssh.Client
 	partDev   string
 	mountPath string
-	part      *disktool.Partition
+	isLVM     bool
 }
 
 var _ fsdriver.IDiskPartition = &SSHPartition{}
 
-func NewSSHPartition(term *ssh.Client, part *disktool.Partition) *SSHPartition {
+func NewSSHPartition(term ISSHClient, partDev string, isLVM bool) *SSHPartition {
 	p := new(SSHPartition)
 	p.term = term
-	p.partDev = part.GetDev()
+	p.partDev = partDev
+	p.isLVM = isLVM
 	p.mountPath = fmt.Sprintf("/tmp/%s", strings.Replace(p.partDev, "/", "_", -1))
-	p.part = part
 	return p
 }
 
@@ -59,7 +60,12 @@ func (p *SSHPartition) GetMountPath() string {
 }
 
 func (p *SSHPartition) GetFsFormat() (string, error) {
-	cmd := fmt.Sprintf("/lib/mos/partfs.sh %s", p.partDev)
+	var cmd string
+	if strings.HasPrefix(p.partDev, "/dev/md") {
+		cmd = fmt.Sprintf("blkid -o value -s TYPE %s", p.partDev)
+	} else {
+		cmd = fmt.Sprintf("/lib/mos/partfs.sh %s", p.partDev)
+	}
 	ret, err := p.term.Run(cmd)
 	if err != nil {
 		return "", err
@@ -375,7 +381,7 @@ func (p *SSHPartition) ListDir(sPath string, caseInsensitive bool) []string {
 }
 
 func (p *SSHPartition) osChown(sPath string, uid, gid int) error {
-	cmd := fmt.Sprintf("chown %d.%d %s", uid, gid, sPath)
+	cmd := fmt.Sprintf("chown %d:%d %s", uid, gid, sPath)
 	_, err := p.term.Run(cmd)
 	return err
 }
@@ -485,7 +491,7 @@ func (p *SSHPartition) osStat(sPath string) (os.FileInfo, error) {
 		dat := regexp.MustCompile(`\s+`).Split(strings.TrimSpace(line), -1)
 		if len(dat) > 7 && ((dat[2][0] != 'l' && dat[len(dat)-1] == sPath) ||
 			(dat[2][0] == 'l' && dat[len(dat)-3] == sPath)) {
-			stMode, err := modeStr2Bin(dat[2])
+			stMode, err := fsdriver.ModeStr2Bin(dat[2])
 			if err != nil {
 				return nil, err
 			}
@@ -493,79 +499,22 @@ func (p *SSHPartition) osStat(sPath string) (os.FileInfo, error) {
 			stUid, _ := strconv.Atoi(dat[4])
 			stGid, _ := strconv.Atoi(dat[5])
 			stSize, _ := strconv.Atoi(dat[6])
-			info := &sFileInfo{
-				name:  sPath,
-				size:  int64(stSize),
-				mode:  os.FileMode(stMode),
-				isDir: dat[2][0] == 'd',
-				stat: &syscall.Stat_t{
+			info := fsdriver.NewFileInfo(
+				sPath,
+				int64(stSize),
+				os.FileMode(stMode),
+				dat[2][0] == 'd',
+				&syscall.Stat_t{
 					Ino:  uint64(stIno),
 					Uid:  uint32(stUid),
 					Gid:  uint32(stGid),
 					Size: int64(stSize),
 				},
-			}
+			)
 			return info, nil
 		}
 	}
 	return nil, fmt.Errorf("Can't stat for path %s", sPath)
-}
-
-func modeStr2Bin(mode string) (uint32, error) {
-	table := []map[byte]uint32{
-		{'-': syscall.S_IRUSR, 'd': syscall.S_IFDIR, 'l': syscall.S_IFLNK},
-		{'r': syscall.S_IRUSR},
-		{'w': syscall.S_IWUSR},
-		{'x': syscall.S_IXUSR, 's': syscall.S_ISUID},
-		{'r': syscall.S_IRGRP},
-		{'w': syscall.S_IWGRP},
-		{'x': syscall.S_IXGRP, 's': syscall.S_ISGID},
-		{'r': syscall.S_IROTH},
-		{'w': syscall.S_IWOTH},
-		{'x': syscall.S_IXOTH},
-	}
-	if len(mode) != len(table) {
-		return 0, fmt.Errorf("Invalid mod %q", mode)
-	}
-	var ret uint32 = 0
-	for i := 0; i < len(table); i++ {
-		ret |= table[i][mode[i]]
-	}
-	return ret, nil
-}
-
-// sFileInfo implements os.FileInfo interface
-type sFileInfo struct {
-	name  string
-	size  int64
-	mode  os.FileMode
-	isDir bool
-	stat  *syscall.Stat_t
-}
-
-func (info sFileInfo) Name() string {
-	return info.name
-}
-
-func (info sFileInfo) Size() int64 {
-	return info.size
-}
-
-func (info sFileInfo) Mode() os.FileMode {
-	return info.mode
-}
-
-func (info sFileInfo) IsDir() bool {
-	return info.isDir
-}
-
-func (info sFileInfo) ModTime() time.Time {
-	// TODO: impl
-	return time.Now()
-}
-
-func (info sFileInfo) Sys() interface{} {
-	return info.stat
 }
 
 func (p *SSHPartition) Stat(sPath string, caseInsensitive bool) os.FileInfo {
@@ -601,6 +550,60 @@ func (p *SSHPartition) Zerofree() {
 	log.Warningf("zerofree should not called in ssh partition")
 }
 
+func (p *SSHPartition) CopyFile(src, dest string) error {
+	rpath := path.Join(p.GetMountPath(), dest)
+	term, ok := p.term.(*ssh.Client)
+	if !ok {
+		return errors.Errorf("term %T has no stdin support", p.term)
+	}
+
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		f, err := os.Open(src)
+		if err != nil {
+			pw.CloseWithError(err)
+			log.Errorf("open %s failed: %s", src, err)
+			done <- errors.Wrap(err, fmt.Sprintf("open %s failed", src))
+			return
+		}
+		defer f.Close()
+		if _, err := io.Copy(pw, f); err != nil {
+			pw.CloseWithError(err)
+			log.Errorf("copy %s failed: %s", src, err)
+			done <- errors.Wrap(err, "copy failed")
+			return
+		}
+		done <- pw.Close()
+	}()
+
+	ret, err := term.RunWithInput(pr, fmt.Sprintf("cat > %s", rpath))
+	pr.Close()
+	if err != nil {
+		return errors.Wrapf(err, "failed write to %s: %v", rpath, ret)
+	}
+	if perr := <-done; perr != nil {
+		return errors.Wrapf(perr, "read local %s", src)
+	}
+
+	fi, err := os.Stat(src)
+	if err != nil {
+		return errors.Wrapf(err, "failed stat %s", src)
+	}
+	mode := fi.Mode().Perm()
+	out, err := term.Run(fmt.Sprintf("chmod %04o %s", mode, rpath))
+	if err != nil {
+		return errors.Wrapf(err, "failed chmod %04o %s: %v", mode, rpath, out)
+	}
+
+	return nil
+}
+
+func (p *SSHPartition) ExecCommand(name string, args ...string) ([]string, error) {
+	cmd := strings.Join(append([]string{"/usr/sbin/chroot", p.GetMountPath(), name}, args...), " ")
+	return p.term.Run(cmd)
+}
+
 func MountSSHRootfs(tool *disktool.SSHPartitionTool, term *ssh.Client, layouts []baremetal.Layout) (*SSHPartition, fsdriver.IRootFsDriver, error) {
 	// tool, err := disktool.NewSSHPartitionTool(term, layouts)
 	// if err != nil {
@@ -616,7 +619,7 @@ func MountSSHRootfs(tool *disktool.SSHPartitionTool, term *ssh.Client, layouts [
 		return nil, nil, fmt.Errorf("Not found root disk partitions")
 	}
 	for _, part := range parts {
-		dev := NewSSHPartition(term, part)
+		dev := NewSSHPartition(term, part.GetDev(), false)
 		if !dev.Mount() {
 			continue
 		}

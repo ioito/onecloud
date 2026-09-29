@@ -15,6 +15,7 @@
 package fsdriver
 
 import (
+	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"path"
@@ -49,6 +50,8 @@ const (
 
 	WIN_TELEGRAF_BINARY_PATH = "/opt/yunion/bin/telegraf.exe"
 	WIN_TELEGRAF_PATH        = "/Program Files/Telegraf"
+
+	WIN_QGA_PATH = "/Program Files/Qemu-ga"
 )
 
 type SWindowsRootFs struct {
@@ -105,15 +108,17 @@ func (w *SWindowsRootFs) GetReleaseInfo(IDiskPartition) *deployapi.ReleaseInfo {
 	confPath := w.rootFs.GetLocalPath("/windows/system32/config", true)
 	tool := winutils.NewWinRegTool(confPath)
 	if tool.CheckPath() {
-		distro := tool.GetProductName()
-		version := tool.GetVersion()
+		distro := w.GetName()
+		version := tool.GetProductName()
+		curVersion := tool.GetVersion()
 		arch := w.GetArch(hostCpuArch)
 		lan := tool.GetInstallLanguage()
 		return &deployapi.ReleaseInfo{
-			Distro:   distro,
-			Version:  version,
-			Arch:     arch,
-			Language: lan,
+			Distro:         distro,
+			Version:        version,
+			Arch:           arch,
+			Language:       lan,
+			CurrentVersion: curVersion,
 		}
 	} else {
 		return nil
@@ -170,7 +175,7 @@ func (w *SWindowsRootFs) GetArch(hostCpuArch string) string {
 
 func (w *SWindowsRootFs) IsWindows10NonPro() bool {
 	info := w.GetReleaseInfo(nil)
-	if info != nil && strings.HasPrefix(info.Distro, "Windows 10 ") && !strings.HasPrefix(info.Distro, "Windows 10 Pro") {
+	if info != nil && strings.HasPrefix(info.Version, "Windows 10 ") && !strings.HasPrefix(info.Version, "Windows 10 Pro") {
 		return true
 	}
 	return false
@@ -178,7 +183,7 @@ func (w *SWindowsRootFs) IsWindows10NonPro() bool {
 
 func (w *SWindowsRootFs) IsOldWindows() bool {
 	info := w.GetReleaseInfo(nil)
-	if info != nil && strings.HasPrefix(info.Version, "5.") {
+	if info != nil && strings.HasPrefix(info.CurrentVersion, "5.") {
 		return true
 	}
 	return false
@@ -268,17 +273,7 @@ func (w *SWindowsRootFs) DeployHosts(part IDiskPartition, hn, domain string, ips
 		oldHf = string(oldHfBytes)
 	}
 
-	hf := fileutils2.HostsFile{}
-	hf.Parse(oldHf)
-	hf.Add("127.0.0.1", "localhost")
-	for _, ip := range ips {
-		hf.Add(ip, getHostname(hn, domain), hn)
-	}
-	return w.rootFs.FilePutContents(ETC_HOSTS, hf.String(), false, true)
-}
-
-func (w *SWindowsRootFs) DeployQgaBlackList(part IDiskPartition) error {
-	return nil
+	return w.rootFs.FilePutContents(ETC_HOSTS, fileutils2.FormatHostsFile(oldHf, ips, hn, getHostname(hn, domain)), false, true)
 }
 
 func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*types.SServerNic) error {
@@ -289,6 +284,10 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 	mainIp := ""
 	if mainNic != nil {
 		mainIp = mainNic.Ip
+	}
+	mainIp6 := ""
+	if mainNic != nil {
+		mainIp6 = mainNic.Ip6
 	}
 	bootScript := strings.Join([]string{
 		`set NETCFG_SCRIPT=%SystemRoot%\netcfg.bat`,
@@ -307,6 +306,21 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 		`  for /f "delims=,,, tokens=1,3" %%b in ("!line!") do (`,
 	}
 
+	hasV6 := false
+	for _, snic := range nics {
+		if len(snic.Ip6) > 0 {
+			hasV6 = true
+			break
+		}
+	}
+	if hasV6 {
+		lines = append(lines, `    netsh interface teredo set state disable`)
+		lines = append(lines, `    netsh interface 6to4 set state state=disabled`)
+		lines = append(lines, `    netsh interface isatap set state state=disabled`)
+		lines = append(lines, `    netsh interface ipv6 set privacy disabled store=persistent`)
+		lines = append(lines, `    netsh interface ipv6 set global randomizeidentifiers=disabled store=persistent`)
+	}
+
 	for _, snic := range nics {
 		mac := snic.Mac
 		mac = strings.Replace(strings.ToUpper(mac), ":", "-", -1)
@@ -315,24 +329,47 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 			lines = append(lines, fmt.Sprintf(`      netsh interface ipv4 set subinterface "%%%%b" mtu=%d`, snic.Mtu))
 		}
 		if snic.Manual {
-			netmask := netutils2.Netlen2Mask(int(snic.Masklen))
-			cfg := fmt.Sprintf(`      netsh interface ip set address "%%%%b" static %s %s`, snic.Ip, netmask)
-			if len(snic.Gateway) > 0 && snic.Ip == mainIp {
-				cfg += fmt.Sprintf(" %s", snic.Gateway)
+			if len(snic.Ip) > 0 {
+				netmask := netutils2.Netlen2Mask(int(snic.Masklen))
+				cfg := fmt.Sprintf(`      netsh interface ip set address "%%%%b" static %s %s`, snic.Ip, netmask)
+				if len(snic.Gateway) > 0 && snic.Ip == mainIp {
+					cfg += fmt.Sprintf(" %s", snic.Gateway)
+				}
+				lines = append(lines, cfg)
 			}
-			lines = append(lines, cfg)
-			routes := [][]string{}
-			netutils2.AddNicRoutes(&routes, snic, mainIp, len(nics), privatePrefixes)
-			for _, r := range routes {
-				lines = append(lines, fmt.Sprintf(`      netsh interface ip add route %s "%%%%b" %s`, r[0], r[1]))
+			if len(snic.Ip6) > 0 {
+				cfg := fmt.Sprintf(`      netsh interface ipv6 add address "%%%%b" %s/%d store=persistent`, snic.Ip6, snic.Masklen6)
+				lines = append(lines, cfg)
+				if len(snic.Gateway6) > 0 && snic.Ip6 == mainIp6 {
+					cfg := fmt.Sprintf(`      netsh interface ipv6 add route ::/0 "%%%%b" %s`, snic.Gateway6)
+					lines = append(lines, cfg)
+				}
 			}
-			dnslist := netutils2.GetNicDns(snic)
-			if len(dnslist) > 0 {
+			routes4 := []netutils2.SRouteInfo{}
+			routes6 := []netutils2.SRouteInfo{}
+			routes4, routes6 = netutils2.AddNicRoutes(routes4, routes6, snic, mainIp, mainIp6, len(nics))
+			for _, r := range routes4 {
+				lines = append(lines, fmt.Sprintf(`      netsh interface ip add route %s/%d %s "%%%%b"`, r.Prefix, r.PrefixLen, r.Gateway.String()))
+			}
+			for _, r := range routes6 {
+				lines = append(lines, fmt.Sprintf(`      netsh interface ipv6 add route %s/%d %s "%%%%b"`, r.Prefix, r.PrefixLen, r.Gateway.String()))
+			}
+			dns4list, dns6list := netutils2.GetNicDns(snic)
+			if len(dns4list) > 0 {
 				lines = append(lines, fmt.Sprintf(
-					`      netsh interface ip set dns name="%%%%b" source=static addr=%s`, dnslist[0]))
-				if len(dnslist) > 1 {
-					for i := 1; i < len(dnslist); i++ {
-						lines = append(lines, fmt.Sprintf(`      netsh interface ip add dns "%%%%b" %s index=%d`, dnslist[i], i+1))
+					`      netsh interface ip set dns name="%%%%b" source=static addr=%s`, dns4list[0]))
+				if len(dns4list) > 1 {
+					for i := 1; i < len(dns4list); i++ {
+						lines = append(lines, fmt.Sprintf(`      netsh interface ip add dns "%%%%b" %s index=%d`, dns4list[i], i+1))
+					}
+				}
+			}
+			if len(dns6list) > 0 {
+				lines = append(lines, fmt.Sprintf(
+					`      netsh interface ipv6 set dns name="%%%%b" source=static addr=%s`, dns6list[0]))
+				if len(dns6list) > 1 {
+					for i := 1; i < len(dns6list); i++ {
+						lines = append(lines, fmt.Sprintf(`      netsh interface ip add dns "%%%%b" %s index=%d`, dns6list[i], i+1))
 					}
 				}
 			}
@@ -341,8 +378,16 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 				lines = append(lines, w.regAdd(TCPIP_PARAM_KEY, "SearchList", snic.Domain, "REG_SZ"))
 			}
 		} else {
-			lines = append(lines, `      netsh interface ip set address "%%b" dhcp`)
-			lines = append(lines, `      netsh interface ip set dns "%%b" dhcp`)
+			if len(snic.Ip) > 0 {
+				lines = append(lines, `      netsh interface ip set address "%%b" dhcp`)
+				lines = append(lines, `      netsh interface ip set dns "%%b" dhcp`)
+			}
+			if len(snic.Ip6) > 0 {
+				cfg := `      netsh interface ipv6 set interface "%%b" routerdiscovery=enabled store=persistent`
+				lines = append(lines, cfg)
+				cfg = `      netsh interface ipv6 set interface "%%b" managedaddress=enabled otherstateful=enabled store=persistent`
+				lines = append(lines, cfg)
+			}
 		}
 		lines = append(lines, `    )`)
 	}
@@ -402,16 +447,14 @@ func (w *SWindowsRootFs) CommitChanges(part IDiskPartition) error {
 	return nil
 }
 
-func (w *SWindowsRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, publicKey, password string) (string, error) {
+func (w *SWindowsRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, publicKey, password string, isRandomPassword bool) (string, error) {
 	rinfo := w.GetReleaseInfo(part)
 	confPath := part.GetLocalPath("/windows/system32/config", true)
 	tool := winutils.NewWinRegTool(confPath)
 	tool.CheckPath()
 	success := false
 
-	// symbol ^ is escape character is batch file.
-	password = strings.ReplaceAll(password, "^", "")
-	if rinfo != nil && version.GE(rinfo.Version, "6.1") {
+	if rinfo != nil && version.GE(rinfo.CurrentVersion, "6.1") {
 		success = w.deployPublicKeyByGuest(account, password)
 	} else {
 		success = tool.ChangePassword(account, password) == nil
@@ -433,7 +476,7 @@ func (w *SWindowsRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, pub
 				return "", err
 			}
 		}
-		if rinfo != nil && strings.Contains(rinfo.Distro, "Windows XP") {
+		if rinfo != nil && strings.Contains(rinfo.Version, "Windows XP") {
 			if len(tool.GetLogontype()) > 0 {
 				tool.SetLogontype("0x0")
 			}
@@ -446,6 +489,10 @@ func (w *SWindowsRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, pub
 		tool.SetDefaultAccount(account)
 	}
 	return secret, nil
+}
+
+func encodeWindowsScriptPassword(passwd string) string {
+	return base64.StdEncoding.EncodeToString([]byte(passwd))
 }
 
 func (w *SWindowsRootFs) deployPublicKeyByGuest(uname, passwd string) bool {
@@ -462,13 +509,14 @@ func (w *SWindowsRootFs) deployPublicKeyByGuest(uname, passwd string) bool {
 	w.appendGuestBootScript("chgpwd", bootScript)
 	logPath := w.guestDebugLogPath
 	chksum := stringutils2.GetMD5Hash(passwd + logPath[(len(logPath)-10):])
+	passwdEnc := encodeWindowsScriptPassword(passwd)
 
 	chgpwdScript := strings.Join([]string{
 		w.MakeGuestDebugCmd("change password step 1"),
 		strings.Join([]string{
 			`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`,
 			` -executionpolicy bypass %SystemRoot%\chgpwd.ps1`,
-			fmt.Sprintf(" %s %s %s %s", uname, passwd, chksum, logPath),
+			fmt.Sprintf(" %s %s %s %s", uname, passwdEnc, chksum, logPath),
 		}, ""),
 		`del %SystemRoot%\chgpwd.ps1`,
 		w.MakeGuestDebugCmd("change password step 2"),
@@ -491,14 +539,17 @@ func (w *SWindowsRootFs) deploySetupCompleteScripts(uname, passwd string) bool {
 	if w.putGuestScriptContents("/windows/chgpwd_setup.ps1", WinScriptChangePassword) != nil {
 		return false
 	}
+	passwdEnc := encodeWindowsScriptPassword(passwd)
 	cmds := []string{
 		`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -executionpolicy bypass %SystemRoot%\chgpwd_setup.ps1 ` +
-			fmt.Sprintf("%s %s", uname, passwd),
+			fmt.Sprintf("%s %s", uname, passwdEnc),
 		"Net stop wuauserv",
 	}
 	for _, v := range [][3]string{
-		{"AUOptions", "REG_DWORD", "3"},
-		{"NoAutoUpdate", "REG_DWORD", "0"},
+		// enable: 3, disable: 2
+		{"AUOptions", "REG_DWORD", "2"},
+		// enable: 0, disable: 1
+		{"NoAutoUpdate", "REG_DWORD", "1"},
 		{"ScheduledInstallDay", "REG_DWORD", "0"},
 		{"ScheduledInstallTime", "REG_DWORD", "4"},
 		{"AutoInstallMinorUpdates", "REG_DWORD", "1"},
@@ -510,8 +561,9 @@ func (w *SWindowsRootFs) deploySetupCompleteScripts(uname, passwd string) bool {
 			v[0], v[1], v[2]))
 	}
 	cmds = append(cmds, `REG ADD "HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation" /v RealTimeIsUniversal /t REG_DWORD /d 1 /f`)
-	cmds = append(cmds, "Net start wuauserv")
-	cmds = append(cmds, "wuauclt /detectnow")
+	cmds = append(cmds, `REG ADD "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device" /v DevicePasswordLessBuildVersion /t REG_DWORD /d 0 /f`)
+	// cmds = append(cmds, "Net start wuauserv")
+	// cmds = append(cmds, "wuauclt /detectnow")
 	cmds = append(cmds, `del %SystemRoot%\chgpwd_setup.ps1`)
 	cmds = append(cmds, `del %SystemRoot%\Setup\Scripts\SetupComplete.cmd`)
 	if w.putGuestScriptContents(SETUP_SCRIPT_PATH, strings.Join(cmds, "\r\n")) != nil {
@@ -567,21 +619,45 @@ func (l *SWindowsRootFs) IsResizeFsPartitionSupport() bool {
 	return true
 }
 
+func (w *SWindowsRootFs) DeployQgaService(part IDiskPartition) error {
+	if err := w.rootFs.Mkdir(WIN_QGA_PATH, syscall.S_IRUSR|syscall.S_IWUSR|syscall.S_IXUSR, true); err != nil {
+		return errors.Wrap(err, "mkdir qemu-ga path")
+	}
+
+	winQgaPath := w.rootFs.GetLocalPath(WIN_QGA_PATH, true)
+	qgaInstallerPath := path.Join(winQgaPath, "qemu-ga-x86_64.msi")
+	output, err := procutils.NewCommand("cp", "-f", QGA_WIN_MSI_INSTALLER_PATH, qgaInstallerPath).Output()
+	if err != nil {
+		return errors.Wrapf(err, "cp qga installer failed %s", output)
+	}
+
+	bootScript := strings.Join([]string{
+		`start "" "%PROGRAMFILES%\Qemu-ga\qemu-ga-x86_64.msi"`,
+	}, "\r\n")
+	w.appendGuestBootScript("qemu-ga", bootScript)
+	return nil
+}
+
+func (w *SWindowsRootFs) DeployQgaBlackList(part IDiskPartition) error {
+	return nil
+}
+
 func (w *SWindowsRootFs) DeployTelegraf(config string) (bool, error) {
 	if err := w.rootFs.Mkdir(WIN_TELEGRAF_PATH, syscall.S_IRUSR|syscall.S_IWUSR|syscall.S_IXUSR, true); err != nil {
 		return false, errors.Wrap(err, "mkdir telegraf path")
 	}
 
-	telegrafConfPath := path.Join(w.rootFs.GetMountPath(), WIN_TELEGRAF_PATH, "telegraf.conf")
+	winTelegrafPath := w.rootFs.GetLocalPath(WIN_TELEGRAF_PATH, true)
+	telegrafConfPath := path.Join(winTelegrafPath, "telegraf.conf")
 	if err := w.rootFs.FilePutContents(telegrafConfPath, config, false, true); err != nil {
 		return false, errors.Wrap(err, "write boot script")
 	}
 	telegrafConfPath = strings.ReplaceAll(path.Join("%PROGRAMFILES%", "Telegraf", "telegraf.conf"), "/", "\\")
+	telegrafBinaryPath := path.Join(winTelegrafPath, "telegraf.exe")
 
-	telegrafBinaryPath := path.Join(w.rootFs.GetMountPath(), WIN_TELEGRAF_PATH, "telegraf.exe")
-	output, err := procutils.NewCommand("cp", "-f", WIN_TELEGRAF_BINARY_PATH, telegrafBinaryPath).Output()
+	err := w.rootFs.CopyFile(WIN_TELEGRAF_BINARY_PATH, path.Join(WIN_TELEGRAF_PATH, "telegraf.exe"))
 	if err != nil {
-		return false, errors.Wrapf(err, "cp telegraf failed %s", output)
+		return false, errors.Wrap(err, "cp telegraf failed")
 	}
 	telegrafBinaryPath = strings.ReplaceAll(path.Join("%PROGRAMFILES%", "Telegraf", "telegraf.exe"), "/", "\\")
 	bootScript := strings.Join([]string{
@@ -610,4 +686,15 @@ func (w *SWindowsRootFs) DeployTelegraf(config string) (bool, error) {
 		return false, errors.Wrap(err, "put setup ps1 script")
 	}
 	return true, nil
+}
+
+func (w *SWindowsRootFs) ConfigSshd(loginAccount, loginPassword string, sshPort int) error {
+	return nil
+}
+
+func (w *SWindowsRootFs) IsWindowsVirtioNetSupport(part IDiskPartition) bool {
+	confPath := part.GetLocalPath("/windows/system32/config", true)
+	tool := winutils.NewWinRegTool(confPath)
+	tool.CheckPath()
+	return tool.IsNetKVMInstalled()
 }

@@ -1,0 +1,152 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package isolated_device
+
+import (
+	"fmt"
+
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+
+	"yunion.io/x/onecloud/pkg/apis"
+	api "yunion.io/x/onecloud/pkg/apis/compute"
+	hostapi "yunion.io/x/onecloud/pkg/apis/host"
+)
+
+type containerCDIFactory func() (IContainerCDIManager, error)
+
+var (
+	containerDeviceManagers = make(map[ContainerDeviceType]IContainerDeviceManager)
+	containerCDIManagers    = make(map[apis.ContainerCDIKind]containerCDIFactory)
+)
+
+type ContainerDeviceType string
+
+const (
+	ContainerDeviceTypeCphAMDGPU      ContainerDeviceType = api.CONTAINER_DEV_CPH_AMD_GPU
+	ContainerDeviceTypeCphASOPBinder  ContainerDeviceType = api.CONTAINER_DEV_CPH_AOSP_BINDER
+	ContainerNetintCAASIC             ContainerDeviceType = api.CONTAINER_DEV_NETINT_CA_ASIC
+	ContainerNetintCAQuadra           ContainerDeviceType = api.CONTAINER_DEV_NETINT_CA_QUADRA
+	ContainerDeviceTypeNvidiaGpu      ContainerDeviceType = api.CONTAINER_DEV_NVIDIA_GPU
+	ContainerDeviceTypeNvidiaMps      ContainerDeviceType = api.CONTAINER_DEV_NVIDIA_MPS
+	ContainerDeviceTypeNvidiaGpuShare ContainerDeviceType = api.CONTAINER_DEV_NVIDIA_GPU_SHARE
+	ContainerDeviceTypeNvidiaHAMI     ContainerDeviceType = api.CONTAINER_DEV_NVIDIA_HAMI
+	ContainerDeviceTypeAscendNpu      ContainerDeviceType = api.CONTAINER_DEV_ASCEND_NPU
+	ContainerDeviceTypeAscendNpuHami  ContainerDeviceType = api.CONTAINER_DEV_ASCEND_NPU_HAMI
+	ContainerDeviceTypeVastaitechGpu  ContainerDeviceType = api.CONTAINER_DEV_VASTAITECH_GPU
+	ContainerDeviceTypeHygonDcu       ContainerDeviceType = api.CONTAINER_DEV_HYGON_DCU
+	ContainerDeviceTypeHygonDcuHami   ContainerDeviceType = api.CONTAINER_DEV_HYGON_DCU_HAMI
+	ContainerDeviceTypeIluvatarGpu    ContainerDeviceType = api.CONTAINER_DEV_ILUVATAR_GPU
+	ContainerDeviceTypeTHeadPpu       ContainerDeviceType = api.CONTAINER_DEV_THEAD_PPU
+	ContainerDeviceTypeKunlunxinXpu   ContainerDeviceType = api.CONTAINER_DEV_KUNLUNXIN_XPU
+)
+
+func GetContainerDeviceManager(devType ContainerDeviceType) (IContainerDeviceManager, error) {
+	man, ok := containerDeviceManagers[devType]
+	if !ok {
+		return nil, errors.Wrapf(errors.ErrNotFound, "not found container device manager by %q", devType)
+	}
+	return man, nil
+}
+
+func RegisterContainerDeviceManager(man IContainerDeviceManager) {
+	if _, ok := containerDeviceManagers[man.GetRegisterType()]; ok {
+		panic(fmt.Sprintf("container device manager %s is already registered", man.GetRegisterType()))
+	}
+	containerDeviceManagers[man.GetRegisterType()] = man
+}
+
+func GetContainerCDIManager(t apis.ContainerCDIKind) (IContainerCDIManager, error) {
+	manF, ok := containerCDIManagers[t]
+	if !ok {
+		return nil, errors.Wrapf(errors.ErrNotFound, "not found container cdi manager by %q", t)
+	}
+	return manF()
+}
+
+func RegisterContainerCDIManaer(t apis.ContainerCDIKind, factoryFunc func() (IContainerCDIManager, error)) {
+	if _, ok := containerCDIManagers[t]; ok {
+		panic(fmt.Sprintf("CDI manager %s is already registered", t))
+	}
+	containerCDIManagers[t] = factoryFunc
+}
+
+type ContainerDevice struct {
+	Path          string              `json:"path"`
+	Type          ContainerDeviceType `json:"type"`
+	VirtualNumber int                 `json:"virtual_number"`
+}
+
+type ContainerDeviceConfiguration struct {
+	Devices []*ContainerDevice `json:"devices"`
+}
+
+type IContainerDeviceManager interface {
+	GetRegisterType() ContainerDeviceType
+	NewDevices(dev *ContainerDevice) ([]IDevice, error)
+	NewContainerDevices(input *hostapi.ContainerCreateInput, dev *hostapi.ContainerDevice) ([]*runtimeapi.Device, []*runtimeapi.Device, error)
+	ProbeDevices() ([]IDevice, error)
+	GetContainerExtraConfigures(devs []*hostapi.ContainerDevice) ([]*runtimeapi.KeyValue, []*runtimeapi.Mount)
+}
+
+// IContainerDeviceReleaseManager is implemented by device managers that need cleanup on container delete.
+type IContainerDeviceReleaseManager interface {
+	ReleaseContainerDevices(devs []*hostapi.ContainerDevice)
+}
+
+type IContainerCDIManager interface {
+	GetKind() apis.ContainerCDIKind
+	GetSpecFilePath() string
+	GetDeviceName(dev *hostapi.ContainerDevice) (string, error)
+}
+
+func GetContainerCDIDevices(devs []*hostapi.ContainerDevice) ([]*runtimeapi.CDIDevice, error) {
+	errs := []error{}
+	retDevs := make([]*runtimeapi.CDIDevice, 0)
+	for i := range devs {
+		dev := devs[i]
+		cdiDev, err := getContainerCDIDevice(dev)
+		if err != nil {
+			errs = append(errs, errors.Wrapf(err, "get CDI by %s", jsonutils.Marshal(dev)))
+			continue
+		}
+		retDevs = append(retDevs, cdiDev)
+	}
+	return retDevs, nil
+}
+
+func getContainerCDIDevice(dev *hostapi.ContainerDevice) (*runtimeapi.CDIDevice, error) {
+	isoDev := dev.IsolatedDevice
+	if isoDev == nil {
+		return nil, errors.Wrap(errors.ErrNotEmpty, "isolated_device is nil")
+	}
+	cdi := isoDev.CDI
+	if cdi == nil {
+		return nil, errors.Wrap(errors.ErrNotEmpty, "CDI is nil")
+	}
+	man, err := GetContainerCDIManager(isoDev.CDI.Kind)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetContainerCDIManager by %s", cdi.Kind)
+	}
+	name, err := man.GetDeviceName(dev)
+	if err != nil {
+		return nil, errors.Wrapf(err, "get CDI device name")
+	}
+	return &runtimeapi.CDIDevice{
+		Name: fmt.Sprintf("%s=%s", man.GetKind(), name),
+	}, nil
+}

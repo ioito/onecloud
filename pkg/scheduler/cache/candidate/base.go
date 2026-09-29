@@ -34,6 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/cloudregion"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/netinterface"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/network"
+	"yunion.io/x/onecloud/pkg/scheduler/data_manager/network_additional_wire"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/sku"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/zone"
 	schedmodels "yunion.io/x/onecloud/pkg/scheduler/models"
@@ -92,8 +93,16 @@ func (b baseHostGetter) IsArmHost() bool {
 	return b.h.IsArmHost()
 }
 
+func (b baseHostGetter) IsRISCVHost() bool {
+	return b.h.IsRISCVHost()
+}
+
 func (b baseHostGetter) CPUArch() string {
 	return b.h.CpuArchitecture
+}
+
+func (b baseHostGetter) KvmCapMaxVcpuCount() int64 {
+	return int64(b.h.KvmCapMaxVcpu)
 }
 
 func (b baseHostGetter) Cloudprovider() *computemodels.SCloudprovider {
@@ -139,7 +148,7 @@ func (b baseHostGetter) HostType() string {
 
 func (b baseHostGetter) Sku(instanceType string) *sku.ServerSku {
 	zone := b.Zone()
-	return sku.GetByZone(instanceType, zone.GetId())
+	return sku.GetByZone(instanceType, zone.CloudregionId, zone.GetId())
 }
 
 func (b baseHostGetter) Storages() []*api.CandidateStorage {
@@ -287,32 +296,32 @@ func (b baseHostGetter) GetPendingUsage() *schedmodels.SPendingUsage {
 	return b.h.GetPendingUsage()
 }
 
-func (b baseHostGetter) UnusedIsolatedDevices() []*core.IsolatedDeviceDesc {
-	return b.h.UnusedIsolatedDevices()
+func (b baseHostGetter) AvailableIsolatedDevices() []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevices()
 }
 
-func (b baseHostGetter) UnusedIsolatedDevicesByType(devType string) []*core.IsolatedDeviceDesc {
-	return b.h.UnusedIsolatedDevicesByType(devType)
+func (b baseHostGetter) AvailableIsolatedDevicesByTypeSharingMode(devType string, sharingMode string) []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevicesByTypeSharingMode(devType, sharingMode)
 }
 
-func (b baseHostGetter) UnusedIsolatedDevicesByVendorModel(vendorModel string) []*core.IsolatedDeviceDesc {
-	return b.h.UnusedIsolatedDevicesByVendorModel(vendorModel)
+func (b baseHostGetter) AvailableIsolatedDevicesByVendorModel(vendorModel string) []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevicesByVendorModel(vendorModel)
 }
 
-func (b baseHostGetter) UnusedIsolatedDevicesByModel(model string) []*core.IsolatedDeviceDesc {
-	return b.h.UnusedIsolatedDevicesByModel(model)
+func (b baseHostGetter) AvailableIsolatedDevicesByDevicePath(devPath string) []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevicesByDevicePath(devPath)
 }
 
-func (b baseHostGetter) UnusedIsolatedDevicesByModelAndWire(model, wire string) []*core.IsolatedDeviceDesc {
-	return b.h.UnusedIsolatedDevicesByModelAndWire(model, wire)
+func (b baseHostGetter) AvailableIsolatedDevicesByModel(model string) []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevicesByModel(model)
+}
+
+func (b baseHostGetter) AvailableIsolatedDevicesByModelAndWire(model, wire string) []*core.IsolatedDeviceDesc {
+	return b.h.AvailableIsolatedDevicesByModelAndWire(model, wire)
 }
 
 func (b baseHostGetter) GetIsolatedDevice(devID string) *core.IsolatedDeviceDesc {
 	return b.h.GetIsolatedDevice(devID)
-}
-
-func (b baseHostGetter) UnusedGpuDevices() []*core.IsolatedDeviceDesc {
-	return b.h.UnusedGpuDevices()
 }
 
 func (b baseHostGetter) GetIsolatedDevices() []*core.IsolatedDeviceDesc {
@@ -373,14 +382,20 @@ func newBaseHostDesc(b *baseBuilder, host *computemodels.SHost, netGetter *netwo
 		return nil, fmt.Errorf("Fill networks error: %v", err)
 	}
 	// only onecloud host should fill onecloud vpc networks
-	if host.HostType == computeapi.HOST_TYPE_HYPERVISOR {
+	if sets.NewString(computeapi.HOST_TYPE_HYPERVISOR, computeapi.HOST_TYPE_CONTAINER).Has(host.HostType) && len(host.ManagerId) == 0 {
 		if err := desc.fillOnecloudVpcNetworks(netGetter); err != nil {
 			return nil, fmt.Errorf("Fill onecloud vpc networks error: %v", err)
 		}
+		if err := desc.fillOneCloudHostLocalNetworks(netGetter); err != nil {
+			return nil, fmt.Errorf("Fill onecloud host local networks error: %v", err)
+		}
 	}
-	if host.HostType == computeapi.HOST_TYPE_CLOUDPODS {
+	if sets.NewString(computeapi.HOST_TYPE_HYPERVISOR, computeapi.HOST_TYPE_BAREMETAL, computeapi.HOST_TYPE_CONTAINER).Has(host.HostType) && len(host.ManagerId) > 0 {
 		if err := desc.fillCloudpodsVpcNetworks(netGetter); err != nil {
 			return nil, fmt.Errorf("Fill cloudpods vpc networks error: %v", err)
+		}
+		if err := desc.fillCloudpodsHostLocalNetworks(netGetter); err != nil {
+			return nil, fmt.Errorf("Fill cloudpods host local networks error: %v", err)
 		}
 	}
 
@@ -390,10 +405,6 @@ func newBaseHostDesc(b *baseBuilder, host *computemodels.SHost, netGetter *netwo
 
 	if err := desc.fillRegion(host); err != nil {
 		return nil, fmt.Errorf("Fill region error: %v", err)
-	}
-
-	if err := desc.fillResidentTenants(host); err != nil {
-		return nil, fmt.Errorf("Fill resident tenants error: %v", err)
 	}
 
 	if err := desc.fillStorages(host); err != nil {
@@ -443,7 +454,7 @@ func (b BaseHostDesc) GetSchedDesc() *jsonutils.JSONDict {
 func (b *BaseHostDesc) GetPendingUsage() *schedmodels.SPendingUsage {
 	usage, err := schedmodels.HostPendingUsageManager.GetPendingUsage(b.GetId())
 	if err != nil {
-		return schedmodels.NewPendingUsageBySchedInfo(b.GetId(), nil)
+		return schedmodels.NewPendingUsageBySchedInfo(b.GetId(), nil, nil)
 	}
 	return usage
 }
@@ -470,30 +481,34 @@ func (b BaseHostDesc) GetResourceType() string {
 	return b.ResourceType
 }
 
-func (h *BaseHostDesc) UnusedIsolatedDevices() []*core.IsolatedDeviceDesc {
+func (h *BaseHostDesc) AvailableIsolatedDevices() []*core.IsolatedDeviceDesc {
 	ret := make([]*core.IsolatedDeviceDesc, 0)
 	for _, dev := range h.IsolatedDevices {
-		if len(dev.GuestID) == 0 {
+		if !dev.IsUsedUp() {
 			ret = append(ret, dev)
 		}
 	}
 	return ret
 }
 
-func (h *BaseHostDesc) UnusedIsolatedDevicesByType(devType string) []*core.IsolatedDeviceDesc {
+func (h *BaseHostDesc) AvailableIsolatedDevicesByTypeSharingMode(devType, sharingMode string) []*core.IsolatedDeviceDesc {
 	ret := make([]*core.IsolatedDeviceDesc, 0)
-	for _, dev := range h.UnusedIsolatedDevices() {
-		if dev.DevType == devType {
-			ret = append(ret, dev)
+	for _, dev := range h.AvailableIsolatedDevices() {
+		if devType != "" && dev.DevType != devType {
+			continue
 		}
+		if sharingMode != "" && dev.SharingMode != sharingMode {
+			continue
+		}
+		ret = append(ret, dev)
 	}
 	return ret
 }
 
-func (h *BaseHostDesc) UnusedIsolatedDevicesByVendorModel(vendorModel string) []*core.IsolatedDeviceDesc {
+func (h *BaseHostDesc) AvailableIsolatedDevicesByVendorModel(vendorModel string) []*core.IsolatedDeviceDesc {
 	ret := make([]*core.IsolatedDeviceDesc, 0)
 	vm := core.NewVendorModelByStr(vendorModel)
-	for _, dev := range h.UnusedIsolatedDevices() {
+	for _, dev := range h.AvailableIsolatedDevices() {
 		if dev.GetVendorModel().IsMatch(vm) {
 			ret = append(ret, dev)
 		}
@@ -501,9 +516,9 @@ func (h *BaseHostDesc) UnusedIsolatedDevicesByVendorModel(vendorModel string) []
 	return ret
 }
 
-func (h *BaseHostDesc) UnusedIsolatedDevicesByModel(model string) []*core.IsolatedDeviceDesc {
+func (h *BaseHostDesc) AvailableIsolatedDevicesByModel(model string) []*core.IsolatedDeviceDesc {
 	ret := make([]*core.IsolatedDeviceDesc, 0)
-	for _, dev := range h.UnusedIsolatedDevices() {
+	for _, dev := range h.AvailableIsolatedDevices() {
 		if strings.Contains(dev.Model, model) {
 			ret = append(ret, dev)
 		}
@@ -511,9 +526,19 @@ func (h *BaseHostDesc) UnusedIsolatedDevicesByModel(model string) []*core.Isolat
 	return ret
 }
 
-func (h *BaseHostDesc) UnusedIsolatedDevicesByModelAndWire(model, wire string) []*core.IsolatedDeviceDesc {
+func (h *BaseHostDesc) AvailableIsolatedDevicesByDevicePath(devPath string) []*core.IsolatedDeviceDesc {
 	ret := make([]*core.IsolatedDeviceDesc, 0)
-	for _, dev := range h.UnusedIsolatedDevices() {
+	for _, dev := range h.AvailableIsolatedDevices() {
+		if devPath == dev.DevicePath {
+			ret = append(ret, dev)
+		}
+	}
+	return ret
+}
+
+func (h *BaseHostDesc) AvailableIsolatedDevicesByModelAndWire(model, wire string) []*core.IsolatedDeviceDesc {
+	ret := make([]*core.IsolatedDeviceDesc, 0)
+	for _, dev := range h.AvailableIsolatedDevices() {
 		log.Errorf("dev wire is %s, dev model is %s, request model is %s, request wire is %s", dev.Model, dev.WireId, model, wire)
 		if strings.Contains(dev.Model, model) && dev.WireId == wire {
 			ret = append(ret, dev)
@@ -535,16 +560,6 @@ func (h *BaseHostDesc) GetIsolatedDevices() []*core.IsolatedDeviceDesc {
 	return h.IsolatedDevices
 }
 
-func (h *BaseHostDesc) UnusedGpuDevices() []*core.IsolatedDeviceDesc {
-	ret := make([]*core.IsolatedDeviceDesc, 0)
-	for _, dev := range h.UnusedIsolatedDevices() {
-		if strings.HasPrefix(dev.DevType, "GPU") {
-			ret = append(ret, dev)
-		}
-	}
-	return ret
-}
-
 func (h *BaseHostDesc) fillIsolatedDevices(b *baseBuilder, host *computemodels.SHost) error {
 	allDevs := b.getIsolatedDevices(host.Id)
 	if len(allDevs) == 0 {
@@ -554,14 +569,19 @@ func (h *BaseHostDesc) fillIsolatedDevices(b *baseBuilder, host *computemodels.S
 	devs := make([]*core.IsolatedDeviceDesc, len(allDevs))
 	for index, devModel := range allDevs {
 		dev := &core.IsolatedDeviceDesc{
-			ID:             devModel.Id,
-			GuestID:        devModel.GuestId,
-			HostID:         devModel.HostId,
-			DevType:        devModel.DevType,
-			Model:          devModel.Model,
-			Addr:           devModel.Addr,
-			VendorDeviceID: devModel.VendorDeviceId,
-			WireId:         devModel.WireId,
+			ID:                  devModel.Id,
+			HostID:              devModel.HostId,
+			DevType:             devModel.DevType,
+			SharingMode:         devModel.SharingMode,
+			Model:               devModel.Model,
+			Addr:                devModel.Addr,
+			VendorDeviceID:      devModel.VendorDeviceId,
+			WireId:              devModel.WireId,
+			DevicePath:          devModel.DevicePath,
+			MemorySize:          devModel.MemorySize,
+			MemorySizeAllocated: devModel.MemoryAllocated,
+			VirtualNum:          devModel.VirtualNum,
+			VirtualNumAllocated: devModel.GuestCount,
 		}
 		devs[index] = dev
 	}
@@ -604,16 +624,16 @@ func (b *BaseHostDesc) fillZone(host *computemodels.SHost) error {
 	return nil
 }
 
-func (b *BaseHostDesc) fillResidentTenants(host *computemodels.SHost) error {
-	rets, err := HostResidentTenantCount(host.Id)
-	if err != nil {
-		return err
-	}
-
-	b.Tenants = rets
-
-	return nil
-}
+// func (b *BaseHostDesc) fillResidentTenants(host *computemodels.SHost) error {
+// 	rets, err := HostResidentTenantCount(host.Id)
+// 	if err != nil {
+// 		return err
+// 	}
+//
+// 	b.Tenants = rets
+//
+// 	return nil
+// }
 
 func (b *BaseHostDesc) fillSharedDomains() error {
 	b.SharedDomains = b.SHost.GetSharedDomains()
@@ -634,11 +654,7 @@ func (b *BaseHostDesc) fillNetworks(host *computemodels.SHost, netGetter *networ
 	nets := make([]computemodels.SNetwork, 0)
 	allNets := network.Manager.GetStore().GetAll()
 	for _, net := range allNets {
-		netAdditionalWireIds, err := computemodels.NetworkAdditionalWireManager.FetchNetworkAdditionalWireIds(net.Id)
-		if err != nil {
-			log.Errorf("NetworkAdditionalWireManager.FetchNetworkAdditionalWireIds %s error %s", net.Id, err)
-			netAdditionalWireIds = []string{}
-		}
+		netAdditionalWireIds := network_additional_wire.FetchNetworkAdditionalWireIds(net.Id)
 		if wireIds.Has(net.WireId) || wireIds.HasAny(netAdditionalWireIds...) {
 			nets = append(nets, net)
 		}
@@ -677,7 +693,7 @@ func (b *BaseHostDesc) fillCloudpodsVpcNetworks(netGetter *networkGetter) error 
 	nets := computemodels.NetworkManager.Query()
 	wires := computemodels.WireManager.Query().SubQuery()
 	vpcs := computemodels.VpcManager.Query().SubQuery()
-	regions := computemodels.CloudregionManager.Query().SubQuery()
+	regions := computemodels.CloudregionManager.Query().Equals("provider", computeapi.CLOUD_PROVIDER_CLOUDPODS).SubQuery()
 	q := nets.AppendField(nets.QueryFields()...)
 	q = q.AppendField(
 		vpcs.Field("id", "vpc_id"),
@@ -686,44 +702,17 @@ func (b *BaseHostDesc) fillCloudpodsVpcNetworks(netGetter *networkGetter) error 
 	q = q.Join(wires, sqlchemy.Equals(wires.Field("id"), nets.Field("wire_id")))
 	q = q.Join(vpcs, sqlchemy.Equals(vpcs.Field("id"), wires.Field("vpc_id")))
 	q = q.Join(regions, sqlchemy.Equals(regions.Field("id"), vpcs.Field("cloudregion_id")))
-	q = q.Filter(sqlchemy.AND(
-		sqlchemy.Equals(regions.Field("provider"), computeapi.CLOUD_PROVIDER_CLOUDPODS),
+	q = q.Filter(
 		sqlchemy.NOT(sqlchemy.Equals(vpcs.Field("external_id"), computeapi.DEFAULT_VPC_ID)),
-	))
-
-	type Row struct {
-		computemodels.SNetwork
-		VpcId    string
-		Provider string
-	}
-	rows := []Row{}
-	if err := q.All(&rows); err != nil {
-		return errors.Wrap(err, "query cloudpods vpc networks")
-	}
-	for i := range rows {
-		row := &rows[i]
-		net := &row.SNetwork
-		net.SetModelManager(computemodels.NetworkManager, net)
-		freePort, err := netGetter.GetFreePort(b.SHost, net)
-		if err != nil {
-			return errors.Wrapf(err, "GetFreeAddressCount for network %s(%s)", net.GetName(), net.GetId())
-		}
-		candidateNet := &api.CandidateNetwork{
-			SNetwork: net,
-			FreePort: freePort,
-			VpcId:    row.VpcId,
-			Provider: row.Provider,
-		}
-		b.Networks = append(b.Networks, candidateNet)
-	}
-	return nil
+	)
+	return b.fillNetworksByQuery(netGetter, q)
 }
 
 func (b *BaseHostDesc) fillOnecloudVpcNetworks(netGetter *networkGetter) error {
 	nets := computemodels.NetworkManager.Query()
 	wires := computemodels.WireManager.Query().SubQuery()
 	vpcs := computemodels.VpcManager.Query().SubQuery()
-	regions := computemodels.CloudregionManager.Query().SubQuery()
+	regions := computemodels.CloudregionManager.Query().Equals("provider", computeapi.CLOUD_PROVIDER_ONECLOUD).SubQuery()
 	q := nets.AppendField(nets.QueryFields()...)
 	q = q.AppendField(
 		vpcs.Field("id", "vpc_id"),
@@ -732,11 +721,45 @@ func (b *BaseHostDesc) fillOnecloudVpcNetworks(netGetter *networkGetter) error {
 	q = q.Join(wires, sqlchemy.Equals(wires.Field("id"), nets.Field("wire_id")))
 	q = q.Join(vpcs, sqlchemy.Equals(vpcs.Field("id"), wires.Field("vpc_id")))
 	q = q.Join(regions, sqlchemy.Equals(regions.Field("id"), vpcs.Field("cloudregion_id")))
-	q = q.Filter(sqlchemy.AND(
-		sqlchemy.Equals(regions.Field("provider"), computeapi.CLOUD_PROVIDER_ONECLOUD),
+	q = q.Filter(
 		sqlchemy.NOT(sqlchemy.Equals(vpcs.Field("id"), computeapi.DEFAULT_VPC_ID)),
-	))
+	)
+	return b.fillNetworksByQuery(netGetter, q)
+}
 
+func (b *BaseHostDesc) fillOneCloudHostLocalNetworks(netGetter *networkGetter) error {
+	nets := computemodels.NetworkManager.Query()
+	wires := computemodels.WireManager.Query().Equals("id", computeapi.DEFAULT_HOST_LOCAL_WIRE_ID).SubQuery()
+	vpcs := computemodels.VpcManager.Query().Equals("id", computeapi.DEFAULT_VPC_ID).SubQuery()
+	regions := computemodels.CloudregionManager.Query().Equals("provider", computeapi.CLOUD_PROVIDER_ONECLOUD).SubQuery()
+	q := nets.AppendField(nets.QueryFields()...)
+	q = q.AppendField(
+		vpcs.Field("id", "vpc_id"),
+		regions.Field("provider"),
+	)
+	q = q.Join(wires, sqlchemy.Equals(wires.Field("id"), nets.Field("wire_id")))
+	q = q.Join(vpcs, sqlchemy.Equals(vpcs.Field("id"), wires.Field("vpc_id")))
+	q = q.Join(regions, sqlchemy.Equals(regions.Field("id"), vpcs.Field("cloudregion_id")))
+	return b.fillNetworksByQuery(netGetter, q)
+}
+
+func (b *BaseHostDesc) fillCloudpodsHostLocalNetworks(netGetter *networkGetter) error {
+	nets := computemodels.NetworkManager.Query()
+	wires := computemodels.WireManager.Query().Equals("external_id", computeapi.DEFAULT_HOST_LOCAL_WIRE_ID).SubQuery()
+	vpcs := computemodels.VpcManager.Query().Equals("external_id", computeapi.DEFAULT_VPC_ID).SubQuery()
+	regions := computemodels.CloudregionManager.Query().Equals("provider", computeapi.CLOUD_PROVIDER_CLOUDPODS).SubQuery()
+	q := nets.AppendField(nets.QueryFields()...)
+	q = q.AppendField(
+		vpcs.Field("id", "vpc_id"),
+		regions.Field("provider"),
+	)
+	q = q.Join(wires, sqlchemy.Equals(wires.Field("id"), nets.Field("wire_id")))
+	q = q.Join(vpcs, sqlchemy.Equals(vpcs.Field("id"), wires.Field("vpc_id")))
+	q = q.Join(regions, sqlchemy.Equals(regions.Field("id"), vpcs.Field("cloudregion_id")))
+	return b.fillNetworksByQuery(netGetter, q)
+}
+
+func (b *BaseHostDesc) fillNetworksByQuery(netGetter *networkGetter, q *sqlchemy.SQuery) error {
 	type Row struct {
 		computemodels.SNetwork
 		VpcId    string
@@ -766,31 +789,32 @@ func (b *BaseHostDesc) fillOnecloudVpcNetworks(netGetter *networkGetter) error {
 }
 
 func (b *BaseHostDesc) GetHypervisorDriver() computemodels.IGuestDriver {
-	hypervisor := computeapi.HOSTTYPE_HYPERVISOR[b.HostType]
-	if hypervisor == "" {
+	if b.Region == nil {
 		return nil
 	}
-	return computemodels.GetDriver(hypervisor)
+	hostDriver, _ := computemodels.GetHostDriver(b.HostType, b.Region.Provider)
+	if hostDriver == nil {
+		return nil
+	}
+	driver, _ := computemodels.GetDriver(hostDriver.GetHypervisor(), b.Region.Provider)
+	return driver
 }
 
 func (b *BaseHostDesc) fillStorages(host *computemodels.SHost) error {
 	ss := make([]*api.CandidateStorage, 0)
-	for _, s := range host.GetHoststorages() {
-		storage := s.GetStorage()
-		if storage == nil {
-			log.Warningf("%s invoke s.GetStorage return nil", s.StorageId)
-			continue
-		}
+	storages, err := host.GetStorages()
+	if err != nil {
+		return errors.Wrapf(err, "host %s/%s get storages", b.Name, b.Id)
+	}
+	for _, tmpS := range storages {
+		storage := tmpS
 		cs := &api.CandidateStorage{
-			SStorage:           storage,
+			SStorage:           &storage,
 			ActualFreeCapacity: storage.Capacity - storage.ActualCapacityUsed,
 		}
-		if b.GetHypervisorDriver() == nil {
+		driver := b.GetHypervisorDriver()
+		if driver == nil || driver.DoScheduleStorageFilter() {
 			cs.FreeCapacity = storage.GetFreeCapacity()
-		} else {
-			if b.GetHypervisorDriver().DoScheduleStorageFilter() {
-				cs.FreeCapacity = storage.GetFreeCapacity()
-			}
 		}
 		ss = append(ss, cs)
 	}
@@ -872,7 +896,10 @@ func (h *BaseHostDesc) getQuotaKeys(s *api.SchedInfo) computemodels.SComputeReso
 	}
 	computeKeys.RegionId = h.Region.Id
 	computeKeys.ZoneId = h.Zone.Id
-	computeKeys.Hypervisor = computeapi.HOSTTYPE_HYPERVISOR[h.HostType]
+	driver, _ := computemodels.GetHostDriver(h.HostType, computeKeys.Provider)
+	if driver != nil {
+		computeKeys.Hypervisor = driver.GetHypervisor()
+	}
 	return computeKeys
 }
 

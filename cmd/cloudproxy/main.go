@@ -23,7 +23,9 @@ import (
 
 	"yunion.io/x/log"
 
+	api "yunion.io/x/onecloud/pkg/apis/cloudproxy"
 	common_app "yunion.io/x/onecloud/pkg/cloudcommon/app"
+	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/cloudproxy/agent/worker"
 	"yunion.io/x/onecloud/pkg/cloudproxy/options"
 	"yunion.io/x/onecloud/pkg/cloudproxy/service"
@@ -33,42 +35,35 @@ import (
 func main() {
 	defer atexit.Handle()
 
-	nop := true
 	wg := &sync.WaitGroup{}
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, "wg", wg)
 	ctx, cancelFunc := context.WithCancel(ctx)
 
 	var (
-		opts       = options.Get()
-		commonOpts = &opts.CommonOptions
+		opts = options.Get()
 	)
-	if opts.EnableAPIServer || opts.EnableProxyAgent {
-		common_app.InitAuth(commonOpts, func() {
-			log.Infof("Auth complete")
-		})
-	}
 
-	if opts.EnableAPIServer {
-		nop = false
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			service.StartService()
-		}()
-	}
+	common_app.InitAuth(&opts.CommonOptions, func() {
+		log.Infof("Auth complete")
+	})
+
+	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		service.StartService()
+	}()
 
 	if opts.EnableProxyAgent {
-		if opts.EnableAPIServer {
-			const d = "10m"
-			log.Infof("set proxy_agent_init_wait to %s", d)
-			opts.Options.ProxyAgentInitWait = d
-		}
+		const d = "10m"
+		log.Infof("set proxy_agent_init_wait to %s", d)
+		opts.Options.ProxyAgentInitWait = d
 		if err := opts.Options.ValidateThenInit(); err != nil {
 			log.Fatalf("proxy agent options validation: %v", err)
 		}
 		worker := worker.NewWorker(&opts.CommonOptions, &opts.Options)
-		nop = false
 		go func() {
 			worker.Start(ctx)
 			pid := os.Getpid()
@@ -79,17 +74,13 @@ func main() {
 			p.Signal(syscall.SIGTERM)
 		}()
 	}
-	if nop {
-		log.Warningln("nothing to do.  Please check configuration")
-	} else {
-		go func() {
-			sigChan := make(chan os.Signal)
-			signal.Notify(sigChan, syscall.SIGINT)
-			signal.Notify(sigChan, syscall.SIGTERM)
-			sig := <-sigChan
-			log.Infof("signal received: %s", sig)
-			cancelFunc()
-		}()
-		wg.Wait()
-	}
+	go func() {
+		sigChan := make(chan os.Signal)
+		signal.Notify(sigChan, syscall.SIGINT)
+		signal.Notify(sigChan, syscall.SIGTERM)
+		sig := <-sigChan
+		log.Infof("signal received: %s", sig)
+		cancelFunc()
+	}()
+	wg.Wait()
 }

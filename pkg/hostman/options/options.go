@@ -15,8 +15,14 @@
 package options
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 
+	"yunion.io/x/log"
+	"yunion.io/x/structarg"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/ovnutils"
@@ -29,16 +35,43 @@ type SHostBaseOptions struct {
 
 	DisableSecurityGroup bool `help:"disable security group" default:"false"`
 
-	HostCpuPassthrough        bool  `default:"true" help:"if it is true, set qemu cpu type as -cpu host, otherwise, qemu64. default is true"`
-	LiveMigrateCpuThrottleMax int64 `default:"99" help:"live migrate auto converge cpu throttle max"`
+	HostCpuPassthrough              bool  `default:"true" help:"if it is true, set qemu cpu type as -cpu host, otherwise, qemu64. default is true"`
+	LiveMigrateCpuThrottleMax       int64 `default:"99" help:"live migrate auto converge cpu throttle max"`
+	LiveMigrateCpuThrottleInitial   int64 `default:"60" help:"live migrate auto convert cpu throttle initial"`
+	LiveMigrateCpuThrottleIncrement int64 `default:"20" help:"live migrate auto convert cpu throttle increment"`
 
-	DefaultQemuVersion string `help:"Default qemu version" default:"4.2.0"`
-	NoHpet             bool   `help:"disable qemu hpet timer" default:"false"`
+	DefaultQemuVersion string `help:"Default qemu version" default:"10.0.7"`
+	NoHpet             bool   `help:"Disable qemu hpet timer" default:"true"`
+	QgaStopTimeout     int64  `default:"30" help:"Qemu guest agent stop timeout"`
 
 	CdromCount  int `help:"cdrom count" default:"1"`
 	FloppyCount int `help:"floppy count" default:"1"`
 
 	DisableLocalVpc bool `help:"disable local VPC support" default:"false"`
+
+	EnableDmesgCollect bool `default:"true" help:"Enable dmesg collect or not, default true"`
+
+	DhcpLeaseTime   int `default:"100663296" help:"DHCP lease time in seconds"`
+	DhcpRenewalTime int `default:"67108864" help:"DHCP renewal time in seconds"`
+
+	Dhcp6RouterAdvertisementIntervalSecs int `default:"3" help:"DHCPv6 router advertisement interval in seconds, default 3 seconds"`
+	Dhcp6RouterAdvertisementAttempts     int `default:"3" help:"DHCPv6 router advertisement attempts, default 3 attempts"`
+	Dhcp6RouterLifetimeSeconds           int `default:"9000" help:"DHCPv6 router lifetime in seconds, default 9000 seconds"`
+
+	Ext4LargefileSizeGb int `default:"4096" help:"Use largefile options when the ext4 fs greater than this size"`
+	Ext4HugefileSizeGb  int `default:"512" help:"Use huge options when the ext4 fs greater than this size"`
+
+	ImageCacheExpireDays        int  `help:"Image cache expire duration in days" default:"30"`
+	ImageCacheCleanupPercentage int  `help:"The cleanup threshold ratio of image cache size v.s. total storage size" default:"12"`
+	ImageCacheCleanupOnStartup  bool `help:"Cleanup image cache on host startup" default:"false"`
+	ImageCacheCleanupDryRun     bool `help:"Dry run cleanup image cache" default:"false"`
+
+	TelegrafKafkaOutputTopic         string `json:"telegraf_kafka_output_topic" help:"telegraf kafka output topic"`
+	TelegrafKafkaOutputSaslUsername  string `json:"telegraf_kafka_output_sasl_username" help:"telegraf kafka output sasl_username"`
+	TelegrafKafkaOutputSaslPassword  string `json:"telegraf_kafka_output_sasl_password" help:"telegraf kafka output sasl_password"`
+	TelegrafKafkaOutputSaslMechanism string `json:"telegraf_kafka_output_sasl_mechanism" help:"telegraf kafka output sasl_mechanism"`
+
+	BackupTaskWorkerCount int `default:"3" help:"backup task worker count"`
 }
 
 type SHostOptions struct {
@@ -47,8 +80,9 @@ type SHostOptions struct {
 	SHostBaseOptions
 
 	CommonConfigFile string `help:"common config file for container"`
+	LocalConfigFile  string `help:"local config file" default:"/etc/yunion/host_local.conf"`
 
-	HostType        string   `help:"Host server type, either hypervisor or kubelet" default:"hypervisor"`
+	HostType        string   `help:"Host server type, either hypervisor or container" default:"hypervisor" choices:"hypervisor|container"`
 	ListenInterface string   `help:"Master address of host server"`
 	BridgeDriver    string   `help:"Bridge driver, bridge or openvswitch" default:"openvswitch"`
 	Networks        []string `help:"Network interface information"`
@@ -59,9 +93,13 @@ type SHostOptions struct {
 	ServersPath         string `help:"Path for virtual server configuration files" default:"/opt/cloud/workspace/servers"`
 	ImageCachePath      string `help:"Path for storing image caches" default:"/opt/cloud/workspace/disks/image_cache"`
 	MemorySnapshotsPath string `help:"Path for memory snapshot stat files" default:"/opt/cloud/workspace/memory_snapshots"`
+	HostFilesPath       string `help:"Path for host files" default:"/opt/cloud/workspace/host_files"`
 	// ImageCacheLimit int    `help:"Maximal storage space for image caching, in GB" default:"20"`
 	AgentTempPath  string `help:"Path for ESXi agent"`
 	AgentTempLimit int    `help:"Maximal storage space for ESXi agent, in GB" default:"10"`
+
+	RecycleServerfiles         bool `help:"Recycle instead of remove deleted servers file" default:"true"`
+	RecycleServerfilesKeepDays int  `help:"How long recycled files kept, default 28 days" default:"28"`
 
 	RecycleDiskfile         bool `help:"Recycle instead of remove deleted disk file" default:"true"`
 	RecycleDiskfileKeepDays int  `help:"How long recycled files kept, default 28 days" default:"28"`
@@ -82,31 +120,37 @@ type SHostOptions struct {
 	DnsServer       string `help:"Address of host DNS server"`
 	DnsServerLegacy string `help:"Deprecated Address of host DNS server"`
 
-	ChntpwPath string `help:"path to chntpw tool" default:"/usr/local/bin/chntpw.static"`
-	OvmfPath   string `help:"Path to OVMF.fd" default:"/opt/cloud/contrib/OVMF.fd"`
+	ChntpwPath          string `help:"path to chntpw tool" default:"/usr/local/bin/chntpw.static"`
+	OvmfPath            string `help:"Path to OVMF.fd" default:"/opt/cloud/contrib/OVMF.fd"`
+	OvmfVarsPath        string `help:"Path to OVMF_VARS.fd" default:"/opt/cloud/contrib/OVMF_VARS.fd"`
+	Ovmf4MCodePath      string `help:"Path to OVMF_CODE_4M.fd" default:"/opt/cloud/contrib/OVMF_CODE_4M.fd"`
+	Ovmf4MCodeVarsPath  string `help:"Path to OVMF_VARS_4M.fd" default:"/opt/cloud/contrib/OVMF_VARS_4M.code.fd"`
+	SecbootOvmfPath     string `help:"Path to secboot ovmf fd" default:"/opt/cloud/contrib/OVMF_CODE_4M.secboot.fd"`
+	SecbootOvmfVarsPath string `help:"Path to secboot ovmf vars fd" default:"/opt/cloud/contrib/OVMF_VARS_4M.fd"`
 
 	LinuxDefaultRootUser    bool `help:"Default account for linux system is root"`
 	WindowsDefaultAdminUser bool `default:"true" help:"Default account for Windows system is Administrator"`
 
-	BlockIoScheduler string `help:"Block IO scheduler, deadline or cfq" default:"deadline"`
-	EnableKsm        bool   `help:"Enable Kernel Same Page Merging"`
-	HugepagesOption  string `help:"Hugepages option: disable|native|transparent" default:"transparent"`
-	HugepageSizeMb   int    `help:"hugepage size mb default 1G" default:"1024"`
+	BlockIoScheduler    string `help:"HDD Block IO scheduler, deadline or cfq" default:"deadline"`
+	SsdBlockIoScheduler string `help:"SSD Block IO scheduler, none deadline or cfq" default:"none"`
+	EnableKsm           bool   `help:"Enable Kernel Same Page Merging"`
+	HugepagesOption     string `help:"Hugepages option: disable|native|transparent" default:"transparent"`
+	HugepageSizeMb      int    `help:"hugepage size mb default 1G" default:"1024"`
 
-	PrivatePrefixes []string `help:"IPv4 private prefixes"`
+	// PrivatePrefixes []string `help:"IPv4 private prefixes"`
 	LocalImagePath  []string `help:"Local image storage paths"`
 	SharedStorages  []string `help:"Path of shared storages"`
 	LVMVolumeGroups []string `help:"LVM Volume Groups(vgs)"`
 
-	DhcpRelay       []string `help:"DHCP relay upstream"`
-	DhcpLeaseTime   int      `default:"100663296" help:"DHCP lease time in seconds"`
-	DhcpRenewalTime int      `default:"67108864" help:"DHCP renewal time in seconds"`
+	DhcpRelay  []string `help:"DHCP relay upstream"`
+	Dhcp6Relay []string `help:"DHCPv6 relay upstream"`
 
 	TunnelPaddingBytes int64 `help:"Specify tunnel padding bytes" default:"0"`
 
 	CheckSystemServices bool `help:"Check system services (ntpd, telegraf) on startup" default:"true"`
 
 	DhcpServerPort     int    `help:"Host dhcp server bind port" default:"67"`
+	Dhcp6ServerPort    int    `help:"Host dhcp6 server bind port" default:"547"`
 	FetcherfsPath      string `default:"/opt/yunion/fetchclient/bin/fetcherfs" help:"Fuse fetcherfs path"`
 	FetcherfsBlockSize int    `default:"16" help:"Fuse fetcherfs fetch chunk_size MB"`
 
@@ -119,10 +163,13 @@ type SHostOptions struct {
 	SetVncPassword         bool `default:"true" help:"Auto set vnc password after monitor connected"`
 	UseBootVga             bool `default:"false" help:"Use boot VGA GPU for guest"`
 
-	EnableCpuBinding         bool `default:"true" help:"Enable cpu binding and rebalance"`
-	EnableOpenflowController bool `default:"false"`
+	EnableStrictCpuBind         bool   `default:"false" help:"Enable strict cpu bind, one vcpu bind one pcpu"`
+	EnableHostAgentNumaAllocate bool   `default:"true" help:"Enable host agent numa allocate"`
+	EnableCpuBinding            bool   `default:"true" help:"Enable cpu binding and rebalance"`
+	EnableOpenflowController    bool   `default:"false"`
+	BootVgaPciAddr              string `help:"Specific boot vga pci addr incase detect wrong device"`
 
-	PingRegionInterval int      `default:"60" help:"interval to ping region, deefault is 1 minute"`
+	PingRegionInterval int      `default:"60" help:"interval to ping region, default is 1 minute"`
 	LogSystemdUnits    []string `help:"Systemd units log collected by fluent-bit"`
 	// 更改默认带宽限速为400GBps, qiujian
 	BandwidthLimit int `default:"400000" help:"Bandwidth upper bound when migrating disk image in MB/sec, default 400GBps"`
@@ -140,6 +187,9 @@ type SHostOptions struct {
 	MaxReservedMemory int `default:"10240" help:"host reserved memory"`
 
 	DefaultRequestWorkerCount int `default:"8" help:"default request worker count"`
+	ImageCacheWorkerCount     int `default:"8" help:"default request worker count"`
+	ContainerStartWorkerCount int `default:"1" help:"container start worker count"`
+	ContainerStopWorkerCount  int `default:"1" help:"container stop worker count"`
 
 	AllowSwitchVMs bool `help:"allow machines run as switch (spoof mac)" default:"true"`
 	AllowRouterVMs bool `help:"allow machines run as router (spoof ip)" default:"true"`
@@ -153,7 +203,10 @@ type SHostOptions struct {
 	SdnEnableTapMan bool   `help:"enable tap service" default:"$SDN_ENABLE_TAP_MAN|true"`
 	TapBridgeName   string `help:"bridge name for tap service" default:"brtap"`
 
-	SdnAllowConntrackInvalid bool `help:"allow packets marked by conntrack as INVALID to pass" default:"$SDN_ALLOW_CONNTRACK_INVALID|false"`
+	HostLocalBridgeName string `help:"bridge name for host local network" default:"brlocal"`
+
+	SdnAllowConntrackInvalid       bool `help:"allow packets marked by conntrack as INVALID to pass" default:"$SDN_ALLOW_CONNTRACK_INVALID|false"`
+	SdnFetchDataFromComputeService bool `help:"fetch network releated data from compute service" default:"$SDN_FETCH_DATA_FROM_COMPUTE_SERVICE|true"`
 
 	ovnutils.SOvnOptions
 
@@ -168,16 +221,17 @@ type SHostOptions struct {
 
 	DisableKVM bool `help:"force disable KVM" default:"false" json:"disable_kvm"`
 
-	DisableGPU          bool     `help:"force disable GPU detect" default:"false" json:"disable_gpu"`
-	DisableCustomDevice bool     `help:"force disable custom pci device detect" default:"false" json:"disable_custom_device"`
-	DisableUSB          bool     `help:"force disable USB detect" default:"true" json:"disable_usb"`
-	SRIOVNics           []string `help:"nics enable sriov" json:"sriov_nics"`
-	OvsOffloadNics      []string `help:"nics enable ovs offload" json:"ovs_offload_nics"`
-	PTNVMEConfigs       []string `help:"passthrough nvme disk pci address and size"`
-	AMDVgpuPFs          []string `help:"amd vgpu pf pci addresses"`
-	NVIDIAVgpuPFs       []string `help:"nvidia vgpu pf pci addresses"`
+	DisableGPU                           bool     `help:"force disable GPU detect" default:"false" json:"disable_gpu"`
+	DisableCustomDevice                  bool     `help:"force disable custom pci device detect" default:"false" json:"disable_custom_device"`
+	DisableUSB                           bool     `help:"force disable USB detect" default:"true" json:"disable_usb"`
+	DisablePassthroughWithVendorDeviceId bool     `help:"disable usb passthrough with vendor device id" default:"false" json:"disable_passthrough_with_vendor_device_id"`
+	SRIOVNics                            []string `help:"nics enable sriov" json:"sriov_nics"`
+	OvsOffloadNics                       []string `help:"nics enable ovs offload" json:"ovs_offload_nics"`
+	PTNVMEConfigs                        []string `help:"passthrough nvme disk pci address and size"`
+	AMDVgpuPFs                           []string `help:"amd vgpu pf pci addresses"`
+	NVIDIAVgpuPFs                        []string `help:"nvidia vgpu pf pci addresses"`
 
-	EthtoolEnableGso bool `help:"use ethtool to turn on or off GSO(generic segment offloading)" default:"false" json:"ethtool_enable_gso"`
+	EthtoolEnableGso bool `help:"use ethtool to turn on or off GSO(generic segment offloading)" default:"true" json:"ethtool_enable_gso"`
 
 	EthtoolEnableGsoInterfaces  []string `help:"use ethtool to turn on GSO for the specific interfaces" json:"ethtool_enable_gso_interfaces"`
 	EthtoolDisableGsoInterfaces []string `help:"use ethtool to turn off GSO for the specific interfaces" json:"ethtool_disable_gso_interfaces"`
@@ -194,17 +248,93 @@ type SHostOptions struct {
 	LocalBackupTempPath    string `help:"the local temporary directory for backup" default:"/opt/cloud/workspace/run/backups"`
 
 	BinaryMemcleanPath string `help:"execute binary memclean path" default:"/opt/yunion/bin/memclean"`
+	BinarySwtpmPath    string `help:"swtpm binary path" default:"/usr/bin/swtpm"`
 
-	MaxHotplugVCpuCount int  `help:"maximal possible vCPU count that the platform kvm supports"`
-	PcieRootPortCount   int  `help:"pcie root port count" default:"2"`
-	EnableQemuDebugLog  bool `help:"enable qemu debug logs" default:"false"`
+	MaxHotplugVCpuCount int    `help:"maximal possible vCPU count that the platform kvm supports"`
+	PcieRootPortCount   int    `help:"pcie root port count" default:"2"`
+	EnableQemuDebugLog  bool   `help:"enable qemu debug logs" default:"false"`
+	ResetDiskTmpDir     string `help:"auto reset disk after guest shutdown will write disk to tmpdir"`
+
+	GuestMaxMemSizeMb int `help:"guest maximal mem size, default 0 is not set" default:"0"`
+
+	// container related endpoint
+	// EnableContainerRuntime   bool   `help:"enable container runtime" default:"false"`
+	ContainerRuntimeEndpoint                 string `help:"endpoint of container runtime service" default:"unix:///var/run/onecloud/containerd/containerd.sock"`
+	ContainerDeviceConfigFile                string `help:"container device configuration file path"`
+	LxcfsPath                                string `help:"lxcfs directory path" default:"/var/lib/lxcfs"`
+	ContainerSystemCpufreqSimulateConfigFile string `help:"container system cpu simulate config file path" default:"/etc/yunion/container_cpufreq_simulate.conf"`
+	EnableRealtimeCpufreqSimulate            bool   `help:"realtime cpufreq simulate" default:"true"`
+	RealtimeCpufreqSimulateInterval          int    `help:"realtime cpufreq simulate interval(second)" default:"2"`
+
+	EnableCudaMPS        bool   `help:"enable cuda mps" default:"false"`
+	CudaMPSPipeDirectory string `help:"cuda mps pipe dir" default:"/tmp/nvidia-mps/pipe"`
+	CudaMPSLogDirectory  string `help:"cuda mps log dir" default:"/tmp/nvidia-mps/log"`
+	CudaMPSReplicas      int    `help:"cuda mps replicas" default:"10"`
+
+	EnableCudaHAMI      bool   `help:"enable cuda hami" default:"true"`
+	HAMICoreLibvgpuPath string `help:"hami core libvgpu.so path" default:"/opt/cloud/hami/libvgpu.so"`
+
+	SkipCheckKernelMods []string `help:"skip check kernel modules"`
+
+	EnableContainerAscendNPU     bool   `help:"enable container npu" default:"false"`
+	EnableContainerAscendNPUHami bool   `help:"enable container npu hami" default:"true"`
+	AscendNpuHamiShmPath         string `help:"ascend npu hami shm path" default:"/opt/cloud/hami-shared-region"`
+	AscendNpuHamiLibvnpuPath     string `help:"ascend npu hami libvnpu.so path" default:"/opt/cloud/hami/libvnpu.so"`
+
+	EnableContainerHygonDCU     bool   `help:"enable container hygon dcu" default:"true"`
+	EnableContainerHygonDCUHami bool   `help:"enable container hygon dcu hami" default:"false"`
+	HygonHyhalPath              string `help:"hygon hyhal driver path" default:"/opt/hyhal"`
+	HygonDtkPath                string `help:"hygon dtk toolkit path" default:"/opt/dtk"`
+	HygonHySmiPath              string `help:"hygon hy-smi path" default:"/opt/hyhal/bin/hy-smi"`
+	HygonVdevConfDir            string `help:"hygon vdcu config directory" default:"/etc/vdev"`
+	HygonVgpuCacheDir           string `help:"hygon vgpu vdev cache directory" default:"/usr/local/vgpu/dcu"`
+
+	EnableContainerIluvatarGPU bool   `help:"enable container iluvatar gpu" default:"true"`
+	IluvatarIxsmiPath          string `help:"iluvatar ixsmi path" default:"/usr/local/bin/ixsmi"`
+
+	EnableContainerTHeadPPU bool   `help:"enable container t-head ppu" default:"true"`
+	THeadPpuSdkHome         string `help:"t-head ppu sdk home" default:"/usr/local/PPU_SDK"`
+	THeadPpuSmiPath         string `help:"t-head ppu-smi path" default:"/usr/local/bin/ppu-smi"`
+
+	EnableContainerKunlunxinXPU bool   `help:"enable container kunlunxin xpu" default:"true"`
+	KunlunxinXreHome            string `help:"kunlunxin xre home" default:"/usr/local/xpu"`
+	KunlunxinXpuSmiPath         string `help:"kunlunxin xpu-smi path" default:"/usr/local/bin/xpu-smi"`
+
+	EnableDirtyRecoverySeconds int  `help:"Seconds to delay enable dirty guests recovery feature, default 15 minutes" default:"900"`
+	EnableContainerCniPortmap  bool `help:"Use container cni portmap plugin" default:"false"`
+	DisableReconcileContainer  bool `help:"disable reconcile container" default:"false"`
+
+	// Container log rotation (Docker-style max-size and max-file)
+	ContainerLogMaxSize  string `help:"Max size of container log file before rotation (e.g. 10m, 100k). Disabled if empty or <= 0" default:"256m"`
+	ContainerLogMaxFiles int    `help:"Max number of container log files to keep (current + rotated). Disabled if <= 0" default:"1"`
+
+	PortMappingRangeStart int `default:"20000" help:"port mapping range start for guest port mapping allocation"`
+	PortMappingRangeEnd   int `default:"25000" help:"port mapping range end for guest port mapping allocation"`
+}
+
+func (o SHostOptions) HostLocalNetconfPath(br string) string {
+	return filepath.Join(o.ServersPath, fmt.Sprintf("host_local_netconf_%s.json", br))
+}
+
+func (o SHostOptions) NicBridgeDevName(bridge string) string {
+	switch bridge {
+	case computeapi.HostVpcBridge:
+		return o.OvnIntegrationBridge
+	case computeapi.HostTapBridge:
+		return o.TapBridgeName
+	case computeapi.HostLocalBridge:
+		return o.HostLocalBridgeName
+	default:
+		return bridge
+	}
 }
 
 var (
 	HostOptions SHostOptions
 )
 
-func Parse() (hostOpts SHostOptions) {
+func Parse() SHostOptions {
+	var hostOpts SHostOptions
 	common_options.ParseOptions(&hostOpts, os.Args, "host.conf", "host")
 	if len(hostOpts.CommonConfigFile) > 0 && fileutils2.Exists(hostOpts.CommonConfigFile) {
 		commonCfg := &SHostBaseOptions{}
@@ -215,6 +345,18 @@ func Parse() (hostOpts SHostOptions) {
 		// keep base options
 		hostOpts.BaseOptions.BaseOptions = baseOpt
 	}
+	if len(hostOpts.LocalConfigFile) > 0 && fileutils2.Exists(hostOpts.LocalConfigFile) {
+		log.Infof("Use local configuration file: %s", hostOpts.Config)
+		parser, err := structarg.NewArgumentParser(&hostOpts, "", "", "")
+		if err != nil {
+			log.Fatalf("fail to create local parse %s", err)
+		}
+		err = parser.ParseFile(hostOpts.LocalConfigFile)
+		if err != nil {
+			log.Fatalf("Parse local configuration file: %v", err)
+		}
+	}
+
 	return hostOpts
 }
 

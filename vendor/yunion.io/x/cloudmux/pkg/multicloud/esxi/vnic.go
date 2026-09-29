@@ -49,8 +49,10 @@ func (nic *SVirtualNIC) GetId() string {
 
 func (nic *SVirtualNIC) GetIP() string {
 	guestIps := nic.vm.getGuestIps()
-	if ip, ok := guestIps[nic.GetMAC()]; ok {
-		return ip
+	if nicConf, ok := guestIps[nic.GetMAC()]; ok {
+		if len(nicConf.IPs) > 0 {
+			return nicConf.IPs[0]
+		}
 	}
 	log.Warningf("cannot find ip for mac %s", nic.GetMAC())
 	return ""
@@ -61,7 +63,34 @@ func (nic *SVirtualNIC) GetDriver() string {
 }
 
 func (nic *SVirtualNIC) GetMAC() string {
-	return netutils.FormatMacAddr(nic.getVirtualEthernetCard().MacAddress)
+	card := nic.getVirtualEthernetCard()
+	if card == nil {
+		return ""
+	}
+	return netutils.FormatMacAddr(card.MacAddress)
+}
+
+func (nic *SVirtualNIC) GetNetworkName() string {
+	card := nic.getVirtualEthernetCard()
+	if card == nil {
+		return ""
+	}
+	switch bk := card.Backing.(type) {
+	case *types.VirtualEthernetCardNetworkBackingInfo:
+		if len(bk.DeviceName) > 0 {
+			return bk.DeviceName
+		}
+	case *types.VirtualEthernetCardOpaqueNetworkBackingInfo:
+		if len(bk.OpaqueNetworkId) > 0 {
+			return bk.OpaqueNetworkId
+		}
+	}
+	if card.DeviceInfo != nil {
+		if desc := card.DeviceInfo.GetDescription(); desc != nil && len(desc.Summary) > 0 {
+			return desc.Summary
+		}
+	}
+	return ""
 }
 
 func (nic *SVirtualNIC) InClassicNetwork() bool {
@@ -70,4 +99,14 @@ func (nic *SVirtualNIC) InClassicNetwork() bool {
 
 func (nic *SVirtualNIC) GetINetworkId() string {
 	return ""
+}
+
+func (nic *SVirtualNIC) GetSubAddress() ([]string, error) {
+	guestIps := nic.vm.getGuestIps()
+	if nicConf, ok := guestIps[nic.GetMAC()]; ok {
+		if len(nicConf.IPs) > 1 {
+			return nicConf.IPs[1:], nil
+		}
+	}
+	return nil, nil
 }

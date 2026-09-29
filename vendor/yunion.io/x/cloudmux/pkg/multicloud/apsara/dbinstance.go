@@ -166,10 +166,6 @@ func (rds *SDBInstance) GetBillingType() string {
 	return convertChargeType(rds.PayType)
 }
 
-func (rds *SDBInstance) GetExpiredAt() time.Time {
-	return rds.ExpireTime
-}
-
 func (rds *SDBInstance) GetCreatedAt() time.Time {
 	return rds.CreateTime
 }
@@ -408,7 +404,7 @@ func (region *SRegion) GetIDBInstances() ([]cloudprovider.ICloudDBInstance, erro
 			return nil, err
 		}
 		instances = append(instances, part...)
-		if len(instances) >= total {
+		if len(instances) >= total || len(part) == 0 {
 			break
 		}
 	}

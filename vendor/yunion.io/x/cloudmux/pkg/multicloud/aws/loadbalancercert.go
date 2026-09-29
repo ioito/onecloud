@@ -26,7 +26,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
-	api "yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/apis"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
@@ -38,11 +38,11 @@ type SElbCertificate struct {
 	cert   *x509.Certificate
 
 	Path                  string    `json:"Path"`
-	ServerCertificateName string    `json:"ServerCertificateName"`
-	ServerCertificateID   string    `json:"ServerCertificateId"`
-	Arn                   string    `json:"Arn"`
-	UploadDate            time.Time `json:"UploadDate"`
-	Expiration            time.Time `json:"Expiration"`
+	ServerCertificateName string    `xml:"ServerCertificateName"`
+	ServerCertificateID   string    `xml:"ServerCertificateId"`
+	Arn                   string    `xml:"Arn"`
+	UploadDate            time.Time `xml:"UploadDate"`
+	Expiration            time.Time `xml:"Expiration"`
 	PublicKey             string
 }
 
@@ -59,7 +59,7 @@ func (self *SElbCertificate) GetGlobalId() string {
 }
 
 func (self *SElbCertificate) GetStatus() string {
-	return api.LB_STATUS_ENABLED
+	return apis.STATUS_AVAILABLE
 }
 
 func (self *SElbCertificate) Refresh() error {
@@ -76,16 +76,8 @@ func (self *SElbCertificate) Refresh() error {
 	return nil
 }
 
-func (self *SElbCertificate) IsEmulated() bool {
-	return false
-}
-
 func (self *SElbCertificate) GetProjectId() string {
 	return ""
-}
-
-func (self *SElbCertificate) Sync(name, privateKey, publickKey string) error {
-	return cloudprovider.ErrNotSupported
 }
 
 func (self *SElbCertificate) Delete() error {

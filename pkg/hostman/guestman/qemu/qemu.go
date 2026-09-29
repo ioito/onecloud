@@ -17,11 +17,13 @@ package qemu
 import (
 	"fmt"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
@@ -33,6 +35,9 @@ const (
 	Version_4_2_0  Version = "4.2.0"
 	Version_4_0_1  Version = "4.0.1"
 	Version_2_12_1 Version = "2.12.1"
+	Version_9_0_1  Version = "9.0.1"
+	Version_10_0_3 Version = "10.0.3"
+	Version_10_0_7 Version = "10.0.7"
 )
 
 type Arch string
@@ -40,7 +45,12 @@ type Arch string
 const (
 	Arch_x86_64  Arch = "x86_64"
 	Arch_aarch64 Arch = "aarch64"
+	Arch_riscv64 Arch = "riscv64"
 )
+
+func (a Arch) IsX86() bool {
+	return a == Arch_x86_64
+}
 
 const (
 	OS_NAME_LINUX   = "Linux"
@@ -87,7 +97,7 @@ type QemuOptions interface {
 	Daemonize() string
 	Nodefaults() string
 	Nodefconfig() string
-	NoHpet() string
+	NoHpet() (bool, string)
 	Global() string
 	KeyboardLayoutLanguage(lang string) string
 	Name(name string) string
@@ -96,7 +106,7 @@ type QemuOptions interface {
 	MemDev(sizeMB uint64) string
 	MemFd(sizeMB uint64) string
 	Boot(order *string, enableMenu bool) string
-	BIOS(ovmfPath, homedir string) (string, error)
+	BIOS(ovmfPath, ovmfVarsPath, homedir string) (string, error)
 	Device(devStr string) string
 	Drive(driveStr string) string
 	Chardev(backend string, id string, name string) string
@@ -106,6 +116,9 @@ type QemuOptions interface {
 	Pidfile(file string) string
 	USB() string
 	VNC(port uint, usePasswd bool) string
+	Initrd(initrdPath string) string
+	Kernel(kernelPath string) string
+	ScsiDeviceId(serial string, driver string) string
 }
 
 var (
@@ -206,12 +219,19 @@ func (o baseOptions) Nodefaults() string {
 	return "-nodefaults"
 }
 
-func (o baseOptions) NoHpet() string {
-	return "-no-hpet"
+func (o baseOptions) NoHpet() (bool, string) {
+	return false, "-no-hpet"
 }
 
 func (o baseOptions) Nodefconfig() string {
 	return "-nodefconfig"
+}
+
+func (o baseOptions) ScsiDeviceId(serial string, driver string) string {
+	if !utils.IsInStringArray(driver, []string{DISK_DRIVER_SCSI, DISK_DRIVER_PVSCSI}) {
+		return ""
+	}
+	return fmt.Sprintf(",device_id=%s", serial[:20])
 }
 
 /*
@@ -269,17 +289,25 @@ func (o baseOptions) Boot(order *string, enableMenu bool) string {
 	return fmt.Sprintf("-boot %s", strings.Join(opts, ","))
 }
 
-func (o baseOptions) BIOS(ovmfPath, homedir string) (string, error) {
-	ovmfVarsPath := path.Join(homedir, "OVMF_VARS.fd")
-	if !fileutils2.Exists(ovmfVarsPath) {
-		err := procutils.NewRemoteCommandAsFarAsPossible("cp", "-f", ovmfPath, ovmfVarsPath).Run()
+func (o baseOptions) BIOS(ovmfPath, ovmfVarsPath, homedir string) (string, error) {
+	ovmfVarsName := "OVMF_VARS.fd"
+	if ovmfVarsPath != "" {
+		ovmfVarsName = filepath.Base(ovmfVarsPath)
+	}
+	guestOvmfVarsPath := path.Join(homedir, ovmfVarsName)
+	if !fileutils2.Exists(guestOvmfVarsPath) {
+		sourceOvmfVarsPath := ovmfPath
+		if ovmfVarsPath != "" && fileutils2.Exists(ovmfVarsPath) {
+			sourceOvmfVarsPath = ovmfVarsPath
+		}
+		err := procutils.NewRemoteCommandAsFarAsPossible("cp", "-f", sourceOvmfVarsPath, guestOvmfVarsPath).Run()
 		if err != nil {
 			return "", errors.Wrap(err, "failed copy ovmf vars")
 		}
 	}
 	return fmt.Sprintf(
 		"-drive if=pflash,format=raw,unit=0,file=%s,readonly=on -drive if=pflash,format=raw,unit=1,file=%s",
-		ovmfPath, ovmfVarsPath,
+		ovmfPath, guestOvmfVarsPath,
 	), nil
 }
 
@@ -328,6 +356,14 @@ func (o baseOptions) USB() string {
 	return "-usb"
 }
 
+func (o baseOptions) Initrd(initrdPath string) string {
+	return "-initrd " + initrdPath
+}
+
+func (o baseOptions) Kernel(kernelPath string) string {
+	return "-kernel " + kernelPath
+}
+
 func (o baseOptions) VNC(port uint, usePasswd bool) string {
 	opt := fmt.Sprintf("-vnc :%d", port)
 	if usePasswd {
@@ -346,6 +382,30 @@ func newBaseOptions_x86_64() *baseOptions_x86_64 {
 	}
 }
 
+// qemu version grate or equal 8.0.0
+type baseOptions_ge_800_x86_64 struct {
+}
+
+func (o baseOptions_ge_800_x86_64) NoHpet() (bool, string) {
+	return true, "hpet=off"
+}
+
+func newBaseOptionsGE800_x86_64() *baseOptions_ge_800_x86_64 {
+	return &baseOptions_ge_800_x86_64{}
+}
+
+// qemu version grate or equal 3.1.0
+type baseOptions_ge_310 struct {
+}
+
+func (o baseOptions_ge_310) Nodefconfig() string {
+	return "-no-user-config"
+}
+
+func newBaseOptionsGE310() *baseOptions_ge_310 {
+	return &baseOptions_ge_310{}
+}
+
 type baseOptions_aarch64 struct {
 	*baseOptions
 }
@@ -360,6 +420,24 @@ func (o baseOptions_aarch64) Global() string {
 	return ""
 }
 
-func (o baseOptions_aarch64) NoHpet() string {
+func (o baseOptions_aarch64) NoHpet() (bool, string) {
+	return false, ""
+}
+
+type baseOptions_riscv64 struct {
+	*baseOptions
+}
+
+func newBaseOptions_riscv64() *baseOptions_riscv64 {
+	return &baseOptions_riscv64{
+		baseOptions: newBaseOptions(Arch_riscv64),
+	}
+}
+
+func (o baseOptions_riscv64) Global() string {
 	return ""
+}
+
+func (o baseOptions_riscv64) NoHpet() (bool, string) {
+	return false, ""
 }

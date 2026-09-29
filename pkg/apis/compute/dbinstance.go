@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 )
 
 type DBInstanceCreateInput struct {
@@ -40,7 +41,7 @@ type DBInstanceCreateInput struct {
 	// 创建只读实例时此参数必传
 	MasterInstance string `json:"master_instance"`
 	// swagger:ignore
-	MasterInstanceId string
+	MasterInstanceId string `json:"master_instance_id"`
 
 	// 安全组Id列表
 	//
@@ -64,16 +65,16 @@ type DBInstanceCreateInput struct {
 	Zone3 string `json:"zone3"`
 
 	// swagger:ignore
-	ZoneId string
+	ZoneId string `json:"zone_id"`
 
 	// swagger:ignore
-	CloudregionId string
+	CloudregionId string `json:"cloudregion_id"`
 
 	// swagger:ignore
-	VpcId string
+	VpcId string `json:"vpc_id"`
 
 	// swagger:ignore
-	ManagerId string
+	ManagerId string `json:"manager_id"`
 
 	// 包年包月时间周期
 	Duration string `json:"duration"`
@@ -82,21 +83,21 @@ type DBInstanceCreateInput struct {
 	// default: false
 	AutoRenew bool `json:"auto_renew"`
 
-	// swagger:ignore
-	ExpiredAt time.Time `json:"expired_at"`
+	// 到期释放时间
+	ReleaseAt time.Time `json:"release_at"`
 
 	// 计费方式
-	// enum: postpaid, prepaid
-	BillingType string
+	// enum: ["postpaid", "prepaid"]
+	BillingType billing_api.TBillingType `json:"billing_type"`
 	// swagger:ignore
-	BillingCycle string
+	BillingCycle string `json:"billing_cycle"`
 
 	// 套餐名称, 若此参数不填, 则必须有vmem_size_mb及vcpu_count参数
 	// 套餐列表可以通过 dbinstancesku 获取
 	InstanceType string `json:"instance_type"`
 
 	// rds引擎
-	// enum: MySQL, SQLServer, PostgreSQL, MariaDB, Oracle, PPAS
+	// enum: ["MySQL", "SQLServer", "PostgreSQL", "MariaDB", "Oracle", "PPAS"]
 	// required: true
 	Engine string `json:"engine"`
 
@@ -169,8 +170,8 @@ type DBInstanceCreateInput struct {
 type SDBInstanceChangeConfigInput struct {
 	apis.Meta
 
-	InstanceType string
-	DiskSizeGB   int
+	InstanceType string `json:"instance_type"`
+	DiskSizeGB   int    `json:"disk_size_gb"`
 }
 
 type SDBInstanceRecoveryConfigInput struct {
@@ -221,6 +222,9 @@ type DBInstanceListInput struct {
 
 	// 通过IP搜索RDS实例
 	IpAddr []string `json:"ip_addr"`
+
+	// 通过安全组Id过滤RDS实例
+	SecgroupId string `json:"secgroup_id"`
 }
 
 type DBInstanceBackupListInput struct {
@@ -339,13 +343,16 @@ func (self DBInstanceDetails) GetMetricTags() map[string]string {
 		"tenant_id":      self.ProjectId,
 		"brand":          self.Brand,
 		"domain_id":      self.DomainId,
+		"account":        self.Account,
+		"account_id":     self.AccountId,
 		"project_domain": self.ProjectDomain,
 		"external_id":    self.ExternalId,
 	}
 	if len(self.IpAddrs) > 0 {
 		ret["rds_ip"] = strings.ReplaceAll(self.IpAddrs, ",", "|")
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self DBInstanceDetails) GetMetricPairs() map[string]string {

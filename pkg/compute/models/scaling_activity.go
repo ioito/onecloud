@@ -29,6 +29,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=scalingactivity
+// +onecloud:swagger-gen-model-plural=scalingactivities
 type SScalingActivityManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	SScalingGroupResourceBaseManager
@@ -190,7 +192,7 @@ func (sam *SScalingActivityManager) ResourceScope() rbacscope.TRbacScope {
 	return rbacscope.ScopeProject
 }
 
-func (sam *SScalingActivityManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (sam *SScalingActivityManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		switch scope {
 		case rbacscope.ScopeProject, rbacscope.ScopeDomain:

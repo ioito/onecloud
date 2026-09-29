@@ -15,25 +15,15 @@
 package huawei
 
 import (
-	"strings"
+	"fmt"
 	"time"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/util/osprofile"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
-	"yunion.io/x/cloudmux/pkg/multicloud/huawei/client/modules"
 )
-
-func (r *SRegion) GetMetrics() ([]modules.SMetricMeta, error) {
-	return r.ecsClient.CloudEye.ListMetrics()
-}
-
-func (r *SRegion) GetMetricsData(metrics []modules.SMetricMeta, since time.Time, until time.Time) ([]modules.SMetricData, error) {
-	return r.ecsClient.CloudEye.GetMetricsData(metrics, since, until)
-}
 
 type MetricData struct {
 	Namespace  string
@@ -81,7 +71,7 @@ func (self *SHuaweiClient) getServerMetrics(opts *cloudprovider.MetricListOption
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +82,9 @@ func (self *SHuaweiClient) getServerMetrics(opts *cloudprovider.MetricListOption
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -137,9 +130,6 @@ func (self *SHuaweiClient) getServerMetrics(opts *cloudprovider.MetricListOption
 }
 
 func (self *SHuaweiClient) getServerAgentMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
-	if strings.ToLower(opts.OsType) == strings.ToLower(osprofile.OS_TYPE_WINDOWS) {
-		return []cloudprovider.MetricValues{}, nil
-	}
 	params := map[string]interface{}{
 		"from":   opts.StartTime.UnixMilli(),
 		"to":     opts.EndTime.UnixMilli(),
@@ -149,6 +139,8 @@ func (self *SHuaweiClient) getServerAgentMetrics(opts *cloudprovider.MetricListO
 	metrics := []interface{}{}
 	namespace, dimesionName, metricNames := "AGT.ECS", "instance_id", []string{
 		"mem_usedPercent",
+		"cpu_usage",
+		"disk_usedPercent",
 	}
 	for _, metricName := range metricNames {
 		metrics = append(metrics, map[string]interface{}{
@@ -163,7 +155,7 @@ func (self *SHuaweiClient) getServerAgentMetrics(opts *cloudprovider.MetricListO
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +166,9 @@ func (self *SHuaweiClient) getServerAgentMetrics(opts *cloudprovider.MetricListO
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -183,6 +178,8 @@ func (self *SHuaweiClient) getServerAgentMetrics(opts *cloudprovider.MetricListO
 		switch metricData[i].MetricName {
 		case "mem_usedPercent":
 			ret.MetricType = cloudprovider.VM_METRIC_TYPE_MEM_USAGE
+		case "cpu_usage":
+			ret.MetricType = cloudprovider.VM_METRIC_TYPE_CPU_USAGE
 		case "disk_usedPercent":
 			ret.MetricType = cloudprovider.VM_METRIC_TYPE_DISK_USAGE
 		default:
@@ -234,7 +231,7 @@ func (self *SHuaweiClient) getRedisMetrics(opts *cloudprovider.MetricListOptions
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -245,6 +242,9 @@ func (self *SHuaweiClient) getRedisMetrics(opts *cloudprovider.MetricListOptions
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -330,7 +330,7 @@ func (self *SHuaweiClient) getRdsMetrics(opts *cloudprovider.MetricListOptions) 
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -341,6 +341,9 @@ func (self *SHuaweiClient) getRdsMetrics(opts *cloudprovider.MetricListOptions) 
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -419,7 +422,7 @@ func (self *SHuaweiClient) getBucketMetrics(opts *cloudprovider.MetricListOption
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +433,9 @@ func (self *SHuaweiClient) getBucketMetrics(opts *cloudprovider.MetricListOption
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -500,7 +506,7 @@ func (self *SHuaweiClient) getLoadbalancerMetrics(opts *cloudprovider.MetricList
 		})
 	}
 	params["metrics"] = metrics
-	resp, err := self.monitorPost("batch-query-metric-data", params)
+	resp, err := self.post(SERVICE_CES, opts.RegionExtId, "batch-query-metric-data", params)
 	if err != nil {
 		return nil, err
 	}
@@ -511,6 +517,9 @@ func (self *SHuaweiClient) getLoadbalancerMetrics(opts *cloudprovider.MetricList
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		ret := cloudprovider.MetricValues{
 			Id:     opts.ResourceId,
 			Unit:   metricData[i].Unit,
@@ -552,7 +561,8 @@ func (self *SHuaweiClient) getLoadbalancerMetrics(opts *cloudprovider.MetricList
 }
 
 func (self *SHuaweiClient) getModelartsPoolMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
-	resp, err := self.modelartsPoolMonitor(opts.ResourceId, nil)
+	resource := fmt.Sprintf("pools/%s/monitor", opts.ResourceId)
+	resp, err := self.list(SERVICE_MODELARTS, opts.RegionExtId, resource, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -563,6 +573,9 @@ func (self *SHuaweiClient) getModelartsPoolMetrics(opts *cloudprovider.MetricLis
 	}
 	result := []cloudprovider.MetricValues{}
 	for i := range metricData {
+		if len(metricData[i].Datapoints) == 0 {
+			continue
+		}
 		isMB := false
 		if metricData[i].Datapoints[0].Unit == "Megabytes" {
 			isMB = true

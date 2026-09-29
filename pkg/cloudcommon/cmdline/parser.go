@@ -29,7 +29,9 @@ import (
 	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/pkg/utils"
 
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/httperrors"
 )
 
 var (
@@ -123,6 +125,8 @@ func ParseDiskConfig(diskStr string, idx int) (*compute.DiskConfig, error) {
 			diskConfig.Mountpoint = p
 		} else if p == "autoextend" {
 			diskConfig.SizeMb = -1
+		} else if p == "autoreset" {
+			diskConfig.AutoReset = true
 		} else if utils.IsInStringArray(p, compute.STORAGE_TYPES) {
 			diskConfig.Backend = p
 		} else if len(p) > 0 {
@@ -147,6 +151,33 @@ func ParseDiskConfig(diskStr string, idx int) (*compute.DiskConfig, error) {
 				return nil, errors.Errorf("invalid disk fs %s, allow choices: %s", str, osprofile.FS_TYPES)
 			}
 			diskConfig.Fs = str
+		case "fs_features":
+			if diskConfig.Fs == "" {
+				return nil, errors.Errorf("disk fs is required")
+			}
+			diskConfig.FsFeatures = &compute.DiskFsFeatures{}
+			for _, feature := range strings.Split(str, ",") {
+				if diskConfig.Fs == "ext4" {
+					if diskConfig.FsFeatures.Ext4 == nil {
+						diskConfig.FsFeatures.Ext4 = &compute.DiskFsExt4Features{}
+					}
+					if feature == "casefold" {
+						diskConfig.FsFeatures.Ext4.CaseInsensitive = true
+					} else {
+						return nil, errors.Errorf("invalid feature %s of %s", feature, diskConfig.Fs)
+					}
+				}
+				if diskConfig.Fs == "f2fs" {
+					if diskConfig.FsFeatures.F2fs == nil {
+						diskConfig.FsFeatures.F2fs = &compute.DiskFsF2fsFeatures{}
+					}
+					if feature == "casefold" {
+						diskConfig.FsFeatures.F2fs.CaseInsensitive = true
+					} else {
+						return nil, errors.Errorf("invalid feature %s of %s", feature, diskConfig.Fs)
+					}
+				}
+			}
 		case "format":
 			if !utils.IsInStringArray(str, osprofile.IMAGE_FORMAT_TYPES) {
 				return nil, errors.Errorf("invalid disk format %s, allow choices: %s", str, osprofile.IMAGE_FORMAT_TYPES)
@@ -212,6 +243,17 @@ func ParseDiskConfig(diskStr string, idx int) (*compute.DiskConfig, error) {
 			if err != nil {
 				return nil, errors.Wrapf(err, "parse disk iops %s", str)
 			}
+		case "preallocation":
+			if !utils.IsInStringArray(str, compute.DISK_PREALLOCATIONS) {
+				return nil, errors.Errorf("invalid preallocation %s, allow choices: %s", str, compute.DISK_PREALLOCATIONS)
+			}
+			diskConfig.Preallocation = str
+		case "auto_delete":
+			v, err := strconv.ParseBool(str)
+			if err != nil {
+				return nil, errors.Wrapf(err, "parse disk auto_delete %s", str)
+			}
+			diskConfig.AutoDelete = &v
 		default:
 			return nil, errors.Errorf("invalid disk description %s", p)
 		}
@@ -230,11 +272,27 @@ func ParseNetworkConfigByJSON(desc jsonutils.JSONObject, idx int) (*compute.Netw
 	return conf, err
 }
 
+func isQuoteChar(ch byte) (bool, string) {
+	switch ch {
+	case '[':
+		return true, "]"
+	default:
+		return false, ""
+	}
+}
+
+func splitConfig(confStr string) ([]string, error) {
+	return utils.FindWords2([]byte(confStr), 0, ":", isQuoteChar)
+}
+
 func ParseNetworkConfig(desc string, idx int) (*compute.NetworkConfig, error) {
 	if len(desc) == 0 {
 		return nil, ErrorEmptyDesc
 	}
-	parts := strings.Split(desc, ":")
+	parts, err := splitConfig(desc)
+	if err != nil {
+		return nil, errors.Wrap(err, "splitConfig")
+	}
 	netConfig := new(compute.NetworkConfig)
 	netConfig.Index = idx
 	for _, p := range parts {
@@ -244,7 +302,11 @@ func ParseNetworkConfig(desc string, idx int) (*compute.NetworkConfig, error) {
 		if regutils.MatchIP4Addr(p) {
 			netConfig.Address = p
 		} else if regutils.MatchIP6Addr(p) {
-			netConfig.Address6 = p
+			addr6, err := netutils.NewIPV6Addr(p)
+			if err != nil {
+				return nil, errors.Wrap(httperrors.ErrInvalidFormat, p)
+			}
+			netConfig.Address6 = addr6.String()
 		} else if regutils.MatchCompactMacAddr(p) {
 			netConfig.Mac = netutils.MacUnpackHex(p)
 		} else if strings.HasPrefix(p, "wire=") {
@@ -258,22 +320,44 @@ func ParseNetworkConfig(desc string, idx int) (*compute.NetworkConfig, error) {
 			netConfig.Macs = macs
 		} else if strings.HasPrefix(p, "ips=") {
 			netConfig.Addresses = strings.Split(p[len("ips="):], ",")
+			for _, addr := range netConfig.Addresses {
+				_, err := netutils.NewIPV4Addr(addr)
+				if err != nil {
+					return nil, errors.Wrap(err, p)
+				}
+			}
 		} else if strings.HasPrefix(p, "ip6s=") {
 			netConfig.Addresses6 = strings.Split(p[len("ip6s="):], ",")
-		} else if p == "[require_designated_ip]" {
+			for i, addrStr := range netConfig.Addresses6 {
+				addr6, err := netutils.NewIPV6Addr(addrStr)
+				if err != nil {
+					return nil, errors.Wrap(err, p)
+				}
+				netConfig.Addresses6[i] = addr6.String()
+			}
+		} else if strings.HasPrefix(p, "secgroups=") {
+			netConfig.Secgroups = strings.Split(p[len("secgroups="):], ",")
+		} else if p == "require_designated_ip" {
 			netConfig.RequireDesignatedIP = true
-		} else if p == "[random_exit]" {
+		} else if p == "random_exit" {
 			netConfig.Exit = true
-		} else if p == "[random]" {
+		} else if p == "random" {
 			netConfig.Exit = false
-		} else if p == "[private]" {
+		} else if p == "private" {
 			netConfig.Private = true
-		} else if p == "[reserved]" {
+		} else if p == "reserved" {
 			netConfig.Reserved = true
-		} else if p == "[teaming]" {
+		} else if p == "teaming" {
 			netConfig.RequireTeaming = true
-		} else if p == "[try-teaming]" {
+		} else if p == "try-teaming" {
 			netConfig.TryTeaming = true
+		} else if p == "defaultgw" {
+			netConfig.IsDefault = true
+		} else if p == "ipv6" {
+			netConfig.RequireIPv6 = true
+		} else if p == "strict-ipv6" {
+			netConfig.RequireIPv6 = true
+			netConfig.StrictIPv6 = true
 		} else if strings.HasPrefix(p, "standby-port=") {
 			netConfig.StandbyPortCount, _ = strconv.Atoi(p[len("standby-port="):])
 		} else if strings.HasPrefix(p, "standby-addr=") {
@@ -282,13 +366,29 @@ func ParseNetworkConfig(desc string, idx int) (*compute.NetworkConfig, error) {
 			netConfig.Driver = p
 		} else if strings.HasPrefix(p, "num-queues=") {
 			netConfig.NumQueues, _ = strconv.Atoi(p[len("num-queues="):])
+		} else if strings.HasPrefix(p, "billing-type=") {
+			netConfig.BillingType = billing_api.ParseBillingType(p[len("billing-type="):])
+		} else if strings.HasPrefix(p, "charge-type=") {
+			netConfig.ChargeType = billing_api.ParseNetChargeType(p[len("charge-type="):])
 		} else if regutils.MatchSize(p) {
 			bw, err := fileutils.GetSizeMb(p, 'M', 1000)
 			if err != nil {
 				return nil, err
 			}
 			netConfig.BwLimit = bw
-		} else if p == "[vip]" {
+		} else if strings.HasPrefix(p, "rx-bw=") {
+			bw, err := fileutils.GetSizeMb(p[len("rx-bw="):], 'M', 1000)
+			if err != nil {
+				return nil, err
+			}
+			netConfig.RxBwLimit = bw
+		} else if strings.HasPrefix(p, "tx-bw=") {
+			bw, err := fileutils.GetSizeMb(p[len("tx-bw="):], 'M', 1000)
+			if err != nil {
+				return nil, err
+			}
+			netConfig.TxBwLimit = bw
+		} else if p == "vip" {
 			netConfig.Vip = true
 		} else if strings.HasPrefix(p, "sriov-nic-id=") {
 			netConfig.SriovDevice = &compute.IsolatedDeviceConfig{
@@ -310,13 +410,98 @@ func ParseNetworkConfig(desc string, idx int) (*compute.NetworkConfig, error) {
 			if err != nil {
 				return nil, errors.Wrap(err, "parse tx-traffic-limit")
 			}
-		} else if utils.IsInStringArray(p, compute.ALL_NETWORK_TYPES) {
-			netConfig.NetType = p
+		} else if compute.IsInNetworkTypes(compute.TNetworkType(p), compute.ALL_NETWORK_TYPES) {
+			netConfig.NetType = compute.TNetworkType(p)
 		} else {
 			netConfig.Network = p
 		}
 	}
 	return netConfig, nil
+}
+
+func ParseNetworkConfigPortMappings(descs []string) (map[int]compute.GuestPortMappings, error) {
+	if len(descs) == 0 {
+		return nil, ErrorEmptyDesc
+	}
+	pms := make(map[int]compute.GuestPortMappings, 0)
+	for _, desc := range descs {
+		idx, pm, err := parseNetworkConfigPortMapping(desc)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parse port mapping: %s", desc)
+		}
+		mappings, ok := pms[idx]
+		if !ok {
+			mappings = make([]*compute.GuestPortMapping, 0)
+		}
+		mappings = append(mappings, pm)
+		pms[idx] = mappings
+	}
+
+	return pms, nil
+}
+
+func parseNetworkConfigPortMapping(desc string) (int, *compute.GuestPortMapping, error) {
+	pm := &compute.GuestPortMapping{
+		Protocol: compute.GuestPortMappingProtocolTCP,
+	}
+	idx := 0
+	for _, seg := range strings.Split(desc, ",") {
+		info := strings.Split(seg, "=")
+		if len(info) != 2 {
+			return -1, nil, errors.Errorf("invalid option %s", seg)
+		}
+		key := info[0]
+		val := info[1]
+		switch key {
+		case "index":
+			valIdx, err := strconv.Atoi(val)
+			if err != nil {
+				return -1, nil, errors.Wrapf(err, "invalid index %s", val)
+			}
+			idx = valIdx
+		case "host_port":
+			hp, err := strconv.Atoi(val)
+			if err != nil {
+				return -1, nil, errors.Wrapf(err, "invalid host_port %s", val)
+			}
+			pm.HostPort = &hp
+		case "container_port", "port":
+			cp, err := strconv.Atoi(val)
+			if err != nil {
+				return -1, nil, errors.Wrapf(err, "invalid container_port %s", val)
+			}
+			pm.Port = cp
+		case "proto", "protocol":
+			pm.Protocol = compute.GuestPortMappingProtocol(val)
+		case "host_port_range":
+			rangeParts := strings.Split(val, "-")
+			if len(rangeParts) != 2 {
+				return -1, nil, errors.Errorf("invalid range string %s", val)
+			}
+			start, err := strconv.Atoi(rangeParts[0])
+			if err != nil {
+				return -1, nil, errors.Wrapf(err, "invalid host_port_range %s", rangeParts[0])
+			}
+			end, err := strconv.Atoi(rangeParts[1])
+			if err != nil {
+				return -1, nil, errors.Wrapf(err, "invalid host_port_range %s", rangeParts[1])
+			}
+			pm.HostPortRange = &compute.GuestPortMappingPortRange{
+				Start: start,
+				End:   end,
+			}
+		case "remote_ips", "remote_ip":
+			ips := strings.Split(val, "|")
+			pm.RemoteIps = ips
+		}
+	}
+	if pm.Port == 0 {
+		return -1, nil, errors.Error("container_port must specified")
+	}
+	if idx < 0 {
+		return -1, nil, errors.Errorf("invalid index %d", idx)
+	}
+	return idx, pm, nil
 }
 
 func ParseIsolatedDevice(desc string, idx int) (*compute.IsolatedDeviceConfig, error) {
@@ -328,18 +513,62 @@ func ParseIsolatedDevice(desc string, idx int) (*compute.IsolatedDeviceConfig, e
 	}
 	dev := new(compute.IsolatedDeviceConfig)
 	parts := strings.Split(desc, ":")
+	devTypes := sets.NewString(compute.VALID_TYPES...)
 	for _, p := range parts {
 		if regutils.MatchUUIDExact(p) {
 			dev.Id = p
-		} else if utils.IsInStringArray(p, compute.VALID_PASSTHROUGH_TYPES) {
+		} else if devTypes.Has(p) {
 			dev.DevType = p
 		} else if strings.HasPrefix(p, "vendor=") {
 			dev.Vendor = p[len("vendor="):]
+		} else if strings.HasPrefix(p, "device_path=") {
+			dev.DevicePath = p[len("device_path="):]
 		} else {
 			dev.Model = p
 		}
 	}
 	return dev, nil
+}
+
+func ParseBaremetalRootDiskMatcher(line string) (*compute.BaremetalRootDiskMatcher, error) {
+	ret := new(compute.BaremetalRootDiskMatcher)
+	for _, seg := range strings.Split(line, ",") {
+		info := strings.Split(seg, "=")
+		if len(info) != 2 {
+			return nil, errors.Errorf("invalid option %s", seg)
+		}
+		key := info[0]
+		val := info[1]
+		switch key {
+		case "size":
+			sizeMB, err := fileutils.GetSizeMb(val, 'M', 1024)
+			if err != nil {
+				return nil, errors.Wrapf(err, "parse size %s", val)
+			}
+			ret.SizeMB = int64(sizeMB)
+		case "device", "dev":
+			ret.Device = val
+		case "size_start":
+			sizeMB, err := fileutils.GetSizeMb(val, 'M', 1024)
+			if err != nil {
+				return nil, errors.Wrapf(err, "parse size_start %s", val)
+			}
+			if ret.SizeMBRange == nil {
+				ret.SizeMBRange = new(compute.RootDiskMatcherSizeMBRange)
+			}
+			ret.SizeMBRange.Start = int64(sizeMB)
+		case "size_end":
+			sizeMB, err := fileutils.GetSizeMb(val, 'M', 1024)
+			if err != nil {
+				return nil, errors.Wrapf(err, "parse size_end %s", val)
+			}
+			if ret.SizeMBRange == nil {
+				ret.SizeMBRange = new(compute.RootDiskMatcherSizeMBRange)
+			}
+			ret.SizeMBRange.End = int64(sizeMB)
+		}
+	}
+	return ret, nil
 }
 
 func ParseBaremetalDiskConfig(desc string) (*compute.BaremetalDiskConfig, error) {

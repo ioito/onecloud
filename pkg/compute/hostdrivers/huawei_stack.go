@@ -41,6 +41,10 @@ func (self *SHCSOHostDriver) GetHypervisor() string {
 	return api.HYPERVISOR_HCSO
 }
 
+func (self *SHCSOHostDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_HCSO
+}
+
 // 系统盘必须至少40G
 func (self *SHCSOHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb int) error {
 	switch storage.StorageType {
@@ -60,7 +64,7 @@ func (self *SHCSOHostDriver) ValidateResetDisk(ctx context.Context, userCred mcc
 		if disk.DiskType == api.DISK_TYPE_SYS {
 			for _, g := range guests {
 				if g.Status != api.VM_READY {
-					return nil, httperrors.NewBadRequestError("Server %s must in status ready", g.GetName())
+					return nil, httperrors.NewBadRequestError("Server %s must be in ready status", g.GetName())
 				}
 			}
 		} else {

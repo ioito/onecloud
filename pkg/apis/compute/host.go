@@ -19,8 +19,8 @@ import (
 
 	cloudmux "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/jsonutils"
-
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/cloudcommon/types"
 )
 
@@ -71,6 +71,7 @@ type HostListInput struct {
 
 	StorageFilterListInput
 	UsableResourceListInput
+	BackupstorageFilterListInput
 
 	// filter by ResourceType
 	ResourceType string `json:"resource_type"`
@@ -95,6 +96,8 @@ type HostListInput struct {
 	AccessMac []string `json:"access_mac"`
 	// 管理口Ip地址
 	AccessIp []string `json:"access_ip"`
+	// 公网IP地址
+	PublicIp []string `json:"public_ip"`
 	// 物理机序列号信息
 	SN []string `json:"sn"`
 	// CPU大小
@@ -133,7 +136,7 @@ type HostListInput struct {
 	OsArch          []string `json:"os_arch"`
 
 	// 按虚拟机数量排序
-	// enum: asc,desc
+	// enum: ["asc","desc"]
 	OrderByServerCount string `json:"order_by_server_count"`
 	// 按存储大小排序
 	// enmu: asc,desc
@@ -150,6 +153,42 @@ type HostListInput struct {
 	// 按内存超分率排序
 	// enmu: asc,desc
 	OrderByMemCommitRate string `json:"order_by_mem_commit_rate"`
+
+	// 按本地存储分配大小排序
+	// enmu: asc,desc
+	OrderByStorageUsed string `json:"order_by_storage_used"`
+
+	// 按cpu分配大小排序
+	// enmu: asc,desc
+	OrderByCpuCommit string `json:"order_by_cpu_commit"`
+
+	// 按内存分配大小排序
+	// enmu: asc,desc
+	OrderByMemCommit string `json:"order_by_mem_commit"`
+
+	// 按物理cpu使用率排序
+	// enmu: asc,desc
+	OrderByCpuUsage string `json:"order_by_cpu_usage"`
+
+	// 按物理内存使用率排序
+	// enmu: asc,desc
+	OrderByMemUsage string `json:"order_by_mem_usage"`
+
+	// 按物理存储使用率排序
+	// enmu: asc,desc
+	OrderByStorageUsage string `json:"order_by_storage_usage"`
+
+	// 按虚拟内存使用率排序
+	// enmu: asc,desc
+	OrderByVirtualMemUsage string `json:"order_by_virtual_mem_usage"`
+
+	// 按虚拟cpu使用率排序
+	// enmu: asc,desc
+	OrderByVirtualCpuUsage string `json:"order_by_virtual_cpu_usage"`
+
+	// 按虚拟存储使用率排序
+	// enmu: asc,desc
+	OrderByVirtualStorageUsage string `json:"order_by_virtual_storage_usage"`
 }
 
 type HostDetails struct {
@@ -176,6 +215,9 @@ type HostDetails struct {
 	// 云主机数量
 	// example: 10
 	Guests int `json:"guests,allowempty"`
+	// 主备云主机数量
+	// example: 10
+	BackupGuests int `json:"backup_guests,allowempty"`
 	// 非系统云主机数量
 	// example: 0
 	NonsystemGuests int `json:"nonsystem_guests,allowempty"`
@@ -224,14 +266,18 @@ type HostDetails struct {
 	AutoMigrateOnHostShutdown bool `json:"auto_migrate_on_host_shutdown"`
 
 	// reserved resource for isolated device
-	ReservedResourceForGpu IsolatedDeviceReservedResourceInput `json:"reserved_resource_for_gpu"`
+	ReservedResourceForGpu *IsolatedDeviceReservedResourceInput `json:"reserved_resource_for_gpu"`
 	// isolated device count
-	IsolatedDeviceCount int
+	IsolatedDeviceCount     int            `json:"isolated_device_count"`
+	IsolatedDeviceTypeCount map[string]int `json:"isolated_device_type_count"`
+	GuestPinnedCpus         []int          `json:"guest_pinned_cpus"`
 
 	// host init warnning
 	SysWarn string `json:"sys_warn"`
 	// host init error info
 	SysError string `json:"sys_error"`
+
+	HostFiles []string `json:"host_files"`
 }
 
 func (self HostDetails) GetMetricTags() map[string]string {
@@ -255,12 +301,47 @@ func (self HostDetails) GetMetricTags() map[string]string {
 		"account_id":     self.AccountId,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo)
 }
 
 func (self HostDetails) GetMetricPairs() map[string]string {
 	ret := map[string]string{}
 	return ret
+}
+
+type HostInfo struct {
+	// 宿主机ID
+	Id string `json:"id"`
+	// 宿主机名称
+	Name string `json:"name"`
+
+	ResourceType string `json:"resource_type"`
+
+	// 宿主机序列号
+	SN string `json:"sn"`
+
+	// 宿主是否启用
+	Enabled bool `json:"enabled"`
+
+	// 宿主机状态
+	Status string `json:"status"`
+
+	// 宿主机计费类型
+	BillingType string `json:"billing_type"`
+
+	// 宿主机服务状态`
+	HostStatus string `json:"host_status"`
+
+	// 宿主机类型
+	HostType string `json:"host_type"`
+
+	// 宿主机管理IP
+	AccessIp string `json:"access_ip"`
+	// 宿主机公网IP（如果有）
+	PublicIp string `json:"public_ip"`
+	// 宿主机MAC
+	AccessMac string `json:"access_mac"`
 }
 
 type HostResourceInfo struct {
@@ -286,11 +367,23 @@ type HostResourceInfo struct {
 	// 宿主机状态
 	HostStatus string `json:"host_status"`
 
+	HostResourceType string `json:"host_resource_type"`
+
+	// 宿主机计费类型
+	HostBillingType billing_api.TBillingType `json:"host_billing_type"`
+
 	// 宿主机服务状态`
 	HostServiceStatus string `json:"host_service_status"`
 
 	// 宿主机类型
 	HostType string `json:"host_type"`
+
+	// 宿主机管理IP
+	HostAccessIp string `json:"host_access_ip"`
+	// 宿主机公网IP（如果有）
+	HostEIP string `json:"host_eip"`
+	// 宿主机MAC
+	HostAccessMac string `json:"host_access_mac"`
 }
 
 type HostFilterListInput struct {
@@ -350,6 +443,9 @@ type HostAccessAttributes struct {
 	AccessNet string `json:"access_net"`
 	// 物理机管理口二次网络
 	AccessWire string `json:"access_wire"`
+
+	// 公网IP
+	PublicIp *string `json:"public_ip"`
 }
 
 type HostSizeAttributes struct {
@@ -371,6 +467,8 @@ type HostSizeAttributes struct {
 	CpuMicrocode string `json:"cpu_microcode"`
 	// CPU架构
 	CpuArchitecture string `json:"cpu_architecture"`
+	// KVM 允许单台虚机最大 vcpu 个数
+	KvmCapMaxVcpu *int `json:"kvm_cap_max_vcpu"`
 
 	// 内存大小(单位MB)
 	MemSize string `json:"mem_size"`
@@ -401,7 +499,9 @@ type HostIpmiAttributes struct {
 	// presence
 	IpmiPresent *bool `json:"ipmi_present"`
 	// lan channel
-	IpmiLanChannel *int `json:"ipmi_lan_channel"`
+	IpmiLanChannel *uint8 `json:"ipmi_lan_channel"`
+	// RMCP+ cipher suite for ipmitool -C
+	IpmiCipherSuite *int `json:"ipmi_cipher_suite"`
 	// verified
 	IpmiVerified *bool `json:"ipmi_verified"`
 	// Redfish API support
@@ -502,11 +602,13 @@ type HostUpdateInput struct {
 
 	// 主机启动模式, 可能值位PXE和ISO
 	BootMode string `json:"boot_mode"`
+
+	EnableNumaAllocate *bool `json:"enable_numa_allocate"`
 }
 
 type HostOfflineInput struct {
-	UpdateHealthStatus *bool `json:"update_health_status"`
-	Reason             string
+	UpdateHealthStatus *bool  `json:"update_health_status"`
+	Reason             string `json:"reason"`
 }
 
 type SHostStorageStat struct {
@@ -519,17 +621,32 @@ type SHostStorageStat struct {
 type SHostPingInput struct {
 	WithData bool `json:"with_data"`
 
-	MemoryUsedMb int `json:"memory_used_mb"`
+	MemoryUsedMb    int     `json:"memory_used_mb"`
+	CpuUsagePercent float64 `json:"cpu_usage_percent"`
 
 	RootPartitionUsedCapacityMb int `json:"root_partition_used_capacity_mb"`
 
 	StorageStats []SHostStorageStat `json:"storage_stats"`
+
+	QgaRunningGuestIds []string `json:"qga_running_guests"`
+}
+
+type SKmsgEntry struct {
+	Level   int       `json:"level"`
+	Seq     int       `json:"sql"`
+	Message string    `json:"message"`
+	Time    time.Time `json:"time"`
+}
+
+type SHostReportDmesgInput struct {
+	Entries []SKmsgEntry `json:"entries"`
 }
 
 type HostReserveCpusInput struct {
-	Cpus                    string
-	Mems                    string
-	DisableSchedLoadBalance *bool `json:"disable_sched_load_balance"`
+	Cpus                    string   `json:"cpus"`
+	Mems                    string   `json:"mems"`
+	DisableSchedLoadBalance *bool    `json:"disable_sched_load_balance"`
+	ProcessesPrefix         []string `json:"processes_prefix"`
 }
 
 type HostAutoMigrateInput struct {
@@ -557,7 +674,7 @@ type HostAddNetifInput struct {
 
 	NicType cloudmux.TNicType `json:"nic_type"`
 
-	Index int8 `json:"index"`
+	Index int `json:"index"`
 
 	LinkUp string `json:"link_up"`
 
@@ -572,12 +689,19 @@ type HostAddNetifInput struct {
 	Reserve *bool `json:"reserve"`
 
 	RequireDesignatedIp *bool `json:"require_designated_ip"`
+
+	Ip6Addr string `json:"ip6_addr"`
+
+	RequireIpv6 *bool `json:"require_ipv6"`
+
+	StrictIpv6 *bool `json:"strict_ipv6"`
 }
 
 type HostEnableNetifInput struct {
 	HostNetifInput
 
 	// Deprecated
+	// swagger:ignore
 	Network   string `json:"network" yunion-deprecated-by:"network_id"`
 	NetworkId string `json:"network_id"`
 
@@ -585,11 +709,17 @@ type HostEnableNetifInput struct {
 
 	AllocDir string `json:"alloc_dir"`
 
-	NetType string `json:"net_type"`
+	NetType TNetworkType `json:"net_type"`
 
 	Reserve *bool `json:"reserve"`
 
 	RequireDesignatedIp *bool `json:"require_designated_ip"`
+
+	Ip6Addr string `json:"ip6_addr"`
+
+	RequireIpv6 *bool `json:"require_ipv6"`
+
+	StrictIpv6 *bool `json:"strict_ipv6"`
 }
 
 type HostDisableNetifInput struct {
@@ -605,15 +735,15 @@ type HostRemoveNetifInput struct {
 }
 
 type HostError struct {
-	Type    string
-	Id      string
-	Name    string
-	Content string
-	Time    time.Time
+	Type    string    `json:"type"`
+	Id      string    `json:"id"`
+	Name    string    `json:"name"`
+	Content string    `json:"content"`
+	Time    time.Time `json:"time"`
 }
 
 type HostSyncErrorsInput struct {
-	HostErrors []HostError
+	HostErrors []HostError `json:"host_errors"`
 }
 
 type HostLoginInfoInput struct {
@@ -626,4 +756,41 @@ type HostLoginInfoOutput struct {
 }
 
 type HostPerformStartInput struct {
+}
+
+type HostSetCommitBoundInput struct {
+	CpuCmtbound *float32
+	MemCmtbound *float32
+}
+
+type HostUploadGuestsStatusRequest struct {
+	GuestIds []string `json:"guest_ids"`
+}
+
+type HostUploadGuestStatusInput struct {
+	apis.PerformStatusInput
+	Containers map[string]*ContainerPerformStatusInput `json:"containers"`
+}
+
+type HostUploadGuestsStatusInput struct {
+	Guests map[string]*HostUploadGuestStatusInput `json:"guests"`
+}
+
+type HostIsolatedDeviceNumaStatsInput struct {
+	Model string
+}
+
+type GuestUploadContainerStatusResponse struct {
+	Error string `json:"error"`
+	OK    bool   `json:"ok"`
+}
+
+type GuestUploadStatusResponse struct {
+	Error      string                                         `json:"error"`
+	OK         bool                                           `json:"ok"`
+	Containers map[string]*GuestUploadContainerStatusResponse `json:"containers"`
+}
+
+type GuestUploadStatusesResponse struct {
+	Guests map[string]*GuestUploadStatusResponse `json:"guests"`
 }

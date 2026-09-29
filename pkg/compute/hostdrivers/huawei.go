@@ -41,6 +41,10 @@ func (self *SHuaweiHostDriver) GetHypervisor() string {
 	return api.HYPERVISOR_HUAWEI
 }
 
+func (self *SHuaweiHostDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_HUAWEI
+}
+
 // 系统盘必须至少40G
 func (self *SHuaweiHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb int) error {
 	switch storage.StorageType {
@@ -60,7 +64,7 @@ func (self *SHuaweiHostDriver) ValidateResetDisk(ctx context.Context, userCred m
 		if disk.DiskType == api.DISK_TYPE_SYS {
 			for _, g := range guests {
 				if g.Status != api.VM_READY {
-					return nil, httperrors.NewBadRequestError("Server %s must in status ready", g.GetName())
+					return nil, httperrors.NewBadRequestError("Server %s must be in ready status", g.GetName())
 				}
 			}
 		} else {

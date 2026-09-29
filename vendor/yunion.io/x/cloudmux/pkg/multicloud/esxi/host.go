@@ -145,29 +145,59 @@ func (host *SHost) GetName() string {
 	return formatName(host.SManagedObject.GetName())
 }
 
-func (host *SHost) GetSchedtags() ([]string, error) {
-	clusters, err := host.datacenter.listClusters()
+func (host *SHost) getCluster() (*mo.ClusterComputeResource, error) {
+	moHost := host.getHostSystem()
+	if moHost.Parent.Type != "ClusterComputeResource" {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "host %s parent is not the cluster resource", host.GetName())
+	}
+	cluster := &mo.ClusterComputeResource{}
+	err := host.manager.reference2Object(*moHost.Parent, []string{"name", "resourcePool"}, cluster)
+	if err != nil {
+		return nil, errors.Wrap(err, "SESXiClient.reference2Object")
+	}
+	return cluster, nil
+}
+
+func (host *SHost) GetCluster() (*SCluster, error) {
+	cluster, err := host.getCluster()
+	if err != nil {
+		return nil, errors.Wrap(err, "getCluster")
+	}
+	return NewCluster(host.manager, cluster, host.datacenter), nil
+}
+
+func (host *SHost) GetSchedtags() ([]cloudprovider.Schedtag, error) {
+	dc, err := host.GetDatacenter()
 	if err != nil {
 		return nil, err
 	}
-	cpName := host.datacenter.manager.cpcfg.Name
-	reference := host.GetHostSystem().Reference()
-	tags := make([]string, 0, 1)
-	oDatacenter := host.datacenter.getDatacenter()
-Loop:
-	for i := range clusters {
-		oc := clusters[i].getoCluster()
-		if len(oc.Host) == 0 {
+	cluster, err := host.GetCluster()
+	if err != nil {
+		return nil, err
+	}
+	ret := []cloudprovider.Schedtag{}
+	ret = append(ret, cloudprovider.Schedtag{
+		Name: fmt.Sprintf("cluster:|%s|%s|%s", host.datacenter.manager.cpcfg.Name, dc.GetName(), cluster.GetName()),
+		Id:   fmt.Sprintf("%s|%s|%s", host.datacenter.manager.cpcfg.Id, dc.GetId(), cluster.GetId()),
+	})
+	pools, err := cluster.listResourcePools()
+	if err != nil {
+		return nil, err
+	}
+	for i := range pools {
+		pool := NewResourcePool(host.manager, &pools[i], host.datacenter)
+		if pool.IsDefault() {
 			continue
 		}
-		for _, h := range oc.Host {
-			if h == reference {
-				tags = append(tags, fmt.Sprintf("cluster:/%s/%s/%s", cpName, oDatacenter.Name, oc.Name))
-				continue Loop
-			}
-		}
+		ret = append(ret, cloudprovider.Schedtag{
+			Name: fmt.Sprintf("pool:|%s|%s|%s|%s", host.datacenter.manager.cpcfg.Name, dc.GetName(), cluster.GetName(), strings.Join(pool.GetPath(), "|")),
+			Id:   fmt.Sprintf("%s|%s|%s|%s", host.datacenter.manager.cpcfg.Id, dc.GetId(), cluster.GetId(), pool.GetId()),
+			Meta: map[string]string{
+				cloudprovider.METADATA_POOL_ID: pool.GetId(),
+			},
+		})
 	}
-	return tags, nil
+	return ret, nil
 }
 
 func (host *SHost) getHostSystem() *mo.HostSystem {
@@ -305,7 +335,7 @@ func (host *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 		return nil, err
 	}
 	for i := 0; i < len(vms); i += 1 {
-		if vms[i].GetGlobalId() == id {
+		if vms[i].GetGlobalId() == id || vms[i].GetName() == id {
 			return vms[i], nil
 		}
 	}
@@ -330,10 +360,7 @@ func (host *SHost) GetIStorageById(id string) (cloudprovider.ICloudStorage, erro
 }
 
 func (host *SHost) GetEnabled() bool {
-	if host.getHostSystem().Summary.Runtime.InMaintenanceMode {
-		return false
-	}
-	return true
+	return !host.getHostSystem().Summary.Runtime.InMaintenanceMode
 }
 
 func (host *SHost) GetHostStatus() string {
@@ -390,20 +417,24 @@ func mask2len(mask string) int8 {
 }
 
 func (host *SHost) isVnicAdmin(nic types.HostVirtualNic) bool {
+	return host.isIpAdmin(nic.Spec.Ip.IpAddress)
+}
+
+func (host *SHost) isIpAdmin(ip string) bool {
 	if len(host.masterIp) > 0 {
-		if host.masterIp == nic.Spec.Ip.IpAddress {
+		if host.masterIp == ip {
 			return true
 		} else {
 			return false
 		}
 	}
-	exist, err := host.manager.IsHostIpExists(nic.Spec.Ip.IpAddress)
+	exist, err := host.manager.IsHostIpExists(ip)
 	if err != nil {
-		log.Errorf("IsHostIpExists %s fail %s", nic.Spec.Ip.IpAddress, err)
+		log.Errorf("IsHostIpExists %s fail %s", ip, err)
 		return false
 	}
 	if exist {
-		host.masterIp = nic.Spec.Ip.IpAddress
+		host.masterIp = ip
 		return true
 	}
 	return false
@@ -448,6 +479,9 @@ func (host *SHost) fetchNicInfo(debug bool) []sHostNicInfo {
 		mac := netutils.FormatMacAddr(nic.Spec.Mac)
 		pnic := findHostNicByMac(nicInfoList, mac)
 		if pnic != nil {
+			if len(pnic.IpAddr) > 0 && host.isIpAdmin(pnic.IpAddr) {
+				continue
+			}
 			// findMaster = true
 			pnic.IpAddr = nic.Spec.Ip.IpAddress
 			pnic.IpAddrPrefixLen = mask2len(nic.Spec.Ip.SubnetMask)
@@ -598,14 +632,10 @@ func (host *SHost) GetMemSizeMB() int {
 	return int(host.getHostSystem().Summary.Hardware.MemorySize / 1024 / 1024)
 }
 
-func (host *SHost) GetStorageInfo() []SHostStorageInfo {
-	if host.storageInfo == nil {
-		host.storageInfo = host.getStorageInfo()
-	}
-	return host.storageInfo
-}
-
 func (host *SHost) getStorageInfo() []SHostStorageInfo {
+	if host.storageInfo != nil {
+		return host.storageInfo
+	}
 	diskSlots := make(map[int]SHostStorageInfo)
 	list := host.getStorages()
 	for i := 0; i < len(list); i += 1 {
@@ -633,7 +663,8 @@ func (host *SHost) getStorageInfo() []SHostStorageInfo {
 			break
 		}
 	}
-	return disks
+	host.storageInfo = disks
+	return host.storageInfo
 }
 
 func (host *SHost) getStorages() []*SHostStorageAdapterInfo {
@@ -715,7 +746,7 @@ func (host *SHost) getStorages() []*SHostStorageAdapterInfo {
 	return adapterList
 }
 
-func (host *SHost) GetStorageSizeMB() int {
+func (host *SHost) GetStorageSizeMB() int64 {
 	storages, err := host.GetIStorages()
 	if err != nil {
 		log.Errorf("SHost.GetStorageSizeMB: SHost.GetIStorages: %s", err)
@@ -725,13 +756,13 @@ func (host *SHost) GetStorageSizeMB() int {
 	for _, stor := range storages {
 		size += stor.GetCapacityMB()
 	}
-	return int(size)
+	return size
 }
 
 func (host *SHost) GetStorageType() string {
 	ssd := 0
 	rotate := 0
-	storages := host.GetStorageInfo()
+	storages := host.getStorageInfo()
 	for i := 0; i < len(storages); i += 1 {
 		if storages[i].Rotate {
 			rotate += 1
@@ -769,16 +800,20 @@ func (host *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudpr
 
 type SCreateVMParam struct {
 	Name                 string
+	Desc                 string `json:"description"`
 	Uuid                 string
 	OsName               string
+	CpuSockets           int
 	Cpu                  int
 	Mem                  int
 	Bios                 string
 	Cdrom                SCdromInfo
 	Disks                []SDiskInfo
 	Nics                 []jsonutils.JSONObject
+	ProjectId            string
 	ResourcePool         string
 	InstanceSnapshotInfo SEsxiInstanceSnapshotInfo
+	EnableEsxiSwap       bool
 }
 
 type SEsxiInstanceSnapshotInfo struct {
@@ -794,12 +829,13 @@ type SCdromInfo struct {
 }
 
 type SDiskInfo struct {
-	ImagePath string
-	Size      int64
-	DiskId    string
-	Driver    string
-	ImageInfo SEsxiImageInfo
-	StorageId string
+	ImagePath     string
+	Size          int64
+	DiskId        string
+	Driver        string
+	ImageInfo     SEsxiImageInfo
+	StorageId     string
+	Preallocation string
 }
 
 type SEsxiImageInfo struct {
@@ -860,7 +896,7 @@ func (host *SHost) needScsi(disks []SDiskInfo) bool {
 	return false
 }
 
-func (host *SHost) addDisks(ctx context.Context, dc *SDatacenter, ds *SDatastore, disks []SDiskInfo, uuid string, objectVm *object.VirtualMachine) (*SVirtualMachine, error) {
+func (host *SHost) addDisks(ctx context.Context, ds *SDatastore, disks []SDiskInfo, uuid string, objectVm *object.VirtualMachine) (*SVirtualMachine, error) {
 	getVM := func() (*SVirtualMachine, error) {
 		var moVM mo.VirtualMachine
 		err := host.manager.reference2Object(objectVm.Reference(), VIRTUAL_MACHINE_PROPS, &moVM)
@@ -905,7 +941,7 @@ func (host *SHost) addDisks(ctx context.Context, dc *SDatacenter, ds *SDatastore
 			}
 			newImagePath := fmt.Sprintf("[%s] %s/%s.vmdk", ds.GetRelName(), uuid, uuid)
 
-			err = host.copyVirtualDisk(imagePath, newImagePath, disk.Driver)
+			err = host.copyVirtualDisk(imagePath, newImagePath, disk.Driver, disk.Preallocation)
 			if err != nil {
 				return nil, err
 			}
@@ -946,8 +982,12 @@ func (host *SHost) addDisks(ctx context.Context, dc *SDatacenter, ds *SDatastore
 		} else {
 			tds = ds
 		}
-		log.Debugf("ds: %s, size: %d, image path: %s, uuid: %s, index: %d, ctrlKey: %d, driver: %s, key: %d.", tds.getDatastoreObj().String(), size, imagePath, uuid, unitNumber, ctrlKey, disk.Driver, 2000+i)
-		spec := addDevSpec(NewDiskDev(size, SDiskConfig{
+		vds, err := tds.getDatastoreObj(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "getDatastoreObj")
+		}
+		log.Debugf("ds: %s, size: %d, image path: %s, uuid: %s, index: %d, preallocation: %s, ctrlKey: %d, driver: %s, key: %d.", vds.String(), size, imagePath, uuid, unitNumber, disk.Preallocation, ctrlKey, disk.Driver, 2000+i)
+		diskDev, err := NewDiskDev(ctx, size, SDiskConfig{
 			SizeMb:        size,
 			Uuid:          uuid,
 			ControllerKey: int32(ctrlKey),
@@ -956,7 +996,12 @@ func (host *SHost) addDisks(ctx context.Context, dc *SDatacenter, ds *SDatastore
 			ImagePath:     imagePath,
 			IsRoot:        i == 0,
 			Datastore:     tds,
-		}))
+			Preallocation: disk.Preallocation,
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "NewDiskDev")
+		}
+		spec := addDevSpec(diskDev)
 		if len(imagePath) == 0 {
 			spec.FileOperation = "create"
 		}
@@ -990,10 +1035,10 @@ func (host *SHost) addDisks(ctx context.Context, dc *SDatacenter, ds *SDatastore
 	return evm, nil
 }
 
-func (host *SHost) copyVirtualDisk(srcPath, dstPath, diskDriver string) error {
+func (host *SHost) copyVirtualDisk(srcPath, dstPath, diskDriver, preallocation string) error {
 	dm := object.NewVirtualDiskManager(host.manager.client.Client)
 	spec := &types.VirtualDiskSpec{
-		DiskType: "thin",
+		DiskType: string(types.VirtualDiskTypeThin),
 	}
 	switch diskDriver {
 	case "", "scsi", "pvscsi":
@@ -1021,6 +1066,22 @@ func (host *SHost) copyVirtualDisk(srcPath, dstPath, diskDriver string) error {
 	if err != nil {
 		return errors.Wrap(err, "wait CopyVirtualDiskTask")
 	}
+	if preallocation == api.DISK_PREALLOCATION_FULL || preallocation == api.DISK_PREALLOCATION_FALLOC {
+		err = func() error {
+			task, err = dm.InflateVirtualDisk(host.manager.context, dstPath, host.datacenter.getDcObj())
+			if err != nil {
+				return errors.Wrap(err, "unable to InflateVirtualDisk")
+			}
+			err = task.Wait(host.manager.context)
+			if err != nil {
+				return errors.Wrap(err, "wait InflateVirtualDiskTask")
+			}
+			return nil
+		}()
+		if err != nil {
+			log.Errorf("inflate disk %s failed: %s", dstPath, err)
+		}
+	}
 	return nil
 }
 
@@ -1028,18 +1089,18 @@ func (host *SHost) DoCreateVM(ctx context.Context, ds *SDatastore, params SCreat
 	needDeploy = true
 	deviceChange := make([]types.BaseVirtualDeviceConfigSpec, 0, 5)
 
-	// uuid first
 	name := params.Name
-	if len(params.Uuid) != 0 {
+	if len(params.Uuid) > 0 {
 		name = params.Uuid
 	}
 	datastorePath := fmt.Sprintf("[%s] ", ds.GetRelName())
 
 	firmware := ""
 	if len(params.Bios) != 0 {
-		if params.Bios == "BIOS" {
+		switch params.Bios {
+		case "BIOS":
 			firmware = "bios"
-		} else if params.Bios == "UEFI" {
+		case "UEFI":
 			firmware = "efi"
 		}
 	}
@@ -1049,24 +1110,39 @@ func (host *SHost) DoCreateVM(ctx context.Context, ds *SDatastore, params SCreat
 		guestId = "windows7Server64Guest"
 	}
 
-	version := "vmx-10"
-	if host.isVersion50() {
-		version = "vmx-08"
+	version := host.getVmVersion()
+
+	if params.CpuSockets == 0 {
+		params.CpuSockets = 1
 	}
 
+	perSocket := params.Cpu / params.CpuSockets
+
 	spec := types.VirtualMachineConfigSpec{
-		Name:     name,
-		Version:  version,
-		Uuid:     params.Uuid,
-		GuestId:  guestId,
-		NumCPUs:  int32(params.Cpu),
-		MemoryMB: int64(params.Mem),
-		Firmware: firmware,
+		Name:              name,
+		Annotation:        params.Desc,
+		Version:           version,
+		Uuid:              params.Uuid,
+		GuestId:           guestId,
+		NumCPUs:           int32(params.Cpu),
+		NumCoresPerSocket: int32(perSocket),
+		MemoryMB:          int64(params.Mem),
+		Firmware:          firmware,
 
 		CpuHotAddEnabled:    &True,
 		CpuHotRemoveEnabled: &True,
 		MemoryHotAddEnabled: &True,
+
+		ExtraConfig: []types.BaseOptionValue{},
 	}
+
+	if !params.EnableEsxiSwap {
+		spec.ExtraConfig = append(spec.ExtraConfig, &types.OptionValue{
+			Key:   "sched.swap.vmxSwapEnabled",
+			Value: "FALSE",
+		})
+	}
+
 	spec.Files = &types.VirtualMachineFileInfo{
 		VmPathName: datastorePath,
 	}
@@ -1126,19 +1202,19 @@ func (host *SHost) DoCreateVM(ctx context.Context, ds *SDatastore, params SCreat
 		err = errors.Wrapf(err, "SHost.GetDatacenter for host '%s'", host.GetId())
 		return
 	}
-	// get vmFloder
-	folders, err := dc.getObjectDatacenter().Folders(ctx)
+
+	vmFolder, err := dc.GetFolder(params.ProjectId)
 	if err != nil {
-		err = errors.Wrap(err, "object.DataCenter.Folders")
+		err = errors.Wrap(err, "GetFolder")
 		return
 	}
-	vmFolder := folders.VmFolder
-	resourcePool, err := host.SyncResourcePool(params.ResourcePool)
+
+	pool, err := host.SyncResourcePool(params.ResourcePool)
 	if err != nil {
-		err = errors.Wrap(err, "SyncResourcePool")
+		err = errors.Wrap(err, "GetResourcePool")
 		return
 	}
-	task, err := vmFolder.CreateVM(ctx, spec, resourcePool, host.GetHostSystem())
+	task, err := vmFolder.CreateVM(ctx, spec, pool, host.GetHostSystem())
 	if err != nil {
 		err = errors.Wrap(err, "VmFolder.Create")
 		return
@@ -1151,7 +1227,11 @@ func (host *SHost) DoCreateVM(ctx context.Context, ds *SDatastore, params SCreat
 	}
 	vmRef := info.Result.(types.ManagedObjectReference)
 	objectVM := object.NewVirtualMachine(host.manager.client.Client, vmRef)
-	vm, err = host.addDisks(ctx, dc, ds, params.Disks, params.Uuid, objectVM)
+	uuid := params.Uuid
+	if len(uuid) == 0 {
+		uuid = params.Name
+	}
+	vm, err = host.addDisks(ctx, ds, params.Disks, uuid, objectVM)
 	return
 }
 
@@ -1215,29 +1295,68 @@ func (host *SHost) CloneVM(ctx context.Context, from *SVirtualMachine, snapshot 
 		}
 	}
 
+	diskPreallocationChanged := false
+	diskChanged := []types.VirtualMachineRelocateSpecDiskLocator{}
+	idisks, _ := from.GetIDisks()
+	for i, disk := range idisks {
+		if i > len(params.Disks)-1 {
+			break
+		}
+		if len(params.Disks[i].Preallocation) > 0 && params.Disks[i].Preallocation != disk.GetPreallocation() {
+			diskPreallocationChanged = true
+		}
+
+		locator := types.VirtualMachineRelocateSpecDiskLocator{}
+		tds, _ := host.FindDataStoreById(params.Disks[i].StorageId)
+		if tds != nil {
+			locator.Datastore = tds.object.Reference()
+		}
+		backing := &types.VirtualDiskFlatVer2BackingInfo{}
+		switch params.Disks[i].Preallocation {
+		case api.DISK_PREALLOCATION_OFF, api.DISK_PREALLOCATION_METADATA, "":
+			backing.ThinProvisioned = types.NewBool(true)
+		case api.DISK_PREALLOCATION_FALLOC:
+			backing.ThinProvisioned = types.NewBool(false)
+			backing.EagerlyScrub = types.NewBool(false)
+		case api.DISK_PREALLOCATION_FULL:
+			backing.ThinProvisioned = types.NewBool(false)
+			backing.EagerlyScrub = types.NewBool(true)
+		}
+		locator.DiskId = int32(2000 + i)
+		locator.DiskBackingInfo = backing
+		diskChanged = append(diskChanged, locator)
+	}
+
 	dc, err := host.GetDatacenter()
 	if err != nil {
 		return nil, errors.Wrapf(err, "SHost.GetDatacenter for host '%s'", host.GetId())
 	}
-	// get vmFloder
-	folders, err := dc.getObjectDatacenter().Folders(ctx)
+	vmFolder, err := dc.GetFolder(params.ProjectId)
 	if err != nil {
-		return nil, errors.Wrap(err, "object.DataCenter.Folders")
+		return nil, errors.Wrap(err, "GetFolder")
 	}
+
 	resourcePool, err := host.SyncResourcePool(params.ResourcePool)
 	if err != nil {
 		return nil, errors.Wrap(err, "SyncResourcePool")
 	}
 
-	folderref := folders.VmFolder.Reference()
 	poolref := resourcePool.Reference()
 	hostref := host.GetHostSystem().Reference()
-	dsref := ds.getDatastoreObj().Reference()
+	tds, err := ds.getDatastoreObj(ctx)
+	if err != nil {
+		return nil, errors.Wrapf(err, "getDatastoreObj")
+	}
+	dsref := tds.Reference()
+	vmFolderRef := vmFolder.Reference()
 	relocateSpec := types.VirtualMachineRelocateSpec{
-		Folder:    &folderref,
+		Folder:    &vmFolderRef,
 		Pool:      &poolref,
 		Host:      &hostref,
 		Datastore: &dsref,
+	}
+	if diskPreallocationChanged {
+		relocateSpec.Disk = diskChanged
 	}
 	cloneSpec := &types.VirtualMachineCloneSpec{
 		PowerOn:  false,
@@ -1251,18 +1370,37 @@ func (host *SHost) CloneVM(ctx context.Context, from *SVirtualMachine, snapshot 
 	if len(params.Uuid) != 0 {
 		name = params.Uuid
 	}
+	if params.CpuSockets == 0 {
+		params.CpuSockets = 1
+	}
+	perSocket := params.Cpu / params.CpuSockets
 	spec := types.VirtualMachineConfigSpec{
-		Name:     name,
-		Uuid:     params.Uuid,
-		NumCPUs:  int32(params.Cpu),
-		MemoryMB: int64(params.Mem),
+		Name:              name,
+		Annotation:        params.Desc,
+		Uuid:              params.Uuid,
+		NumCPUs:           int32(params.Cpu),
+		NumCoresPerSocket: int32(perSocket),
+		MemoryMB:          int64(params.Mem),
 
 		CpuHotAddEnabled:    &True,
 		CpuHotRemoveEnabled: &True,
 		MemoryHotAddEnabled: &True,
+
+		ExtraConfig: []types.BaseOptionValue{},
+
+		Firmware: "bios",
+	}
+	if from.GetBios() == cloudprovider.UEFI {
+		spec.Firmware = "efi"
+	}
+	if !params.EnableEsxiSwap {
+		spec.ExtraConfig = append(spec.ExtraConfig, &types.OptionValue{
+			Key:   "sched.swap.vmxSwapEnabled",
+			Value: "FALSE",
+		})
 	}
 	cloneSpec.Config = &spec
-	task, err := ovm.Clone(ctx, folders.VmFolder, name, *cloneSpec)
+	task, err := ovm.Clone(ctx, vmFolder, name, *cloneSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "object.VirtualMachine.Clone")
 	}
@@ -1371,10 +1509,11 @@ func (host *SHost) CloneVM(ctx context.Context, from *SVirtualMachine, snapshot 
 		uuid := params.Disks[i].DiskId
 		driver := params.Disks[i].Driver
 		opts := &cloudprovider.GuestDiskCreateOptions{
-			SizeMb:    int(size),
-			UUID:      uuid,
-			Driver:    driver,
-			StorageId: params.Disks[i].StorageId,
+			SizeMb:        int(size),
+			UUID:          uuid,
+			Driver:        driver,
+			StorageId:     params.Disks[i].StorageId,
+			Preallocation: params.Disks[i].Preallocation,
 		}
 		_, err := vm.CreateDisk(ctx, opts)
 		if err != nil {
@@ -1382,6 +1521,19 @@ func (host *SHost) CloneVM(ctx context.Context, from *SVirtualMachine, snapshot 
 			return vm, nil
 		}
 	}
+
+	task, err = vm.getVmObj().UpgradeVM(ctx, host.getVmVersion())
+	if err != nil {
+		log.Errorf("upgrade vm %s error: %v", vm.GetName(), err)
+		return vm, nil
+	}
+
+	err = task.Wait(ctx)
+	if err != nil {
+		log.Errorf("wait vm %s upgrade error: %v", vm.GetName(), err)
+		return vm, nil
+	}
+
 	return vm, nil
 }
 
@@ -1400,10 +1552,30 @@ func (host *SHost) changeNic(device types.BaseVirtualDevice, update types.BaseVi
 
 func (host *SHost) isVersion50() bool {
 	version := host.GetVersion()
-	if strings.HasPrefix(version, "5.") {
-		return true
+	return strings.HasPrefix(version, "5.")
+}
+
+func (host *SHost) getVmVersion() string {
+	ver := func() string {
+		version := host.GetVersion()
+		if len(version) >= 3 {
+			return version[:3]
+		}
+		return version
+	}()
+	version, ok := map[string]string{
+		"5.0": "vmx-08",
+		"5.1": "vmx-09",
+		"5.5": "vmx-10",
+		"6.0": "vmx-11",
+		"6.5": "vmx-13",
+		"6.7": "vmx-14",
+		"7.0": "vmx-17",
+	}[ver]
+	if ok {
+		return version
 	}
-	return false
+	return "vmx-10"
 }
 
 func (host *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
@@ -1473,7 +1645,7 @@ func (host *SHost) newLocalStorageCache() (*SDatastoreImageCache, error) {
 	}
 
 	if cacheDs == nil {
-		return nil, fmt.Errorf(errmsg)
+		return nil, fmt.Errorf("%s", errmsg)
 	}
 
 	return &SDatastoreImageCache{
@@ -1557,33 +1729,6 @@ func (host *SHost) FileUrlPathToDsPath(path string) (string, error) {
 	return newPath, nil
 }
 
-/*func (host *SHost) FindNetworkByVlanID(vlanID int32) (IVMNetwork, error) {
-	if host.IsActiveVlanID(vlanID) {
-		net, err := host.findBasicNetwork(vlanID)
-		if err != nil {
-			return nil, errors.Wrap(err, "findBasicNetwork error")
-		}
-		if net != nil {
-			return net, nil
-		}
-
-		// no found in basic network
-		dvpg, err := host.findVlanDVPG(vlanID)
-		if err != nil {
-			return nil, errors.Wrap(err, "findVlanDVPG")
-		}
-		return dvpg, nil
-	}
-	n, err := host.findBasicNetwork(vlanID)
-	if err != nil {
-		return nil, errors.Wrap(err, "find Basic network")
-	}
-	if n != nil {
-		return n, err
-	}
-	return host.findNovlanDVPG()
-}*/
-
 // IsActiveVlanID will detect if vlanID is active that means vlanID in (1, 4095).
 func (host *SHost) IsActiveVlanID(vlanID int32) bool {
 	if vlanID > 1 && vlanID < 4095 {
@@ -1591,25 +1736,6 @@ func (host *SHost) IsActiveVlanID(vlanID int32) bool {
 	}
 	return false
 }
-
-/*func (host *SHost) findBasicNetwork(vlanID int32) (IVMNetwork, error) {
-	nets, err := host.getBasicNetworks()
-	if err != nil {
-		return nil, err
-	}
-	if len(nets) == 0 {
-		return nil, nil
-	}
-	if !host.IsActiveVlanID(vlanID) {
-		return nets[0], nil
-	}
-	for i := range nets {
-		if nets[i].GetVlanId() == vlanID {
-			return nets[i], nil
-		}
-	}
-	return nil, nil
-}*/
 
 func (host *SHost) getBasicNetworks() ([]IVMNetwork, error) {
 	nets, err := host.GetNetworks()
@@ -1657,24 +1783,6 @@ func (host *SHost) getNetworkById(netId string) (IVMNetwork, error) {
 	return nil, errors.ErrNotFound
 }
 
-/*func (host *SHost) findNovlanDVPG() (*SDistributedVirtualPortgroup, error) {
-	nets, err := host.datacenter.GetNetworks()
-	if err != nil {
-		return nil, errors.Wrap(err, "SHost.datacenter.GetNetworks")
-	}
-	for _, net := range nets {
-		dvpg, ok := net.(*SDistributedVirtualPortgroup)
-		if !ok || !dvpg.ContainHost(host) || len(dvpg.GetActivePorts()) == 0 {
-			continue
-		}
-		nvlan := dvpg.GetVlanId()
-		if !host.IsActiveVlanID(nvlan) {
-			return dvpg, nil
-		}
-	}
-	return nil, nil
-}*/
-
 func (host *SHost) findDVPGById(id string) (*SDistributedVirtualPortgroup, error) {
 	nets, err := host.datacenter.GetNetworks()
 	if err != nil {
@@ -1687,34 +1795,6 @@ func (host *SHost) findDVPGById(id string) (*SDistributedVirtualPortgroup, error
 	}
 	return nil, nil
 }
-
-/*func (host *SHost) findVlanDVPG(vlanId int32) (*SDistributedVirtualPortgroup, error) {
-	nets, err := host.datacenter.GetNetworks()
-	if err != nil {
-		return nil, errors.Wrap(err, "SHost.datacenter.GetNetworks")
-	}
-	for _, net := range nets {
-		dvpg, ok := net.(*SDistributedVirtualPortgroup)
-		if !ok || len(dvpg.GetActivePorts()) == 0 {
-			continue
-		}
-		nvlan := dvpg.GetVlanId()
-		if nvlan == vlanId {
-			if dvpg.ContainHost(host) {
-				return dvpg, nil
-			}
-			msg := "Find dvpg with correct vlan but it didn't contain this host"
-			log.Debugf(msg)
-			// add host to dvg
-			// err := dvpg.AddHostToDVS(host)
-			// if err != nil {
-			//     return nil, errors.Wrapf(err, "dvpg %s add host to dvs error", dvpg.GetName())
-			// }
-			continue
-		}
-	}
-	return nil, nil
-}*/
 
 func (host *SHost) GetHostSystem() *object.HostSystem {
 	return object.NewHostSystem(host.manager.client.Client, host.getHostSystem().Reference())
@@ -1756,47 +1836,15 @@ func (host *SHost) getParent() (*mo.ComputeResource, error) {
 	return mcr, nil
 }
 
-func (host *SHost) GetResourcePools() ([]mo.ResourcePool, error) {
-	cluster, err := host.GetCluster()
-	if err != nil {
-		return nil, errors.Wrap(err, "GetCluster")
-	}
-	return cluster.ListResourcePools()
-}
-
-func (host *SHost) GetCluster() (*SCluster, error) {
-	cluster, err := host.getCluster()
-	if err != nil {
-		return nil, errors.Wrap(err, "getCluster")
-	}
-	return NewCluster(host.manager, cluster, host.datacenter), nil
-}
-
 func (host *SHost) SyncResourcePool(name string) (*object.ResourcePool, error) {
+	if len(name) == 0 {
+		return host.GetResourcePool()
+	}
 	cluster, err := host.GetCluster()
 	if err != nil {
-		log.Errorf("failed to get host %s cluster info: %v", host.GetName(), err)
 		return host.GetResourcePool()
 	}
-	pool, err := cluster.SyncResourcePool(name)
-	if err != nil {
-		log.Errorf("failed to sync resourcePool(%s) for cluster %s error: %v", name, cluster.GetName(), err)
-		return host.GetResourcePool()
-	}
-	return object.NewResourcePool(host.manager.client.Client, pool.Reference()), nil
-}
-
-func (host *SHost) getCluster() (*mo.ClusterComputeResource, error) {
-	moHost := host.getHostSystem()
-	if moHost.Parent.Type != "ClusterComputeResource" {
-		return nil, fmt.Errorf("host %s parent is not the cluster resource", host.GetName())
-	}
-	cluster := &mo.ClusterComputeResource{}
-	err := host.manager.reference2Object(*moHost.Parent, []string{"name", "resourcePool"}, cluster)
-	if err != nil {
-		return nil, errors.Wrap(err, "SESXiClient.reference2Object")
-	}
-	return cluster, nil
+	return cluster.SyncResourcePool(name)
 }
 
 func (host *SHost) GetSiblingHosts() ([]*SHost, error) {

@@ -16,12 +16,18 @@ package report
 
 import (
 	"context"
+	"net"
+	"os"
 	"strings"
 	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
@@ -54,8 +60,14 @@ type sReport struct {
 	BaremetalMemSizeMb     int64
 	BaremetalStorageSizeGb int64
 	ServerCnt              int64
+	ContainerCnt           int64
+	ContainerCpuCnt        int64
+	ContainerMemSizeMb     int64
 	ServerCpuCnt           int64
 	ServerMemSizeMb        int64
+	KvmServerCnt           int64
+	KvmServerCpuCnt        int64
+	KvmServerMemSizeMb     int64
 	DiskCnt                int64
 	DiskSizeMb             int64
 	BucketCnt              int64
@@ -65,6 +77,99 @@ type sReport struct {
 	UserCnt                int64
 	ProjectCnt             int64
 	DomainCnt              int64
+	RunningEnv             string
+}
+
+const (
+	RUNNING_ENV_KUBERNETES               = "kubernetes"
+	RUNNING_ENV_K3S                      = "k3s"
+	RUNNING_ENV_DOCKER_COMPOSE           = "docker-compose"
+	RUNNING_ENV_DOCKER_COMPOSE_BAREMETAL = "docker-compose-baremetal"
+	RUNNING_ENV_UNKNOWN                  = "unknown"
+)
+
+func isInsideDockerCompose() bool {
+	// hostname likes: c1577eee2aed
+	DOCKER_HOSTNAME_LEN := 12
+	hostname := os.Getenv("HOSTNAME")
+	if len(hostname) != DOCKER_HOSTNAME_LEN {
+		return false
+	}
+	// resolv mysql and keystone host
+	resolvTimeout := 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), resolvTimeout)
+	defer cancel()
+	var r net.Resolver
+	hosts := []string{"mysql", "keystone", "region"}
+
+	for _, host := range hosts {
+		_, err := r.LookupIPAddr(ctx, host)
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func isInsideKubernetes() bool {
+	k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	if len(k8sHost) == 0 {
+		return false
+	}
+	// check /var/run/secrets/kubernetes.io/serviceaccount/ directory
+	k8sSecDir := "/var/run/secrets/kubernetes.io/serviceaccount/"
+	if _, err := os.Stat(k8sSecDir); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func getK8sVersion() (string, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return "", errors.Wrap(err, "get k8s config")
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", errors.Wrap(err, "get k8s client")
+	}
+	ver, err := client.ServerVersion()
+	if err != nil {
+		return "", errors.Wrap(err, "get k8s version")
+	}
+	return ver.String(), nil
+}
+
+func getRunningEnv() string {
+	if isInsideKubernetes() {
+		ver, err := getK8sVersion()
+		if err != nil {
+			log.Errorf("get k8s version: %v", err)
+		}
+		if strings.Contains(ver, "k3s") {
+			return RUNNING_ENV_K3S
+		}
+		return RUNNING_ENV_KUBERNETES
+	}
+
+	if isInsideDockerCompose() {
+		// list agent to check whether we're running baremetal agent
+		s := auth.GetAdminSession(context.Background(), options.Options.Region)
+		ret, err := compute.Baremetalagents.List(s, nil)
+		if err != nil {
+			log.Warningf("list agents error: %s", err)
+			return RUNNING_ENV_DOCKER_COMPOSE
+		}
+		for _, agent := range ret.Data {
+			aType, _ := agent.GetString("agent_type")
+			if aType == "baremetal" {
+				return RUNNING_ENV_DOCKER_COMPOSE_BAREMETAL
+			}
+		}
+		return RUNNING_ENV_DOCKER_COMPOSE
+	}
+	return RUNNING_ENV_UNKNOWN
 }
 
 func Report(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
@@ -101,6 +206,20 @@ func Report(ctx context.Context, userCred mcclient.TokenCredential, isStart bool
 			return nil, errors.Wrapf(err, "Hosts.List")
 		}
 		ret.VmwareHostCnt = int64(resp.Total)
+
+		resp, err = compute.Servers.List(s, jsonutils.Marshal(map[string]interface{}{
+			"scope":      "system",
+			"hypervisor": api.HYPERVISOR_KVM,
+			"limit":      1,
+		}))
+		if err != nil {
+			return nil, errors.Wrapf(err, "Server.List")
+		}
+		ret.KvmServerCnt = int64(resp.Total)
+		if !gotypes.IsNil(resp.Totals) {
+			ret.KvmServerCpuCnt, _ = resp.Totals.Int("cpu_count")
+			ret.KvmServerMemSizeMb, _ = resp.Totals.Int("mem_mb")
+		}
 
 		osDists, osVersions, qemuVersions, archs := []string{}, []string{}, []string{}, []string{}
 		hosts := []api.HostDetails{}
@@ -154,6 +273,9 @@ func Report(ctx context.Context, userCred mcclient.TokenCredential, isStart bool
 		ret.ServerCnt, _ = usage.Int("all.servers")
 		ret.ServerCpuCnt, _ = usage.Int("all.servers.cpu")
 		ret.ServerMemSizeMb, _ = usage.Int("all.servers.memory")
+		ret.ContainerCnt, _ = usage.Int("all.containers")
+		ret.ContainerCpuCnt, _ = usage.Int("all.containers.cpu")
+		ret.ContainerMemSizeMb, _ = usage.Int("all.containers.memory")
 		ret.DiskCnt, _ = usage.Int("all.disks.count")
 		ret.DiskSizeMb, _ = usage.Int("all.disks")
 		ret.BucketCnt, _ = usage.Int("all.buckets")
@@ -171,6 +293,7 @@ func Report(ctx context.Context, userCred mcclient.TokenCredential, isStart bool
 		ret.UserCnt, _ = usage.Int("users")
 		ret.DomainCnt, _ = usage.Int("domains")
 		ret.ProjectCnt, _ = usage.Int("projects")
+		ret.RunningEnv = getRunningEnv()
 		return ret, nil
 	}
 	rp, err := func() (*sReport, error) {

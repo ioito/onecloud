@@ -16,7 +16,6 @@ package handler
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"reflect"
 
@@ -79,11 +78,10 @@ func RpcHandler(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 			log.Errorf("Error get JSON body: %s", e)
 		}
 	default:
-		httperrors.InvalidInputError(ctx, w, fmt.Sprintf("Unsupported RPC method %s", req.Method))
+		httperrors.InvalidInputError(ctx, w, "Unsupported RPC method %s", req.Method)
 		return
 	}
 	token := AppContextToken(ctx)
-	// pathParams := appctx.AppContextParams(ctx)
 	s := auth.GetSession(ctx, token, FetchRegion(req))
 	funcname := verb + utils.Kebab2Camel(callName, "-")
 	mod, e := modulebase.GetModule(s, resType)
@@ -91,13 +89,13 @@ func RpcHandler(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 		if e != nil {
 			log.Debugf("module %s not found %s", resType, e)
 		}
-		httperrors.NotFoundError(ctx, w, fmt.Sprintf("resource %s not exists", resType))
+		httperrors.NotFoundError(ctx, w, "resource %s not exists", resType)
 		return
 	}
 	modvalue := reflect.ValueOf(mod)
 	funcvalue := modvalue.MethodByName(funcname)
 	if !funcvalue.IsValid() || funcvalue.IsNil() {
-		httperrors.NotFoundError(ctx, w, fmt.Sprintf("RPC method %s not found", funcname))
+		httperrors.NotFoundError(ctx, w, "RPC method %s not found", funcname)
 		return
 	}
 	callParams := make([]reflect.Value, 0)
@@ -114,13 +112,14 @@ func RpcHandler(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	retobj := retValue[0]
 	reterr := retValue[1]
 	if reterr.IsNil() {
-		v, ok := retobj.Interface().(jsonutils.JSONObject)
+		addr := retobj.Interface()
+		v, ok := addr.(jsonutils.JSONObject)
 		if ok {
 			appsrv.SendJSON(w, v)
 			return
 		}
 
-		v2, ok := retobj.Interface().([]printutils.SubmitResult)
+		v2, ok := addr.([]printutils.SubmitResult)
 		if ok {
 			w.WriteHeader(207)
 			appsrv.SendJSON(w, modulebase.SubmitResults2JSON(v2))
@@ -128,13 +127,14 @@ func RpcHandler(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 		}
 
 		httperrors.BadGatewayError(ctx, w, "recv invalid data")
-	} else {
-		ge, ok := reterr.Interface().(error)
-		if ok {
-			je := httperrors.NewGeneralError(ge)
-			httperrors.GeneralServerError(ctx, w, je)
-			return
-		}
-		httperrors.BadGatewayError(ctx, w, fmt.Sprintf("%s", reterr.Interface()))
+		return
 	}
+	errAddr := reterr.Interface()
+	ge, ok := errAddr.(error)
+	if ok {
+		je := httperrors.NewGeneralError(ge)
+		httperrors.GeneralServerError(ctx, w, je)
+		return
+	}
+	httperrors.BadGatewayError(ctx, w, "%s", reterr.Interface())
 }

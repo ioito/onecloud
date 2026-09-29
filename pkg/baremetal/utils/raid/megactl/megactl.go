@@ -207,29 +207,6 @@ func (dev *MegaRaidPhyDev) convertState(val string) string {
 	return state
 }
 
-func (dev *MegaRaidPhyDev) parseStripSize(lines []string) error {
-	size2Int := func(sizeStr string) int {
-		sz, _ := strconv.ParseFloat(strings.Fields(sizeStr)[0], 32)
-		szInt := int(sz)
-		if strings.Contains(sizeStr, "KB") {
-			return szInt
-		}
-		if strings.Contains(sizeStr, "MB") {
-			return szInt * 1024
-		}
-		return -1
-	}
-	for _, line := range lines {
-		if strings.Contains(line, "Min") {
-			dev.minStripSize = size2Int(strings.Split(line, ": ")[1])
-		}
-		if strings.Contains(line, "Max") {
-			dev.maxStripSize = size2Int(strings.Split(line, ": ")[1])
-		}
-	}
-	return nil
-}
-
 func (dev *MegaRaidPhyDev) isComplete() bool {
 	if !dev.RaidBasePhyDev.IsComplete() {
 		return false
@@ -270,6 +247,9 @@ type MegaRaidAdaptor struct {
 	// used by sg_map
 	hostNum int
 	//channelNum int
+
+	minStripSize int
+	maxStripSize int
 }
 
 func NewMegaRaidAdaptor(index int, raid *MegaRaid) (*MegaRaidAdaptor, error) {
@@ -305,8 +285,26 @@ func (adapter MegaRaidAdaptor) key() string {
 	return adapter.name + adapter.sn
 }
 
+/*
+Adapter: 0
+Product Name: MegaRAID 9560-8i 4GB
+Memory: 4096MB
+BBU: Absent
+Serial No: SKC4011564
+*/
 func (adapter *MegaRaidAdaptor) fillInfo() error {
-	cmd := GetCommand("-AdpAllInfo", fmt.Sprintf("-a%d", adapter.index))
+	size2Int := func(sizeStr string) int {
+		sz, _ := strconv.ParseFloat(strings.Fields(sizeStr)[0], 32)
+		szInt := int(sz)
+		if strings.Contains(sizeStr, "KB") {
+			return szInt
+		}
+		if strings.Contains(sizeStr, "MB") {
+			return szInt * 1024
+		}
+		return -1
+	}
+	cmd := GetCommand("-CfgDsply", fmt.Sprintf("-a%d", adapter.index))
 	ret, err := adapter.remoteRun(cmd)
 	if err != nil {
 		return errors.Wrap(err, "remote get SN")
@@ -321,6 +319,14 @@ func (adapter *MegaRaidAdaptor) fillInfo() error {
 			adapter.sn = val
 		case "Product Name":
 			adapter.name = val
+		case "Strip Size":
+			sz := size2Int(val)
+			adapter.minStripSize = sz
+			adapter.maxStripSize = sz
+		case "Min Strip Size":
+			adapter.minStripSize = size2Int(val)
+		case "Max Strip Size":
+			adapter.maxStripSize = size2Int(val)
 		}
 	}
 	if len(adapter.key()) == 0 {
@@ -438,15 +444,24 @@ func (adapter *MegaRaidAdaptor) GetDevices() []*baremetal.BaremetalStorage {
 }
 
 func (adapter *MegaRaidAdaptor) GetLogicVolumes() ([]*raiddrivers.RaidLogicalVolume, error) {
-	lvs, err := adapter.getMegacliLogicVolumes()
-	if err == nil {
-		return lvs, nil
+	errs := make([]error, 0)
+	megaLvs, megacliErr := adapter.getMegacliLogicVolumes()
+	if megacliErr != nil {
+		errs = append(errs, megacliErr)
 	}
-	errs := []error{err}
-	if lvs, err := adapter.getStorcliLogicVolums(); err == nil {
-		return lvs, nil
-	} else {
-		errs = append(errs, err)
+	storeLvs, storcliErr := adapter.getStorcliLogicVolums()
+	if storcliErr != nil {
+		errs = append(errs, storcliErr)
+	}
+	if len(megaLvs) > 0 {
+		return megaLvs, nil
+	}
+	if len(storeLvs) > 0 {
+		return storeLvs, nil
+	}
+	if len(errs) == 0 || megacliErr == nil || storcliErr == nil {
+		// no error, no volume
+		return []*raiddrivers.RaidLogicalVolume{}, nil
 	}
 	return nil, errors.NewAggregate(errs)
 }
@@ -455,23 +470,17 @@ func (adapter *MegaRaidAdaptor) getMegacliLogicVolumes() ([]*raiddrivers.RaidLog
 	cmd := GetCommand("-LDInfo", "-Lall", fmt.Sprintf("-a%d", adapter.index))
 	ret, err := adapter.remoteRun(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("getMegacliLogicVolumes error: %v", err)
+		return nil, errors.Wrapf(err, "remoteRun %s", cmd)
 	}
-	return adapter.parseLogicVolumes(ret)
+	lvs, err := adapter.parseLogicVolumes(ret)
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	for i := range lvs {
+		lvs[i].Driver = raiddrivers.RaidDriverToolMegacli64
+	}
+	return lvs, nil
 }
-
-// func (adapter *MegaRaidAdaptor) getStorcliLogicVolums() ([]*raiddrivers.RaidLogicalVolume, error) {
-// 	cmd := GetCommand2(fmt.Sprintf("/c%d/vall", adapter.index), "show")
-// 	ret, err := adapter.remoteRun(cmd)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("getStorcliLogicVolums error: %v", err)
-// 	}
-// 	lvs, err := parseStorcliLogicalVolumes(adapter.index, ret)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return lvs, nil
-// }
 
 func (adapter *MegaRaidAdaptor) getStorcliLogicVolums() ([]*raiddrivers.RaidLogicalVolume, error) {
 	lvs, err := adapter.getStorcliLogicVolumsV2()
@@ -482,10 +491,11 @@ func (adapter *MegaRaidAdaptor) getStorcliLogicVolums() ([]*raiddrivers.RaidLogi
 	for i := range lvs {
 		lv := lvs[i]
 		ret[i] = &raiddrivers.RaidLogicalVolume{
-			Index:    i,
+			Index:    lv.Index,
 			Adapter:  adapter.index,
 			BlockDev: lv.GetOSDevice(),
 			IsSSD:    tristate.NewFromBool(lv.IsSSD()),
+			Driver:   raiddrivers.RaidDriverToolStorecli,
 		}
 	}
 	return ret, nil
@@ -899,20 +909,33 @@ func (adapter *MegaRaidAdaptor) megacliBuildJBOD(devs []*baremetal.BaremetalStor
 func (adapter *MegaRaidAdaptor) RemoveLogicVolumes() error {
 	lvIdx, err := adapter.GetLogicVolumes()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "GetLogicVolumes")
 	}
-	for _, i := range raiddrivers.ReverseLogicalArray(lvIdx) {
-		cmd := GetCommand("-CfgLdDel", fmt.Sprintf("-L%d", i.Index), "-Force", fmt.Sprintf("-a%d", adapter.index))
-		_, err := adapter.remoteRun(cmd)
-		if err == nil {
-			continue
+	if len(lvIdx) == 0 {
+		log.Infof("RemoveLogicVolumes: no logical volume to delete!")
+		return nil
+	}
+	errs := make([]error, 0)
+	lvIdx = raiddrivers.ReverseLogicalArray(lvIdx)
+	for i := range lvIdx {
+		lv := lvIdx[i]
+		switch lv.Driver {
+		case raiddrivers.RaidDriverToolMegacli64:
+			cmd := GetCommand("-CfgLdDel", fmt.Sprintf("-L%d", lv.Index), "-Force", fmt.Sprintf("-a%d", adapter.index))
+			_, err := adapter.remoteRun(cmd)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		case raiddrivers.RaidDriverToolStorecli:
+			cmd := GetCommand2(fmt.Sprintf("/c%d/v%d", adapter.index, lv.Index), "delete", "force")
+			_, err := adapter.remoteRun(cmd)
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
-		errs := []error{err}
-		cmd = GetCommand2(fmt.Sprintf("/c%d/v%d", adapter.index, i.Index), "delete", "force")
-		if _, err := adapter.remoteRun(cmd); err != nil {
-			errs = append(errs, err)
-			return errors.NewAggregate(errs)
-		}
+	}
+	if len(errs) > 0 {
+		return errors.NewAggregate(errs)
 	}
 	return nil
 }
@@ -1076,18 +1099,9 @@ func (raid *MegaRaid) parsePhyDevs(lines []string) error {
 }
 
 func (adapter *MegaRaidAdaptor) addPhyDevsStripSize() error {
-	grepCmd := []string{"grep", "-iE", "'^(Min|Max) Strip Size'"}
-	args := []string{"-adpallinfo", fmt.Sprintf("-a%d", adapter.index), "|"}
-	args = append(args, grepCmd...)
-	cmd := GetCommand(args...)
-	ret, err := adapter.remoteRun(cmd)
-	if err != nil {
-		return fmt.Errorf("addPhyDevStripSize error: %v", err)
-	}
 	for _, dev := range adapter.devs {
-		if err := dev.parseStripSize(ret); err != nil {
-			return err
-		}
+		dev.minStripSize = adapter.minStripSize
+		dev.maxStripSize = adapter.maxStripSize
 	}
 	return nil
 }

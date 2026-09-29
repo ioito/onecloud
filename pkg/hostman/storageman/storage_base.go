@@ -19,30 +19,27 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
-	"regexp"
-	"runtime/debug"
 	"strings"
 	"sync"
-	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/qemuimgfmt"
+	"yunion.io/x/pkg/util/regutils"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	hostapi "yunion.io/x/onecloud/pkg/apis/host"
-	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
+	imageapi "yunion.io/x/onecloud/pkg/apis/image"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
+	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman/storageutils"
 	"yunion.io/x/onecloud/pkg/httperrors"
-	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/image"
-	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 )
@@ -101,40 +98,44 @@ type IStorage interface {
 	SetStoragecacheId(storagecacheId string)
 
 	IsLocal() bool
+	Lvmlockd() bool
 
 	SetPath(string)
 	GetPath() string
 
 	GetSnapshotDir() string
 	GetSnapshotPathByIds(diskId, snapshotId string) string
+	DeleteSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 	DeleteSnapshots(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 	IsSnapshotExist(diskId, snapshotId string) (bool, error)
 
 	GetBackupDir() string
-	StorageBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
+	StorageBackup(ctx context.Context, params *SStorageBackup) (jsonutils.JSONObject, error)
 	StorageBackupRecovery(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 
 	GetFreeSizeMb() int
-	GetCapacity() int
+	GetCapacityMb() int
 
 	// Find owner disks first, if not found, call create disk
 	GetDiskById(diskId string) (IDisk, error)
 	CreateDisk(diskId string) IDisk
 	RemoveDisk(IDisk)
+	GetDisksPath() ([]string, error)
 
 	// DeleteDisk(ctx context.Context, params interface{}) (jsonutils.JSONObject, error)
 
 	// *SDiskCreateByDiskinfo
 	CreateDiskByDiskinfo(context.Context, interface{}) (jsonutils.JSONObject, error)
 	SaveToGlance(context.Context, interface{}) (jsonutils.JSONObject, error)
-	CreateDiskFromSnapshot(context.Context, IDisk, *SDiskCreateByDiskinfo) error
+	CreateDiskFromSnapshot(context.Context, IDisk, *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error)
 	CreateDiskFromExistingPath(context.Context, IDisk, *SDiskCreateByDiskinfo) error
 	CreateDiskFromBackup(context.Context, IDisk, *SDiskCreateByDiskinfo) error
+	DiskMigrate(context.Context, interface{}) (jsonutils.JSONObject, error)
 
 	// GetCloneTargetDiskPath generate target disk path by target disk id
 	GetCloneTargetDiskPath(ctx context.Context, targetDiskId string) string
 	// CloneDiskFromStorage clone disk from other storage
-	CloneDiskFromStorage(ctx context.Context, srcStorage IStorage, srcDisk IDisk, targetDiskId string, fullCopy bool) (*hostapi.ServerCloneDiskFromStorageResponse, error)
+	CloneDiskFromStorage(ctx context.Context, srcStorage IStorage, srcDisk IDisk, targetDiskId string, fullCopy bool, encInfo apis.SEncryptInfo) (*hostapi.ServerCloneDiskFromStorageResponse, error)
 
 	CreateSnapshotFormUrl(ctx context.Context, snapshotUrl, diskId, snapshotPath string) error
 
@@ -148,6 +149,8 @@ type IStorage interface {
 
 	Accessible() error
 	Detach() error
+
+	CleanRecycleDiskfiles(ctx context.Context)
 }
 
 type SBaseStorage struct {
@@ -176,6 +179,18 @@ func (s *SBaseStorage) GetId() string {
 	return s.StorageId
 }
 
+func (s *SBaseStorage) Lvmlockd() bool {
+	return false
+}
+
+func (s *SBaseStorage) GetFuseTmpPath() string {
+	return path.Join(s.Path, _FUSE_TMP_PATH_)
+}
+
+func (s *SBaseStorage) GetFuseMountPath() string {
+	return path.Join(s.Path, _FUSE_MOUNT_PATH_)
+}
+
 func (s *SBaseStorage) GetStorageName() string {
 	return s.StorageName
 }
@@ -188,7 +203,7 @@ func (s *SBaseStorage) SetStoragecacheId(storagecacheId string) {
 	s.StoragecacheId = storagecacheId
 }
 
-func (s *SBaseStorage) StorageBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+func (s *SBaseStorage) StorageBackup(ctx context.Context, params *SStorageBackup) (jsonutils.JSONObject, error) {
 	return nil, nil
 }
 
@@ -216,7 +231,23 @@ func (s *SBaseStorage) GetZoneId() string {
 	return s.Manager.GetZoneId()
 }
 
-func (s *SBaseStorage) GetCapacity() int {
+func (d *SBaseStorage) GetDisksPath() ([]string, error) {
+	spath := d.GetPath()
+	files, err := ioutil.ReadDir(spath)
+	if err != nil {
+		return nil, err
+	}
+	disksPath := make([]string, 0)
+	for i := range files {
+		if !files[i].IsDir() && regutils.MatchUUIDExact(files[i].Name()) {
+			disksPath = append(disksPath, path.Join(spath, files[i].Name()))
+		}
+	}
+
+	return disksPath, nil
+}
+
+func (s *SBaseStorage) GetCapacityMb() int {
 	return s.GetAvailSizeMb()
 }
 
@@ -273,7 +304,7 @@ func (s *SBaseStorage) SyncStorageSize() (api.SHostStorageStat, error) {
 	stat := api.SHostStorageStat{
 		StorageId: s.StorageId,
 	}
-	stat.CapacityMb = int64(s.GetCapacity())
+	stat.CapacityMb = int64(s.GetCapacityMb())
 	stat.ActualCapacityUsedMb = int64(s.GetUsedSizeMb())
 	return stat, nil
 }
@@ -345,8 +376,12 @@ func (s *SBaseStorage) CreateDiskByDiskinfo(ctx context.Context, params interfac
 		if !createParams.DiskInfo.Rebuild {
 			return nil, fmt.Errorf("Disk exist")
 		}
-		if err := createParams.Disk.OnRebuildRoot(ctx, createParams.DiskInfo); err != nil {
-			return nil, err
+		if createParams.DiskInfo.Backup != nil && createParams.DiskInfo.Backup.BackupAsTar != nil {
+			log.Infof("skip OnRebuildRoot step when backup_as_tar is provided")
+		} else {
+			if err := createParams.Disk.OnRebuildRoot(ctx, createParams.DiskInfo); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -355,11 +390,12 @@ func (s *SBaseStorage) CreateDiskByDiskinfo(ctx context.Context, params interfac
 		return nil, fmt.Errorf("Fail to Create disk %s", createParams.DiskId)
 	}
 
+	log.Infof("storage %s %s(%s) start create disk", createParams.Storage.StorageType(), createParams.Storage.GetStorageName(), createParams.Storage.GetId())
 	switch {
 	case len(createParams.DiskInfo.SnapshotId) > 0:
 		log.Infof("CreateDiskFromSnpashot %s", createParams)
 		return s.CreateDiskFromSnpashot(ctx, disk, createParams)
-	case len(createParams.DiskInfo.ImageId) > 0:
+	case len(createParams.DiskInfo.ImageId) > 0 && createParams.DiskInfo.ImageFormat != imageapi.IMAGE_DISK_FORMAT_TGZ:
 		log.Infof("CreateDiskFromTemplate %s", createParams)
 		return s.CreateDiskFromTemplate(ctx, disk, createParams)
 	case createParams.DiskInfo.Backup != nil:
@@ -380,7 +416,11 @@ func (s *SBaseStorage) CreateRawDisk(ctx context.Context, disk IDisk, input *SDi
 	if input.DiskInfo.Encryption {
 		encryptInfo = &input.DiskInfo.EncryptInfo
 	}
-	return disk.CreateRaw(ctx, input.DiskInfo.DiskSizeMb, input.DiskInfo.Format, input.DiskInfo.FsFormat, encryptInfo, input.DiskId, "")
+	return disk.CreateRaw(ctx, input.DiskInfo.DiskSizeMb,
+		input.DiskInfo.Format,
+		input.DiskInfo.FsFormat,
+		input.DiskInfo.FsFeatures,
+		encryptInfo, input.DiskId, "")
 }
 
 func (s *SBaseStorage) CreateDiskFromTemplate(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
@@ -402,12 +442,7 @@ func (s *SBaseStorage) CreateDiskFromSnpashot(ctx context.Context, disk IDisk, i
 		return nil, httperrors.NewMissingParameterError("snapshot_url")
 	}
 
-	err := storage.CreateDiskFromSnapshot(ctx, disk, input)
-	if err != nil {
-		return nil, errors.Wrapf(err, "CreateDiskFromSnapshot")
-	}
-
-	return disk.GetDiskDesc(), nil
+	return storage.CreateDiskFromSnapshot(ctx, disk, input)
 }
 
 func (s *SBaseStorage) createDiskFromExistingPath(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
@@ -452,7 +487,7 @@ func (s *SBaseStorage) GetCloneTargetDiskPath(ctx context.Context, targetDiskId 
 }
 
 func (s *SBaseStorage) CloneDiskFromStorage(
-	ctx context.Context, srcStorage IStorage, srcDisk IDisk, targetDiskId string, fullCopy bool,
+	ctx context.Context, srcStorage IStorage, srcDisk IDisk, targetDiskId string, fullCopy bool, encInfo apis.SEncryptInfo,
 ) (*hostapi.ServerCloneDiskFromStorageResponse, error) {
 	return nil, httperrors.ErrNotImplemented
 }
@@ -473,6 +508,10 @@ func (s *SBaseStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, inp
 	return err
 }
 
+func (s *SBaseStorage) DiskMigrate(context.Context, interface{}) (jsonutils.JSONObject, error) {
+	return nil, httperrors.ErrNotImplemented
+}
+
 func (s *SBaseStorage) onSaveToGlanceFailed(ctx context.Context, imageId string, reason string) {
 	params := jsonutils.NewDict()
 	params.Set("status", jsonutils.NewString("killed"))
@@ -486,122 +525,22 @@ func (s *SBaseStorage) onSaveToGlanceFailed(ctx context.Context, imageId string,
 	}
 }
 
-/*************************Background delete snapshot job****************************/
-
-func StartSnapshotRecycle(storage IStorage) {
-	log.Infof("Snapshot recyle job started")
-	if !fileutils2.Exists(storage.GetSnapshotDir()) {
-		procutils.NewCommand("mkdir", "-p", storage.GetSnapshotDir()).Run()
-	}
-	cronman.GetCronJobManager().AddJobAtIntervals(
-		"SnapshotRecycle", time.Hour*6,
-		func(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
-			snapshotRecycle(ctx, userCred, isStart, storage)
-		})
-}
-
-func StorageRequestSnapshotRecycle(ctx context.Context, userCred mcclient.TokenCredential, storage IStorage) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Errorf("On storage request snapshot recycle %s \n %s", r, debug.Stack())
+func releaseInfoToParams(relInfo *deployapi.ReleaseInfo, params *jsonutils.JSONDict) {
+	if relInfo != nil {
+		params.Set("os_distribution", jsonutils.NewString(relInfo.Distro))
+		if len(relInfo.Version) > 0 {
+			params.Set("os_version", jsonutils.NewString(relInfo.Version))
 		}
-	}()
-
-	if !fileutils2.Exists(storage.GetSnapshotDir()) {
-		procutils.NewCommand("mkdir", "-p", storage.GetSnapshotDir()).Run()
-	}
-	snapshotRecycle(ctx, userCred, false, storage)
-}
-
-func snapshotRecycle(ctx context.Context, userCred mcclient.TokenCredential, isStart bool, storage IStorage) {
-	log.Infof("Snapshot Recycle Job Start, storage is  %s, ss dir is %s", storage.GetStorageName(), storage.GetSnapshotDir())
-	res, err := modules.Snapshots.GetById(hostutils.GetComputeSession(ctx), "max-count", nil)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	maxSnapshotCount, err := res.Int("max_count")
-	if err != nil {
-		log.Errorln("Request region get snapshot max count failed")
-		return
-	}
-	files, err := ioutil.ReadDir(storage.GetSnapshotDir())
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	for _, file := range files {
-		checkSnapshots(storage, file.Name(), int(maxSnapshotCount))
-	}
-}
-
-func checkSnapshots(storage IStorage, snapshotDir string, maxSnapshotCount int) {
-	re := regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}_snap$`)
-	if !re.MatchString(snapshotDir) {
-		log.Warningf("snapshot_dir got unexcept file %s", snapshotDir)
-		return
-	}
-	diskId := snapshotDir[:len(snapshotDir)-len(options.HostOptions.SnapshotDirSuffix)]
-	snapshotPath := path.Join(storage.GetSnapshotDir(), snapshotDir)
-
-	// If disk is Deleted, request delete this disk all snapshots
-	if !fileutils2.Exists(path.Join(storage.GetPath(), diskId)) && fileutils2.Exists(snapshotPath) {
-		params := jsonutils.NewDict()
-		params.Set("disk_id", jsonutils.NewString(diskId))
-		_, err := modules.Snapshots.PerformClassAction(
-			hostutils.GetComputeSession(context.Background()),
-			"delete-disk-snapshots", params)
-		if err != nil {
-			log.Infof("Request delele disk %s snapshots failed %s", diskId, err)
+		if len(relInfo.Arch) > 0 {
+			params.Set("os_arch", jsonutils.NewString(relInfo.Arch))
 		}
-		return
+		if len(relInfo.Version) > 0 {
+			params.Set("os_language", jsonutils.NewString(relInfo.Language))
+		}
+		if len(relInfo.CurrentVersion) > 0 {
+			params.Set("os_current_version", jsonutils.NewString(relInfo.CurrentVersion))
+		}
 	}
-
-	snapshots, err := ioutil.ReadDir(snapshotPath)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
-	// if snapshot count greater than maxsnapshot count, do convert
-	if len(snapshots) >= maxSnapshotCount {
-		requestConvertSnapshot(storage, snapshotPath, diskId)
-	}
-}
-
-func requestConvertSnapshot(storage IStorage, snapshotPath, diskId string) {
-	log.Infof("SNPASHOT path %s", snapshotPath)
-	res, err := modules.Disks.GetSpecific(
-		hostutils.GetComputeSession(context.Background()), diskId, "convert-snapshot", nil)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
-	var (
-		deleteSnapshot, _  = res.GetString("delete_snapshot")
-		convertSnapshot, _ = res.GetString("convert_snapshot")
-		pendingDelete, _   = res.Bool("pending_delete")
-	)
-	log.Infof("start convert disk(%s) snapshot(%s), delete_snapshot is %s",
-		diskId, convertSnapshot, deleteSnapshot)
-	convertSnapshotPath := path.Join(snapshotPath, convertSnapshot)
-	outfile := convertSnapshotPath + ".tmp"
-	img, err := qemuimg.NewQemuImage(convertSnapshotPath)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	log.Infof("convertSnapshot path %s", convertSnapshotPath)
-	err = img.Convert2Qcow2To(outfile, true, "", "", "")
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	requestDeleteSnapshot(
-		storage, diskId, snapshotPath, deleteSnapshot,
-		convertSnapshotPath, outfile, pendingDelete,
-	)
 }
 
 func requestDeleteSnapshot(

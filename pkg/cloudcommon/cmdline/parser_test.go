@@ -195,3 +195,155 @@ func TestFetchDiskConfigsByJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestParseIsolatedDevice(t *testing.T) {
+	tests := []struct {
+		desc    string
+		idx     int
+		want    *compute.IsolatedDeviceConfig
+		wantErr bool
+	}{
+		{
+			desc: "device_path=/dev/nvme0",
+			idx:  0,
+			want: &compute.IsolatedDeviceConfig{
+				DevicePath: "/dev/nvme0",
+			},
+		},
+		{
+			desc: "GPU_HPC:device_path=/dev/nvme0",
+			idx:  0,
+			want: &compute.IsolatedDeviceConfig{
+				DevicePath: "/dev/nvme0",
+				Model:      "GPU_HPC",
+			},
+		},
+		{
+			desc: "GPU_HPC:device_path=/dev/nvme0:1d3ce781-2b64-4ee7-8d23-6bbcf478c54b",
+			idx:  0,
+			want: &compute.IsolatedDeviceConfig{
+				Id:         "1d3ce781-2b64-4ee7-8d23-6bbcf478c54b",
+				DevicePath: "/dev/nvme0",
+				Model:      "GPU_HPC",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			got, err := ParseIsolatedDevice(tt.desc, tt.idx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseIsolatedDevice() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseIsolatedDevice() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseBaremetalRootDiskMatcher(t *testing.T) {
+	tests := []struct {
+		args    string
+		want    *compute.BaremetalRootDiskMatcher
+		wantErr bool
+	}{
+		{
+			args: "size=100G",
+			want: &compute.BaremetalRootDiskMatcher{SizeMB: 102400},
+		},
+		{
+			args: "device=/dev/sda",
+			want: &compute.BaremetalRootDiskMatcher{Device: "/dev/sda"},
+		},
+		{
+			args: "size_end=100G",
+			want: &compute.BaremetalRootDiskMatcher{SizeMBRange: &compute.RootDiskMatcherSizeMBRange{End: 102400}},
+		},
+		{
+			args: "size_end=100G,size_start=50G",
+			want: &compute.BaremetalRootDiskMatcher{
+				SizeMBRange: &compute.RootDiskMatcherSizeMBRange{
+					Start: 51200,
+					End:   102400,
+				}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.args, func(t *testing.T) {
+			got, err := ParseBaremetalRootDiskMatcher(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseBaremetalRootDiskMatcher() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseBaremetalRootDiskMatcher() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseNetworkConfig(t *testing.T) {
+	tests := []struct {
+		args string
+		want *compute.NetworkConfig
+	}{
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+			want: &compute.NetworkConfig{Network: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94"},
+		},
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:172.22.121.12",
+			want: &compute.NetworkConfig{
+				Network: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				Address: "172.22.121.12",
+			},
+		},
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:172.22.121.12:[fd:3ffe:3200:90::2]",
+			want: &compute.NetworkConfig{
+				Network:  "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				Address:  "172.22.121.12",
+				Address6: "fd:3ffe:3200:90::2",
+			},
+		},
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:172.22.121.12:[fd:3ffe:3200:90::2]:[teaming]",
+			want: &compute.NetworkConfig{
+				Network:        "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				Address:        "172.22.121.12",
+				Address6:       "fd:3ffe:3200:90::2",
+				RequireTeaming: true,
+			},
+		},
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:172.22.121.12:[fd:3ffe:3200:90::2]:wire=77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+			want: &compute.NetworkConfig{
+				Network:  "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				Address:  "172.22.121.12",
+				Address6: "fd:3ffe:3200:90::2",
+				Wire:     "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+			},
+		},
+		{
+			args: "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:172.22.121.12:[fd:3ffe:3200:90::2]:wire=77a7d3a7-022d-4b48-8bb6-e37ea3a20c94:[try-teaming]",
+			want: &compute.NetworkConfig{
+				Network:    "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				Address:    "172.22.121.12",
+				Address6:   "fd:3ffe:3200:90::2",
+				Wire:       "77a7d3a7-022d-4b48-8bb6-e37ea3a20c94",
+				TryTeaming: true,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.args, func(t *testing.T) {
+			got, err := ParseNetworkConfig(tt.args, 0)
+			if err != nil {
+				t.Errorf("ParseNetworkConfig %s fail %s", tt.args, err)
+			} else if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseNetworkConfig() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

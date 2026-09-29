@@ -24,7 +24,7 @@ type TemplateCreateInput struct {
 	// example: email
 	ContactType string `json:"contact_type"`
 	// description: Template type
-	// enum: title,content,remote
+	// enum: ["title","content","remote"]
 	// example: title
 	TemplateType string `json:"template_type"`
 
@@ -42,14 +42,14 @@ type TemplateCreateInput struct {
 	// example: {"name": "centos7.6"}
 	Example string `json:"example"`
 	// description: Language
-	// enum: cn,en
+	// enum: ["cn","en"]
 	Lang string `json:"lang"`
 }
 
 type TemplateManagerSaveInput struct {
-	ContactType string
-	Templates   []TemplateCreateInput
-	Force       bool
+	ContactType string                `json:"contact_type"`
+	Templates   []TemplateCreateInput `json:"templates"`
+	Force       bool                  `json:"force"`
 }
 
 type TemplateListInput struct {
@@ -61,7 +61,7 @@ type TemplateListInput struct {
 	ContactType string `json:"contact_type"`
 
 	// description: Template type
-	// enum: title,content,remote
+	// enum: ["title","content","remote"]
 	// example: title
 	TemplateType string `json:"template_type"`
 
@@ -71,7 +71,7 @@ type TemplateListInput struct {
 	Topic string `json:"topic"`
 
 	// description: Language
-	// enum: cn,en
+	// enum: ["cn","en"]
 	Lang string `json:"lang"`
 }
 
@@ -501,4 +501,33 @@ const (
 	服务{{ d.service_name}} worker阻塞半小时，请及时检查。`
 	WORK_BLOCK_CONTENT_EN = `{{- $d := .resource_details -}}
 	The service: {{ d.service_name}} worker has been block 30 minutes.Please verify the service in time.`
+)
+
+// TODO
+// 资源挂载\卸载通知
+const (
+// ACTION_ATTACH_TITLE_CN = `{{- $d := .resource_details -}}
+// 操作日志超出设置数量{{ $d.exceed_count }}条，当前{{ $d.current_count }}条`
+// ACTION_ATTACH_TITLE_EN = `{{- $d := .resource_details -}}
+// Action logs excced expected count {{ $d.exceed_count }}, current count is {{ $d.current_count }}`
+// ACTION_ATTACH_CONTENT_CN = `{{- $d := .resource_details.action -}}
+// 当前日志 ID: {{ $d.id }}`
+// ACTION_ATTACH_CONTENT_EN = `{{- $d := .resource_details.action -}}
+// Current log ID: {{ $d.id }}`
+)
+
+const (
+	STATUS_CHANGED_TITLE_CN = `{{- $d := .resource_details -}}
+		{{ $d.project }}项目的
+		{{ .resource_type_display }}{{ $d.name }}状态发生变更`
+	STATUS_CHANGED_TITLE_EN = `{{- $d := .resource_details -}}
+		{{ .resource_type }} {{ $d.name }} {{ if $d.project -}} in project {{ $d.project }} {{ end -}} status changed`
+	STATUS_CHANGED_CONTENT_CN = `{{- $d := .resource_details -}}
+		您在{{ $d.project }}项目的
+		{{- if $d.brand -}}
+		{{ $d.brand }}平台
+		{{- end -}}
+		{{ .resource_type_display }}{{ $d.name }}状态发生变更,原状态为:{{ $d.old_status }},变更后状态为{{$d.new_status }}`
+	STATUS_CHANGED_CONTENT_EN = `{{- $d := .resource_details -}}
+		Your {{ if $d.brand -}} {{ $d.brand }} {{ end -}} {{ .resource_type }} {{ $d.name }} status has changed,old status: {{ $d.old_status }},new_status: {{$d.new_status }}{{ if $d.project -}} in project {{ $d.project }} {{ end -}} `
 )

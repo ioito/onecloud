@@ -14,7 +14,10 @@
 
 package remotefile
 
-import "yunion.io/x/cloudmux/pkg/cloudprovider"
+import (
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/util/netutils"
+)
 
 type SInstanceNic struct {
 	SResourceBase
@@ -31,7 +34,15 @@ func (self *SInstanceNic) GetIP() string {
 	return self.Ip
 }
 
+func (self *SInstanceNic) GetIP6() string {
+	return ""
+}
+
 func (self *SInstanceNic) GetMAC() string {
+	if len(self.Mac) == 0 {
+		ip, _ := netutils.NewIPV4Addr(self.GetIP())
+		return ip.ToMac("00:16:")
+	}
 	return self.Mac
 }
 

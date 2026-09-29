@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -311,6 +312,7 @@ func (w *SWinRegTool) listRegistry(spath string, keySeg []string) ([]string, []s
 }
 
 func (w *SWinRegTool) cmdRegistry(spath string, ops []string, retcode []int) bool {
+	log.Infof("cmdRegistry %s -e %v", GetChntpwPath(), spath)
 	proc := procutils.NewCommand(GetChntpwPath(), "-e", spath)
 	stdin, err := proc.StdinPipe()
 	if err != nil {
@@ -369,7 +371,7 @@ func (w *SWinRegTool) cmdRegistry(spath string, ops []string, retcode []int) boo
 	case err := <-done:
 		if err != nil {
 			if exitStatus, ok := proc.GetExitStatus(err); ok {
-				log.Errorf("exit status: %d", exitStatus)
+				log.Errorf("ops %v exit status: %d", ops, exitStatus)
 				if in, _ := utils.InArray(exitStatus, retcode); in {
 					return true
 				}
@@ -618,6 +620,20 @@ func (w *SWinRegTool) SetDnsServer(nameserver, searchlist string) {
 
 func (w *SWinRegTool) GetProductName() string {
 	prodKey := `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProductName`
+	prodName := w.GetRegistry(prodKey)
+
+	if strings.Contains(prodName, "Windows 10") {
+		// check build number to determine whether it's actually Windows 11
+		buildNumStr := w.GetCurrentBuildNumber()
+		if buildNum, err := strconv.Atoi(strings.TrimSpace(buildNumStr)); err == nil && buildNum >= 22000 {
+			prodName = strings.Replace(prodName, "Windows 10", "Windows 11", 1)
+		}
+	}
+	return prodName
+}
+
+func (w *SWinRegTool) GetCurrentBuildNumber() string {
+	prodKey := `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentBuildNumber`
 	return w.GetRegistry(prodKey)
 }
 
@@ -757,4 +773,21 @@ func (w *SWinRegTool) ResetUSBProfile() {
 	w.DelRegistry(key)
 	key = w.GetCcsKeyPath() + `\Enum\USB`
 	w.DelRegistry(key)
+}
+
+func (w *SWinRegTool) IsNetKVMInstalled() bool {
+	key := w.GetCcsKeyPath() + `\Services\netkvm`
+
+	if !w.KeyExists(key) {
+		log.Errorf("key %s not exist", key)
+		return false
+	}
+
+	imagePath := w.GetRegistry(key + `\ImagePath`)
+	if imagePath == "" {
+		log.Errorf("image path is empty")
+		return false
+	}
+
+	return true
 }

@@ -1,0 +1,887 @@
+package models
+
+import (
+	"context"
+	"database/sql"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
+
+	commonapi "yunion.io/x/onecloud/pkg/apis"
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	apis "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	"yunion.io/x/onecloud/pkg/util/logclient"
+)
+
+func getInstantModelPostOverlayVolumeMountIndex(drv ILLMContainerInstantModelDriver) int {
+	if drv.GetType() == apis.LLM_CONTAINER_COMFYUI {
+		return 1
+	}
+	return 0
+}
+
+func (llm *SLLM) getMountedInstantModels(ctx context.Context, probedExt map[string]apis.LLMInternalInstantMdlInfo) (map[string]struct{}, error) {
+	container, err := llm.GetLLMSContainer(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetSContainer")
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil, nil
+	}
+	volumeMountIndex := getInstantModelPostOverlayVolumeMountIndex(drv)
+	if container.Spec == nil {
+		return nil, errors.Wrap(errors.ErrEmpty, "no Spec")
+	}
+	if volumeMountIndex < 0 || volumeMountIndex >= len(container.Spec.VolumeMounts) {
+		return nil, errors.Wrap(errors.ErrEmpty, "no VolumeMounts")
+	}
+	if container.Spec.VolumeMounts[volumeMountIndex].Disk == nil {
+		return nil, errors.Wrap(errors.ErrEmpty, "no Disk")
+	}
+	if len(container.Spec.VolumeMounts[volumeMountIndex].Disk.PostOverlay) == 0 {
+		return nil, nil
+	}
+	mdlNameToId := make(map[string]string)
+	for mdlId, model := range probedExt {
+		mdlNameToId[model.Name+":"+model.Tag] = mdlId
+	}
+	mdlMap := make(map[string]struct{})
+	postOverlays := container.Spec.VolumeMounts[volumeMountIndex].Disk.PostOverlay
+	for i := range postOverlays {
+		postOverlay := postOverlays[i]
+		mdlId := ""
+		if postOverlay.Image != nil {
+			instMdl, err := GetInstantModelManager().findInstantModelByImageId(postOverlay.Image.Id)
+			if err != nil {
+				return nil, errors.Wrapf(err, "findInstantModelByImageId %s", postOverlay.Image.Id)
+			}
+			if instMdl != nil {
+				mdlId = instMdl.Id
+			}
+		}
+		if mdlId == "" {
+			mdlId = drv.GetInstantModelIdByPostOverlay(postOverlay, mdlNameToId)
+		}
+		if mdlId != "" {
+			mdlMap[mdlId] = struct{}{}
+		}
+	}
+	return mdlMap, nil
+}
+
+func (llm *SLLM) getProbedInstantModelsExt(ctx context.Context, userCred mcclient.TokenCredential, instantModelIds ...string) (map[string]apis.LLMInternalInstantMdlInfo, error) {
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil, nil
+	}
+	return drv.GetProbedInstantModelsExt(ctx, userCred, llm, instantModelIds...)
+}
+
+type sInstantModelStatus struct {
+	apis.LLMInternalInstantMdlInfo
+
+	Probed  bool
+	Mounted bool
+}
+
+func (llm *SLLM) getProbedMountedInstantModels(ctx context.Context, userCred mcclient.TokenCredential) (map[string]*sInstantModelStatus, error) {
+	mdlMap := make(map[string]*sInstantModelStatus)
+	probedExt, errExt := llm.getProbedInstantModelsExt(ctx, userCred)
+	if errExt != nil {
+		return nil, errors.Wrap(errExt, "getProbedInstantModelsExt")
+	}
+
+	for modelId := range probedExt {
+		mdlMap[modelId] = &sInstantModelStatus{
+			LLMInternalInstantMdlInfo: probedExt[modelId],
+			Probed:                    true,
+		}
+	}
+
+	mounted, err := llm.getMountedInstantModels(ctx, probedExt)
+	if err != nil {
+		return nil, errors.Wrap(err, "llm.getMountedInstantModels")
+	}
+	for instantModelId := range mounted {
+		if _, ok := mdlMap[instantModelId]; ok {
+			mdlMap[instantModelId].Mounted = true
+		} else {
+			// 仅 mounted 未 probed 时无 ollama model id，ModelId 留空
+			mdlMap[instantModelId] = &sInstantModelStatus{
+				LLMInternalInstantMdlInfo: apis.LLMInternalInstantMdlInfo{},
+				Mounted:                   true,
+			}
+		}
+	}
+	return mdlMap, nil
+}
+
+func (llm *SLLM) uninstallInstantModel(ctx context.Context, userCred mcclient.TokenCredential, instantModelId string) error {
+	boolFalse := false
+	// uninstalled
+	probed := &boolFalse
+	mounted := &boolFalse
+	_, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, instantModelId, "", "", probed, mounted)
+	if err != nil {
+		return errors.Wrap(err, "uninstallPackage")
+	}
+	return nil
+}
+
+func findInstantModelWithModelInfo(allModels []SLLMInstantModel, mdl apis.ModelInfo) *SLLMInstantModel {
+	for i := range allModels {
+		if allModels[i].InstantModelId == mdl.Id {
+			return &allModels[i]
+		}
+	}
+	return nil
+}
+
+func findModelsToUninstall(allModels []SLLMInstantModel, input apis.LLMSyncModelTaskInput) []SLLMInstantModel {
+	ret := make([]SLLMInstantModel, 0)
+	for i := range input.Models {
+		existingModel := findInstantModelWithModelInfo(allModels, input.Models[i])
+		if existingModel != nil && existingModel.IsMounted && (input.Method == apis.QuickModelUninstall || input.Method == apis.QuickModelReinstall || (!existingModel.IsProbed && input.Method == apis.QuickModelInstall)) {
+			ret = append(ret, *existingModel)
+		}
+	}
+	return ret
+}
+
+func findModelsToUnmount(allModels []SLLMInstantModel, input apis.LLMSyncModelTaskInput) []SLLMInstantModel {
+	ret := make([]SLLMInstantModel, 0)
+	for i := range input.Models {
+		existingModel := findInstantModelWithModelInfo(allModels, input.Models[i])
+		if existingModel != nil && existingModel.IsMounted && (input.Method == apis.QuickModelUninstall || input.Method == apis.QuickModelReinstall || (!existingModel.IsProbed && input.Method == apis.QuickModelInstall)) {
+			ret = append(ret, *existingModel)
+		}
+	}
+	return ret
+}
+
+func isImageInUnmountModels(imageId string, mdls []SLLMInstantModel) (bool, error) {
+	instMdl, err := GetInstantModelManager().findInstantModelByImageId(imageId)
+	if err != nil {
+		return false, errors.Wrap(err, "findInstantAppByImageId")
+	}
+	if instMdl == nil {
+		return false, nil
+	}
+	for i := range mdls {
+		if mdls[i].InstantModelId == instMdl.Id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (llm *SLLM) RefreshInstantModels(ctx context.Context, userCred mcclient.TokenCredential, refresh bool) error {
+	lockman.LockObject(ctx, llm)
+	defer lockman.ReleaseObject(ctx, llm)
+
+	if !llm.LastInstantModelProbe.IsZero() && time.Since(llm.LastInstantModelProbe) < apis.LLM_PROBE_INSTANT_MODEl_INTERVAL_SECOND*time.Second && (!refresh || time.Since(llm.LastInstantModelProbe) < apis.LLM_PROBE_INSTANT_MODEl_INTERVAL_SECOND*time.Second) {
+		// already probed, null operation
+		return nil
+	}
+
+	mdlMap, err := llm.getProbedMountedInstantModels(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "getProbedMountedInstantModels")
+	}
+
+	models, err := llm.FetchModels(nil, nil, nil)
+	if err != nil {
+		return errors.Wrap(err, "FetchModels")
+	}
+
+	var errs []error
+	for i := range models {
+		mdl := models[i]
+		var probed *bool
+		var mounted *bool
+		if status, ok := mdlMap[mdl.InstantModelId]; ok {
+			// probed
+			probed = &status.Probed
+			mounted = &status.Mounted
+			_, err = GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, mdl.InstantModelId, status.Name, status.Tag, probed, mounted)
+			delete(mdlMap, mdl.InstantModelId)
+		} else {
+			// uninstalled
+			err = llm.uninstallInstantModel(ctx, userCred, mdl.InstantModelId)
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(mdlMap) > 0 {
+		for instantModelId, status := range mdlMap {
+			_, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, instantModelId, status.Name, status.Tag, &status.Probed, &status.Mounted)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.NewAggregate(errs)
+	}
+	// update timer
+	_, err = db.Update(llm, func() error {
+		llm.LastInstantModelProbe = time.Now()
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "update last_instant_model_probe")
+	}
+
+	return nil
+}
+
+func (llm *SLLM) PerformQuickModels(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.LLMPerformQuickModelsInput) (*apis.LLMBatchPerformOutput, error) {
+	if !utils.IsInArray(llm.Status, []string{apis.LLM_STATUS_RUNNING, apis.LLM_STATUS_READY}) {
+		return nil, errors.Wrapf(errors.ErrInvalidStatus, "llm:%s(%s) status:%s", llm.Name, llm.Id, llm.Status)
+	}
+
+	llmStatus := llm.Status
+	if len(input.Method) == 0 {
+		input.Method = apis.QuickModelInstall
+	}
+
+	var toInstallSizeGb float64
+	var errs []error
+	for i := range input.Models {
+		// specified by ID
+		if len(input.Models[i].Id) > 0 {
+			instModelObj, err := GetInstantModelManager().FetchByIdOrName(ctx, userCred, input.Models[i].Id)
+			if err != nil {
+				if errors.Cause(err) == sql.ErrNoRows {
+					errs = append(errs, httperrors.NewResourceNotFoundError2(GetInstantModelManager().Keyword(), input.Models[i].Id))
+				} else {
+					errs = append(errs, errors.Wrap(err, "FetchByIdOrName"))
+				}
+			} else {
+				instMdl := instModelObj.(*SInstantModel)
+				input.Models[i].Id = instMdl.Id
+				input.Models[i].ModelId = instMdl.ModelId
+				input.Models[i].Tag = instMdl.ModelTag
+				input.Models[i].LlmType = instMdl.LlmType
+				if input.Method == apis.QuickModelInstall {
+					toInstallSizeGb += float64(instMdl.GetActualSizeMb()) * 1024 * 1024 / 1000 / 1000 / 1000
+				}
+			}
+		} else {
+			mdl, err := GetInstantModelManager().FindInstantModel(input.Models[i].ModelId, input.Models[i].Tag, true)
+			if err != nil {
+				return nil, errors.Wrapf(err, "findInstantModel %s %s", input.Models[i].ModelId, input.Models[i].Tag)
+			}
+			if mdl == nil {
+				errs = append(errs, httperrors.NewResourceNotFoundError2(GetInstantModelManager().Keyword(), input.Models[i].ModelId))
+			} else {
+				input.Models[i].Id = mdl.Id
+				input.Models[i].Tag = mdl.ModelTag
+				input.Models[i].ModelId = mdl.ModelId
+				input.Models[i].LlmType = mdl.LlmType
+			}
+		}
+		if !apis.IsLLMInstantModelType(input.Models[i].LlmType) || !apis.IsLLMInstantModelCompatible(apis.LLMContainerType(input.Models[i].LlmType), llm.GetLLMContainerDriver().GetType()) {
+			errs = append(errs, errors.Wrapf(httperrors.ErrInvalidStatus, "model %s is not of type %s", input.Models[i].Id, llm.GetLLMContainerDriver().GetType()))
+		}
+	}
+	if len(errs) > 0 {
+		return nil, errors.NewAggregate(errs)
+	}
+	if input.Method == apis.QuickModelInstall {
+		if llm.InstantModelQuotaGb > 0 && toInstallSizeGb > float64(llm.InstantModelQuotaGb)-llm.GetTotalInstantModelSizeGb() {
+			return nil, errors.Wrapf(httperrors.ErrOutOfQuota, "toInstallSizeGb %f > InstantAppQuotaGb %d - total %f Gb", toInstallSizeGb, llm.InstantModelQuotaGb, llm.GetTotalInstantModelSizeGb())
+		}
+	}
+
+	task, err := llm.StartLLMInstantModelsSyncTask(ctx, userCred, llmStatus, input, "")
+	if err != nil {
+		return nil, errors.Wrap(err, "StartLLMInstantModelsSyncTask")
+	}
+
+	if input.Method == apis.QuickModelInstall {
+		// save pending quota
+		llm.insertPendingInstantModelQuota(task.Id, toInstallSizeGb)
+	}
+
+	output := apis.LLMBatchPerformOutput{
+		Data: []apis.LLMPerformOutput{
+			{
+				Id:            llm.Id,
+				Name:          llm.Name,
+				RequestStatus: http.StatusOK,
+				TaskId:        task.Id,
+			},
+		},
+		Task: task,
+	}
+	return &output, nil
+}
+
+func (llm *SLLM) StartLLMInstantModelsSyncTask(ctx context.Context, userCred mcclient.TokenCredential, llmStatus string, input apis.LLMPerformQuickModelsInput, parentTaskid string) (*taskman.STask, error) {
+	if !utils.IsInArray(llmStatus, []string{apis.LLM_STATUS_RUNNING, apis.LLM_STATUS_READY}) {
+		return nil, errors.Wrapf(errors.ErrInvalidStatus, "cannot sync models in status %s", llmStatus)
+	}
+	taskInput := apis.LLMSyncModelTaskInput{
+		LLMPerformQuickModelsInput: input,
+		LLMStatus:                  llmStatus,
+	}
+	task, err := taskman.TaskManager.NewTask(ctx, "LLMInstantModelsSyncTask", llm, userCred, jsonutils.Marshal(taskInput).(*jsonutils.JSONDict), parentTaskid, "")
+	if err != nil {
+		return nil, errors.Wrap(err, "NewTask")
+	}
+	err = task.ScheduleRun(nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "ScheduleRun")
+	}
+	return task, nil
+}
+
+func (llm *SLLM) FetchModels(isProbed, isMounted, isSystem *bool) ([]SLLMInstantModel, error) {
+	q := GetLLMInstantModelManager().Query().Equals("llm_id", llm.Id)
+	q = GetLLMInstantModelManager().filterModels(q, isProbed, isMounted, isSystem)
+
+	models := make([]SLLMInstantModel, 0)
+	err := db.FetchModelObjects(GetLLMInstantModelManager(), q, &models)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+	return models, nil
+}
+
+func (llm *SLLM) FetchModelsFullName(isProbed, isMounted *bool) ([]string, error) {
+	models, err := llm.FetchModels(isProbed, isMounted, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModels")
+	}
+	mdlFullNames := make([]string, len(models))
+	for idx, mdl := range models {
+		mdlFullNames[idx] = mdl.InstantModelId
+	}
+	return mdlFullNames, nil
+}
+
+func (llm *SLLM) FetchMountedModelFullName() ([]string, error) {
+	boolTrue := true
+	return llm.FetchModelsFullName(nil, &boolTrue)
+}
+
+func (llm *SLLM) FetchMountedModelInfo() ([]apis.MountedModelInfo, error) {
+	boolTrue := true
+	models, err := llm.FetchModels(nil, &boolTrue, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModels")
+	}
+	result := make([]apis.MountedModelInfo, len(models))
+	for idx, mdl := range models {
+		instMdl, _ := GetInstantModelManager().GetInstantModelById(mdl.InstantModelId)
+		modelIdForDisplay := ""
+		if instMdl != nil {
+			modelIdForDisplay = instMdl.ModelId
+		}
+		result[idx] = apis.MountedModelInfo{
+			FullName: mdl.ModelName + ":" + mdl.Tag,
+			ModelId:  modelIdForDisplay,
+			Id:       mdl.InstantModelId,
+		}
+	}
+	return result, nil
+}
+
+func (llm *SLLM) RequestUnmountModel(ctx context.Context, userCred mcclient.TokenCredential, input apis.LLMSyncModelTaskInput) ([]string, []*commonapi.ContainerVolumeMountDiskPostOverlay, error) {
+	if input.LLMStatus == apis.LLM_STATUS_RUNNING {
+		err := llm.RefreshInstantModels(ctx, userCred, true)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "RefreshInstantModels")
+		}
+	}
+	allModels, err := llm.FetchModels(nil, nil, nil)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FetchModels")
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil, nil, nil
+	}
+
+	if input.LLMStatus == apis.LLM_STATUS_RUNNING {
+		uninstallModels := findModelsToUninstall(allModels, input)
+		for i := range uninstallModels {
+			err := drv.UninstallModel(ctx, userCred, llm, &uninstallModels[i])
+			if err != nil {
+				log.Errorf("fail to uninstall %s", err)
+				continue
+			}
+		}
+	}
+
+	// next found out models that need to unmount
+	unmountModels := findModelsToUnmount(allModels, input)
+	if len(unmountModels) == 0 {
+		return nil, nil, nil
+	}
+
+	container, err := llm.GetLLMSContainer(ctx)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "GetContainer")
+	}
+
+	var unmountOverlays []*commonapi.ContainerVolumeMountDiskPostOverlay
+	volumeMountIndex := getInstantModelPostOverlayVolumeMountIndex(drv)
+	if volumeMountIndex < 0 || volumeMountIndex >= len(container.Spec.VolumeMounts) || container.Spec.VolumeMounts[volumeMountIndex].Disk == nil {
+		return nil, nil, errors.Wrap(errors.ErrEmpty, "no instant model volume mount")
+	}
+	existingOverlays := container.Spec.VolumeMounts[volumeMountIndex].Disk.PostOverlay
+
+	for i := range existingOverlays {
+		eOverlay := existingOverlays[i]
+		if eOverlay.Image != nil && len(eOverlay.Image.Id) > 0 {
+			find, err := isImageInUnmountModels(eOverlay.Image.Id, unmountModels)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "isImageInUnmountModels")
+			}
+			if find {
+				unmountOverlays = append(unmountOverlays, eOverlay)
+			}
+
+		}
+	}
+
+	var modelIds []string
+	for i := range unmountModels {
+		modelIds = append(modelIds, unmountModels[i].InstantModelId)
+	}
+	return modelIds, unmountOverlays, nil
+}
+
+func (llm *SLLM) RequestMountModels(ctx context.Context, userCred mcclient.TokenCredential, input apis.LLMSyncModelTaskInput) ([]string, []string, []*commonapi.ContainerVolumeMountDiskPostOverlay, error) {
+	if input.LLMStatus == apis.LLM_STATUS_RUNNING {
+		err := llm.RefreshInstantModels(ctx, userCred, true)
+		if err != nil {
+			return nil, nil, nil, errors.Wrap(err, "RefreshApps")
+		}
+	}
+	existingMdls, err := llm.FetchModels(nil, nil, nil)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "FetchApps")
+	}
+	log.Debugf("=======RequestMountModels input: %s", jsonutils.Marshal(input).PrettyString())
+	models, overlays, err := llm.getMountingModelsPostOverlay(ctx, input, existingMdls)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "getMountingModelsPostOverlay")
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		// return nil, nil, nil, nil
+		log.Warningf("driver %s does not support instant model operations", llm.GetLLMContainerDriver().GetType())
+	}
+	var mdlIds []string
+	for i := range models {
+		model := models[i]
+		if input.LLMStatus == apis.LLM_STATUS_RUNNING {
+			if drv != nil {
+				err := drv.PreInstallModel(ctx, userCred, llm, &model)
+				if err != nil {
+					log.Errorf("preinstallPackage fail %s", err)
+				}
+			}
+		}
+		mdlIds = append(mdlIds, model.InstantModelId)
+	}
+	targetDirs := make([]string, 0)
+	for i := range overlays {
+		if len(overlays[i].ContainerTargetDir) > 0 {
+			targetDirs = append(targetDirs, overlays[i].ContainerTargetDir)
+		}
+	}
+	return mdlIds, targetDirs, overlays, nil
+}
+
+func (llm *SLLM) TryContainerUnmountPaths(ctx context.Context, userCred mcclient.TokenCredential, s *mcclient.ClientSession, overlays []*commonapi.ContainerVolumeMountDiskPostOverlay, waitSecs int) error {
+	start := time.Now()
+	for time.Since(start) < time.Second*time.Duration(waitSecs) {
+		err := llm.containerUnmountPaths(ctx, userCred, s, overlays)
+		if err != nil {
+			if strings.Contains(err.Error(), string(errors.ErrInvalidStatus)) {
+				// wait
+				time.Sleep(5 * time.Second)
+			} else {
+				return errors.Wrap(err, "containerMountPaths")
+			}
+		} else {
+			// success
+			return nil
+		}
+	}
+	return errors.ErrTimeout
+}
+
+func (llm *SLLM) containerUnmountPaths(ctx context.Context, userCred mcclient.TokenCredential, s *mcclient.ClientSession, overlays []*commonapi.ContainerVolumeMountDiskPostOverlay) error {
+	ctr, err := llm.GetLLMSContainer(ctx)
+	if err != nil {
+		return errors.Wrap(err, "GetSContainer")
+	}
+
+	if !computeapi.ContainerFinalStatus.Has(ctr.Status) {
+		return errors.Wrapf(errors.ErrInvalidStatus, "cannot unmount post path in status %s", ctr.Status)
+	}
+
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil
+	}
+	params := computeapi.ContainerVolumeMountRemovePostOverlayInput{
+		Index:       getInstantModelPostOverlayVolumeMountIndex(drv),
+		PostOverlay: overlays,
+		UseLazy:     true,
+		ClearLayers: true,
+	}
+	_, err = compute.Containers.PerformAction(s, ctr.Id, "remove-volume-mount-post-overlay", jsonutils.Marshal(params))
+	if err != nil {
+		return errors.Wrap(err, "PerformAction remove-volume-mount-post-overlay")
+	}
+	return nil
+}
+
+func (llm *SLLM) TryContainerMountPaths(ctx context.Context, userCred mcclient.TokenCredential, s *mcclient.ClientSession, overlays []*commonapi.ContainerVolumeMountDiskPostOverlay, waitSecs int) error {
+	start := time.Now()
+	for time.Since(start) < time.Second*time.Duration(waitSecs) {
+		err := llm.containerMountPaths(ctx, userCred, s, overlays)
+		if err != nil {
+			if strings.Contains(err.Error(), string(errors.ErrInvalidStatus)) {
+				log.Errorf("containerMountPaths error %s, retry", err)
+				// retry
+				time.Sleep(5 * time.Second)
+			} else {
+				return errors.Wrap(err, "containerMountPaths")
+			}
+		} else {
+			// success
+			return nil
+		}
+	}
+	return errors.ErrTimeout
+}
+
+func (llm *SLLM) containerMountPaths(ctx context.Context, userCred mcclient.TokenCredential, s *mcclient.ClientSession, overlays []*commonapi.ContainerVolumeMountDiskPostOverlay) error {
+	ctr, err := llm.GetLLMSContainer(ctx)
+	if err != nil {
+		return errors.Wrap(err, "GetLLMSContainer")
+	}
+
+	if !computeapi.ContainerFinalStatus.Has(ctr.Status) {
+		return errors.Wrapf(errors.ErrInvalidStatus, "cannot mount post path in status %s", ctr.Status)
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil
+	}
+	params := computeapi.ContainerVolumeMountAddPostOverlayInput{
+		Index:       getInstantModelPostOverlayVolumeMountIndex(drv),
+		PostOverlay: overlays,
+	}
+	_, err = compute.Containers.PerformAction(s, ctr.Id, "add-volume-mount-post-overlay", jsonutils.Marshal(params))
+	if err != nil {
+		return errors.Wrap(err, "PerformAction add-volume-mount-post-overlay")
+	}
+	return nil
+}
+
+func (llm *SLLM) MarkInstantModelsUnmounted(ctx context.Context, userCred mcclient.TokenCredential, llmStatus string, mdlIds []string) error {
+	return llm.markInstantModelsMounted(ctx, userCred, llmStatus, mdlIds, false)
+}
+
+func (llm *SLLM) MarkInstantModelsMounted(ctx context.Context, userCred mcclient.TokenCredential, llmStatus string, mdlIds []string) error {
+	return llm.markInstantModelsMounted(ctx, userCred, llmStatus, mdlIds, true)
+}
+
+func (llm *SLLM) markInstantModelsMounted(ctx context.Context, userCred mcclient.TokenCredential, llmStatus string, mdlIds []string, mounted bool) error {
+	boolFalse := false
+	boolTrue := true
+	var isProbed *bool
+	if !mounted {
+		isProbed = &boolFalse
+	} else {
+		isProbed = &boolTrue
+	}
+
+	var errs []error
+	for i := range mdlIds {
+		_, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, mdlIds[i], "", "", isProbed, &mounted)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.NewAggregate(errs)
+	}
+	if llmStatus == apis.LLM_STATUS_RUNNING {
+		err := llm.RefreshInstantModels(ctx, userCred, true)
+		if err != nil {
+			return errors.Wrap(err, "RefreshApps")
+		}
+	}
+	mountedModelsFullName, err := llm.FetchMountedModelFullName()
+	if err != nil {
+		return errors.Wrap(err, "FetchMountedModelFullName")
+	}
+	{
+		// save mounted apps to volume
+		err := llm.UpdateVolumeMountedModelFullNames(mountedModelsFullName)
+		if err != nil {
+			return errors.Wrap(err, "UpdateVolumeMountedModelFullNames")
+		}
+	}
+	logclient.AddActionLogWithContext(ctx, llm, logclient.ACT_UPDATE, mountedModelsFullName, userCred, true)
+	return nil
+}
+
+func (llm *SLLM) UpdateVolumeMountedModelFullNames(mdlFullNames []string) error {
+	volume, err := llm.GetVolume()
+	if err != nil {
+		return errors.Wrap(err, "GetVolume")
+	}
+	return volume.UpdateMountedModelFullNames(mdlFullNames)
+}
+
+type mdlFullNameInfo struct {
+	InstantModelId string // instant model 主键 id
+	ModelFullName  string
+	IsMounted      bool
+}
+
+func (llm *SLLM) UpdateMountedModelFullNames(ctx context.Context, userCred mcclient.TokenCredential, mdlinfos []string, isReset bool, imageId string, skuId string) error {
+	mdlFullNameInfos := make(map[string]*mdlFullNameInfo)
+	for i := range mdlinfos {
+		parts := strings.Split(mdlinfos[i], "@")
+		mdlFullNameInfos[parts[0]] = &mdlFullNameInfo{
+			InstantModelId: parts[0],
+			ModelFullName:  parts[1],
+			IsMounted:      false,
+		}
+	}
+
+	preinstallModel := true
+
+	if preinstallModel {
+		sku, err := llm.GetLLMSku(skuId)
+		if err != nil {
+			return errors.Wrap(err, "GetLLMSku")
+		}
+		var deletedModelIds []string
+		if !isReset {
+			deletedModelIds, err = GetLLMInstantModelManager().getDeletedModelIds(llm.Id)
+			if err != nil {
+				return errors.Wrap(err, "getDeletedModelIds")
+			}
+		}
+		mountedModels := GetEffectiveMountedModels(llm, sku)
+		for i := range mountedModels {
+			instMdl, err := GetInstantModelManager().FetchByIdOrName(ctx, userCred, mountedModels[i])
+			if err != nil {
+				return errors.Wrap(err, "FetchByIdOrName")
+			}
+			instantModle := instMdl.(*SInstantModel)
+			if !isReset && slices.Contains(deletedModelIds, instantModle.Id) {
+				// if not reset, and the model is deleted, skip it
+				continue
+			}
+			if _, ok := mdlFullNameInfos[instantModle.Id]; !ok {
+				mdlFullNameInfos[instantModle.Id] = &mdlFullNameInfo{
+					InstantModelId: instantModle.Id,
+					ModelFullName:  instantModle.ModelName + ":" + instantModle.ModelTag,
+					IsMounted:      false,
+				}
+			}
+		}
+	}
+
+	boolTrue := true
+	boolFalse := false
+	mountedModels, err := llm.FetchModels(nil, &boolTrue, nil)
+	if err != nil {
+		return errors.Wrap(err, "FetchApps")
+	}
+	for i := range mountedModels {
+		find := false
+		if _, ok := mdlFullNameInfos[mountedModels[i].InstantModelId]; ok {
+			find = true
+			mdlFullNameInfos[mountedModels[i].InstantModelId].IsMounted = true
+		}
+		if isReset && !find {
+			// remove instant model not in mdlInfos
+			mountedModel := mountedModels[i]
+			log.Debugf("UpdateMountedModelFullNames remove model %s", mountedModel.InstantModelId)
+			_, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, mountedModel.InstantModelId, "", "", &boolFalse, &boolFalse)
+			if err != nil {
+				return errors.Wrap(err, "remove instant model")
+			}
+		}
+	}
+
+	installModelFullNames := make([]string, 0)
+	for _, mdlFullNameInfo := range mdlFullNameInfos {
+		installModelFullNames = append(installModelFullNames, mdlFullNameInfo.InstantModelId)
+		if !mdlFullNameInfo.IsMounted {
+			modelName, modelTag, _ := llm.GetLargeLanguageModelName(mdlFullNameInfo.ModelFullName)
+			_, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, mdlFullNameInfo.InstantModelId, modelName, modelTag, &boolFalse, &boolTrue)
+			if err != nil {
+				return errors.Wrap(err, "install model")
+			}
+		}
+	}
+
+	volume, _ := llm.GetVolume()
+	if volume != nil {
+		err := llm.UpdateVolumeMountedModelFullNames(installModelFullNames)
+		if err != nil {
+			return errors.Wrap(err, "UpdateVolumeMountedModelFullNames")
+		}
+	}
+
+	return nil
+}
+
+func (llm *SLLM) GetMountedModelsPostOverlay() ([]*commonapi.ContainerVolumeMountDiskPostOverlay, error) {
+	boolTrue := true
+	mdls, err := llm.FetchModels(nil, &boolTrue, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchApps")
+	}
+	if len(mdls) == 0 {
+		return nil, nil
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil, nil
+	}
+	overlays, err := models2overlays(drv, mdls, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "models2overlays")
+	}
+	return overlays, nil
+}
+
+func (llm *SLLM) getMountingModelsPostOverlay(ctx context.Context, input apis.LLMSyncModelTaskInput, existingMdls []SLLMInstantModel) ([]SLLMInstantModel, []*commonapi.ContainerVolumeMountDiskPostOverlay, error) {
+	var models []SLLMInstantModel
+	for i := range input.Models {
+		if input.Method == apis.QuickModelInstall || input.Method == apis.QuickModelReinstall {
+			mdl := input.Models[i]
+			if input.Method == apis.QuickModelInstall {
+				existingModel := findInstantModelWithModelInfo(existingMdls, mdl)
+				if existingModel != nil && (existingModel.IsProbed || existingModel.IsMounted) {
+					// if the model is already probed or mounted, skip mount
+					continue
+				}
+			}
+			model, err := GetLLMInstantModelManager().updateInstantModel(ctx, llm.Id, mdl.Id, mdl.DisplayName, mdl.Tag, nil, nil)
+			if err != nil {
+				return nil, nil, errors.Wrapf(err, "updateInstantModel %s", mdl.Id)
+			}
+			models = append(models, *model)
+		}
+	}
+	if len(models) == 0 {
+		return nil, nil, nil
+	}
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil, nil, nil
+	}
+	overlays, err := models2overlays(drv, models, true)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "models2overlays")
+	}
+	return models, overlays, nil
+}
+
+func models2overlays(drv ILLMContainerInstantModelDriver, models []SLLMInstantModel, isInstall bool) ([]*commonapi.ContainerVolumeMountDiskPostOverlay, error) {
+	var errs []error
+	var allDirs []apis.LLMMountDirInfo
+	for i := range models {
+		mdlDirs, err := models[i].getMountPaths(isInstall)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		allDirs = append(allDirs, mdlDirs...)
+	}
+	if len(allDirs) == 0 {
+		if len(errs) > 0 {
+			return nil, errors.Wrap(errors.NewAggregate(errs), "getMountPaths")
+		}
+		return nil, nil
+	}
+	if len(errs) > 0 {
+		log.Errorf("models2overlays getMountPaths error %s", errors.NewAggregate(errs))
+	}
+	var overlays []*commonapi.ContainerVolumeMountDiskPostOverlay
+	for i := range allDirs {
+		overlay := drv.GetDirPostOverlay(allDirs[i])
+		overlays = append(overlays, overlay)
+	}
+	return overlays, nil
+}
+
+func (llm *SLLM) InstallInstantModels(ctx context.Context, userCred mcclient.TokenCredential, dirs []string, mdlIds []string) error {
+	drv, err := GetLLMContainerInstantModelDriver(llm.GetLLMContainerDriver().GetType())
+	if err != nil {
+		return nil
+	}
+	return drv.InstallModel(ctx, userCred, llm, dirs, mdlIds)
+}
+
+func (llm *SLLM) EnsureInstantModelsInstalled(ctx context.Context, userCred mcclient.TokenCredential, mdlIds []string) error {
+	mdlMap, err := llm.getProbedInstantModelsExt(ctx, userCred, mdlIds...)
+	if err != nil {
+		return errors.Wrap(err, "FetchApps")
+	}
+	if len(mdlIds) == 0 {
+		return nil
+	}
+	instModels := make(map[string]SInstantModel)
+	if err := db.FetchModelObjectsByIds(GetInstantModelManager(), "id", mdlIds, &instModels); err != nil {
+		return errors.Wrap(err, "FetchModelObjectsByIds")
+	}
+	var errs []error
+	for _, mdlId := range mdlIds {
+		if _, ok := mdlMap[mdlId]; ok {
+			continue
+		}
+		instModel, ok := instModels[mdlId]
+		if !ok {
+			errs = append(errs, errors.Wrapf(errors.ErrNotFound, "mdlId %s", mdlId))
+			continue
+		}
+		found := false
+		for _, info := range mdlMap {
+			if info.ModelId == instModel.ModelId {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, errors.Wrapf(errors.ErrNotFound, "mdlId %s", mdlId))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.NewAggregate(errs)
+	}
+	return nil
+}

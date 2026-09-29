@@ -18,10 +18,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/sqlchemy"
 
@@ -29,9 +31,12 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=baremetalagent
+// +onecloud:swagger-gen-model-plural=baremetalagents
 type SBaremetalagentManager struct {
 	db.SStandaloneResourceBaseManager
 	SZoneResourceBaseManager
@@ -42,13 +47,13 @@ type SBaremetalagent struct {
 	SZoneResourceBase `width:"128" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 
 	Status     string `width:"36" charset:"ascii" nullable:"false" default:"disable" create:"optional"`
-	AccessIp   string `width:"16" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
+	AccessIp   string `width:"64" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 	ManagerUri string `width:"256" charset:"ascii" nullable:"true" list:"admin" update:"admin" create:"admin_required"`
 	// ZoneId     string `width:"128" charset:"ascii" nullable:"false" list:"admin" update:"admin" create:"admin_required"`
 
 	AgentType string `width:"32" charset:"ascii" nullable:"true" default:"baremetal" list:"admin" update:"admin" create:"admin_optional"`
 
-	Version string `width:"64" charset:"ascii" list:"admin" update:"admin" create:"admin_optional"` // Column(VARCHAR(64, charset='ascii'))
+	Version string `width:"128" charset:"ascii" list:"admin" update:"admin" create:"admin_optional"` // Column(VARCHAR(64, charset='ascii'))
 
 	StoragecacheId    string `width:"36" charset:"ascii" nullable:"true" list:"admin" get:"admin" update:"admin" create:"admin_optional"`
 	DisableImageCache bool   `default:"false" list:"admin" create:"admin_optional" update:"admin"`
@@ -87,14 +92,14 @@ func (self *SBaremetalagent) ValidateUpdateData(ctx context.Context, userCred mc
 		count, err := BaremetalagentManager.Query().Equals("manager_uri", mangerUri).
 			NotEquals("id", self.Id).CountWithError()
 		if err != nil {
-			return input, httperrors.NewInternalServerError("check agent uniqness fail %s", err)
+			return input, httperrors.NewInternalServerError("check agent uniqueness failed %s", err)
 		}
 		if count > 0 {
 			return input, httperrors.NewConflictError("Conflict manager_uri %s", mangerUri)
 		}
 	}
 	if len(input.ZoneId) > 0 {
-		_, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+		_, input.ZoneResourceInput, err = ValidateZoneResourceInput(ctx, userCred, input.ZoneResourceInput)
 		if err != nil {
 			return input, errors.Wrap(err, "ValidateZoneResourceInput")
 		}
@@ -114,7 +119,7 @@ func (manager *SBaremetalagentManager) ValidateCreateData(ctx context.Context, u
 	}
 	count, err := manager.Query().Equals("manager_uri", mangerUri).CountWithError()
 	if err != nil {
-		return input, httperrors.NewInternalServerError("check agent uniqness fail %s", err)
+		return input, httperrors.NewInternalServerError("check agent uniqueness failed %s", err)
 	}
 	if count > 0 {
 		return input, httperrors.NewDuplicateResourceError("Duplicate manager_uri %s", mangerUri)
@@ -122,7 +127,7 @@ func (manager *SBaremetalagentManager) ValidateCreateData(ctx context.Context, u
 	if len(input.ZoneId) == 0 {
 		return input, errors.Wrap(httperrors.ErrMissingParameter, "zone/zone_id")
 	}
-	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(ctx, userCred, input.ZoneResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateZoneResourceInput")
 	}
@@ -247,6 +252,16 @@ func (manager *SBaremetalagentManager) GetAgent(agentType api.TAgentType, zoneId
 		}
 	}
 	return &agents[0]
+}
+
+func (h *SBaremetalagent) GetDetailsAppOptions(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	return h.Request(ctx, userCred, httputils.GET, "/app-options", nil, nil)
+}
+
+func (self *SBaremetalagent) Request(ctx context.Context, userCred mcclient.TokenCredential, method httputils.THttpMethod, url string, headers http.Header, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	s := auth.GetSession(ctx, userCred, "")
+	_, ret, err := s.JSONRequest(self.ManagerUri, "", method, url, headers, body)
+	return ret, err
 }
 
 func (cache *SBaremetalagent) getStorageCache() (*SStoragecache, error) {

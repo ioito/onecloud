@@ -53,7 +53,6 @@ type Attributes struct {
 	NetworkPerformance          string `json:"networkPerformance"`
 	Servicename                 string `json:"servicename"`
 	InstanceType                string `json:"instanceType"`
-	InstanceSku                 string `json:"instancesku"`
 	Tenancy                     string `json:"tenancy"`
 	Usagetype                   string `json:"usagetype"`
 	NormalizationSizeFactor     string `json:"normalizationSizeFactor"`
@@ -116,6 +115,9 @@ type InstanceType struct {
 	MemoryInfo   struct {
 		SizeInMiB int `xml:"sizeInMiB"`
 	} `xml:"memoryInfo"`
+	VCpuInfo struct {
+		DefaultVCpus int `xml:"defaultVCpus"`
+	} `xml:"vCpuInfo"`
 }
 
 func (self *SRegion) GetInstanceType(name string) (*InstanceType, error) {
@@ -135,10 +137,10 @@ func (self *SRegion) GetInstanceType(name string) (*InstanceType, error) {
 			return &ret.InstanceTypeSet[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, name)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", name)
 }
 
-func (self *SRegion) GetInstanceTypes() ([]SInstanceType, error) {
+func (self *SRegion) GetInstanceTypes(instanceType string) ([]SInstanceType, error) {
 	filters := map[string]string{
 		"regionCode":      self.RegionId,
 		"operatingSystem": "Linux",
@@ -148,6 +150,10 @@ func (self *SRegion) GetInstanceTypes() ([]SInstanceType, error) {
 		"preInstalledSw":  "NA",
 		"tenancy":         "Shared",
 		"capacitystatus":  "Used",
+	}
+
+	if len(instanceType) > 0 {
+		filters["instanceType"] = instanceType
 	}
 
 	params := []ProductFilter{}

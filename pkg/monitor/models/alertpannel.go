@@ -49,6 +49,8 @@ func init() {
 	AlertPanelManager.SetVirtualObject(AlertPanelManager)
 }
 
+// +onecloud:swagger-gen-model-singular=alertpanel
+// +onecloud:swagger-gen-model-plural=alertpanels
 type SAlertPanelManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	db.SScopedResourceBaseManager
@@ -58,8 +60,8 @@ type SAlertPanel struct {
 	db.SStatusStandaloneResourceBase
 	db.SScopedResourceBase
 
-	Settings jsonutils.JSONObject `nullable:"false" list:"user" create:"required" update:"user"`
-	Message  string               `charset:"utf8" list:"user" create:"optional" update:"user"`
+	Settings *monitor.AlertSetting `nullable:"false" list:"user" create:"required" update:"user"`
+	Message  string                `charset:"utf8" list:"user" create:"optional" update:"user"`
 }
 
 func (manager *SAlertPanelManager) NamespaceScope() rbacscope.TRbacScope {
@@ -115,7 +117,7 @@ func (man *SAlertPanelManager) ValidateCreateData(
 	} else {
 		for _, query := range data.CommonMetricInputQuery.MetricQuery {
 			if len(query.Comparator) != 0 {
-				if !utils.IsInStringArray(getQueryEvalType(query.Comparator), validators.EvaluatorDefaultTypes) {
+				if !utils.IsInStringArray(string(getQueryEvalType(query.Comparator)), validators.EvaluatorDefaultTypes) {
 					return data, httperrors.NewInputParameterError("the Comparator is illegal: %s", query.Comparator)
 				}
 			}
@@ -125,7 +127,7 @@ func (man *SAlertPanelManager) ValidateCreateData(
 				}
 			}
 		}
-		err := CommonAlertManager.ValidateMetricQuery(&data.CommonMetricInputQuery, data.Scope, ownerId)
+		err := CommonAlertManager.ValidateMetricQuery(&data.CommonMetricInputQuery, data.Scope, ownerId, false)
 		if err != nil {
 			return data, errors.Wrap(err, "metric query error")
 		}
@@ -172,9 +174,9 @@ func (panel *SAlertPanel) CustomizeCreate(
 	query jsonutils.JSONObject,
 	data jsonutils.JSONObject,
 ) error {
-	dashboardId, err := data.GetString("dashboard_id")
+	dashboardId, _ := data.GetString("dashboard_id")
 	if len(dashboardId) == 0 {
-		return errors.Wrap(err, "panel CustomizeCreate can not get dashboard_id")
+		return errors.Wrap(httperrors.ErrInputParameter, "panel CustomizeCreate can not get dashboard_id")
 	}
 	dash, _ := AlertDashBoardManager.getDashboardByid(dashboardId)
 	panel.ProjectId = dash.ProjectId
@@ -231,21 +233,17 @@ func (man *SAlertPanelManager) FetchCustomizeColumns(
 }
 
 func (panel *SAlertPanel) GetMoreDetails(out monitor.PanelDetails) (monitor.PanelDetails, error) {
-	setting, err := panel.GetSettings()
-	if err != nil {
-		return out, err
-	}
-	if len(setting.Conditions) == 0 {
+	if panel.Settings == nil || len(panel.Settings.Conditions) == 0 {
 		return out, nil
 	}
 
-	out.CommonAlertMetricDetails = make([]*monitor.CommonAlertMetricDetails, len(setting.Conditions))
-	for i, cond := range setting.Conditions {
+	out.CommonAlertMetricDetails = make([]*monitor.CommonAlertMetricDetails, len(panel.Settings.Conditions))
+	for i, cond := range panel.Settings.Conditions {
 		metricDetails := panel.GetCommonAlertMetricDetailsFromAlertCondition(i, &cond)
 		out.CommonAlertMetricDetails[i] = metricDetails
-		setting.Conditions[i] = cond
+		panel.Settings.Conditions[i] = cond
 	}
-	panel.Settings = jsonutils.Marshal(setting)
+	out.Settings = panel.Settings
 	return out, nil
 }
 
@@ -255,17 +253,6 @@ func (dash *SAlertPanel) GetCommonAlertMetricDetailsFromAlertCondition(index int
 	metricDetails := new(monitor.CommonAlertMetricDetails)
 	getCommonAlertMetricDetailsFromCondition(cond, metricDetails)
 	return metricDetails
-}
-
-func (dash *SAlertPanel) GetSettings() (*monitor.AlertSetting, error) {
-	setting := new(monitor.AlertSetting)
-	if dash.Settings == nil {
-		return setting, nil
-	}
-	if err := dash.Settings.Unmarshal(setting); err != nil {
-		return nil, errors.Wrapf(err, "dashboard %s unmarshal", dash.GetId())
-	}
-	return setting, nil
 }
 
 func (dash *SAlertPanel) ValidateUpdateData(
@@ -289,7 +276,7 @@ func (dash *SAlertPanel) ValidateUpdateData(
 				return data, errors.Wrap(err, "metric_query Unmarshal error")
 			}
 			if len(query.Comparator) != 0 {
-				if !utils.IsInStringArray(getQueryEvalType(query.Comparator), validators.EvaluatorDefaultTypes) {
+				if !utils.IsInStringArray(string(getQueryEvalType(query.Comparator)), validators.EvaluatorDefaultTypes) {
 					return data, httperrors.NewInputParameterError("the Comparator is illegal: %s", query.Comparator)
 				}
 			}
@@ -309,7 +296,7 @@ func (dash *SAlertPanel) ValidateUpdateData(
 			ownerId = userCred
 		}
 		scope, _ := data.GetString("scope")
-		err = CommonAlertManager.ValidateMetricQuery(metricQuery, scope, ownerId)
+		err = CommonAlertManager.ValidateMetricQuery(metricQuery, scope, ownerId, false)
 		if err != nil {
 			return data, errors.Wrap(err, "metric query error")
 		}

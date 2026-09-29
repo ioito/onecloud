@@ -25,32 +25,40 @@ import (
 	"yunion.io/x/onecloud/pkg/compute/capabilities"
 	"yunion.io/x/onecloud/pkg/compute/misc"
 	"yunion.io/x/onecloud/pkg/compute/models"
+	baremetalmodels "yunion.io/x/onecloud/pkg/compute/models/baremetal"
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/compute/specs"
 	"yunion.io/x/onecloud/pkg/compute/sshkeys"
 	"yunion.io/x/onecloud/pkg/compute/usages"
 )
 
-func InitHandlers(app *appsrv.Application) {
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
+
+	models.InitGuestNetworkTrafficLog()
 
 	db.RegistUserCredCacheUpdater()
 
 	db.AddScopeResourceCountHandler("", app)
+	if !isSlave {
+		db.AddHistoryDataCleanHandler("", app)
+	}
 
-	quotas.AddQuotaHandler(&models.QuotaManager.SQuotaBaseManager, "", app)
-	quotas.AddQuotaHandler(&models.RegionQuotaManager.SQuotaBaseManager, "", app)
-	quotas.AddQuotaHandler(&models.ZoneQuotaManager.SQuotaBaseManager, "", app)
-	quotas.AddQuotaHandler(&models.ProjectQuotaManager.SQuotaBaseManager, "", app)
-	quotas.AddQuotaHandler(&models.DomainQuotaManager.SQuotaBaseManager, "", app)
-	quotas.AddQuotaHandler(&models.InfrasQuotaManager.SQuotaBaseManager, "", app)
+	quotas.AddQuotaHandler(&models.QuotaManager.SQuotaBaseManager, "", app, isSlave)
+	quotas.AddQuotaHandler(&models.RegionQuotaManager.SQuotaBaseManager, "", app, isSlave)
+	quotas.AddQuotaHandler(&models.ZoneQuotaManager.SQuotaBaseManager, "", app, isSlave)
+	quotas.AddQuotaHandler(&models.ProjectQuotaManager.SQuotaBaseManager, "", app, isSlave)
+	quotas.AddQuotaHandler(&models.DomainQuotaManager.SQuotaBaseManager, "", app, isSlave)
+	quotas.AddQuotaHandler(&models.InfrasQuotaManager.SQuotaBaseManager, "", app, isSlave)
 
 	usages.AddUsageHandler("", app)
 	usages.AddHistoryUsageHandler("", app)
 	capabilities.AddCapabilityHandler("", app)
 	specs.AddSpecHandler("", app)
 	sshkeys.AddSshKeysHandler("", app)
-	taskman.AddTaskHandler("", app)
+
+	taskman.AddTaskHandler("", app, isSlave)
+
 	misc.AddMiscHandler("", app)
 
 	app_common.ExportOptionsHandler(app, &options.Options)
@@ -59,6 +67,7 @@ func InitHandlers(app *appsrv.Application) {
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
 		db.UserCacheManager,
 		db.TenantCacheManager,
 		db.SharedResourceManager,
@@ -97,7 +106,11 @@ func InitHandlers(app *appsrv.Application) {
 		models.CloudimageManager,
 
 		models.WafRuleStatementManager,
-		models.BillingResourceCheckManager,
+
+		models.LoadbalancerSecurityGroupManager,
+
+		models.HostFileJointsManager,
+		models.SnapshotPolicyDiskManager,
 	} {
 		db.RegisterModelManager(manager)
 	}
@@ -119,8 +132,10 @@ func InitHandlers(app *appsrv.Application) {
 		models.StoragecacheManager,
 		models.CachedimageManager,
 		models.HostManager,
+		models.HostDmesgLogManager,
 		models.SchedtagManager,
 		models.GuestManager,
+		models.GetContainerManager(),
 		models.GroupManager,
 		models.DiskManager,
 		models.NetworkManager,
@@ -131,8 +146,8 @@ func InitHandlers(app *appsrv.Application) {
 		models.IsolatedDeviceManager,
 		models.IsolatedDeviceModelManager,
 		models.SecurityGroupManager,
-		models.SecurityGroupCacheManager,
 		models.SecurityGroupRuleManager,
+		models.IpSetManager,
 		models.ElasticipManager,
 		models.NatGatewayManager,
 		models.NatDEntryManager,
@@ -140,7 +155,7 @@ func InitHandlers(app *appsrv.Application) {
 		models.InstanceSnapshotManager,
 		models.SnapshotManager,
 		models.SnapshotPolicyManager,
-		models.SnapshotPolicyCacheManager,
+		models.SnapshotPolicyResourceManager,
 		models.BaremetalagentManager,
 		models.LoadbalancerManager,
 		models.LoadbalancerListenerManager,
@@ -151,12 +166,14 @@ func InitHandlers(app *appsrv.Application) {
 		models.LoadbalancerAclManager,
 		models.LoadbalancerAgentManager,
 		models.LoadbalancerClusterManager,
-		models.CachedLoadbalancerAclManager,
-		models.CachedLoadbalancerCertificateManager,
+		models.LoadbalancerHealthCheckManager,
 		models.RouteTableManager,
 		models.RouteTableAssociationManager,
 		models.RouteTableRouteSetManager,
 		models.InterVpcNetworkRouteSetManager,
+		models.GuestScreenDumpManager,
+		models.BillingResourceCheckManager,
+		models.GuestnetworksecgroupManager,
 
 		models.SchedpolicyManager,
 		models.DynamicschedtagManager,
@@ -202,17 +219,13 @@ func InitHandlers(app *appsrv.Application) {
 		models.FileSystemManager,
 		models.AccessGroupManager,
 		models.AccessGroupRuleManager,
-		models.AccessGroupCacheManager,
 		models.MountTargetManager,
 
 		models.ProjectMappingManager,
 
 		models.WafRuleGroupManager,
-		models.WafRuleGroupCacheManager,
 		models.WafIPSetManager,
-		models.WafIPSetCacheManager,
 		models.WafRegexSetManager,
-		models.WafRegexSetCacheManager,
 		models.WafInstanceManager,
 		models.WafRuleManager,
 
@@ -244,17 +257,29 @@ func InitHandlers(app *appsrv.Application) {
 		models.ModelartsPoolSkuManager,
 
 		models.MiscResourceManager,
+
+		models.SSLCertificateManager,
+
+		baremetalmodels.BaremetalProfileManager,
+
+		models.HostFileManager,
+
+		models.AiGatewayManager,
+
+		models.GuestNetworkTrafficLogManager,
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 
 	for _, manager := range []db.IJointModelManager{
 		models.HostwireManagerDeprecated,
 		models.HostnetworkManager,
 		models.HoststorageManager,
+		models.HostBackupstorageManager,
 		models.HostschedtagManager,
+		models.HostIsolatedDeviceModelManager,
 		models.StorageschedtagManager,
 		models.NetworkschedtagManager,
 		models.CloudproviderschedtagManager,
@@ -264,13 +289,13 @@ func InitHandlers(app *appsrv.Application) {
 		models.GuestsecgroupManager,
 		models.LoadbalancernetworkManager,
 		models.GuestdiskManager,
+		models.GuestIsolatedDeviceManager,
 		models.GroupnetworkManager,
 		models.GroupguestManager,
 		models.StoragecachedimageManager,
 		models.CloudproviderRegionManager,
 		models.DBInstanceNetworkManager,
 		models.NetworkinterfacenetworkManager,
-		models.SnapshotPolicyDiskManager,
 		models.InstanceSnapshotJointManager,
 		models.DnsZoneVpcManager,
 		models.DBInstanceSecgroupManager,
@@ -280,6 +305,6 @@ func InitHandlers(app *appsrv.Application) {
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewJointModelHandler(manager)
-		dispatcher.AddJointModelDispatcher("", app, handler)
+		dispatcher.AddJointModelDispatcher("", app, handler, isSlave)
 	}
 }

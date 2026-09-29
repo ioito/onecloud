@@ -22,9 +22,12 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
 	hostapi "yunion.io/x/onecloud/pkg/apis/host"
+	schedapi "yunion.io/x/onecloud/pkg/apis/scheduler"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/hostman/guestman"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
@@ -57,6 +60,10 @@ func AddGuestTaskHandler(prefix string, app *appsrv.Application) {
 			fmt.Sprintf("%s/%s/prepare-import-from-libvirt", prefix, keyWord),
 			auth.Authenticate(guestPrepareImportFormLibvirt))
 
+		app.AddHandler("POST",
+			fmt.Sprintf("%s/%s/upload-status", prefix, keyWord),
+			auth.Authenticate(uploadStatus))
+
 		app.AddHandler("DELETE",
 			fmt.Sprintf("%s/%s/<sid>", prefix, keyWord),
 			auth.Authenticate(deleteGuest))
@@ -69,6 +76,7 @@ func AddGuestTaskHandler(prefix string, app *appsrv.Application) {
 			"stop":                     guestStop,
 			"monitor":                  guestMonitor,
 			"sync":                     guestSync,
+			"set-port-mapping":         guestSetPortMapping,
 			"suspend":                  guestSuspend,
 			"io-throttle":              guestIoThrottle,
 			"snapshot":                 guestSnapshot,
@@ -104,6 +112,11 @@ func AddGuestTaskHandler(prefix string, app *appsrv.Application) {
 			"qga-guest-info-task":      qgaGuestInfoTask,
 			"qga-get-network":          qgaGetNetwork,
 			"qga-set-network":          qgaSetNetwork,
+			"qga-get-os-info":          qgaGetOsInfo,
+			"start-rescue":             guestStartRescue,
+			"guest-screen-dump":        guestScreenDump,
+			"upload-status":            guestUploadStatus,
+			"reset-uefi-vars":          guestResetUefiVars,
 		} {
 			app.AddHandler("POST",
 				fmt.Sprintf("%s/%s/<sid>/%s", prefix, keyWord, action),
@@ -128,7 +141,7 @@ func guestActions(f actionFunc) appsrv.FilterHandler {
 		res, err := f(ctx, userCred, sid, body)
 		if err != nil {
 			hostutils.Response(ctx, w, err)
-		} else if res != nil {
+		} else if !gotypes.IsNil(res) {
 			hostutils.Response(ctx, w, res)
 		} else {
 			hostutils.ResponseOk(ctx, w)
@@ -139,7 +152,7 @@ func guestActions(f actionFunc) appsrv.FilterHandler {
 func getStatus(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	params, _, _ := appsrv.FetchEnv(ctx, w, r)
 	sid := params["<sid>"]
-	hostutils.DelayTaskWithoutReqctx(ctx, guestman.GetGuestManager().StatusWithBlockJobsCount, sid)
+	hostutils.DelayTaskWithoutReqctx(ctx, guestman.GetGuestManager().GetGuestStatus, sid)
 	hostutils.ResponseOk(ctx, w)
 }
 
@@ -229,7 +242,8 @@ func guestStop(ctx context.Context, userCred mcclient.TokenCredential, sid strin
 	if err != nil {
 		timeout = 30
 	}
-	return nil, guestman.GetGuestManager().GuestStop(ctx, sid, timeout)
+	forceStop := jsonutils.QueryBoolean(body, "is_force", false)
+	return nil, guestman.GetGuestManager().GuestStop(ctx, sid, timeout, forceStop)
 }
 
 func guestMonitor(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
@@ -265,6 +279,21 @@ func guestSync(ctx context.Context, userCred mcclient.TokenCredential, sid strin
 	hostutils.DelayTask(ctx, guestman.GetGuestManager().GuestSync, &guestman.SBaseParams{
 		Sid:  sid,
 		Body: body,
+	})
+	return nil, nil
+}
+
+func guestSetPortMapping(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	if !guestman.GetGuestManager().IsGuestExist(sid) {
+		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
+	}
+	input := new(computeapi.ServerSetPortMappingInput)
+	if err := body.Unmarshal(input); err != nil {
+		return nil, httperrors.NewInputParameterError("unmarshal input %s", err)
+	}
+	hostutils.DelayTask(ctx, guestman.GetGuestManager().GuestSetPortMapping, &guestman.SGuestSetPortMapping{
+		Sid:   sid,
+		Input: input,
 	})
 	return nil, nil
 }
@@ -484,7 +513,7 @@ func guestLiveMigrate(ctx context.Context, userCred mcclient.TokenCredential, si
 }
 
 func guestCancelLiveMigrate(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	guest, ok := guestman.GetGuestManager().GetServer(sid)
+	guest, ok := guestman.GetGuestManager().GetKVMServer(sid)
 	if !ok {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -543,7 +572,7 @@ func guestBlockReplication(ctx context.Context, userCred mcclient.TokenCredentia
 }
 
 func slaveGuestBlockStreamDisks(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	guest, ok := guestman.GetGuestManager().GetServer(sid)
+	guest, ok := guestman.GetGuestManager().GetKVMServer(sid)
 	if !ok {
 		return nil, httperrors.NewNotFoundError("Guest %s not found", sid)
 	}
@@ -579,12 +608,47 @@ func guestHotplugCpuMem(ctx context.Context, userCred mcclient.TokenCredential, 
 
 	addCpuCount, _ := body.Int("add_cpu")
 	addMemSize, _ := body.Int("add_mem")
-	hostutils.DelayTaskWithoutReqctx(ctx, guestman.GetGuestManager().HotplugCpuMem,
-		&guestman.SGuestHotplugCpuMem{
-			Sid:         sid,
-			AddCpuCount: addCpuCount,
-			AddMemSize:  addMemSize,
-		})
+
+	input := &guestman.SGuestHotplugCpuMem{
+		Sid:         sid,
+		AddCpuCount: addCpuCount,
+		AddMemSize:  addMemSize,
+	}
+	totalMemSize, err := body.Int("total_mem")
+	if err == nil {
+		input.TotalMemSize = &totalMemSize
+	}
+	totalCpuCount, err := body.Int("total_cpu")
+	if err == nil {
+		input.TotalCpuCount = &totalCpuCount
+	}
+
+	if body.Contains("cpu_numa_pin") {
+		cpuNumaPin := make([]schedapi.SCpuNumaPin, 0)
+		if err := body.Unmarshal(&cpuNumaPin, "cpu_numa_pin"); err != nil {
+			return nil, httperrors.NewInputParameterError("failed parse cpu_numa_pin %s", err)
+		}
+
+		if len(cpuNumaPin) > 0 {
+			descCpuNumaPin := make([]*desc.SCpuNumaPin, len(cpuNumaPin))
+			for i := range cpuNumaPin {
+				if cpuNumaPin[i].MemSizeMB != nil {
+					descCpuNumaPin[i].SizeMB = int64(*cpuNumaPin[i].MemSizeMB)
+					nodeId := uint16(cpuNumaPin[i].NodeId)
+					descCpuNumaPin[i].NodeId = &nodeId
+				}
+				if len(cpuNumaPin[i].CpuPin) > 0 {
+					vcpuPin := make([]desc.SVCpuPin, len(cpuNumaPin[i].CpuPin))
+					for j := range vcpuPin {
+						vcpuPin[j].Pcpu = cpuNumaPin[i].CpuPin[j]
+					}
+					descCpuNumaPin[i].VcpuPin = vcpuPin
+				}
+			}
+			input.CpuNumaPin = descCpuNumaPin
+		}
+	}
+	hostutils.DelayTaskWithoutReqctx(ctx, guestman.GetGuestManager().HotplugCpuMem, input)
 	return nil, nil
 }
 
@@ -593,7 +657,7 @@ func guestReloadDiskSnapshot(ctx context.Context, userCred mcclient.TokenCredent
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("disk_id")
 	}
-	guest, ok := guestman.GetGuestManager().GetServer(sid)
+	guest, ok := guestman.GetGuestManager().GetKVMServer(sid)
 	if !ok {
 		return nil, httperrors.NewNotFoundError("guest %s not found", sid)
 	}
@@ -632,13 +696,12 @@ func guestSnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid s
 	}
 
 	var disk storageman.IDisk
-	disks := guest.Desc.Disks
+	disks := guest.GetDesc().Disks
 	for _, d := range disks {
 		if diskId == d.DiskId {
-			diskPath := d.Path
-			disk, err = storageman.GetManager().GetDiskByPath(diskPath)
+			disk, err = storageman.GetManager().GetDiskById(diskId)
 			if err != nil {
-				return nil, errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
+				return nil, errors.Wrapf(err, "GetDiskById(%s)", diskId)
 			}
 			break
 		}
@@ -646,13 +709,22 @@ func guestSnapshot(ctx context.Context, userCred mcclient.TokenCredential, sid s
 	if disk == nil {
 		return nil, httperrors.NewNotFoundError("Disk not found")
 	}
-
-	hostutils.DelayTask(ctx, guestman.GetGuestManager().DoSnapshot, &guestman.SDiskSnapshot{
+	input := &guestman.SDiskSnapshot{
 		UserCred:   userCred,
 		Sid:        sid,
 		SnapshotId: snapshotId,
 		Disk:       disk,
-	})
+	}
+
+	if body.Contains("backup_disk_config") {
+		backupDiskConfig := new(guestman.SBackupDiskConfig)
+		if err := body.Unmarshal(backupDiskConfig, "backup_disk_config"); err != nil {
+			return nil, httperrors.NewInputParameterError("unmarshal backup_disk_config")
+		}
+		input.BackupDiskConfig = backupDiskConfig
+	}
+
+	hostutils.DelayBackupTask(ctx, guestman.GetGuestManager().DoSnapshot, input)
 	return nil, nil
 }
 
@@ -665,18 +737,24 @@ func guestDeleteSnapshot(ctx context.Context, userCred mcclient.TokenCredential,
 	if err != nil {
 		return nil, httperrors.NewMissingParameterError("disk_id")
 	}
+	var totalCnt, deletedCnt int64 = 1, 0
+	if body.Contains("snapshot_total_count") {
+		totalCnt, _ = body.Int("snapshot_total_count")
+		deletedCnt, _ = body.Int("deleted_snapshot_count")
+	}
+
 	guest, ok := guestman.GetGuestManager().GetServer(sid)
 	if !ok {
 		return nil, httperrors.NewNotFoundError("guest %s not found", sid)
 	}
 
 	var disk storageman.IDisk
-	disks := guest.Desc.Disks
+	disks := guest.GetDesc().Disks
 	for _, d := range disks {
 		if diskId == d.DiskId {
-			disk, err = storageman.GetManager().GetDiskByPath(d.Path)
+			disk, err = storageman.GetManager().GetDiskById(diskId)
 			if err != nil {
-				return nil, errors.Wrapf(err, "GetDiskByPath(%s)", d.Path)
+				return nil, errors.Wrapf(err, "GetDiskById(%s)", diskId)
 			}
 			break
 		}
@@ -686,23 +764,28 @@ func guestDeleteSnapshot(ctx context.Context, userCred mcclient.TokenCredential,
 	}
 
 	params := &guestman.SDeleteDiskSnapshot{
-		Sid:            sid,
-		DeleteSnapshot: deleteSnapshot,
-		Disk:           disk,
+		Sid:                      sid,
+		DeleteSnapshot:           deleteSnapshot,
+		Disk:                     disk,
+		TotalDeleteSnapshotCount: int(totalCnt),
+		DeletedSnapshotCount:     int(deletedCnt),
+	}
+	if snapshotIds, err := body.GetArray("snapshot_ids"); err == nil {
+		for _, snapshotId := range snapshotIds {
+			if id, err := snapshotId.GetString(); err == nil {
+				params.SnapshotIds = append(params.SnapshotIds, id)
+			}
+		}
 	}
 
-	if !jsonutils.QueryBoolean(body, "auto_deleted", false) {
-		convertSnapshot, err := body.GetString("convert_snapshot")
-		if err != nil {
-			return nil, httperrors.NewMissingParameterError("convert_snapshot")
+	if body.Contains("encrypt_info") {
+		encryptInfo := apis.SEncryptInfo{}
+		if err = body.Unmarshal(&encryptInfo, "encrypt_info"); err != nil {
+			return nil, httperrors.NewInputParameterError("unmarshal encrypt_info failed %s", err)
 		}
-		params.ConvertSnapshot = convertSnapshot
-		pendingDelete, err := body.Bool("pending_delete")
-		if err != nil {
-			return nil, httperrors.NewMissingParameterError("pending_delete")
-		}
-		params.PendingDelete = pendingDelete
+		params.EncryptInfo = encryptInfo
 	}
+
 	hostutils.DelayTask(ctx, guestman.GetGuestManager().DeleteSnapshot, params)
 	return nil, nil
 }
@@ -833,8 +916,8 @@ func guestMemorySnapshotDelete(ctx context.Context, w http.ResponseWriter, r *ht
 }
 
 func guestResetNicTrafficLimit(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	input := new(computeapi.ServerNicTrafficLimit)
-	if err := body.Unmarshal(input); err != nil {
+	input := []computeapi.ServerNicTrafficLimit{}
+	if err := body.Unmarshal(&input); err != nil {
 		return nil, httperrors.NewInputParameterError("failed unmarshal input %s", err)
 	}
 
@@ -846,8 +929,8 @@ func guestResetNicTrafficLimit(ctx context.Context, userCred mcclient.TokenCrede
 }
 
 func guestSetNicTrafficLimit(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	input := new(computeapi.ServerNicTrafficLimit)
-	if err := body.Unmarshal(input); err != nil {
+	input := []computeapi.ServerNicTrafficLimit{}
+	if err := body.Unmarshal(&input); err != nil {
 		return nil, httperrors.NewInputParameterError("failed unmarshal input %s", err)
 	}
 
@@ -899,11 +982,13 @@ func qgaCommand(ctx context.Context, userCred mcclient.TokenCredential, sid stri
 		return nil, httperrors.NewInputParameterError("failed parse qga command")
 	}
 	qgaCmd := &monitor.Command{}
-	err = cmdJson.Unmarshal(qgaCmd)
+	qgaCmd.Execute, err = cmdJson.GetString("execute")
 	if err != nil {
-		return nil, httperrors.NewInputParameterError("failed unmarshal qga command")
+		return nil, httperrors.NewInputParameterError("failed get qga command")
 	}
-
+	if cmdJson.Contains("arguments") {
+		qgaCmd.Args, _ = cmdJson.Get("arguments")
+	}
 	return gm.QgaCommand(qgaCmd, sid, input.Timeout)
 }
 
@@ -918,7 +1003,6 @@ func qgaGetNetwork(ctx context.Context, userCred mcclient.TokenCredential, sid s
 }
 
 func qgaSetNetwork(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
-	gm := guestman.GetGuestManager()
 	input := computeapi.ServerQgaSetNetworkInput{}
 	err := body.Unmarshal(&input)
 	if err != nil {
@@ -927,17 +1011,60 @@ func qgaSetNetwork(ctx context.Context, userCred mcclient.TokenCredential, sid s
 	if input.Device == "" {
 		return nil, httperrors.NewMissingParameterError("device")
 	}
-	if input.Ipmask == "" {
+	if input.Ipmask == "" && input.Ip6mask == "" {
 		return nil, httperrors.NewMissingParameterError("ipmask")
 	}
-	if input.Gateway == "" {
+	if input.Gateway == "" && input.Gateway6 == "" {
 		return nil, httperrors.NewMissingParameterError("gateway")
 	}
 
-	qgaNetMod := &monitor.NetworkModify{
-		Device:  input.Device,
-		Ipmask:  input.Ipmask,
-		Gateway: input.Gateway,
+	hostutils.DelayTask(ctx, guestman.GetGuestManager().QgaSetNetwork, &guestman.SQgaGuestSetNetwork{
+		Sid:      sid,
+		Device:   input.Device,
+		Ipmask:   input.Ipmask,
+		Gateway:  input.Gateway,
+		Ip6mask:  input.Ip6mask,
+		Gateway6: input.Gateway6,
+	})
+
+	return nil, nil
+}
+
+func qgaGetOsInfo(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	gm := guestman.GetGuestManager()
+	return gm.QgaGetOsInfo(sid)
+}
+
+func guestScreenDump(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	gm := guestman.GetGuestManager()
+	return gm.RequestGuestScreenDump(sid)
+}
+
+func guestResetUefiVars(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	gm := guestman.GetGuestManager()
+	return gm.ResetGuestUefiVars(sid)
+}
+
+// prepare rescue files
+func guestStartRescue(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	return guestman.GetGuestManager().GuestStartRescue(ctx, userCred, sid, body)
+}
+
+func uploadStatus(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, _, body := appsrv.FetchEnv(ctx, w, r)
+	input := new(computeapi.HostUploadGuestsStatusRequest)
+	if err := body.Unmarshal(input); err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("Unmarshal body to input: %v", err))
+		return
 	}
-	return gm.QgaSetNetwork(qgaNetMod, sid, input.Timeout)
+	hostutils.DelayTask(ctx, guestman.GetGuestManager().UploadGuestsStatus, input)
+	hostutils.ResponseOk(ctx, w)
+}
+
+func guestUploadStatus(ctx context.Context, userCred mcclient.TokenCredential, sid string, body jsonutils.JSONObject) (interface{}, error) {
+	hostutils.DelayTask(ctx, func(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+		return guestman.GetGuestManager().UploadGuestStatus(ctx, sid)
+	}, nil)
+
+	return nil, nil
 }

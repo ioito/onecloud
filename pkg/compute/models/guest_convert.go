@@ -16,18 +16,25 @@ package models
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/utils"
+	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/scheduler"
 )
 
 func (self *SGuest) PerformConvert(
@@ -35,7 +42,7 @@ func (self *SGuest) PerformConvert(
 	query jsonutils.JSONObject, data *api.ConvertToKvmInput,
 ) (jsonutils.JSONObject, error) {
 	if data.TargetHypervisor != api.HYPERVISOR_KVM {
-		return nil, httperrors.NewBadRequestError("not support target hypervisor %s", data.TargetHypervisor)
+		return nil, httperrors.NewBadRequestError("target hypervisor %s is not supported", data.TargetHypervisor)
 	}
 
 	return self.PerformConvertToKvm(ctx, userCred, query, data)
@@ -48,20 +55,24 @@ func (self *SGuest) PerformConvertToKvm(
 	if len(self.GetMetadata(ctx, api.SERVER_META_CONVERTED_SERVER, userCred)) > 0 {
 		return nil, httperrors.NewBadRequestError("guest has been converted")
 	}
-	switch self.Hypervisor {
-	case api.HYPERVISOR_ESXI:
-		return self.ConvertEsxiToKvm(ctx, userCred, data)
-	case api.HYPERVISOR_CLOUDPODS:
-		return self.ConvertCloudpodsToKvm(ctx, userCred, data)
-	default:
-		return nil, httperrors.NewBadRequestError("not support %s", self.Hypervisor)
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
 	}
+
+	if drv.GetProvider() == api.CLOUD_PROVIDER_ONECLOUD && drv.GetHypervisor() == api.HYPERVISOR_ESXI {
+		return self.ConvertEsxiToKvm(ctx, userCred, data)
+	}
+	if drv.GetProvider() == api.CLOUD_PROVIDER_CLOUDPODS && drv.GetHypervisor() == api.HYPERVISOR_DEFAULT {
+		return self.ConvertCloudpodsToKvm(ctx, userCred, data)
+	}
+	return nil, httperrors.NewBadRequestError("hypervisor %s is not supported", self.Hypervisor)
 }
 
 func (self *SGuest) ConvertCloudpodsToKvm(ctx context.Context, userCred mcclient.TokenCredential, data *api.ConvertToKvmInput) (jsonutils.JSONObject, error) {
 	preferHost := data.PreferHost
 	if len(preferHost) > 0 {
-		iHost, err := HostManager.FetchByIdOrName(userCred, preferHost)
+		iHost, err := HostManager.FetchByIdOrName(ctx, userCred, preferHost)
 		if err != nil {
 			return nil, err
 		}
@@ -75,31 +86,18 @@ func (self *SGuest) ConvertCloudpodsToKvm(ctx context.Context, userCred mcclient
 	if self.Status != api.VM_READY {
 		return nil, httperrors.NewBadRequestError("guest status must be ready")
 	}
-	newGuest, createInput, err := self.createConvertedServer(ctx, userCred)
+	newGuest, createInput, err := self.createConvertedServer(ctx, userCred, data)
 	if err != nil {
 		return nil, errors.Wrap(err, "create converted server")
 	}
-	if data.Networks != nil && len(data.Networks) != len(createInput.Networks) {
-		return nil, httperrors.NewInputParameterError("input network configs length  must equal guestnetworks length")
-	}
 
-	for i := 0; i < len(createInput.Networks); i++ {
-		createInput.Networks[i].Network = ""
-		createInput.Networks[i].Wire = ""
-		if data.Networks != nil {
-			createInput.Networks[i].Network = data.Networks[i].Network
-			createInput.Networks[i].Address = data.Networks[i].Address
-			createInput.Networks[i].Schedtags = data.Networks[i].Schedtags
-		}
-	}
-
-	return nil, self.StartConvertToKvmTask(ctx, userCred, "GuestConvertCloudpodsToKvmTask", preferHost, newGuest, createInput)
+	return nil, self.StartConvertToKvmTask(ctx, userCred, "GuestConvertCloudpodsToKvmTask", preferHost, newGuest, createInput, data)
 }
 
 func (self *SGuest) ConvertEsxiToKvm(ctx context.Context, userCred mcclient.TokenCredential, data *api.ConvertToKvmInput) (jsonutils.JSONObject, error) {
 	preferHost := data.PreferHost
 	if len(preferHost) > 0 {
-		iHost, err := HostManager.FetchByIdOrName(userCred, preferHost)
+		iHost, err := HostManager.FetchByIdOrName(ctx, userCred, preferHost)
 		if err != nil {
 			return nil, err
 		}
@@ -125,16 +123,33 @@ func (self *SGuest) ConvertEsxiToKvm(ctx context.Context, userCred mcclient.Toke
 		}
 	}
 
-	newGuest, createInput, err := self.createConvertedServer(ctx, userCred)
+	newGuest, createInput, err := self.createConvertedServer(ctx, userCred, data)
 	if err != nil {
 		return nil, errors.Wrap(err, "create converted server")
 	}
-	return nil, self.StartConvertToKvmTask(ctx, userCred, "GuestConvertEsxiToKvmTask", preferHost, newGuest, createInput)
+
+	if data.Networks != nil && len(data.Networks) != len(createInput.Networks) {
+		return nil, httperrors.NewInputParameterError("input network configs length must equal guestnetworks length")
+	}
+
+	for i := 0; i < len(createInput.Networks); i++ {
+		createInput.Networks[i].Network = ""
+		createInput.Networks[i].Wire = ""
+		if data.Networks != nil {
+			createInput.Networks[i].Network = data.Networks[i].Network
+			createInput.Networks[i].Address = data.Networks[i].Address
+			if data.Networks[i].Schedtags != nil {
+				createInput.Networks[i].Schedtags = data.Networks[i].Schedtags
+			}
+		}
+	}
+
+	return nil, self.StartConvertToKvmTask(ctx, userCred, "GuestConvertEsxiToKvmTask", preferHost, newGuest, createInput, data)
 }
 
 func (self *SGuest) StartConvertToKvmTask(
 	ctx context.Context, userCred mcclient.TokenCredential, taskName, preferHostId string,
-	newGuest *SGuest, createInput *api.ServerCreateInput,
+	newGuest *SGuest, createInput *api.ServerCreateInput, data *api.ConvertToKvmInput,
 ) error {
 	params := jsonutils.NewDict()
 	if len(preferHostId) > 0 {
@@ -142,22 +157,131 @@ func (self *SGuest) StartConvertToKvmTask(
 	}
 	params.Set("target_guest_id", jsonutils.NewString(newGuest.Id))
 	params.Set("input", jsonutils.Marshal(createInput))
+	params.Set("deploy_telegraf", jsonutils.NewBool(data.DeployTelegraf))
 	task, err := taskman.TaskManager.NewTask(ctx, taskName, self, userCred,
 		params, "", "", nil)
 	if err != nil {
 		return err
 	} else {
-		self.SetStatus(userCred, api.VM_CONVERTING, "esxi guest convert to kvm")
+		self.SetStatus(ctx, userCred, api.VM_CONVERTING, "esxi guest convert to kvm")
 		task.ScheduleRun(nil)
 		return nil
 	}
 }
 
-func (self *SGuest) createConvertedServer(
-	ctx context.Context, userCred mcclient.TokenCredential,
-) (*SGuest, *api.ServerCreateInput, error) {
+func isConvertSysDisk(disk *api.DiskConfig) bool {
+	if disk.DiskType == api.DISK_TYPE_SYS {
+		return true
+	}
+	if len(disk.DiskType) > 0 {
+		return false
+	}
+	return disk.Index == 0
+}
+
+func fetchPreferStorageId(ctx context.Context, userCred mcclient.TokenCredential, preferStorage string) (string, error) {
+	if len(preferStorage) == 0 {
+		return "", nil
+	}
+	storageObj, err := StorageManager.FetchByIdOrName(ctx, userCred, preferStorage)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return "", httperrors.NewResourceNotFoundError2(StorageManager.Keyword(), preferStorage)
+		}
+		return "", errors.Wrapf(err, "StorageManager.FetchByIdOrName %s", preferStorage)
+	}
+	return storageObj.GetId(), nil
+}
+
+type convertDiskPrefer struct {
+	backend   string
+	storageId string
+	medium    string
+	schedtags []*api.SchedtagConfig
+}
+
+func convertDiskTypePrefer(disk *api.DiskConfig, data *api.ConvertToKvmInput, sysStorageId, dataStorageId string) convertDiskPrefer {
+	if isConvertSysDisk(disk) {
+		return convertDiskPrefer{
+			backend:   data.SysDiskBackend,
+			storageId: sysStorageId,
+			medium:    data.SysDiskMedium,
+			schedtags: data.SysDiskSchedtags,
+		}
+	}
+	return convertDiskPrefer{
+		backend:   data.DataDiskBackend,
+		storageId: dataStorageId,
+		medium:    data.DataDiskMedium,
+		schedtags: data.DataDiskSchedtags,
+	}
+}
+
+// applyConvertDiskConfigs applies target storage preference for convert-to-kvm.
+// Priority: per-disk Disks configs > sys/data DiskBackend / PreferStorage / Medium / DiskSchedtags.
+// When nothing is specified, disks keep cleared Backend/Storage (scheduler default, usually local).
+func applyConvertDiskConfigs(ctx context.Context, userCred mcclient.TokenCredential, disks []*api.DiskConfig, data *api.ConvertToKvmInput) error {
+	if data == nil || len(disks) == 0 {
+		return nil
+	}
+
+	if data.Disks != nil && len(data.Disks) != len(disks) {
+		return httperrors.NewInputParameterError("input disk configs length must equal guest disks length")
+	}
+
+	sysPreferStorageId, err := fetchPreferStorageId(ctx, userCred, data.SysPreferStorage)
+	if err != nil {
+		return err
+	}
+	dataPreferStorageId, err := fetchPreferStorageId(ctx, userCred, data.DataPreferStorage)
+	if err != nil {
+		return err
+	}
+
+	for i := range disks {
+		prefer := convertDiskTypePrefer(disks[i], data, sysPreferStorageId, dataPreferStorageId)
+		var perDisk *api.DiskConfig
+		if data.Disks != nil {
+			perDisk = data.Disks[i]
+		}
+
+		if perDisk != nil && len(perDisk.Backend) > 0 {
+			disks[i].Backend = perDisk.Backend
+		} else if len(prefer.backend) > 0 {
+			disks[i].Backend = prefer.backend
+		}
+
+		if perDisk != nil && len(perDisk.Storage) > 0 {
+			id, err := fetchPreferStorageId(ctx, userCred, perDisk.Storage)
+			if err != nil {
+				return err
+			}
+			disks[i].Storage = id
+		} else if len(prefer.storageId) > 0 {
+			disks[i].Storage = prefer.storageId
+		}
+
+		if perDisk != nil && len(perDisk.Medium) > 0 {
+			disks[i].Medium = perDisk.Medium
+		} else if len(prefer.medium) > 0 {
+			disks[i].Medium = prefer.medium
+		}
+
+		if perDisk != nil && perDisk.Schedtags != nil {
+			disks[i].Schedtags = perDisk.Schedtags
+		} else if prefer.schedtags != nil {
+			disks[i].Schedtags = prefer.schedtags
+		}
+	}
+	return nil
+}
+
+func (self *SGuest) createConvertedServer(ctx context.Context, userCred mcclient.TokenCredential, data *api.ConvertToKvmInput) (*SGuest, *api.ServerCreateInput, error) {
 	// set guest pending usage
 	pendingUsage, pendingRegionUsage, err := self.getGuestUsage(1)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "getGuestUsage")
+	}
 	keys, err := self.GetQuotaKeys()
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "GetQuotaKeys")
@@ -165,7 +289,7 @@ func (self *SGuest) createConvertedServer(
 	pendingUsage.SetKeys(keys)
 	err = quotas.CheckSetPendingQuota(ctx, userCred, &pendingUsage)
 	if err != nil {
-		return nil, nil, httperrors.NewOutOfQuotaError("Check set pending quota error %s", err)
+		return nil, nil, httperrors.NewOutOfQuotaError("check set pending quota failed %s", err)
 	}
 	regionKeys, err := self.GetRegionalQuotaKeys()
 	if err != nil {
@@ -181,27 +305,90 @@ func (self *SGuest) createConvertedServer(
 	// generate guest create params
 	createInput := self.ToCreateInput(ctx, userCred)
 	createInput.Hypervisor = api.HYPERVISOR_KVM
-	createInput.PreferHost = ""
+	createInput.PreferHost = data.PreferHost
 	createInput.GenerateName = fmt.Sprintf("%s-%s", self.Name, api.HYPERVISOR_KVM)
+	createInput.Hostname = self.Name
+	if self.Hostname != "" {
+		createInput.Hostname = self.Hostname
+	}
 
 	if self.Hypervisor == api.HYPERVISOR_ESXI {
 		// change drivers so as to bootable in KVM
 		for i := range createInput.Disks {
-			if createInput.Disks[i].Driver != "ide" {
-				createInput.Disks[i].Driver = "ide"
+			if !utils.IsInStringArray(createInput.Disks[i].Driver, []string{api.DISK_DRIVER_VIRTIO, api.DISK_DRIVER_PVSCSI, api.DISK_DRIVER_IDE}) {
+				createInput.Disks[i].Driver = api.DISK_DRIVER_IDE
 			}
 			createInput.Disks[i].Format = ""
 			createInput.Disks[i].Backend = ""
 			createInput.Disks[i].Medium = ""
+			createInput.Disks[i].Storage = ""
+		}
+		gns, err := self.GetNetworks("")
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "GetNetworks")
 		}
 		for i := range createInput.Networks {
 			if createInput.Networks[i].Driver != "e1000" && createInput.Networks[i].Driver != "vmxnet3" {
 				createInput.Networks[i].Driver = "e1000"
 			}
+			createInput.Networks[i].Network = ""
+			createInput.Networks[i].Wire = ""
+			createInput.Networks[i].Mac = gns[i].MacAddr
+			createInput.Networks[i].Address = gns[i].IpAddr
 		}
 		createInput.Vdi = api.VM_VDI_PROTOCOL_VNC
 	} else {
 		createInput.Disks[0].ImageId = ""
+	}
+
+	err = applyConvertDiskConfigs(ctx, userCred, createInput.Disks, data)
+	if err != nil {
+		quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, false)
+		return nil, nil, errors.Wrap(err, "applyConvertDiskConfigs")
+	}
+
+	if data.Networks != nil && len(data.Networks) != len(createInput.Networks) {
+		return nil, nil, httperrors.NewInputParameterError("input network configs length  must equal guestnetworks length")
+	}
+
+	for i := 0; i < len(createInput.Networks); i++ {
+		createInput.Networks[i].Network = ""
+		createInput.Networks[i].Wire = ""
+		if data.Networks != nil {
+			if data.Networks[i].Schedtags != nil {
+				createInput.Networks[i].Schedtags = data.Networks[i].Schedtags
+			}
+			createInput.Networks[i].Address = data.Networks[i].Address
+			createInput.Networks[i].Network = data.Networks[i].Network
+		}
+	}
+
+	schedDesc := self.ToSchedDesc()
+	// convert creates a new guest; do not treat as migrate (HostId would force shared
+	// backends to require an existing storage_id accessible on the candidate host)
+	schedDesc.HostId = ""
+	schedDesc.PreferHost = data.PreferHost
+	for i := range schedDesc.Disks {
+		schedDesc.Disks[i].Backend = ""
+		schedDesc.Disks[i].Medium = ""
+		schedDesc.Disks[i].Storage = ""
+		schedDesc.Disks[i].DiskId = ""
+	}
+	err = applyConvertDiskConfigs(ctx, userCred, schedDesc.Disks, data)
+	if err != nil {
+		quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, false)
+		return nil, nil, errors.Wrap(err, "applyConvertDiskConfigs schedDesc")
+	}
+	schedDesc.Networks = data.Networks
+	schedDesc.Hypervisor = api.HYPERVISOR_KVM
+
+	s := auth.GetAdminSession(ctx, options.Options.Region)
+	succ, res, err := scheduler.SchedManager.DoScheduleForecast(s, schedDesc, 1)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Do schedule migrate forecast")
+	}
+	if !succ {
+		return nil, nil, httperrors.NewInsufficientResourceError("%s", res.String())
 	}
 
 	lockman.LockClass(ctx, GuestManager, userCred.GetProjectId())
@@ -213,4 +400,63 @@ func (self *SGuest) createConvertedServer(
 		return nil, nil, errors.Wrap(err, "db.DoCreate")
 	}
 	return newGuest.(*SGuest), createInput, nil
+}
+
+func (manager *SGuestManager) PerformBatchConvertPrecheck(
+	ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data *api.BatchConvertToKvmCheckInput,
+) (jsonutils.JSONObject, error) {
+	if len(data.GuestIds) == 0 {
+		return nil, httperrors.NewInputParameterError("missing guest ids")
+	}
+	guests := make([]SGuest, 0)
+	q := GuestManager.Query().In("id", data.GuestIds)
+	err := db.FetchModelObjects(GuestManager, q, &guests)
+	if err != nil {
+		return nil, httperrors.NewInternalServerError("%v", err)
+	}
+	if len(guests) != len(data.GuestIds) {
+		return nil, httperrors.NewBadRequestError("Check input guests is exist")
+	}
+	res := jsonutils.NewDict()
+	for i := 0; i < len(guests); i++ {
+		gns, err := guests[i].GetNetworks("")
+		if err != nil {
+			return nil, errors.Wrapf(err, "Get guest networks %s", err)
+		}
+		for j := 0; j < len(gns); j++ {
+			if gns[j].IpAddr != "" {
+				cnt, err := NetworkManager.checkIpHasOneCloudNetworks(gns[j].IpAddr)
+				if err != nil {
+					return nil, err
+				}
+				if cnt <= 0 {
+					reason := fmt.Sprintf("kvm networks has no addr %s for guest %s convert", gns[j].IpAddr, guests[i].GetName())
+					res.Set("reason", jsonutils.NewString(reason))
+					res.Set("network_failed", jsonutils.JSONTrue)
+					return res, nil
+				}
+			}
+		}
+	}
+
+	return res, nil
+}
+
+func (manager *SNetworkManager) checkIpHasOneCloudNetworks(ipAddr string) (int, error) {
+	ip4Addr, err := netutils.NewIPV4Addr(ipAddr)
+	if err != nil {
+		return -1, err
+	}
+	q := manager.Query()
+	// filter onecloud wire
+	wireQ := WireManager.Query().IsNullOrEmpty("manager_id").SubQuery()
+	ipStart := sqlchemy.INET_ATON(q.Field("guest_ip_start"))
+	ipEnd := sqlchemy.INET_ATON(q.Field("guest_ip_end"))
+	ipCondtion := sqlchemy.AND(
+		sqlchemy.GE(ipEnd, uint32(ip4Addr)),
+		sqlchemy.LE(ipStart, uint32(ip4Addr)),
+	)
+	q = q.Filter(ipCondtion)
+	q = q.Join(wireQ, sqlchemy.Equals(q.Field("wire_id"), wireQ.Field("id")))
+	return q.CountWithError()
 }

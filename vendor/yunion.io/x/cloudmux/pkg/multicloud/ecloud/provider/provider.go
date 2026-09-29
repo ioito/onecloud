@@ -42,6 +42,10 @@ func (f *SEcloudProviderFactory) IsSupportPrepaidResources() bool {
 	return true
 }
 
+func (f *SEcloudProviderFactory) IsReadOnly() bool {
+	return true
+}
+
 func (f *SEcloudProviderFactory) ValidateCreateCloudaccountData(ctx context.Context, input cloudprovider.SCloudaccountCredential) (cloudprovider.SCloudaccount, error) {
 	output := cloudprovider.SCloudaccount{}
 	if len(input.AccessKeyId) == 0 {
@@ -78,14 +82,13 @@ func (f *SEcloudProviderFactory) GetProvider(cfg cloudprovider.ProviderConfig) (
 	}
 
 	client, err := ecloud.NewEcloudClient(
-		ecloud.NewEcloudClientConfig(
-			ecloud.NewRamRoleSigner(account, cfg.Secret),
-		).SetCloudproviderConfig(cfg),
+		ecloud.NewEcloudClientConfig(account, cfg.Secret).
+			SetCloudproviderConfig(cfg),
 	)
 	if err != nil {
 		return nil, err
 	}
-	err = client.TryConnect()
+	_, err = client.GetRegions()
 	if err != nil {
 		return nil, err
 	}
@@ -122,12 +125,12 @@ func (p *SEcloudProvider) GetAccountId() string {
 	return p.client.GetAccountId()
 }
 
-func (p *SEcloudProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (p *SEcloudProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return p.client.GetIRegions()
 }
 
 func (p *SEcloudProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	iregions := p.client.GetIRegions()
+	iregions, _ := p.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(iregions))), "region_count")
 	info.Add(jsonutils.NewString(ecloud.CLOUD_API_VERSION), "api_version")
@@ -150,11 +153,17 @@ func (p *SEcloudProvider) GetIRegionById(id string) (cloudprovider.ICloudRegion,
 }
 
 func (p *SEcloudProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) {
-	return &cloudprovider.SBalanceInfo{
-		Amount:   0.0,
-		Currency: "CNY",
-		Status:   api.CLOUD_PROVIDER_HEALTH_NORMAL,
-	}, cloudprovider.ErrNotSupported
+	balance, err := p.client.GetBalance()
+	if err != nil {
+		return nil, err
+	}
+	balance.Status = api.CLOUD_PROVIDER_HEALTH_NORMAL
+	if balance.Amount < 0 {
+		balance.Status = api.CLOUD_PROVIDER_HEALTH_ARREARS
+	} else if balance.Amount < 400 {
+		balance.Status = api.CLOUD_PROVIDER_HEALTH_INSUFFICIENT
+	}
+	return balance, nil
 }
 
 func (p *SEcloudProvider) GetIProjects() ([]cloudprovider.ICloudProject, error) {

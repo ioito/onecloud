@@ -18,7 +18,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
@@ -35,6 +34,7 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	identityapi "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
@@ -114,14 +114,14 @@ func (manager *SWireManager) ValidateCreateData(
 	}
 
 	if input.Mtu < 0 || input.Mtu > 1000000 {
-		return input, httperrors.NewOutOfRangeError("mtu must be range of 0~1000000")
+		return input, httperrors.NewOutOfRangeError("mtu must be in range 0~1000000")
 	}
 
 	if input.VpcId == "" {
 		input.VpcId = api.DEFAULT_VPC_ID
 	}
 
-	_vpc, err := validators.ValidateModel(userCred, VpcManager, &input.VpcId)
+	_vpc, err := validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcId)
 	if err != nil {
 		return input, err
 	}
@@ -135,7 +135,7 @@ func (manager *SWireManager) ValidateCreateData(
 		return input, httperrors.NewMissingParameterError("zone")
 	}
 
-	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(userCred, input.ZoneResourceInput)
+	_, input.ZoneResourceInput, err = ValidateZoneResourceInput(ctx, userCred, input.ZoneResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateZoneResourceInput")
 	}
@@ -155,7 +155,7 @@ func (wire *SWire) ValidateUpdateData(ctx context.Context, userCred mcclient.Tok
 	}
 	for _, v := range keysV {
 		v.Optional(true)
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return input, err
 		}
 	}
@@ -169,6 +169,9 @@ func (wire *SWire) ValidateUpdateData(ctx context.Context, userCred mcclient.Tok
 }
 
 func (wire *SWire) ValidateDeleteCondition(ctx context.Context, info *api.WireDetails) error {
+	if wire.Id == api.DEFAULT_HOST_LOCAL_WIRE_ID {
+		return httperrors.NewProtectedResourceError("not allowed to delete default host local wire")
+	}
 	if gotypes.IsNil(info) {
 		info = &api.WireDetails{}
 		usage, err := WireManager.TotalResourceCount([]string{wire.Id})
@@ -261,6 +264,10 @@ func (wire *SWire) GetVpcId() string {
 }
 
 func (manager *SWireManager) getWiresByVpcAndZone(vpc *SVpc, zone *SZone) ([]SWire, error) {
+	return manager.getWiresByVpcZoneAndManager(vpc, zone, nil)
+}
+
+func (manager *SWireManager) getWiresByVpcZoneAndManager(vpc *SVpc, zone *SZone, provider *SCloudprovider) ([]SWire, error) {
 	wires := make([]SWire, 0)
 	q := manager.Query()
 	if vpc != nil {
@@ -268,6 +275,9 @@ func (manager *SWireManager) getWiresByVpcAndZone(vpc *SVpc, zone *SZone) ([]SWi
 	}
 	if zone != nil {
 		q = q.Equals("zone_id", zone.Id)
+	}
+	if provider != nil {
+		q = q.Equals("manager_id", provider.Id)
 	}
 	err := db.FetchModelObjects(manager, q, &wires)
 	if err != nil {
@@ -292,7 +302,7 @@ func (manager *SWireManager) SyncWires(
 	remoteWires := make([]cloudprovider.ICloudWire, 0)
 	syncResult := compare.SyncResult{}
 
-	dbWires, err := manager.getWiresByVpcAndZone(vpc, zone)
+	dbWires, err := manager.getWiresByVpcZoneAndManager(vpc, zone, provider)
 	if err != nil {
 		syncResult.Error(err)
 		return nil, nil, syncResult
@@ -361,7 +371,7 @@ func (swire *SWire) syncRemoveCloudWire(ctx context.Context, userCred mcclient.T
 
 	err := swire.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		err = swire.markNetworkUnknown(userCred)
+		err = swire.markNetworkUnknown(ctx, userCred)
 	} else {
 		err = swire.Delete(ctx, userCred)
 	}
@@ -416,19 +426,19 @@ func (swire *SWire) syncWithCloudWire(ctx context.Context, userCred mcclient.Tok
 	} else if swire.IsEmulated {
 		swire.SaveSharedInfo(apis.TOwnerSource(vpc.PublicSrc), ctx, userCred, vpc.GetSharedInfo())
 	}
-	syncMetadata(ctx, userCred, swire, extWire)
+	syncMetadata(ctx, userCred, swire, extWire, false)
 
 	db.OpsLog.LogSyncUpdate(swire, diff, userCred)
 	return err
 }
 
-func (swire *SWire) markNetworkUnknown(userCred mcclient.TokenCredential) error {
-	nets, err := swire.getNetworks(nil, nil, rbacscope.ScopeNone)
+func (swire *SWire) markNetworkUnknown(ctx context.Context, userCred mcclient.TokenCredential) error {
+	nets, err := swire.getNetworks(ctx, nil, nil, rbacscope.ScopeNone)
 	if err != nil {
 		return err
 	}
 	for i := 0; i < len(nets); i += 1 {
-		nets[i].SetStatus(userCred, api.NETWORK_STATUS_UNKNOWN, "wire sync to remove")
+		nets[i].SetStatus(ctx, userCred, api.NETWORK_STATUS_UNKNOWN, "wire sync to remove")
 	}
 	return nil
 }
@@ -443,24 +453,23 @@ func (manager *SWireManager) newFromCloudWire(ctx context.Context, userCred mccl
 	wire.Description = extWire.GetDescription()
 	wire.VpcId = vpc.Id
 	wire.ManagerId = provider.Id
-	region, err := vpc.GetRegion()
-	if err != nil {
-		return nil, errors.Wrapf(err, "GetRegion for vpc %s(%s)", vpc.Name, vpc.Id)
-	}
-	if zone != nil {
-		wire.ZoneId = zone.Id
-	} else if !utils.IsInStringArray(region.Provider, api.REGIONAL_NETWORK_PROVIDERS) {
+	var err error
+	wire.ZoneId, err = func() (string, error) {
+		if zone != nil {
+			return zone.Id, nil
+		}
 		izone := extWire.GetIZone()
 		if gotypes.IsNil(izone) {
-			return nil, fmt.Errorf("missing zone for wire %s(%s)", wire.Name, wire.ExternalId)
+			return "", nil
 		}
 		zone, err := vpc.getZoneByExternalId(izone.GetGlobalId())
 		if err != nil {
-			return nil, errors.Wrapf(err, "newFromCloudWire.getZoneByExternalId")
+			return "", errors.Wrapf(err, "getZoneByExternalId")
 		}
-		wire.ZoneId = zone.Id
-	} else {
-		// regional network, wire belongs to region
+		return zone.Id, nil
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "get zone id")
 	}
 
 	wire.IsEmulated = extWire.IsEmulated()
@@ -491,7 +500,7 @@ func (manager *SWireManager) newFromCloudWire(ctx context.Context, userCred mccl
 		wire.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
 	}
 
-	syncMetadata(ctx, userCred, &wire, extWire)
+	syncMetadata(ctx, userCred, &wire, extWire, false)
 	db.OpsLog.LogEvent(&wire, db.ACT_CREATE, wire.GetShortDesc(ctx), userCred)
 	return &wire, nil
 }
@@ -532,6 +541,7 @@ func fixVmwareProvider(providers []string) (bool, []string) {
 }
 
 func (manager *SWireManager) totalCountQ(
+	ctx context.Context,
 	rangeObjs []db.IStandaloneModel,
 	hostTypes []string, hostProviders, hostBrands []string,
 	providers []string, brands []string, cloudEnv string,
@@ -541,7 +551,7 @@ func (manager *SWireManager) totalCountQ(
 ) *sqlchemy.SQuery {
 	guestsQ := GuestManager.Query()
 	guestsQ = filterByScopeOwnerId(guestsQ, scope, ownerId, false)
-	guestsQ = db.ObjectIdQueryWithPolicyResult(guestsQ, GuestManager, policyResult)
+	guestsQ = db.ObjectIdQueryWithPolicyResult(ctx, guestsQ, GuestManager, policyResult)
 	guests := guestsQ.SubQuery()
 
 	// hosts no filter, for guest networks
@@ -559,7 +569,7 @@ func (manager *SWireManager) totalCountQ(
 
 	// hosts filter by owner, for host networks
 	hostsQ2 := HostManager.Query()
-	hostsQ2 = db.ObjectIdQueryWithPolicyResult(hostsQ2, HostManager, policyResult)
+	hostsQ2 = db.ObjectIdQueryWithPolicyResult(ctx, hostsQ2, HostManager, policyResult)
 	hostsQ2 = filterByScopeOwnerId(hostsQ2, scope, ownerId, true)
 	if len(hostTypes) > 0 {
 		hostsQ2 = hostsQ2.In("host_type", hostTypes)
@@ -573,12 +583,12 @@ func (manager *SWireManager) totalCountQ(
 	hosts2 := hostsQ2.SubQuery()
 
 	groupsQ := GroupManager.Query()
-	groupsQ = db.ObjectIdQueryWithPolicyResult(groupsQ, GroupManager, policyResult)
+	groupsQ = db.ObjectIdQueryWithPolicyResult(ctx, groupsQ, GroupManager, policyResult)
 	groupsQ = filterByScopeOwnerId(groupsQ, scope, ownerId, false)
 	groups := groupsQ.SubQuery()
 
 	lbsQ := LoadbalancerManager.Query()
-	lbsQ = db.ObjectIdQueryWithPolicyResult(lbsQ, LoadbalancerManager, policyResult)
+	lbsQ = db.ObjectIdQueryWithPolicyResult(ctx, lbsQ, LoadbalancerManager, policyResult)
 	lbsQ = filterByScopeOwnerId(lbsQ, scope, ownerId, false)
 	if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
 		lbsQ = CloudProviderFilter(lbsQ, lbsQ.Field("manager_id"), providers, brands, cloudEnv)
@@ -589,101 +599,146 @@ func (manager *SWireManager) totalCountQ(
 	lbs := lbsQ.SubQuery()
 
 	dbsQ := DBInstanceManager.Query()
-	dbsQ = db.ObjectIdQueryWithPolicyResult(dbsQ, DBInstanceManager, policyResult)
+	dbsQ = db.ObjectIdQueryWithPolicyResult(ctx, dbsQ, DBInstanceManager, policyResult)
 	dbsQ = filterByScopeOwnerId(dbsQ, scope, ownerId, false)
 	if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
 		dbsQ = CloudProviderFilter(dbsQ, dbsQ.Field("manager_id"), providers, brands, cloudEnv)
 	}
 	if len(rangeObjs) > 0 {
-		dbsQ = RangeObjectsFilter(dbsQ, rangeObjs, dbsQ.Field("cloudregion_id"), dbsQ.Field("zone_id"), dbsQ.Field("manager_id"), nil, nil)
+		dbsQ = RangeObjectsFilter(dbsQ, rangeObjs, dbsQ.Field("cloudregion_id"), dbsQ.Field("zone1"), dbsQ.Field("manager_id"), nil, nil)
 	}
 	dbs := dbsQ.SubQuery()
 
-	gNics := GuestnetworkManager.Query().SubQuery()
-	gNicQ := gNics.Query(
-		gNics.Field("network_id"),
-		sqlchemy.COUNT("gnic_count"),
-		sqlchemy.SUM("pending_deleted_gnic_count", guests.Field("pending_deleted")),
+	var (
+		gNicSQ     *sqlchemy.SSubQuery
+		gNicSQ4    *sqlchemy.SSubQuery
+		gNicSQ6    *sqlchemy.SSubQuery
+		hNicSQ     *sqlchemy.SSubQuery
+		grpNicSQ   *sqlchemy.SSubQuery
+		lbNicSQ    *sqlchemy.SSubQuery
+		eipNicSQ   *sqlchemy.SSubQuery
+		netifNicSQ *sqlchemy.SSubQuery
+		dbNicSQ    *sqlchemy.SSubQuery
 	)
-	gNicQ = gNicQ.Join(guests, sqlchemy.Equals(guests.Field("id"), gNics.Field("guest_id")))
-	gNicQ = gNicQ.Join(hosts, sqlchemy.Equals(guests.Field("host_id"), hosts.Field("id")))
-	gNicQ = gNicQ.Filter(sqlchemy.IsTrue(hosts.Field("enabled")))
+	{
+		gNics := GuestnetworkManager.Query().SubQuery()
+		gNicQ := gNics.Query(
+			gNics.Field("network_id"),
+			sqlchemy.COUNT("gnic_count"),
+			sqlchemy.SUM("pending_deleted_gnic_count", guests.Field("pending_deleted")),
+		)
+		gNicQ = gNicQ.Join(guests, sqlchemy.Equals(guests.Field("id"), gNics.Field("guest_id")))
+		gNicQ = gNicQ.Join(hosts, sqlchemy.Equals(guests.Field("host_id"), hosts.Field("id")))
+		gNicQ = gNicQ.Filter(sqlchemy.IsTrue(hosts.Field("enabled")))
 
-	hNics := HostnetworkManager.Query().SubQuery()
-	hNicQ := hNics.Query(
-		hNics.Field("network_id"),
-		sqlchemy.COUNT("hnic_count"),
-	)
-	hNicQ = hNicQ.Join(hosts2, sqlchemy.Equals(hNics.Field("baremetal_id"), hosts2.Field("id")))
-	hNicQ = hNicQ.Filter(sqlchemy.IsTrue(hosts2.Field("enabled")))
-
-	groupNics := GroupnetworkManager.Query().SubQuery()
-	grpNicQ := groupNics.Query(
-		groupNics.Field("network_id"),
-		sqlchemy.COUNT("grpnic_count"),
-	)
-	grpNicQ = grpNicQ.Join(groups, sqlchemy.Equals(groups.Field("id"), groupNics.Field("group_id")))
-
-	lbNics := LoadbalancernetworkManager.Query().SubQuery()
-	lbNicQ := lbNics.Query(
-		lbNics.Field("network_id"),
-		sqlchemy.COUNT("lbnic_count"),
-	)
-	lbNicQ = lbNicQ.Join(lbs, sqlchemy.Equals(lbs.Field("id"), lbNics.Field("loadbalancer_id")))
-	lbNicQ = lbNicQ.Filter(sqlchemy.IsFalse(lbs.Field("pending_deleted")))
-
-	eipNicsQ := ElasticipManager.Query().IsNotEmpty("network_id")
-	eipNicsQ = db.ObjectIdQueryWithPolicyResult(eipNicsQ, ElasticipManager, policyResult)
-	eipNics := filterByScopeOwnerId(eipNicsQ, scope, ownerId, false).SubQuery()
-	eipNicQ := eipNics.Query(
-		eipNics.Field("network_id"),
-		sqlchemy.COUNT("eipnic_count"),
-	)
-	if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
-		eipNicQ = CloudProviderFilter(eipNicQ, eipNicQ.Field("manager_id"), providers, brands, cloudEnv)
+		gNicSQ = gNicQ.GroupBy(gNics.Field("network_id")).SubQuery()
 	}
-	if len(rangeObjs) > 0 {
-		eipNicQ = RangeObjectsFilter(eipNicQ, rangeObjs, eipNicQ.Field("cloudregion_id"), nil, eipNicQ.Field("manager_id"), nil, nil)
-	}
+	{
+		gNics := GuestnetworkManager.Query().IsNotEmpty("ip_addr").SubQuery()
+		gNicQ := gNics.Query(
+			gNics.Field("network_id"),
+			sqlchemy.COUNT("gnic_count4"),
+		)
+		gNicQ = gNicQ.Join(guests, sqlchemy.Equals(guests.Field("id"), gNics.Field("guest_id")))
+		gNicQ = gNicQ.Join(hosts, sqlchemy.Equals(guests.Field("host_id"), hosts.Field("id")))
+		gNicQ = gNicQ.Filter(sqlchemy.IsTrue(hosts.Field("enabled")))
 
-	netifsQ := NetworkInterfaceManager.Query()
-	netifsQ = db.ObjectIdQueryWithPolicyResult(netifsQ, NetworkInterfaceManager, policyResult)
-	netifsQ = filterByScopeOwnerId(netifsQ, scope, ownerId, true)
-	if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
-		netifsQ = CloudProviderFilter(netifsQ, netifsQ.Field("manager_id"), providers, brands, cloudEnv)
+		gNicSQ4 = gNicQ.GroupBy(gNics.Field("network_id")).SubQuery()
 	}
-	if len(rangeObjs) > 0 {
-		netifsQ = RangeObjectsFilter(netifsQ, rangeObjs, netifsQ.Field("cloudregion_id"), nil, netifsQ.Field("manager_id"), nil, nil)
+	{
+		gNics := GuestnetworkManager.Query().IsNotEmpty("ip6_addr").SubQuery()
+		gNicQ := gNics.Query(
+			gNics.Field("network_id"),
+			sqlchemy.COUNT("gnic_count6"),
+		)
+		gNicQ = gNicQ.Join(guests, sqlchemy.Equals(guests.Field("id"), gNics.Field("guest_id")))
+		gNicQ = gNicQ.Join(hosts, sqlchemy.Equals(guests.Field("host_id"), hosts.Field("id")))
+		gNicQ = gNicQ.Filter(sqlchemy.IsTrue(hosts.Field("enabled")))
+
+		gNicSQ6 = gNicQ.GroupBy(gNics.Field("network_id")).SubQuery()
 	}
-	netifs := netifsQ.SubQuery()
-	netifNics := NetworkinterfacenetworkManager.Query().SubQuery()
-	netifNicQ := netifNics.Query(
-		netifNics.Field("network_id"),
-		sqlchemy.COUNT("netifnic_count"),
-	)
-	netifNicQ = netifNicQ.Join(netifs, sqlchemy.Equals(netifNics.Field("networkinterface_id"), netifs.Field("id")))
-
-	dbNics := DBInstanceNetworkManager.Query().SubQuery()
-	dbNicQ := dbNics.Query(
-		dbNics.Field("network_id"),
-		sqlchemy.COUNT("dbnic_count"),
-	)
-	dbNicQ = dbNicQ.Join(dbs, sqlchemy.Equals(dbs.Field("id"), dbNics.Field("dbinstance_id")))
-	dbNicQ = dbNicQ.Filter(sqlchemy.IsFalse(dbs.Field("pending_deleted")))
-
-	gNicSQ := gNicQ.GroupBy(gNics.Field("network_id")).SubQuery()
-	hNicSQ := hNicQ.GroupBy(hNics.Field("network_id")).SubQuery()
-	grpNicSQ := grpNicQ.GroupBy(groupNics.Field("network_id")).SubQuery()
-	lbNicSQ := lbNicQ.GroupBy(lbNics.Field("network_id")).SubQuery()
-	eipNicSQ := eipNicQ.GroupBy(eipNics.Field("network_id")).SubQuery()
-	netifNicSQ := netifNicQ.GroupBy(netifNics.Field("network_id")).SubQuery()
-	dbNicSQ := dbNicQ.GroupBy(dbNics.Field("network_id")).SubQuery()
+	{
+		hNics := HostnetworkManager.Query().SubQuery()
+		hNicQ := hNics.Query(
+			hNics.Field("network_id"),
+			sqlchemy.COUNT("hnic_count"),
+		)
+		hNicQ = hNicQ.Join(hosts2, sqlchemy.Equals(hNics.Field("baremetal_id"), hosts2.Field("id")))
+		hNicQ = hNicQ.Filter(sqlchemy.IsTrue(hosts2.Field("enabled")))
+		hNicSQ = hNicQ.GroupBy(hNics.Field("network_id")).SubQuery()
+	}
+	{
+		groupNics := GroupnetworkManager.Query().SubQuery()
+		grpNicQ := groupNics.Query(
+			groupNics.Field("network_id"),
+			sqlchemy.COUNT("grpnic_count"),
+		)
+		grpNicQ = grpNicQ.Join(groups, sqlchemy.Equals(groups.Field("id"), groupNics.Field("group_id")))
+		grpNicSQ = grpNicQ.GroupBy(groupNics.Field("network_id")).SubQuery()
+	}
+	{
+		lbNics := LoadbalancernetworkManager.Query().SubQuery()
+		lbNicQ := lbNics.Query(
+			lbNics.Field("network_id"),
+			sqlchemy.COUNT("lbnic_count"),
+		)
+		lbNicQ = lbNicQ.Join(lbs, sqlchemy.Equals(lbs.Field("id"), lbNics.Field("loadbalancer_id")))
+		lbNicQ = lbNicQ.Filter(sqlchemy.IsFalse(lbs.Field("pending_deleted")))
+		lbNicSQ = lbNicQ.GroupBy(lbNics.Field("network_id")).SubQuery()
+	}
+	{
+		eipNicsQ := ElasticipManager.Query().IsNotEmpty("network_id")
+		eipNicsQ = db.ObjectIdQueryWithPolicyResult(ctx, eipNicsQ, ElasticipManager, policyResult)
+		eipNics := filterByScopeOwnerId(eipNicsQ, scope, ownerId, false).SubQuery()
+		eipNicQ := eipNics.Query(
+			eipNics.Field("network_id"),
+			sqlchemy.COUNT("eipnic_count"),
+		)
+		if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
+			eipNicQ = CloudProviderFilter(eipNicQ, eipNicQ.Field("manager_id"), providers, brands, cloudEnv)
+		}
+		if len(rangeObjs) > 0 {
+			eipNicQ = RangeObjectsFilter(eipNicQ, rangeObjs, eipNicQ.Field("cloudregion_id"), nil, eipNicQ.Field("manager_id"), nil, nil)
+		}
+		eipNicSQ = eipNicQ.GroupBy(eipNics.Field("network_id")).SubQuery()
+	}
+	{
+		netifsQ := NetworkInterfaceManager.Query()
+		netifsQ = db.ObjectIdQueryWithPolicyResult(ctx, netifsQ, NetworkInterfaceManager, policyResult)
+		netifsQ = filterByScopeOwnerId(netifsQ, scope, ownerId, true)
+		if len(providers) > 0 || len(brands) > 0 || len(cloudEnv) > 0 {
+			netifsQ = CloudProviderFilter(netifsQ, netifsQ.Field("manager_id"), providers, brands, cloudEnv)
+		}
+		if len(rangeObjs) > 0 {
+			netifsQ = RangeObjectsFilter(netifsQ, rangeObjs, netifsQ.Field("cloudregion_id"), nil, netifsQ.Field("manager_id"), nil, nil)
+		}
+		netifs := netifsQ.SubQuery()
+		netifNics := NetworkinterfacenetworkManager.Query().SubQuery()
+		netifNicQ := netifNics.Query(
+			netifNics.Field("network_id"),
+			sqlchemy.COUNT("netifnic_count"),
+		)
+		netifNicQ = netifNicQ.Join(netifs, sqlchemy.Equals(netifNics.Field("networkinterface_id"), netifs.Field("id")))
+		netifNicSQ = netifNicQ.GroupBy(netifNics.Field("network_id")).SubQuery()
+	}
+	{
+		dbNics := DBInstanceNetworkManager.Query().SubQuery()
+		dbNicQ := dbNics.Query(
+			dbNics.Field("network_id"),
+			sqlchemy.COUNT("dbnic_count"),
+		)
+		dbNicQ = dbNicQ.Join(dbs, sqlchemy.Equals(dbs.Field("id"), dbNics.Field("dbinstance_id")))
+		dbNicQ = dbNicQ.Filter(sqlchemy.IsFalse(dbs.Field("pending_deleted")))
+		dbNicSQ = dbNicQ.GroupBy(dbNics.Field("network_id")).SubQuery()
+	}
 
 	networks := NetworkManager.Query().SubQuery()
 	netQ := networks.Query(
 		sqlchemy.SUM("guest_nic_count", gNicSQ.Field("gnic_count")),
 		sqlchemy.SUM("pending_deleted_guest_nic_count", gNicSQ.Field("pending_deleted_gnic_count")),
 		sqlchemy.SUM("host_nic_count", hNicSQ.Field("hnic_count")),
+		sqlchemy.SUM("guest_nic_count4", gNicSQ4.Field("gnic_count4")),
+		sqlchemy.SUM("guest_nic_count6", gNicSQ6.Field("gnic_count6")),
 		sqlchemy.SUM("group_nic_count", grpNicSQ.Field("grpnic_count")),
 		sqlchemy.SUM("lb_nic_count", lbNicSQ.Field("lbnic_count")),
 		sqlchemy.SUM("eip_nic_count", eipNicSQ.Field("eipnic_count")),
@@ -691,6 +746,8 @@ func (manager *SWireManager) totalCountQ(
 		sqlchemy.SUM("db_nic_count", dbNicSQ.Field("dbnic_count")),
 	)
 	netQ = netQ.LeftJoin(gNicSQ, sqlchemy.Equals(gNicSQ.Field("network_id"), networks.Field("id")))
+	netQ = netQ.LeftJoin(gNicSQ4, sqlchemy.Equals(gNicSQ4.Field("network_id"), networks.Field("id")))
+	netQ = netQ.LeftJoin(gNicSQ6, sqlchemy.Equals(gNicSQ6.Field("network_id"), networks.Field("id")))
 	netQ = netQ.LeftJoin(hNicSQ, sqlchemy.Equals(hNicSQ.Field("network_id"), networks.Field("id")))
 	netQ = netQ.LeftJoin(grpNicSQ, sqlchemy.Equals(grpNicSQ.Field("network_id"), networks.Field("id")))
 	netQ = netQ.LeftJoin(lbNicSQ, sqlchemy.Equals(lbNicSQ.Field("network_id"), networks.Field("id")))
@@ -702,6 +759,7 @@ func (manager *SWireManager) totalCountQ(
 }
 
 func (manager *SWireManager) totalCountQ2(
+	ctx context.Context,
 	rangeObjs []db.IStandaloneModel,
 	hostTypes []string,
 	providers []string, brands []string, cloudEnv string,
@@ -709,23 +767,36 @@ func (manager *SWireManager) totalCountQ2(
 	ownerId mcclient.IIdentityProvider,
 	policyResult rbacutils.SPolicyResult,
 ) *sqlchemy.SQuery {
-	revIps := filterExpiredReservedIps(ReservedipManager.Query()).SubQuery()
-	revQ := revIps.Query(
-		revIps.Field("network_id"),
-		sqlchemy.COUNT("rnic_count"),
-	)
-
-	revSQ := revQ.GroupBy(revIps.Field("network_id")).SubQuery()
+	var revSQ *sqlchemy.SSubQuery
+	var revSQ6 *sqlchemy.SSubQuery
+	{
+		revIps := filterExpiredReservedIp4s(ReservedipManager.Query()).SubQuery()
+		revQ := revIps.Query(
+			revIps.Field("network_id"),
+			sqlchemy.COUNT("rnic_count"),
+		)
+		revSQ = revQ.GroupBy(revIps.Field("network_id")).SubQuery()
+	}
+	{
+		revIps := filterExpiredReservedIp6s(ReservedipManager.Query()).SubQuery()
+		revQ := revIps.Query(
+			revIps.Field("network_id"),
+			sqlchemy.COUNT("rnic_count6"),
+		)
+		revSQ6 = revQ.GroupBy(revIps.Field("network_id")).SubQuery()
+	}
 
 	ownerNetQ1 := NetworkManager.Query()
-	ownerNetQ1 = db.ObjectIdQueryWithPolicyResult(ownerNetQ1, NetworkManager, policyResult)
+	ownerNetQ1 = db.ObjectIdQueryWithPolicyResult(ctx, ownerNetQ1, NetworkManager, policyResult)
 	ownerNetworks := filterByScopeOwnerId(ownerNetQ1, scope, ownerId, false).SubQuery()
 	ownerNetQ := ownerNetworks.Query(
 		ownerNetworks.Field("wire_id"),
 		sqlchemy.COUNT("id").Label("net_count"),
 		sqlchemy.SUM("rev_count", revSQ.Field("rnic_count")),
+		sqlchemy.SUM("rev_count6", revSQ6.Field("rnic_count6")),
 	)
 	ownerNetQ = ownerNetQ.LeftJoin(revSQ, sqlchemy.Equals(revSQ.Field("network_id"), ownerNetworks.Field("id")))
+	ownerNetQ = ownerNetQ.LeftJoin(revSQ6, sqlchemy.Equals(revSQ6.Field("network_id"), ownerNetworks.Field("id")))
 	ownerNetQ = ownerNetQ.GroupBy(ownerNetworks.Field("wire_id"))
 	ownerNetSQ := ownerNetQ.SubQuery()
 
@@ -733,12 +804,14 @@ func (manager *SWireManager) totalCountQ2(
 	q := wires.Query(
 		sqlchemy.SUM("net_count", ownerNetSQ.Field("net_count")),
 		sqlchemy.SUM("reserved_count", ownerNetSQ.Field("rev_count")),
+		sqlchemy.SUM("reserved_count6", ownerNetSQ.Field("rev_count6")),
 	)
 	q = q.LeftJoin(ownerNetSQ, sqlchemy.Equals(wires.Field("id"), ownerNetSQ.Field("wire_id")))
 	return filterWiresCountQuery(q, hostTypes, providers, brands, cloudEnv, rangeObjs)
 }
 
 func (manager *SWireManager) totalCountQ3(
+	ctx context.Context,
 	rangeObjs []db.IStandaloneModel,
 	hostTypes []string,
 	providers []string, brands []string, cloudEnv string,
@@ -747,7 +820,7 @@ func (manager *SWireManager) totalCountQ3(
 	policyResult rbacutils.SPolicyResult,
 ) *sqlchemy.SQuery {
 	wiresQ := WireManager.Query()
-	wiresQ = db.ObjectIdQueryWithPolicyResult(wiresQ, WireManager, policyResult)
+	wiresQ = db.ObjectIdQueryWithPolicyResult(ctx, wiresQ, WireManager, policyResult)
 	wires := filterByScopeOwnerId(WireManager.Query(), scope, ownerId, true).SubQuery()
 	q := wires.Query(
 		sqlchemy.COUNT("id").Label("wires_count"),
@@ -784,8 +857,11 @@ type WiresCountStat struct {
 	EmulatedWiresCount int
 	NetCount           int
 	GuestNicCount      int
+	GuestNicCount4     int
+	GuestNicCount6     int
 	HostNicCount       int
 	ReservedCount      int
+	ReservedCount6     int
 	GroupNicCount      int
 	LbNicCount         int
 	EipNicCount        int
@@ -800,6 +876,7 @@ func (wstat WiresCountStat) NicCount() int {
 }
 
 func (manager *SWireManager) TotalCount(
+	ctx context.Context,
 	rangeObjs []db.IStandaloneModel,
 	hostTypes []string,
 	providers []string, brands []string, cloudEnv string,
@@ -836,6 +913,7 @@ func (manager *SWireManager) TotalCount(
 
 	stat := WiresCountStat{}
 	err := manager.totalCountQ(
+		ctx,
 		rangeObjs,
 		hostTypes, hostProviders, hostBrands,
 		providers, brands, cloudEnv,
@@ -846,6 +924,7 @@ func (manager *SWireManager) TotalCount(
 		log.Errorf("Wire total count: %v", err)
 	}
 	err = manager.totalCountQ2(
+		ctx,
 		rangeObjs,
 		hostTypes,
 		providers, brands, cloudEnv,
@@ -856,6 +935,7 @@ func (manager *SWireManager) TotalCount(
 		log.Errorf("Wire total count 2: %v", err)
 	}
 	err = manager.totalCountQ3(
+		ctx,
 		rangeObjs,
 		hostTypes,
 		providers, brands, cloudEnv,
@@ -868,7 +948,7 @@ func (manager *SWireManager) TotalCount(
 	return stat
 }
 
-func (swire *SWire) getNetworkQuery(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (swire *SWire) getNetworkQuery(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	additionalNicIds := NetworkAdditionalWireManager.networkIdQuery(swire.Id)
 	q := NetworkManager.Query()
 	q = q.Filter(sqlchemy.OR(
@@ -876,17 +956,17 @@ func (swire *SWire) getNetworkQuery(userCred mcclient.TokenCredential, ownerId m
 		sqlchemy.In(q.Field("id"), additionalNicIds.SubQuery()),
 	))
 	if ownerId != nil {
-		q = NetworkManager.FilterByOwner(q, NetworkManager, userCred, ownerId, scope)
+		q = NetworkManager.FilterByOwner(ctx, q, NetworkManager, userCred, ownerId, scope)
 	}
 	return q
 }
 
-func (swire *SWire) GetNetworks(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
-	return swire.getNetworks(userCred, ownerId, scope)
+func (swire *SWire) GetNetworks(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
+	return swire.getNetworks(ctx, userCred, ownerId, scope)
 }
 
-func (swire *SWire) getNetworks(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
-	q := swire.getNetworkQuery(userCred, ownerId, scope)
+func (swire *SWire) getNetworks(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
+	q := swire.getNetworkQuery(ctx, userCred, ownerId, scope)
 	nets := make([]SNetwork, 0)
 	err := db.FetchModelObjects(NetworkManager, q, &nets)
 	if err != nil {
@@ -895,15 +975,19 @@ func (swire *SWire) getNetworks(userCred mcclient.TokenCredential, ownerId mccli
 	return nets, nil
 }
 
-func (swire *SWire) getGatewayNetworkQuery(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
-	q := swire.getNetworkQuery(userCred, ownerId, scope)
-	q = q.IsNotNull("guest_gateway").IsNotEmpty("guest_gateway")
+func (swire *SWire) getGatewayNetworkQuery(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	q := swire.getNetworkQuery(ctx, userCred, ownerId, scope)
+	q = q.Filter(sqlchemy.OR(
+		sqlchemy.In(q.Field("server_type"), []api.TNetworkType{api.NETWORK_TYPE_BAREMETAL, api.NETWORK_TYPE_PXE, api.NETWORK_TYPE_IPMI}),
+		sqlchemy.AND(sqlchemy.IsNotNull(q.Field("guest_gateway")), sqlchemy.IsNotEmpty(q.Field("guest_gateway"))),
+		sqlchemy.AND(sqlchemy.IsNotNull(q.Field("guest_gateway6")), sqlchemy.IsNotEmpty(q.Field("guest_gateway6"))),
+	))
 	q = q.Equals("status", api.NETWORK_STATUS_AVAILABLE)
 	return q
 }
 
-func (swire *SWire) getAutoAllocNetworks(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
-	q := swire.getGatewayNetworkQuery(userCred, ownerId, scope)
+func (swire *SWire) getAutoAllocNetworks(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
+	q := swire.getGatewayNetworkQuery(ctx, userCred, ownerId, scope)
 	q = q.IsTrue("is_auto_alloc")
 	nets := make([]SNetwork, 0)
 	err := db.FetchModelObjects(NetworkManager, q, &nets)
@@ -913,8 +997,8 @@ func (swire *SWire) getAutoAllocNetworks(userCred mcclient.TokenCredential, owne
 	return nets, nil
 }
 
-func (swire *SWire) getPublicNetworks(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
-	q := swire.getGatewayNetworkQuery(userCred, ownerId, scope)
+func (swire *SWire) getPublicNetworks(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
+	q := swire.getGatewayNetworkQuery(ctx, userCred, ownerId, scope)
 	q = q.IsTrue("is_public")
 	nets := make([]SNetwork, 0)
 	err := db.FetchModelObjects(NetworkManager, q, &nets)
@@ -924,8 +1008,8 @@ func (swire *SWire) getPublicNetworks(userCred mcclient.TokenCredential, ownerId
 	return nets, nil
 }
 
-func (swire *SWire) getPrivateNetworks(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
-	q := swire.getGatewayNetworkQuery(userCred, ownerId, scope)
+func (swire *SWire) getPrivateNetworks(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) ([]SNetwork, error) {
+	q := swire.getGatewayNetworkQuery(ctx, userCred, ownerId, scope)
 	q = q.IsFalse("is_public")
 	nets := make([]SNetwork, 0)
 	err := db.FetchModelObjects(NetworkManager, q, &nets)
@@ -935,42 +1019,68 @@ func (swire *SWire) getPrivateNetworks(userCred mcclient.TokenCredential, ownerI
 	return nets, nil
 }
 
-func (swire *SWire) GetCandidatePrivateNetwork(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, isExit bool, serverTypes []string) (*SNetwork, error) {
-	nets, err := swire.getPrivateNetworks(userCred, ownerId, scope)
+func (swire *SWire) GetCandidatePrivateNetwork(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, isExit bool, serverTypes []api.TNetworkType) (*SNetwork, error) {
+	nets, err := swire.getPrivateNetworks(ctx, userCred, ownerId, scope)
 	if err != nil {
 		return nil, err
 	}
 	return ChooseCandidateNetworks(nets, isExit, serverTypes), nil
 }
 
-func (swire *SWire) GetCandidateAutoAllocNetwork(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, isExit bool, serverTypes []string) (*SNetwork, error) {
-	nets, err := swire.getAutoAllocNetworks(userCred, ownerId, scope)
+func (swire *SWire) GetCandidateAutoAllocNetwork(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, isExit bool, serverTypes []api.TNetworkType) (*SNetwork, error) {
+	nets, err := swire.getAutoAllocNetworks(ctx, userCred, ownerId, scope)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "getAutoAllocNetworks with scope %s", scope)
 	}
 	return ChooseCandidateNetworks(nets, isExit, serverTypes), nil
 }
 
-func (swire *SWire) GetCandidateNetworkForIp(userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, ipAddr string) (*SNetwork, error) {
+func (swire *SWire) GetCandidateNetworkForIp(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, ipAddr string) (*SNetwork, error) {
 	ip, err := netutils.NewIPV4Addr(ipAddr)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "netutils.NewIPV4Addr: %s", ipAddr)
 	}
-	netPrivates, err := swire.getPrivateNetworks(userCred, ownerId, scope)
+	netPrivates, err := swire.getPrivateNetworks(ctx, userCred, ownerId, scope)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "swire.getPrivateNetworks %s", swire.GetId())
 	}
 	for _, net := range netPrivates {
 		if net.IsAddressInRange(ip) {
 			return &net, nil
 		}
 	}
-	netPublics, err := swire.getPublicNetworks(userCred, ownerId, scope)
+	netPublics, err := swire.getPublicNetworks(ctx, userCred, ownerId, scope)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "swire.getPublicNetworks %s", swire.GetId())
 	}
 	for _, net := range netPublics {
 		if net.IsAddressInRange(ip) {
+			return &net, nil
+		}
+	}
+	return nil, nil
+}
+
+func (swire *SWire) GetCandidateNetworkForIp6(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope, ip6Addr string) (*SNetwork, error) {
+	ip6, err := netutils.NewIPV6Addr(ip6Addr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "netutils.NewIPV6Addr: %s", ip6Addr)
+	}
+	netPrivates, err := swire.getPrivateNetworks(ctx, userCred, ownerId, scope)
+	if err != nil {
+		return nil, errors.Wrapf(err, "swire.getPrivateNetworks %s", swire.GetId())
+	}
+	for _, net := range netPrivates {
+		if net.IsAddress6InRange(ip6) {
+			return &net, nil
+		}
+	}
+	netPublics, err := swire.getPublicNetworks(ctx, userCred, ownerId, scope)
+	if err != nil {
+		return nil, errors.Wrapf(err, "swire.getPublicNetworks %s", swire.GetId())
+	}
+	for _, net := range netPublics {
+		if net.IsAddress6InRange(ip6) {
 			return &net, nil
 		}
 	}
@@ -1003,14 +1113,14 @@ func chooseNetworkByAddressCount(nets []*SNetwork) (*SNetwork, *SNetwork) {
 	return minSel, maxSel
 }
 
-func ChooseCandidateNetworks(nets []SNetwork, isExit bool, serverTypes []string) *SNetwork {
+func ChooseCandidateNetworks(nets []SNetwork, isExit bool, serverTypes []api.TNetworkType) *SNetwork {
 	matchingNets := make([]*SNetwork, 0)
 	notMatchingNets := make([]*SNetwork, 0)
 
 	for _, s := range serverTypes {
 		net := chooseCandidateNetworksByNetworkType(nets, isExit, s)
 		if net != nil {
-			if utils.IsInStringArray(net.ServerType, serverTypes) {
+			if api.IsInNetworkTypes(net.ServerType, serverTypes) {
 				matchingNets = append(matchingNets, net)
 			} else {
 				notMatchingNets = append(notMatchingNets, net)
@@ -1029,7 +1139,7 @@ func ChooseCandidateNetworks(nets []SNetwork, isExit bool, serverTypes []string)
 	return nil
 }
 
-func chooseCandidateNetworksByNetworkType(nets []SNetwork, isExit bool, serverType string) *SNetwork {
+func chooseCandidateNetworksByNetworkType(nets []SNetwork, isExit bool, serverType api.TNetworkType) *SNetwork {
 	matchingNets := make([]*SNetwork, 0)
 	notMatchingNets := make([]*SNetwork, 0)
 
@@ -1056,6 +1166,12 @@ func chooseCandidateNetworksByNetworkType(nets []SNetwork, isExit bool, serverTy
 }
 
 func (manager *SWireManager) InitializeData() error {
+	{
+		err := manager.initHostLocalWire()
+		if err != nil {
+			return errors.Wrap(err, "initHostLocalWire")
+		}
+	}
 	{
 		err := manager.initVpcId()
 		if err != nil {
@@ -1263,6 +1379,19 @@ func (manager *SWireManager) GetOnPremiseWireOfIp(ipAddr string) (*SWire, error)
 	}
 }
 
+func (manager *SWireManager) GetOnPremiseWireOfIp6(ip6Addr string) (*SWire, error) {
+	net, err := NetworkManager.GetOnPremiseNetworkOfIP6(ip6Addr, "", tristate.None)
+	if err != nil {
+		return nil, err
+	}
+	wire, _ := net.GetWire()
+	if wire != nil {
+		return wire, nil
+	} else {
+		return nil, fmt.Errorf("Wire not found")
+	}
+}
+
 func (w *SWire) PerformMergeNetwork(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.WireMergeNetworkInput) (jsonutils.JSONObject, error) {
 	return nil, w.StartMergeNetwork(ctx, userCred, "")
 }
@@ -1348,7 +1477,7 @@ func (w *SWire) PerformMergeTo(ctx context.Context, userCred mcclient.TokenCrede
 			logclient.AddActionLogWithContext(ctx, w, logclient.ACT_MERGE, err.Error(), userCred, false)
 		}
 	}()
-	iw, err := WireManager.FetchByIdOrName(userCred, input.Target)
+	iw, err := WireManager.FetchByIdOrName(ctx, userCred, input.Target)
 	if err == sql.ErrNoRows {
 		err = httperrors.NewNotFoundError("Wire %q", input.Target)
 		return
@@ -1471,7 +1600,7 @@ func (manager *SWireManager) ListItemFilter(
 
 	hostStr := query.HostId
 	if len(hostStr) > 0 {
-		hostObj, err := HostManager.FetchByIdOrName(userCred, hostStr)
+		hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, hostStr)
 		if err != nil {
 			return nil, httperrors.NewResourceNotFoundError2(HostManager.Keyword(), hostStr)
 		}
@@ -1545,6 +1674,15 @@ func (manager *SWireManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field s
 		return q, nil
 	}
 
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SWireManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SVpcResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
 	return q, httperrors.ErrNotFound
 }
 
@@ -1706,8 +1844,9 @@ func (wire *SWire) GetChangeOwnerCandidateDomainIds() []string {
 }
 
 func (wire *SWire) GetChangeOwnerRequiredDomainIds() []string {
+	ctx := context.Background()
 	requires := stringutils2.SSortedStrings{}
-	networks, _ := wire.getNetworks(nil, nil, rbacscope.ScopeNone)
+	networks, _ := wire.getNetworks(ctx, nil, nil, rbacscope.ScopeNone)
 	for i := range networks {
 		requires = stringutils2.Append(requires, networks[i].DomainId)
 	}
@@ -1715,7 +1854,8 @@ func (wire *SWire) GetChangeOwnerRequiredDomainIds() []string {
 }
 
 func (wire *SWire) GetRequiredSharedDomainIds() []string {
-	networks, _ := wire.getNetworks(nil, nil, rbacscope.ScopeNone)
+	ctx := context.Background()
+	networks, _ := wire.getNetworks(ctx, nil, nil, rbacscope.ScopeNone)
 	if len(networks) == 0 {
 		return wire.SInfrasResourceBase.GetRequiredSharedDomainIds()
 	}
@@ -1784,6 +1924,7 @@ func (swire *SWire) GetDetailsTopology(ctx context.Context, userCred mcclient.To
 		for j := range hns {
 			host.Networks = append(host.Networks, api.HostnetworkTopologyOutput{
 				IpAddr:  hns[j].IpAddr,
+				Ip6Addr: hns[j].Ip6Addr,
 				MacAddr: hns[j].MacAddr,
 			})
 		}
@@ -1799,7 +1940,7 @@ func (swire *SWire) GetDetailsTopology(ctx context.Context, userCred mcclient.To
 		}
 		ret.Hosts = append(ret.Hosts, host)
 	}
-	networks, err := swire.GetNetworks(nil, nil, rbacscope.ScopeSystem)
+	networks, err := swire.GetNetworks(ctx, nil, nil, rbacscope.ScopeSystem)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetNetworks")
 	}
@@ -1812,19 +1953,14 @@ func (swire *SWire) GetDetailsTopology(ctx context.Context, userCred mcclient.To
 			GuestIpMask:  networks[j].GuestIpMask,
 			ServerType:   networks[j].ServerType,
 			VlanId:       networks[j].VlanId,
-			Address:      []api.SNetworkUsedAddress{},
+			// Address:      []api.SNetworkUsedAddress{},
 		}
 
-		netAddrs := make([]api.SNetworkUsedAddress, 0)
-
-		q := networks[j].getUsedAddressQuery(userCred, userCred, rbacscope.ScopeSystem, false)
-		err = q.All(&netAddrs)
+		network.GetNetworkAddressesOutput, err = networks[j].fetchAddressDetails(ctx, userCred, userCred, rbacscope.ScopeSystem)
 		if err != nil {
-			return nil, errors.Wrapf(err, "q.All")
+			return nil, errors.Wrapf(err, "fetchAddressDetails")
 		}
 
-		sort.Sort(SNetworkUsedAddressList(netAddrs))
-		network.Address = netAddrs
 		ret.Networks = append(ret.Networks, network)
 	}
 	return ret, nil
@@ -1847,4 +1983,37 @@ func (wire *SWire) Delete(ctx context.Context, userCred mcclient.TokenCredential
 		return errors.Wrap(err, "NetworkAdditionalWireManager.DeleteWire")
 	}
 	return wire.SStatusInfrasResourceBase.Delete(ctx, userCred)
+}
+
+func (manager *SWireManager) initHostLocalWire() error {
+	if _, err := manager.FetchById(api.DEFAULT_HOST_LOCAL_WIRE_ID); err != nil {
+		if err == sql.ErrNoRows {
+			defWire := SWire{}
+			defWire.SetModelManager(WireManager, &defWire)
+
+			defWire.Id = api.DEFAULT_HOST_LOCAL_WIRE_ID
+			defWire.Name = api.DEFAULT_HOST_LOCAL_WIRE_NAME
+			defWire.VpcId = api.DEFAULT_VPC_ID
+			defWire.ZoneId = ""    // host local wire is not associated with a zone
+			defWire.ManagerId = "" // host local wire is not associated with a manager
+			defWire.IsEmulated = false
+			defWire.ExternalId = "" // host local wire is not associated with an external id
+			defWire.IsPublic = true
+			defWire.PublicScope = string(rbacscope.ScopeSystem)
+			defWire.Status = api.WIRE_STATUS_AVAILABLE
+			defWire.Description = "Host local wire"
+			defWire.Bandwidth = 10000
+			defWire.Mtu = 1500
+			defWire.ScheduleRank = 0
+			defWire.DomainId = identityapi.DEFAULT_DOMAIN_ID
+			err = manager.TableSpec().Insert(context.TODO(), &defWire)
+			if err != nil {
+				log.Errorf("Insert default host local wire fail: %s", err)
+			}
+			return err
+		} else {
+			return err
+		}
+	}
+	return nil
 }

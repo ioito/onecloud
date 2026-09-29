@@ -119,7 +119,7 @@ func (self *SRegion) GetIStorageById(id string) (cloudprovider.ICloudStorage, er
 			return &storages[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetIStoragecaches() ([]cloudprovider.ICloudStoragecache, error) {
@@ -158,7 +158,7 @@ func (self *SRegion) GetIStoragecacheById(id string) (cloudprovider.ICloudStorag
 			return caches[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetIHosts() ([]cloudprovider.ICloudHost, error) {
@@ -193,7 +193,7 @@ func (self *SRegion) GetIHostById(id string) (cloudprovider.ICloudHost, error) {
 			}
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetISnapshots() ([]cloudprovider.ICloudSnapshot, error) {
@@ -221,4 +221,47 @@ func (self *SRegion) GetISnapshotById(id string) (cloudprovider.ICloudSnapshot, 
 		}
 	}
 	return nil, cloudprovider.ErrNotFound
+}
+
+func (self *SRegion) GetISecurityGroups() ([]cloudprovider.ICloudSecurityGroup, error) {
+	var groups []SSecurityGroup
+	nextToken := ""
+	for {
+		part, _nextToken, err := self.GetSecurityGroups("", "", nextToken)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, part...)
+		if len(_nextToken) == 0 || len(part) == 0 {
+			break
+		}
+		nextToken = _nextToken
+	}
+	var ret []cloudprovider.ICloudSecurityGroup
+	for i := range groups {
+		groups[i].region = self
+		ret = append(ret, &groups[i])
+	}
+	return ret, nil
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	var vms []SInstance
+	nextToken := ""
+	for {
+		part, _nextToken, err := region.GetInstances("", "", MAX_RESULT, nextToken)
+		if err != nil {
+			return nil, err
+		}
+		vms = append(vms, part...)
+		if len(part) == 0 || len(_nextToken) == 0 {
+			break
+		}
+		nextToken = _nextToken
+	}
+	var ret []cloudprovider.ICloudVM
+	for i := range vms {
+		ret = append(ret, &vms[i])
+	}
+	return ret, nil
 }

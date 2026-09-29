@@ -16,6 +16,7 @@ package huawei
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -151,6 +152,10 @@ func (self *SfsTurbo) Delete() error {
 	return self.region.DeleteSfsTurbo(self.Id)
 }
 
+func (self *SfsTurbo) GetProjectId() string {
+	return self.EnterpriseProjectId
+}
+
 func (self *SRegion) GetICloudFileSystems() ([]cloudprovider.ICloudFileSystem, error) {
 	sfs, err := self.GetSfsTurbos()
 	if err != nil {
@@ -173,32 +178,58 @@ func (self *SRegion) GetICloudFileSystemById(id string) (cloudprovider.ICloudFil
 }
 
 func (self *SRegion) GetSfsTurbos() ([]SfsTurbo, error) {
-	queues := make(map[string]string)
-	sfs := make([]SfsTurbo, 0, 2)
-	err := doListAllWithOffset(self.ecsClient.SfsTurbos.List, queues, &sfs)
-	if err != nil {
-		return nil, errors.Wrapf(err, "doListAllWithOffset")
+	query := url.Values{}
+	sfs := []SfsTurbo{}
+	for {
+		resp, err := self.list(SERVICE_SFS, "sfs-turbo/shares/detail", query)
+		if err != nil {
+			return nil, err
+		}
+		part := struct {
+			Shares []SfsTurbo
+			Count  int
+		}{}
+		err = resp.Unmarshal(&part)
+		if err != nil {
+			return nil, err
+		}
+		sfs = append(sfs, part.Shares...)
+		if len(part.Shares) == 0 || len(sfs) >= part.Count {
+			break
+		}
+		query.Set("offset", fmt.Sprintf("%d", len(sfs)))
 	}
 	return sfs, nil
 }
 
 func (self *SRegion) GetSfsTurbo(id string) (*SfsTurbo, error) {
+	resp, err := self.list(SERVICE_SFS, "sfs-turbo/shares/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
 	sf := &SfsTurbo{region: self}
-	err := DoGet(self.ecsClient.SfsTurbos.Get, id, nil, &sf)
-	return sf, errors.Wrapf(err, "self.ecsClient.SfsTurbos.Get")
+	err = resp.Unmarshal(sf)
+	if err != nil {
+		return nil, err
+	}
+	return sf, nil
 }
 
 func (self *SRegion) DeleteSfsTurbo(id string) error {
-	return DoDelete(self.ecsClient.SfsTurbos.Delete, id, nil, nil)
+	_, err := self.delete(SERVICE_SFS, "sfs-turbo/shares/"+id)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (self *SRegion) GetSysDefaultSecgroupId() (string, error) {
-	secs, err := self.GetSecurityGroups("default", "")
+	secs, err := self.GetSecurityGroups("")
 	if err != nil {
 		return "", errors.Wrapf(err, "GetSecurityGroups")
 	}
 	if len(secs) > 0 {
-		return secs[0].ID, nil
+		return secs[0].Id, nil
 	}
 	return "", fmt.Errorf("not found default security group")
 }
@@ -234,7 +265,7 @@ func (self *SRegion) CreateSfsTurbo(opts *cloudprovider.FileSystemCraeteOptions)
 			"metadata":          metadata,
 		},
 	}
-	resp, err := self.ecsClient.SfsTurbos.Create(jsonutils.Marshal(params))
+	resp, err := self.post(SERVICE_SFS, "sfs-turbo/shares", params)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Create")
 	}

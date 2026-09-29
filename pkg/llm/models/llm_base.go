@@ -1,0 +1,878 @@
+package models
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/sqlchemy"
+
+	"yunion.io/x/onecloud/pkg/apis"
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/llm/options"
+	cloudutil "yunion.io/x/onecloud/pkg/llm/utils"
+	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	computeoptions "yunion.io/x/onecloud/pkg/mcclient/options/compute"
+	"yunion.io/x/onecloud/pkg/util/stringutils2"
+)
+
+func NewSLLMBaseManager(dt interface{}, tableName string, keyword string, keywordPlural string) SLLMBaseManager {
+	return SLLMBaseManager{
+		SVirtualResourceBaseManager: db.NewVirtualResourceBaseManager(
+			dt,
+			tableName,
+			keyword,
+			keywordPlural,
+		),
+	}
+}
+
+type SLLMBaseManager struct {
+	db.SVirtualResourceBaseManager
+	db.SEnabledResourceBaseManager
+}
+
+type SLLMBase struct {
+	db.SVirtualResourceBase
+	db.SEnabledResourceBase
+
+	CmpId string `width:"128" charset:"ascii" nullable:"true" list:"user"`
+	LLMIp string `width:"20" charset:"ascii" nullable:"true" list:"user"`
+	// Hypervisor     string `width:"128" charset:"ascii" nullable:"true" list:"user"`
+	Priority    int `nullable:"false" default:"100" list:"user"`
+	BandwidthMb int `nullable:"true" list:"user" create:"admin_optional"`
+
+	LastInstantModelProbe time.Time `nullable:"true" list:"user" create:"admin_optional"`
+
+	// 是否请求同步更新镜像
+	SyncImageRequest bool `default:"false" nullable:"false" list:"user" update:"user"`
+
+	VolumeUsedMb int       `nullable:"true" list:"user"`
+	VolumeUsedAt time.Time `nullable:"true" list:"user"`
+
+	// 秒装应用配额（可安装的总容量限制）
+	// InstantAppQuotaGb int `list:"user" update:"user" create:"optional" default:"0" nullable:"false"`
+
+	DebugMode     bool `default:"false" nullable:"false" list:"user" update:"user"`
+	RootfsUnlimit bool `default:"false" nullable:"false" list:"user" update:"user"`
+
+	NetworkType string `charset:"utf8" list:"user" update:"user" create:"optional"`
+	NetworkId   string `charset:"utf8" nullable:"true" list:"user" update:"user" create:"optional"`
+
+	// Devices/HostPaths override the corresponding sku fields when set; sku values are used when nil/empty.
+	HostPaths *api.HostPaths `charset:"utf8" length:"medium" nullable:"true" list:"user" update:"user" create:"optional"`
+	Devices   *api.Devices   `charset:"utf8" length:"medium" nullable:"true" list:"user" update:"user" create:"optional"`
+}
+
+// GetEffectiveDevices returns the devices to apply: llm's override takes priority over sku when non-empty.
+// Drivers should call this when materializing container device specs so that SLLM overrides on the
+// instance are honored (not just on server-level IsolatedDevices allocation).
+func GetEffectiveDevices(llm *SLLM, sku *SLLMSku) *api.Devices {
+	var llmBase *SLLMBase
+	var skuBase *SLLMSkuBase
+	if llm != nil {
+		llmBase = &llm.SLLMBase
+	}
+	if sku != nil {
+		skuBase = &sku.SLLMSkuBase
+	}
+	return getEffectiveDevices(llmBase, skuBase)
+}
+
+func getEffectiveDevices(llmBase *SLLMBase, skuBase *SLLMSkuBase) *api.Devices {
+	if llmBase != nil && llmBase.Devices != nil && !llmBase.Devices.IsZero() {
+		return llmBase.Devices
+	}
+	if skuBase != nil {
+		return skuBase.Devices
+	}
+	return nil
+}
+
+// SyncDetachIsolatedDevicesIfEmpty detaches all guest isolated devices when
+// effective devices (llm override or sku) are empty. Kept for callers that only
+// need the empty-SKU path; full sync (including sharing_mode changes) uses
+// SyncIsolatedDevicesWithSku.
+func (llm *SLLM) SyncDetachIsolatedDevicesIfEmpty(ctx context.Context, userCred mcclient.TokenCredential, sku *SLLMSku) error {
+	return llm.SyncIsolatedDevicesWithSku(ctx, userCred, sku)
+}
+
+type isolatedDeviceBindKey struct {
+	Model       string
+	SharingMode string
+}
+
+// isolatedDevicesNeedSync reports whether bound guest devices differ from
+// desired SKU configs in count, model, or sharing_mode.
+func isolatedDevicesNeedSync(desired []*computeapi.IsolatedDeviceConfig, bound []computeapi.SIsolatedDevice) bool {
+	if len(desired) != len(bound) {
+		return true
+	}
+	want := map[isolatedDeviceBindKey]int{}
+	for _, d := range desired {
+		if d == nil {
+			continue
+		}
+		want[isolatedDeviceBindKey{Model: d.Model, SharingMode: d.SharingMode}]++
+	}
+	for i := range bound {
+		k := isolatedDeviceBindKey{Model: bound[i].Model, SharingMode: bound[i].SharingMode}
+		if want[k] == 0 {
+			return true
+		}
+		want[k]--
+	}
+	return false
+}
+
+type isolatedDeviceAttachGroup struct {
+	Model         string
+	SharingMode   string
+	MemoryRequest int
+	Count         int
+}
+
+func groupIsolatedDeviceAttachConfigs(desired []*computeapi.IsolatedDeviceConfig) []isolatedDeviceAttachGroup {
+	type key struct {
+		Model         string
+		SharingMode   string
+		MemoryRequest int
+	}
+	order := make([]key, 0)
+	counts := map[key]int{}
+	for _, d := range desired {
+		if d == nil {
+			continue
+		}
+		k := key{Model: d.Model, SharingMode: d.SharingMode, MemoryRequest: d.MemoryRequest}
+		if _, ok := counts[k]; !ok {
+			order = append(order, k)
+		}
+		counts[k]++
+	}
+	out := make([]isolatedDeviceAttachGroup, 0, len(order))
+	for _, k := range order {
+		out = append(out, isolatedDeviceAttachGroup{
+			Model:         k.Model,
+			SharingMode:   k.SharingMode,
+			MemoryRequest: k.MemoryRequest,
+			Count:         counts[k],
+		})
+	}
+	return out
+}
+
+// SyncIsolatedDevicesWithSku reconciles guest isolated devices with SKU/LLM
+// effective devices on restart: detach-all when desired differs from bound,
+// then attach by model/sharing_mode/memory_request.
+func (llm *SLLM) SyncIsolatedDevicesWithSku(ctx context.Context, userCred mcclient.TokenCredential, sku *SLLMSku) error {
+	vramClaimMb := 0
+	if sku != nil {
+		vramClaimMb = sku.EstimateVramClaimMb()
+	}
+	desired, err := BuildIsolatedDeviceConfigs(GetEffectiveDevices(llm, sku), vramClaimMb)
+	if err != nil {
+		return errors.Wrap(err, "BuildIsolatedDeviceConfigs")
+	}
+	server, err := llm.GetServer(ctx)
+	if err != nil {
+		return errors.Wrap(err, "GetServer")
+	}
+	if !isolatedDevicesNeedSync(desired, server.IsolatedDevices) {
+		return nil
+	}
+	if len(server.IsolatedDevices) > 0 {
+		if err := llm.detachAllIsolatedDevices(ctx, userCred); err != nil {
+			return errors.Wrap(err, "detachAllIsolatedDevices")
+		}
+	}
+	if len(desired) == 0 {
+		return nil
+	}
+	s := auth.GetSession(ctx, userCred, options.Options.Region)
+	for _, group := range groupIsolatedDeviceAttachConfigs(desired) {
+		if err := llm.waitServerReadyForIsolatedDeviceAction(ctx, userCred); err != nil {
+			return errors.Wrap(err, "wait ready before attach-isolated-device")
+		}
+		count := group.Count
+		input := &computeapi.ServerAttachIsolatedDeviceInput{
+			Model: group.Model,
+			ServerAttachIsolatedDeviceBase: computeapi.ServerAttachIsolatedDeviceBase{
+				SharingMode: group.SharingMode,
+				Count:       &count,
+				AutoStart:   false,
+			},
+		}
+		if group.SharingMode == computeapi.DEVICE_SHARING_MODE_HAMI {
+			if group.MemoryRequest <= 0 {
+				return errors.Wrap(httperrors.ErrInputParameter, "HAMI attach requires memory_request > 0")
+			}
+			memReq := group.MemoryRequest
+			input.MemoryRequest = &memReq
+		}
+		_, err := compute.Servers.PerformAction(s, llm.CmpId, "attach-isolated-device", jsonutils.Marshal(input))
+		if err != nil {
+			return errors.Wrapf(err, "attach-isolated-device model=%s sharing_mode=%s count=%d",
+				group.Model, group.SharingMode, group.Count)
+		}
+		// Wait through sync_config (if any) back to ready before next attach / final check.
+		if _, err := llm.waitAfterIsolatedDeviceAction(ctx, userCred, nil); err != nil {
+			return errors.Wrap(err, "waitAfterIsolatedDeviceAction after attach-isolated-device")
+		}
+	}
+	server, err = llm.waitAfterIsolatedDeviceAction(ctx, userCred, func(srv *computeapi.ServerDetails) bool {
+		return !isolatedDevicesNeedSync(desired, srv.IsolatedDevices)
+	})
+	if err != nil {
+		return errors.Wrap(err, "waitAfterIsolatedDeviceAction for desired devices")
+	}
+	if isolatedDevicesNeedSync(desired, server.IsolatedDevices) {
+		return errors.Wrapf(errors.ErrInvalidStatus,
+			"isolated devices mismatch after sync: desired=%s bound=%s",
+			formatIsolatedDeviceBindKeys(desired), formatBoundIsolatedDeviceBindKeys(server.IsolatedDevices))
+	}
+	return nil
+}
+
+func formatIsolatedDeviceBindKeys(desired []*computeapi.IsolatedDeviceConfig) string {
+	parts := make([]string, 0, len(desired))
+	for _, d := range desired {
+		if d == nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s/%s", d.Model, d.SharingMode))
+	}
+	return fmt.Sprintf("%v", parts)
+}
+
+func formatBoundIsolatedDeviceBindKeys(bound []computeapi.SIsolatedDevice) string {
+	parts := make([]string, 0, len(bound))
+	for i := range bound {
+		parts = append(parts, fmt.Sprintf("%s/%s", bound[i].Model, bound[i].SharingMode))
+	}
+	return fmt.Sprintf("%v", parts)
+}
+
+func (llm *SLLM) detachAllIsolatedDevices(ctx context.Context, userCred mcclient.TokenCredential) error {
+	s := auth.GetSession(ctx, userCred, options.Options.Region)
+	params := jsonutils.NewDict()
+	params.Set("detach_all", jsonutils.JSONTrue)
+	_, err := compute.Servers.PerformAction(s, llm.CmpId, "detach-isolated-device", params)
+	if err != nil {
+		return errors.Wrap(err, "detach-isolated-device")
+	}
+	server, err := llm.waitAfterIsolatedDeviceAction(ctx, userCred, func(srv *computeapi.ServerDetails) bool {
+		return len(srv.IsolatedDevices) == 0
+	})
+	if err != nil {
+		return errors.Wrap(err, "waitAfterIsolatedDeviceAction after detach-isolated-device")
+	}
+	if len(server.IsolatedDevices) > 0 {
+		return errors.Wrapf(errors.ErrInvalidStatus, "isolated devices still present after detach: %d", len(server.IsolatedDevices))
+	}
+	return nil
+}
+
+const (
+	// isolatedDeviceLeaveReadyProbeSecs: KVM sync briefly leaves ready; POD often
+	// never does. Keep the probe short so POD restart is not stuck for minutes.
+	isolatedDeviceLeaveReadyProbeSecs = 5
+	// isolatedDeviceSettleTimeoutSecs: max wait for bound devices to match after
+	// status is back to ready.
+	isolatedDeviceSettleTimeoutSecs = 60
+)
+
+func (llm *SLLM) waitServerReadyForIsolatedDeviceAction(ctx context.Context, userCred mcclient.TokenCredential) error {
+	server, err := llm.GetServer(ctx)
+	if err != nil {
+		return errors.Wrap(err, "GetServer")
+	}
+	if server.Status == computeapi.VM_READY {
+		return nil
+	}
+	if strings.Contains(server.Status, "fail") {
+		return errors.Wrapf(errors.ErrInvalidStatus, "server status %s", server.Status)
+	}
+	if _, err := llm.WaitServerStatus(ctx, userCred, []string{computeapi.VM_READY}, 1800); err != nil {
+		return errors.Wrap(err, "WaitServerStatus ready")
+	}
+	return nil
+}
+
+// waitAfterIsolatedDeviceAction waits for GuestIsolatedDeviceSyncTask to finish.
+// It first probes for a leave-ready transition (sync_config) without treating
+// "devices already match" as done — DB updates can land before status flips,
+// and attaching while still sync_config fails. After back to ready, optionally
+// wait until settled().
+func (llm *SLLM) waitAfterIsolatedDeviceAction(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	settled func(*computeapi.ServerDetails) bool,
+) (*computeapi.ServerDetails, error) {
+	// Do not pass settled into the leave-ready probe: empty/desired bindings may
+	// appear while status is still about to become sync_config.
+	leftReady, server, err := llm.probeServerLeaveReadyStatus(ctx, isolatedDeviceLeaveReadyProbeSecs)
+	if err != nil {
+		return nil, err
+	}
+	if leftReady || (server != nil && server.Status != computeapi.VM_READY) {
+		server, err = llm.WaitServerStatus(ctx, userCred, []string{computeapi.VM_READY}, 1800)
+		if err != nil {
+			return nil, errors.Wrap(err, "WaitServerStatus after isolated-device action")
+		}
+	}
+	if settled == nil {
+		return server, nil
+	}
+	if settled(server) {
+		return server, nil
+	}
+	expire := time.Now().Add(time.Second * time.Duration(isolatedDeviceSettleTimeoutSecs))
+	for time.Now().Before(expire) {
+		server, err = llm.GetServer(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetServer")
+		}
+		if server.Status != computeapi.VM_READY {
+			if strings.Contains(server.Status, "fail") {
+				return nil, errors.Wrapf(errors.ErrInvalidStatus, "server status %s", server.Status)
+			}
+			server, err = llm.WaitServerStatus(ctx, userCred, []string{computeapi.VM_READY}, 1800)
+			if err != nil {
+				return nil, errors.Wrap(err, "WaitServerStatus after late leave-ready")
+			}
+			continue
+		}
+		if settled(server) {
+			return server, nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return server, nil
+}
+
+// probeServerLeaveReadyStatus polls until status leaves ready or timeout.
+// Returns leftReady=true when status left ready.
+func (llm *SLLM) probeServerLeaveReadyStatus(
+	ctx context.Context,
+	timeoutSecs int,
+) (leftReady bool, server *computeapi.ServerDetails, err error) {
+	expire := time.Now().Add(time.Second * time.Duration(timeoutSecs))
+	for {
+		server, err = llm.GetServer(ctx)
+		if err != nil {
+			return false, nil, errors.Wrap(err, "GetServer")
+		}
+		if server.Status != computeapi.VM_READY {
+			if strings.Contains(server.Status, "fail") {
+				return false, nil, errors.Wrapf(errors.ErrInvalidStatus, "server status %s", server.Status)
+			}
+			return true, server, nil
+		}
+		if !time.Now().Before(expire) {
+			return false, server, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// HasHygonDevices reports whether effective devices include Hygon DCU (exclusive or HAMI).
+func HasHygonDevices(llm *SLLM, sku *SLLMSku) bool {
+	devs := GetEffectiveDevices(llm, sku)
+	if devs == nil {
+		return false
+	}
+	for _, d := range *devs {
+		if strings.EqualFold(d.Vendor, "HYGON") {
+			return true
+		}
+		switch d.DevType {
+		case computeapi.CONTAINER_DEV_HYGON_DCU, computeapi.CONTAINER_DEV_HYGON_DCU_HAMI:
+			return true
+		}
+	}
+	return false
+}
+
+// HasIluvatarDevices reports whether effective devices include Iluvatar GPU.
+func HasIluvatarDevices(llm *SLLM, sku *SLLMSku) bool {
+	devs := GetEffectiveDevices(llm, sku)
+	if devs == nil {
+		return false
+	}
+	for _, d := range *devs {
+		if strings.EqualFold(d.Vendor, "ILUVATAR") {
+			return true
+		}
+		if d.DevType == computeapi.CONTAINER_DEV_ILUVATAR_GPU {
+			return true
+		}
+	}
+	return false
+}
+
+// HasTHeadDevices reports whether effective devices include T-Head PPU.
+func HasTHeadDevices(llm *SLLM, sku *SLLMSku) bool {
+	devs := GetEffectiveDevices(llm, sku)
+	if devs == nil {
+		return false
+	}
+	for _, d := range *devs {
+		if strings.EqualFold(d.Vendor, "THEAD") {
+			return true
+		}
+		if d.DevType == computeapi.CONTAINER_DEV_THEAD_PPU {
+			return true
+		}
+	}
+	return false
+}
+
+// HasKunlunxinDevices reports whether effective devices include Kunlunxin XPU.
+func HasKunlunxinDevices(llm *SLLM, sku *SLLMSku) bool {
+	devs := GetEffectiveDevices(llm, sku)
+	if devs == nil {
+		return false
+	}
+	for _, d := range *devs {
+		if strings.EqualFold(d.Vendor, "KUNLUNXIN") {
+			return true
+		}
+		if d.DevType == computeapi.CONTAINER_DEV_KUNLUNXIN_XPU {
+			return true
+		}
+	}
+	return false
+}
+
+// GetEffectiveHostPaths returns the host_paths to apply with llm's override taking priority over sku.
+func GetEffectiveHostPaths(llm *SLLM, sku *SLLMSku) *api.HostPaths {
+	var llmBase *SLLMBase
+	var skuBase *SLLMSkuBase
+	if llm != nil {
+		llmBase = &llm.SLLMBase
+	}
+	if sku != nil {
+		skuBase = &sku.SLLMSkuBase
+	}
+	return getEffectiveHostPaths(llmBase, skuBase)
+}
+
+func getEffectiveHostPaths(llmBase *SLLMBase, skuBase *SLLMSkuBase) *api.HostPaths {
+	if llmBase != nil && llmBase.HostPaths != nil && !llmBase.HostPaths.IsZero() {
+		return llmBase.HostPaths
+	}
+	if skuBase != nil {
+		return skuBase.HostPaths
+	}
+	return nil
+}
+
+func (man *SLLMBaseManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.LLMBaseCreateInput) (api.LLMBaseCreateInput, error) {
+	var err error
+	input.VirtualResourceCreateInput, err = man.SVirtualResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.VirtualResourceCreateInput)
+	if err != nil {
+		return input, errors.Wrap(err, "validate VirtualResourceCreateInput")
+	}
+
+	if len(input.PreferHost) > 0 {
+		resolved, err := resolvePreferHost(ctx, userCred, input.PreferHost)
+		if err != nil {
+			return input, errors.Wrap(err, "resolve prefer_host")
+		}
+		input.PreferHost = resolved
+	}
+
+	// 处理网络配置
+	var firstNet *computeapi.NetworkConfig
+	if len(input.Nets) > 0 {
+		firstNet = input.Nets[0]
+		firstNet.Index = 0
+		if len(string(firstNet.NetType)) > 0 && !api.IsLLMSkuBaseNetworkType(string(firstNet.NetType)) {
+			return input, errors.Wrapf(httperrors.ErrInputParameter, "invalid network type %s", firstNet.NetType)
+		}
+		if len(firstNet.Network) > 0 {
+			s := auth.GetSession(ctx, userCred, "")
+			netObj, err := compute.Networks.Get(s, firstNet.Network, nil)
+			if err != nil {
+				return input, errors.Wrapf(httperrors.ErrInputParameter, "invalid network_id %s", firstNet.Network)
+			}
+			netId, _ := netObj.GetString("id")
+			netType, _ := netObj.GetString("server_type")
+			firstNet.Network = netId
+			if len(string(firstNet.NetType)) == 0 {
+				firstNet.NetType = computeapi.TNetworkType(netType)
+			}
+		}
+	} else {
+		return input, errors.Wrap(httperrors.ErrInputParameter, "nets cannot be empty")
+	}
+
+	return input, nil
+}
+
+func (llmBase *SLLMBase) CustomizeCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
+	err := llmBase.SVirtualResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
+	if err != nil {
+		return errors.Wrap(err, "SVirtualResourceBase.CustomizeCreate")
+	}
+
+	var input api.LLMBaseCreateInput
+	if err := data.Unmarshal(&input); err != nil {
+		return errors.Wrap(err, "unmarshal LLMBaseCreateInput")
+	}
+
+	if len(input.Nets) > 0 {
+		firstNet := input.Nets[0]
+		if len(string(firstNet.NetType)) > 0 {
+			llmBase.NetworkType = string(firstNet.NetType)
+		}
+		if len(firstNet.Network) > 0 {
+			llmBase.NetworkId = firstNet.Network
+		}
+	}
+
+	return nil
+}
+
+func GetServerIdsByHost(ctx context.Context, userCred mcclient.TokenCredential, hostId string) ([]string, error) {
+	s := auth.GetSession(ctx, userCred, options.Options.Region)
+	params := computeoptions.ServerListOptions{}
+	params.Scope = "maxallowed"
+	params.Host = hostId
+	params.Field = []string{"id"}
+	limit := 1024
+	params.Limit = &limit
+	offset := 0
+	total := -1
+	idList := stringutils2.NewSortedStrings(nil)
+	for total < 0 || offset < total {
+		params.Offset = &offset
+		results, err := compute.Servers.List(s, jsonutils.Marshal(params))
+		if err != nil {
+			return nil, errors.Wrap(err, "Servers.List")
+		}
+		total = results.Total
+		for i := range results.Data {
+			idStr, _ := results.Data[i].GetString("id")
+			if len(idStr) > 0 {
+				idList = idList.Append(idStr)
+			}
+		}
+		offset += len(results.Data)
+	}
+	return idList, nil
+}
+
+func (man *SLLMBaseManager) ListItemFilter(ctx context.Context, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, input api.LLMBaseListInput) (*sqlchemy.SQuery, error) {
+	q, err := man.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, input.VirtualResourceListInput)
+	if err != nil {
+		return q, errors.Wrap(err, "VirtualResourceBaseManager.ListItemFilter")
+	}
+	q, err = man.SEnabledResourceBaseManager.ListItemFilter(ctx, q, userCred, input.EnabledResourceBaseListInput)
+	if err != nil {
+		return q, errors.Wrap(err, "SEnabledResourceBaseManager.ListItemFilter")
+	}
+
+	if len(input.NetworkType) > 0 {
+		q = q.Equals("network_type", input.NetworkType)
+	}
+	if len(input.NetworkId) > 0 {
+		s := auth.GetSession(ctx, userCred, "")
+		netObj, err := compute.Networks.Get(s, input.NetworkId, nil)
+		if err != nil {
+			if errors.Cause(err) == sql.ErrNoRows {
+				return nil, errors.Wrapf(httperrors.ErrResourceNotFound, "network %s not found", input.NetworkId)
+			}
+			return nil, errors.Wrap(err, "Networks.Get")
+		}
+		netId, _ := netObj.GetString("id")
+		q = q.Equals("network_id", netId)
+	}
+
+	if len(input.Host) > 0 {
+		serverIds, err := GetServerIdsByHost(ctx, userCred, input.Host)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetServerIdsByHost")
+		}
+		q = q.In("svr_id", serverIds)
+	}
+	if len(input.Status) > 0 {
+		s := auth.GetSession(ctx, userCred, options.Options.Region)
+		params := computeoptions.ServerListOptions{}
+		params.Scope = "maxallowed"
+		params.Status = input.Status
+		params.Field = []string{"guest_id"}
+		limit := 1024
+		params.Limit = &limit
+		offset := 0
+		total := -1
+		idList := stringutils2.NewSortedStrings(nil)
+		for total < 0 || offset < total {
+			params.Offset = &offset
+			results, err := compute.Containers.List(s, jsonutils.Marshal(params))
+			if err != nil {
+				return nil, errors.Wrap(err, "Containers.List")
+			}
+			total = results.Total
+			for i := range results.Data {
+				idStr, _ := results.Data[i].GetString("guest_id")
+				if len(idStr) > 0 {
+					idList = idList.Append(idStr)
+				}
+			}
+			offset += len(results.Data)
+		}
+		q = q.In("svr_id", idList)
+	}
+
+	if input.NoVolume != nil {
+		volumeQ := GetVolumeManager().Query("llm_id").SubQuery()
+		q = q.LeftJoin(volumeQ, sqlchemy.Equals(q.Field("id"), volumeQ.Field("llm_id")))
+		if *input.NoVolume {
+			q = q.Filter(sqlchemy.IsNull(volumeQ.Field("llm_id")))
+		} else {
+			q = q.Filter(sqlchemy.IsNotNull(volumeQ.Field("llm_id")))
+		}
+	}
+	if len(input.VolumeId) > 0 {
+		volumeObj, err := GetVolumeManager().FetchByIdOrName(ctx, userCred, input.VolumeId)
+		if err != nil {
+			return nil, errors.Wrap(err, "VolumeManager.FetchByIdOrName")
+		}
+		vq := GetVolumeManager().Query().SubQuery()
+		q = q.Join(vq, sqlchemy.Equals(q.Field("id"), vq.Field("llm_id")))
+		q = q.Filter(sqlchemy.Equals(vq.Field("id"), volumeObj.GetId()))
+	}
+
+	accessQ := GetAccessInfoManager().Query().SubQuery()
+	if input.ListenPort > 0 {
+		q = q.Join(accessQ, sqlchemy.Equals(q.Field("id"), accessQ.Field("llm_id")))
+		q = q.Filter(sqlchemy.Equals(accessQ.Field("listen_port"), input.ListenPort))
+	}
+
+	if len(input.PublicIp) > 0 {
+		s := auth.GetSession(ctx, userCred, "")
+		hostInput := computeapi.HostListInput{
+			PublicIp: []string{input.PublicIp},
+		}
+		hostInput.Field = []string{"id"}
+		hosts, err := compute.Hosts.List(s, jsonutils.Marshal(hostInput))
+		if err != nil {
+			return nil, errors.Wrap(err, "Hosts.List")
+		}
+		if len(hosts.Data) == 0 {
+			return nil, httperrors.NewNotFoundError("Not found host by public_ip %s", input.PublicIp)
+		}
+		hostIds := []string{}
+		for i := range hosts.Data {
+			idStr, _ := hosts.Data[i].GetString("id")
+			if len(idStr) > 0 {
+				hostIds = append(hostIds, idStr)
+			}
+		}
+		if len(hostIds) > 0 {
+			serverIds, err := GetServerIdsByHost(ctx, userCred, hostIds[0])
+			if err != nil {
+				return nil, errors.Wrap(err, "GetServerIdsByHost")
+			}
+			q = q.In("svr_id", serverIds)
+		}
+	}
+
+	return q, nil
+}
+
+func (llm *SLLMBase) GetServer(ctx context.Context) (*computeapi.ServerDetails, error) {
+	return cloudutil.GetServer(ctx, llm.CmpId)
+}
+
+func (llm *SLLMBase) GetVolume() (*SVolume, error) {
+	volume := &SVolume{}
+	err := GetVolumeManager().Query().Equals("llm_id", llm.Id).First(volume)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return nil, errors.Wrap(errors.ErrNotFound, "query volume")
+		}
+		return nil, errors.Wrap(err, "FetchVolume")
+	}
+	volume.SetModelManager(GetVolumeManager(), volume)
+	return volume, nil
+}
+
+func GetDiskVolumeMounts(vols *api.Volumes, containerIndex int, postOverlays []*apis.ContainerVolumeMountDiskPostOverlay) []*apis.ContainerVolumeMount {
+	if vols == nil {
+		return nil
+	}
+	mounts := make([]*apis.ContainerVolumeMount, 0)
+	for idx, vol := range *vols {
+		volRelation := vol.GetVolumeByContainer(containerIndex)
+		if volRelation == nil {
+			continue
+		}
+		mounts = append(mounts, &apis.ContainerVolumeMount{
+			UniqueName:  fmt.Sprintf("volume-%d-%d-%s", idx, containerIndex, volRelation.MountPath),
+			Type:        apis.CONTAINER_VOLUME_MOUNT_TYPE_DISK,
+			MountPath:   volRelation.MountPath,
+			Propagation: apis.MOUNTPROPAGATION_PROPAGATION_HOST_TO_CONTAINER,
+			Disk: &apis.ContainerVolumeMountDisk{
+				Index:        &idx,
+				SubDirectory: volRelation.SubDirectory,
+				Overlay:      volRelation.Overlay,
+				PostOverlay:  postOverlays,
+			},
+			FsUser:  volRelation.FsUser,
+			FsGroup: volRelation.FsGroup,
+		})
+	}
+
+	return mounts
+}
+
+func GetHostPathVolumeMounts(hostPaths *api.HostPaths, containerIndex int) []*apis.ContainerVolumeMount {
+	if hostPaths == nil {
+		return nil
+	}
+	mounts := make([]*apis.ContainerVolumeMount, 0)
+	for idx, hostPath := range *hostPaths {
+		hostPathRelation := hostPath.GetHostPathByContainer(containerIndex)
+		if hostPathRelation == nil {
+			continue
+		}
+		mounts = append(mounts, &apis.ContainerVolumeMount{
+			UniqueName:  fmt.Sprintf("host-path-%d-%d-%s", idx, containerIndex, hostPathRelation.MountPath),
+			Type:        apis.CONTAINER_VOLUME_MOUNT_TYPE_HOST_PATH,
+			MountPath:   hostPathRelation.MountPath,
+			ReadOnly:    hostPathRelation.ReadOnly,
+			Propagation: hostPathRelation.Propagation,
+			HostPath: &apis.ContainerVolumeMountHostPath{
+				Type:             hostPath.Type,
+				Path:             hostPath.Path,
+				AutoCreate:       hostPath.AutoCreate,
+				AutoCreateConfig: hostPath.AutoCreateConfig,
+			},
+			FsUser:  hostPathRelation.FsUser,
+			FsGroup: hostPathRelation.FsGroup,
+		})
+	}
+	return mounts
+}
+
+func AppendLLMSkuVolumeMounts(containers []*computeapi.PodContainerCreateInput, llmBase *SLLMBase, skuBase *SLLMSkuBase, postOverlays []*apis.ContainerVolumeMountDiskPostOverlay) {
+	if skuBase == nil {
+		return
+	}
+	effectiveHostPaths := getEffectiveHostPaths(llmBase, skuBase)
+	for idx := range containers {
+		if containers[idx] == nil {
+			continue
+		}
+		containers[idx].VolumeMounts = append(containers[idx].VolumeMounts, GetDiskVolumeMounts(skuBase.Volumes, idx, postOverlays)...)
+		containers[idx].VolumeMounts = append(containers[idx].VolumeMounts, GetHostPathVolumeMounts(effectiveHostPaths, idx)...)
+	}
+}
+
+// AppendLLMSkuEnvs merges SKU envs into the primary container (index 0).
+// Same-key SKU values override driver defaults. Empty keys are ignored.
+func AppendLLMSkuEnvs(containers []*computeapi.PodContainerCreateInput, skuBase *SLLMSkuBase) {
+	if skuBase == nil || skuBase.Envs == nil || skuBase.Envs.IsZero() {
+		return
+	}
+	if len(containers) == 0 || containers[0] == nil {
+		return
+	}
+	containers[0].Envs = mergeContainerEnvs(containers[0].Envs, *skuBase.Envs)
+}
+
+func mergeContainerEnvs(existing []*apis.ContainerKeyValue, skuEnvs api.Envs) []*apis.ContainerKeyValue {
+	indexByKey := make(map[string]int, len(existing))
+	out := make([]*apis.ContainerKeyValue, 0, len(existing)+len(skuEnvs))
+	for _, e := range existing {
+		if e == nil {
+			continue
+		}
+		key := strings.TrimSpace(e.Key)
+		if key == "" {
+			continue
+		}
+		indexByKey[key] = len(out)
+		out = append(out, e)
+	}
+	for _, e := range skuEnvs {
+		key := strings.TrimSpace(e.Key)
+		if key == "" {
+			continue
+		}
+		kv := &apis.ContainerKeyValue{Key: key, Value: e.Value}
+		if idx, ok := indexByKey[key]; ok {
+			out[idx] = kv
+			continue
+		}
+		indexByKey[key] = len(out)
+		out = append(out, kv)
+	}
+	return out
+}
+
+// 取消自动删除
+func (llm *SLLMBase) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return nil
+}
+
+func (llm *SLLMBase) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return llm.SVirtualResourceBase.Delete(ctx, userCred)
+}
+
+func (llm *SLLMBase) ServerDelete(ctx context.Context, userCred mcclient.TokenCredential, s *mcclient.ClientSession) error {
+	if len(llm.CmpId) == 0 {
+		return nil
+	}
+	server, err := llm.GetServer(ctx)
+	if err != nil {
+		if errors.Cause(err) == errors.ErrNotFound {
+			return nil
+		} else {
+			return errors.Wrap(err, "GetServer")
+		}
+	}
+	if server.DisableDelete != nil && *server.DisableDelete {
+		// update to allow delete
+		s2 := auth.GetSession(ctx, userCred, "")
+		_, err = compute.Servers.Update(s2, llm.CmpId, jsonutils.Marshal(map[string]interface{}{"disable_delete": false}))
+		if err != nil {
+			return errors.Wrap(err, "update server to delete")
+		}
+	}
+	_, err = compute.Servers.DeleteWithParam(s, llm.CmpId, jsonutils.Marshal(map[string]interface{}{
+		"override_pending_delete": true,
+	}), nil)
+	if err != nil {
+		return errors.Wrap(err, "delete server err:")
+	}
+	return nil
+}
+
+func (llm *SLLMBase) WaitDelete(ctx context.Context, userCred mcclient.TokenCredential, timeoutSecs int) error {
+	return cloudutil.WaitDelete[computeapi.ServerDetails](ctx, &compute.Servers, llm.CmpId, timeoutSecs)
+}
+
+func (llm *SLLMBase) getImage(imageId string) (*SLLMImage, error) {
+	image, err := GetLLMImageManager().FetchById(imageId)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch LLMImage")
+	}
+	return image.(*SLLMImage), nil
+}
+
+func (llm *SLLMBase) WaitServerStatus(ctx context.Context, userCred mcclient.TokenCredential, targetStatus []string, timeoutSecs int) (*computeapi.ServerDetails, error) {
+	return cloudutil.WaitServerStatus(ctx, llm.CmpId, targetStatus, timeoutSecs)
+}

@@ -27,6 +27,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SClouduserJointsManager struct {
 	db.SJointResourceBaseManager
 	SClouduserResourceBaseManager
@@ -45,6 +46,7 @@ func NewClouduserJointsManager(dt interface{}, tableName string, keyword string,
 	}
 }
 
+// +onecloud:swagger-gen-ignore
 type SClouduserJointsBase struct {
 	db.SJointResourceBase
 

@@ -84,6 +84,15 @@ func (self *SAwsGuestDriver) GetWindowsUserDataType() string {
 	return cloudprovider.CLOUD_EC2
 }
 
+// AWS EBS 单卷容量：参见 https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html
+const (
+	awsEbsGp2MaxSizeGiB    = 16384 // gp2 最大 16 TiB
+	awsEbsGp3MaxSizeGiB    = 65536 // gp3 最大 64 TiB
+	awsEbsIoMaxSizeGiB     = 16384 // io1/io2 常规卷最大 16 TiB（io2 Block Express 另受实例等约束）
+	awsEbsHddMaxSizeGiB    = 16384 // st1/sc1 最大 16 TiB
+	awsEbsSt1Sc1MinSizeGiB = 125   // st1/sc1 最小 125 GiB
+)
+
 func (self *SAwsGuestDriver) GetInstanceCapability() cloudprovider.SInstanceCapability {
 	return cloudprovider.SInstanceCapability{
 		Hypervisor: self.GetHypervisor(),
@@ -100,18 +109,21 @@ func (self *SAwsGuestDriver) GetInstanceCapability() cloudprovider.SInstanceCapa
 		},
 		Storages: cloudprovider.Storage{
 			DataDisk: []cloudprovider.StorageInfo{
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP2_SSD, MaxSizeGb: 16384, MinSizeGb: 1, StepSizeGb: 1, Resizable: true},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP3_SSD, MaxSizeGb: 16384, MinSizeGb: 1, StepSizeGb: 1, Resizable: true},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO1_SSD, MaxSizeGb: 16384, MinSizeGb: 4, StepSizeGb: 1, Resizable: true},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_ST1_HDD, MaxSizeGb: 16384, MinSizeGb: 500, StepSizeGb: 1, Resizable: true},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_SC1_HDD, MaxSizeGb: 16384, MinSizeGb: 500, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP2_SSD, MaxSizeGb: awsEbsGp2MaxSizeGiB, MinSizeGb: 1, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP3_SSD, MaxSizeGb: awsEbsGp3MaxSizeGiB, MinSizeGb: 1, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO1_SSD, MaxSizeGb: awsEbsIoMaxSizeGiB, MinSizeGb: 4, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO2_SSD, MaxSizeGb: awsEbsIoMaxSizeGiB, MinSizeGb: 4, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_ST1_HDD, MaxSizeGb: awsEbsHddMaxSizeGiB, MinSizeGb: awsEbsSt1Sc1MinSizeGiB, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_SC1_HDD, MaxSizeGb: awsEbsHddMaxSizeGiB, MinSizeGb: awsEbsSt1Sc1MinSizeGiB, StepSizeGb: 1, Resizable: true},
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_STANDARD_HDD, MaxSizeGb: 1024, MinSizeGb: 1, StepSizeGb: 1, Resizable: true},
 			},
 			SysDisk: []cloudprovider.StorageInfo{
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP2_SSD, MaxSizeGb: 16384, MinSizeGb: 1, StepSizeGb: 1, Resizable: false},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO1_SSD, MaxSizeGb: 16384, MinSizeGb: 4, StepSizeGb: 1, Resizable: false},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_ST1_HDD, MaxSizeGb: 16384, MinSizeGb: 500, StepSizeGb: 1, Resizable: false},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_SC1_HDD, MaxSizeGb: 16384, MinSizeGb: 500, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP2_SSD, MaxSizeGb: awsEbsGp2MaxSizeGiB, MinSizeGb: 1, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_GP3_SSD, MaxSizeGb: awsEbsGp3MaxSizeGiB, MinSizeGb: 1, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO1_SSD, MaxSizeGb: awsEbsIoMaxSizeGiB, MinSizeGb: 4, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_IO2_SSD, MaxSizeGb: awsEbsIoMaxSizeGiB, MinSizeGb: 4, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_ST1_HDD, MaxSizeGb: awsEbsHddMaxSizeGiB, MinSizeGb: awsEbsSt1Sc1MinSizeGiB, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_SC1_HDD, MaxSizeGb: awsEbsHddMaxSizeGiB, MinSizeGb: awsEbsSt1Sc1MinSizeGiB, StepSizeGb: 1, Resizable: false},
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_STANDARD_HDD, MaxSizeGb: 1024, MinSizeGb: 1, StepSizeGb: 1, Resizable: false},
 			},
 		},
@@ -179,8 +191,8 @@ func (self *SAwsGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SAwsGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SAwsGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SAwsGuestDriver) GetDeployStatus() ([]string, error) {
@@ -191,7 +203,7 @@ func (self *SAwsGuestDriver) ValidateCreateData(ctx context.Context, userCred mc
 	if len(input.Eip) > 0 || input.EipBw > 0 {
 		// 未明确指定network时，由调度器进行调度，跳过support_eip检查
 		if len(input.Networks) > 0 && len(input.Networks[0].Network) > 0 {
-			inetwork, err := db.FetchByIdOrName(models.NetworkManager, userCred, input.Networks[0].Network)
+			inetwork, err := db.FetchByIdOrName(ctx, models.NetworkManager, userCred, input.Networks[0].Network)
 			if err != nil {
 				return nil, errors.Wrap(err, "SAwsGuestDriver.ValidateCreateData.Networks.FetchByIdOrName")
 			}
@@ -210,7 +222,7 @@ func (self *SAwsGuestDriver) ValidateCreateData(ctx context.Context, userCred mc
 
 func (self *SAwsGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
 	// https://docs.amazonaws.cn/AWSEC2/latest/UserGuide/stop-start.html
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	if disk.DiskType == api.DISK_TYPE_SYS && !utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_IO1_SSD, api.STORAGE_IO2_SSD, api.STORAGE_STANDARD_HDD, api.STORAGE_GP2_SSD, api.STORAGE_GP3_SSD}) {

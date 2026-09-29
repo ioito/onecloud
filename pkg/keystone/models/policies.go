@@ -26,6 +26,7 @@ import (
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/apis"
@@ -99,6 +100,9 @@ type SPolicy struct {
 
 	// 匹配的资源标签
 	ObjectTags tagutils.TTagSet `nullable:"true" list:"user" update:"domain" create:"domain_optional"`
+
+	// 匹配的组织架构节点
+	OrgNodeId []string `nullable:"true" list:"user" update:"domain" create:"domain_optional"`
 }
 
 func (manager *SPolicyManager) InitializeData() error {
@@ -292,7 +296,46 @@ func (manager *SPolicyManager) ValidateCreateData(
 		input.Name = input.Type
 	}
 
-	policy, err := rbacutils.DecodePolicyData(input.DomainTags, input.ProjectTags, input.ResourceTags, input.Blob)
+	var domainTags, projectTags, objectTags tagutils.TTagSetList
+
+	if len(input.OrgNodeId) > 0 {
+		for i := range input.OrgNodeId {
+			orgNodeObj, err := OrganizationNodeManager.FetchById(input.OrgNodeId[i])
+			if err != nil {
+				if errors.Cause(err) == sql.ErrNoRows {
+					return input, httperrors.NewResourceNotFoundError2(OrganizationNodeManager.Keyword(), input.OrgNodeId[i])
+				} else {
+					return input, errors.Wrap(err, "OrganizationNodeManager.FetchById")
+				}
+			}
+			orgNode := orgNodeObj.(*SOrganizationNode)
+			input.OrgNodeId[i] = orgNode.Id
+			org, err := orgNode.GetOrganization()
+			if err != nil {
+				return input, errors.Wrap(err, "orgNode.GetOrganization")
+			}
+			switch org.Type {
+			case api.OrgTypeDomain:
+				domainTags = domainTags.Append(orgNode.GetTagSet(org))
+			case api.OrgTypeProject:
+				projectTags = projectTags.Append(orgNode.GetTagSet(org))
+			case api.OrgTypeObject:
+				objectTags = objectTags.Append(orgNode.GetTagSet(org))
+			}
+		}
+	}
+
+	if len(input.DomainTags) > 0 {
+		domainTags = domainTags.Append(input.DomainTags)
+	}
+	if len(input.ProjectTags) > 0 {
+		projectTags = projectTags.Append(input.ProjectTags)
+	}
+	if len(input.ObjectTags) > 0 {
+		objectTags = objectTags.Append(input.ObjectTags)
+	}
+
+	policy, err := rbacutils.DecodePolicyData(domainTags, projectTags, objectTags, input.Blob)
 	if err != nil {
 		return input, httperrors.NewInputParameterError("fail to decode policy data")
 	}
@@ -356,21 +399,106 @@ func (policy *SPolicy) ValidateUpdateData(ctx context.Context, userCred mcclient
 		}
 	}
 
+	var tagChanged bool
+
 	switch input.TagUpdatePolicy {
 	case api.TAG_UPDATE_POLICY_REMOVE:
-		input.DomainTags = policy.DomainTags.Remove(input.DomainTags...)
-		input.ProjectTags = policy.ProjectTags.Remove(input.ProjectTags...)
-		input.ObjectTags = policy.ObjectTags.Remove(input.ObjectTags...)
+		var domainChanged, projectChanged, objectChanged bool
+		input.DomainTags, domainChanged = policy.DomainTags.Remove(input.DomainTags...)
+		input.ProjectTags, projectChanged = policy.ProjectTags.Remove(input.ProjectTags...)
+		input.ObjectTags, objectChanged = policy.ObjectTags.Remove(input.ObjectTags...)
+		if domainChanged || projectChanged || objectChanged {
+			tagChanged = true
+		}
 	case api.TAG_UPDATE_POLICY_REPLACE:
 		// do nothing
+		tagChanged = true
 	default:
+		if len(input.DomainTags) > 0 || len(input.ProjectTags) > 0 || len(input.ObjectTags) > 0 {
+			tagChanged = true
+		}
 		input.DomainTags = policy.DomainTags.Append(input.DomainTags...)
 		input.ProjectTags = policy.ProjectTags.Append(input.ProjectTags...)
 		input.ObjectTags = policy.ObjectTags.Append(input.ObjectTags...)
 	}
 
-	if input.Blob != nil {
-		p, err := rbacutils.DecodePolicyData(input.DomainTags, input.ProjectTags, input.ObjectTags, input.Blob)
+	if len(input.OrgNodeId) > 0 {
+		for i := range input.OrgNodeId {
+			orgNode, err := OrganizationNodeManager.FetchById(input.OrgNodeId[i])
+			if err != nil {
+				if errors.Cause(err) == sql.ErrNoRows {
+					return input, httperrors.NewResourceNotFoundError2(OrganizationNodeManager.Keyword(), input.OrgNodeId[i])
+				} else {
+					return input, errors.Wrap(err, "OrganizationNodeManager.FetchById")
+				}
+			}
+			input.OrgNodeId[i] = orgNode.GetId()
+		}
+	}
+	switch input.TagUpdatePolicy {
+	case api.TAG_UPDATE_POLICY_REMOVE:
+		if len(input.OrgNodeId) > 0 {
+			nodeIds := make([]string, 0)
+			for i := range policy.OrgNodeId {
+				if !utils.IsInArray(policy.OrgNodeId[i], input.OrgNodeId) {
+					nodeIds = append(nodeIds, policy.OrgNodeId[i])
+				} else {
+					tagChanged = true
+				}
+			}
+			input.OrgNodeId = nodeIds
+		}
+	case api.TAG_UPDATE_POLICY_REPLACE:
+		// do nothing
+		tagChanged = true
+	default:
+		// add
+		if len(input.OrgNodeId) > 0 {
+			for i := range policy.OrgNodeId {
+				if !utils.IsInArray(policy.OrgNodeId[i], input.OrgNodeId) {
+					input.OrgNodeId = append(input.OrgNodeId, policy.OrgNodeId[i])
+					tagChanged = true
+				}
+			}
+		}
+	}
+
+	if input.Blob != nil || tagChanged {
+		var domainTags, projectTags, objectTags tagutils.TTagSetList
+		if len(input.DomainTags) > 0 {
+			domainTags = domainTags.Append(input.DomainTags)
+		}
+		if len(input.ProjectTags) > 0 {
+			projectTags = projectTags.Append(input.ProjectTags)
+		}
+		if len(input.ObjectTags) > 0 {
+			objectTags = objectTags.Append(input.DomainTags)
+		}
+		for i := range input.OrgNodeId {
+			orgNodeObj, err := OrganizationNodeManager.FetchById(input.OrgNodeId[i])
+			if err != nil {
+				return input, errors.Wrapf(err, "OrganizationNodeManager.FetchById %s", input.OrgNodeId[i])
+			}
+			orgNode := orgNodeObj.(*SOrganizationNode)
+			org, err := orgNode.GetOrganization()
+			if err != nil {
+				return input, errors.Wrap(err, "GetOrganization")
+			}
+			switch org.Type {
+			case api.OrgTypeDomain:
+				domainTags = domainTags.Append(orgNode.GetTagSet(org))
+			case api.OrgTypeProject:
+				projectTags = projectTags.Append(orgNode.GetTagSet(org))
+			case api.OrgTypeObject:
+				objectTags = objectTags.Append(orgNode.GetTagSet(org))
+			}
+		}
+
+		if input.Blob == nil {
+			input.Blob = policy.Blob
+		}
+
+		p, err := rbacutils.DecodePolicyData(domainTags, projectTags, objectTags, input.Blob)
 		if err != nil {
 			return input, httperrors.NewInputParameterError("fail to decode policy data")
 		}
@@ -464,6 +592,13 @@ func (policy *SPolicy) ValidateDeleteCondition(ctx context.Context, info jsonuti
 	// if policy.IsShared() {
 	// 	return httperrors.NewInvalidStatusError("cannot delete shared policy")
 	// }
+	rps, err := RolePolicyManager.fetchByPolicyId(policy.Id)
+	if err != nil {
+		return errors.Wrap(err, "FetchByPolicyId")
+	}
+	if len(rps) > 0 {
+		return httperrors.NewNotEmptyError("policy is in associated with %d roles", len(rps))
+	}
 	if policy.IsSystem.IsTrue() {
 		return httperrors.NewForbiddenError("cannot delete system policy")
 	}
@@ -489,7 +624,7 @@ func (manager *SPolicyManager) ListItemFilter(
 		return nil, errors.Wrap(err, "SSharableBaseResourceManager.ListItemFilter")
 	}
 	if len(query.RoleId) > 0 {
-		_, err := validators.ValidateModel(userCred, RoleManager, &query.RoleId)
+		_, err := validators.ValidateModel(ctx, userCred, RoleManager, &query.RoleId)
 		if err != nil {
 			return nil, err
 		}
@@ -558,9 +693,17 @@ func (manager *SPolicyManager) FetchCustomizeColumns(
 	identRows := manager.SEnabledIdentityBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	shareRows := manager.SSharableBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	for i := range rows {
+		policy := objs[i].(*SPolicy)
 		rows[i] = api.PolicyDetails{
 			EnabledIdentityBaseResourceDetails: identRows[i],
 			SharableResourceBaseInfo:           shareRows[i],
+		}
+		{
+			var err error
+			rows[i].OrgNodes, err = OrganizationNodeManager.fetchOrgNodesInfo(ctx, userCred, policy.OrgNodeId, isList)
+			if err != nil {
+				log.Errorf("SPolicyManager.FetchCustomizeColumns fetchOrgNodesInfo fail %s", err)
+			}
 		}
 	}
 	return rows
@@ -577,8 +720,8 @@ func (policy *SPolicy) GetUsages() []db.IUsage {
 	}
 }
 
-func (manager *SPolicyManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
-	q = db.SharableManagerFilterByOwner(manager, q, userCred, owner, scope)
+func (manager *SPolicyManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	q = db.SharableManagerFilterByOwner(ctx, manager, q, userCred, owner, scope)
 	return q
 }
 
@@ -595,7 +738,39 @@ func (policy *SPolicy) GetSharedDomains() []string {
 }
 
 func (policy *SPolicy) getPolicy() (*rbacutils.SPolicy, error) {
-	pc, err := rbacutils.DecodePolicyData(policy.DomainTags, policy.ProjectTags, policy.ObjectTags, policy.Blob)
+	var domainTags, projectTags, objectTags tagutils.TTagSetList
+	if len(policy.DomainTags) > 0 {
+		domainTags = domainTags.Append(policy.DomainTags)
+	}
+	if len(policy.ProjectTags) > 0 {
+		projectTags = projectTags.Append(policy.ProjectTags)
+	}
+	if len(policy.ObjectTags) > 0 {
+		objectTags = objectTags.Append(policy.ObjectTags)
+	}
+	var errs []error
+	for i := range policy.OrgNodeId {
+		orgNodeObj, err := OrganizationNodeManager.FetchById(policy.OrgNodeId[i])
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			orgNode := orgNodeObj.(*SOrganizationNode)
+			org, err := orgNode.GetOrganization()
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				switch org.Type {
+				case api.OrgTypeDomain:
+					domainTags = domainTags.Append(orgNode.GetTagSet(org))
+				case api.OrgTypeProject:
+					projectTags = projectTags.Append(orgNode.GetTagSet(org))
+				case api.OrgTypeObject:
+					objectTags = objectTags.Append(orgNode.GetTagSet(org))
+				}
+			}
+		}
+	}
+	pc, err := rbacutils.DecodePolicyData(domainTags, projectTags, objectTags, policy.Blob)
 	if err != nil {
 		return nil, errors.Wrap(err, "Decode")
 	}
@@ -622,7 +797,6 @@ func (policy *SPolicy) fetchMatchableRoles() ([]SRole, error) {
 
 // 绑定角色
 func (policy *SPolicy) PerformBindRole(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.PolicyBindRoleInput) (jsonutils.JSONObject, error) {
-	var projectId string
 	prefList := make([]netutils.IPV4Prefix, 0)
 	for _, ipStr := range input.Ips {
 		pref, err := netutils.NewIPV4Prefix(ipStr)
@@ -631,29 +805,11 @@ func (policy *SPolicy) PerformBindRole(ctx context.Context, userCred mcclient.To
 		}
 		prefList = append(prefList, pref)
 	}
-	if len(input.ProjectId) > 0 {
-		proj, err := ProjectManager.FetchByIdOrName(userCred, input.ProjectId)
-		if err != nil {
-			if errors.Cause(err) == sql.ErrNoRows {
-				return nil, errors.Wrapf(httperrors.ErrNotFound, "%s %s", ProjectManager.Keyword(), input.ProjectId)
-			} else {
-				return nil, errors.Wrap(err, "ProjectManager.FetchByIdOrName")
-			}
-		}
-		projectId = proj.GetId()
-	}
-	if len(input.RoleId) == 0 {
-		return nil, errors.Wrap(httperrors.ErrInputParameter, "missing role_id")
-	}
-	role, err := RoleManager.FetchByIdOrName(userCred, input.RoleId)
+	roleId, projectId, policyId, err := normalizeRolePolicyBinding(ctx, userCred, input.RoleId, input.ProjectId, policy.Id)
 	if err != nil {
-		if errors.Cause(err) == sql.ErrNoRows {
-			return nil, errors.Wrapf(httperrors.ErrNotFound, "%s %s", RoleManager.Keyword(), input.RoleId)
-		} else {
-			return nil, errors.Wrap(err, "RoleManager.FetchByIdOrName")
-		}
+		return nil, err
 	}
-	err = RolePolicyManager.newRecord(ctx, role.GetId(), projectId, policy.Id, tristate.True, prefList, input.ValidSince, input.ValidUntil)
+	err = RolePolicyManager.newRecord(ctx, roleId, projectId, policyId, tristate.True, prefList, input.ValidSince, input.ValidUntil)
 	if err != nil {
 		return nil, errors.Wrap(err, "newRecord")
 	}

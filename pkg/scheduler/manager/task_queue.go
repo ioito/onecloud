@@ -84,6 +84,7 @@ func (te *TaskExecutor) Execute(ctx context.Context) {
 	}
 }
 
+// do execute schedule()
 func (te *TaskExecutor) execute(ctx context.Context) (*core.ScheduleResult, error) {
 	scheduler := te.scheduler
 	genericScheduler, err := core.NewGenericScheduler(scheduler.(core.Scheduler))
@@ -99,6 +100,7 @@ func (te *TaskExecutor) execute(ctx context.Context) (*core.ScheduleResult, erro
 
 	te.unit = scheduler.Unit()
 	schedInfo := te.unit.SchedInfo
+	// generate result helper
 	helper := GenerateResultHelper(schedInfo)
 	result, err := genericScheduler.Schedule(ctx, te.unit, candidates, helper)
 	if err != nil {
@@ -108,6 +110,8 @@ func (te *TaskExecutor) execute(ctx context.Context) (*core.ScheduleResult, erro
 		return result, nil
 	}
 	driver := te.unit.GetHypervisorDriver()
+
+	// set sched pending usage
 	if err := setSchedPendingUsage(driver, schedInfo, result.Result); err != nil {
 		return nil, errors.Wrap(err, "setSchedPendingUsage")
 	}
@@ -125,17 +129,25 @@ func GenerateResultHelper(schedInfo *api.SchedInfo) core.IResultHelper {
 }
 
 func setSchedPendingUsage(driver computemodels.IGuestDriver, req *api.SchedInfo, resp *schedapi.ScheduleOutput) error {
-	if req.IsSuggestion || IsDriverSkipScheduleDirtyMark(driver) || req.SkipDirtyMarkHost() {
+	if req.IsSuggestion || IsDriverSkipScheduleDirtyMark(driver) {
 		return nil
 	}
-	for _, item := range resp.Candidates {
-		schedmodels.HostPendingUsageManager.AddPendingUsage(req, item)
+	for i, item := range resp.Candidates {
+		if item.Error != "" {
+			// schedule failed skip add pending usage
+			continue
+		}
+		var guestId string
+		if len(req.GuestIds) > i {
+			guestId = req.GuestIds[i]
+		}
+		schedmodels.HostPendingUsageManager.AddPendingUsage(guestId, req, item)
 	}
 	return nil
 }
 
 func IsDriverSkipScheduleDirtyMark(driver computemodels.IGuestDriver) bool {
-	return !(driver.DoScheduleCPUFilter() && driver.DoScheduleMemoryFilter() && driver.DoScheduleStorageFilter())
+	return driver == nil || !(driver.DoScheduleCPUFilter() && driver.DoScheduleMemoryFilter() && driver.DoScheduleStorageFilter())
 }
 
 func (te *TaskExecutor) cleanup() {
@@ -231,14 +243,13 @@ func (teqm *TaskExecutorQueueManager) GetQueue(schedType string) *TaskExecutorQu
 	defer teqm.lock.Unlock()
 
 	var (
-		key               string
 		taskExecutorQueue *TaskExecutorQueue
 		ok                bool
 	)
 
-	if taskExecutorQueue, ok = teqm.taskExecutorMap[key]; !ok {
+	if taskExecutorQueue, ok = teqm.taskExecutorMap[schedType]; !ok {
 		taskExecutorQueue = NewTaskExecutorQueue(schedType, teqm.stopCh)
-		teqm.taskExecutorMap[key] = taskExecutorQueue
+		teqm.taskExecutorMap[schedType] = taskExecutorQueue
 	}
 
 	return taskExecutorQueue

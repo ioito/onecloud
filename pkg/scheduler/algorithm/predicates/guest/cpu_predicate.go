@@ -18,7 +18,9 @@ import (
 	"context"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/scheduler/algorithm/predicates"
+	"yunion.io/x/onecloud/pkg/scheduler/cache/candidate"
 	"yunion.io/x/onecloud/pkg/scheduler/core"
 )
 
@@ -37,7 +39,8 @@ func (f *CPUPredicate) Clone() core.FitPredicate {
 }
 
 func (f *CPUPredicate) PreExecute(ctx context.Context, u *core.Unit, cs []core.Candidater) (bool, error) {
-	if !u.GetHypervisorDriver().DoScheduleCPUFilter() {
+	driver := u.GetHypervisorDriver()
+	if driver != nil && !driver.DoScheduleCPUFilter() {
 		return false, nil
 	}
 
@@ -59,27 +62,43 @@ func (f *CPUPredicate) Execute(ctx context.Context, u *core.Unit, c core.Candida
 
 	archMatch := true
 	isArmHost := getter.IsArmHost()
-	if apis.IsARM(d.OsArch) {
-		// process arm64 host
-		if !isArmHost {
-			archMatch = false
-		}
-	} else {
-		// process x86_64 host
-		if isArmHost {
-			archMatch = false
+	isRiscvHost := getter.IsRISCVHost()
+	if d.Hypervisor != compute.HYPERVISOR_POD {
+		if apis.IsARM(d.OsArch) {
+			// process arm64 host
+			if !isArmHost {
+				archMatch = false
+			}
+		} else if apis.IsRISCV(d.OsArch) {
+			if !isRiscvHost {
+				archMatch = false
+			}
+		} else {
+			// process x86_64 host
+			if isArmHost || isRiscvHost {
+				archMatch = false
+			}
 		}
 	}
+
 	if !archMatch {
 		h.Exclude2(predicates.ErrHostCpuArchitectureNotMatch, getter.CPUArch(), d.OsArch)
 		return h.GetResult()
 	}
 
+	reqCPUCount := int64(d.Ncpu + d.ExtraCpuCount)
+	if getter.KvmCapMaxVcpuCount() > 0 && reqCPUCount > getter.KvmCapMaxVcpuCount() {
+		h.Exclude2(predicates.ErrHostKvmVcpuMaxNotEnough, getter.KvmCapMaxVcpuCount(), reqCPUCount)
+		return h.GetResult()
+	}
+
 	freeCPUCount := getter.FreeCPUCount(useRsvd)
-	reqCPUCount := int64(d.Ncpu)
 	if freeCPUCount < reqCPUCount {
 		totalCPUCount := getter.TotalCPUCount(useRsvd)
 		h.AppendInsufficientResourceError(reqCPUCount, totalCPUCount, freeCPUCount)
+		if hint := candidate.GetGpuReservedResourceFromGetter(getter).AppendCpuHint("", useRsvd); hint != "" {
+			h.AppendPredicateFailMsg(hint)
+		}
 	}
 
 	h.SetCapacity(freeCPUCount / reqCPUCount)

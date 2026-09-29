@@ -15,41 +15,69 @@
 package models
 
 import (
+	"context"
+
+	"yunion.io/x/sqlchemy"
+
 	api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
+	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
-func Usage(result rbacutils.SPolicyResult) map[string]int {
+func Usage(ctx context.Context, result rbacutils.SPolicyResult) map[string]int {
 	results := make(map[string]int)
 
 	dq := DomainManager.Query()
-	dq = db.ObjectIdQueryWithPolicyResult(dq, DomainManager, result)
+	dq = db.ObjectIdQueryWithPolicyResult(ctx, dq, DomainManager, result)
 	domCnt, _ := dq.IsTrue("is_domain").NotEquals("id", api.KeystoneDomainRoot).CountWithError()
 	results["domains"] = domCnt
 
 	pq := ProjectManager.Query()
-	pq = db.ObjectIdQueryWithPolicyResult(pq, ProjectManager, result)
+	pq = db.ObjectIdQueryWithPolicyResult(ctx, pq, ProjectManager, result)
+
+	// 根据项目标签过滤
+	if result.ProjectTags.Len() > 0 {
+		tagFilters := tagutils.STagFilters{}
+		tagFilters.AddFilters(result.ProjectTags)
+		orConditions := []sqlchemy.ICondition{}
+		metadataResSQ := db.Metadata.Query().Equals("obj_type", "project").SubQuery()
+		for _, filter := range tagFilters.Filters {
+			for key, val := range filter {
+				orConditions = append(orConditions,
+					sqlchemy.AND(
+						sqlchemy.Equals(metadataResSQ.Field("key"), key),
+						sqlchemy.In(metadataResSQ.Field("value"), val),
+					),
+				)
+			}
+		}
+		metadataResQ := metadataResSQ.Query().AppendField(sqlchemy.COUNT("count", metadataResSQ.Field("obj_id")), metadataResSQ.Field("obj_id"), metadataResSQ.Field("key"), metadataResSQ.Field("value"))
+		metadataResSQ = metadataResQ.Filter(sqlchemy.OR(orConditions...)).GroupBy("obj_id").SubQuery()
+		metadataResSecSQ := metadataResSQ.Query().GE("count", len(orConditions)).SubQuery()
+		pq = pq.Join(metadataResSecSQ, sqlchemy.Equals(pq.Field("id"), metadataResSecSQ.Field("obj_id")))
+	}
+
 	projCnt, _ := pq.IsFalse("is_domain").CountWithError()
 	results["projects"] = projCnt
 
 	rq := RoleManager.Query()
-	rq = db.ObjectIdQueryWithPolicyResult(rq, RoleManager, result)
+	rq = db.ObjectIdQueryWithPolicyResult(ctx, rq, RoleManager, result)
 	roleCnt, _ := rq.CountWithError()
 	results["roles"] = roleCnt
 
 	uq := UserManager.Query()
-	uq = db.ObjectIdQueryWithPolicyResult(uq, UserManager, result)
+	uq = db.ObjectIdQueryWithPolicyResult(ctx, uq, UserManager, result)
 	usrCnt, _ := uq.CountWithError()
 	results["users"] = usrCnt
 
 	gq := GroupManager.Query()
-	gq = db.ObjectIdQueryWithPolicyResult(gq, GroupManager, result)
+	gq = db.ObjectIdQueryWithPolicyResult(ctx, gq, GroupManager, result)
 	grpCnt, _ := gq.CountWithError()
 	results["groups"] = grpCnt
 
 	pcq := PolicyManager.Query()
-	pcq = db.ObjectIdQueryWithPolicyResult(pcq, PolicyManager, result)
+	pcq = db.ObjectIdQueryWithPolicyResult(ctx, pcq, PolicyManager, result)
 	policy, _ := pcq.CountWithError()
 	results["policies"] = policy
 

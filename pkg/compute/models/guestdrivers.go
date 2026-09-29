@@ -22,6 +22,7 @@ import (
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/rbacscope"
 
@@ -72,7 +73,7 @@ type IGuestDriver interface {
 	GetNamedNetworkConfiguration(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, host *SHost, netConfig *api.NetworkConfig) (*SNetwork, []SNicConfig, api.IPAllocationDirection, bool, error)
 
 	Attach2RandomNetwork(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, host *SHost, netConfig *api.NetworkConfig, pendingUsage quotas.IQuota) ([]SGuestnetwork, error)
-	GetRandomNetworkTypes() []string
+	GetRandomNetworkTypes() []api.TNetworkType
 
 	GetStorageTypes() []string
 	ChooseHostStorage(host *SHost, guest *SGuest, diskConfig *api.DiskConfig, storageIds []string) (*SStorage, error)
@@ -83,9 +84,10 @@ type IGuestDriver interface {
 
 	RequestGuestCreateInsertIso(ctx context.Context, imageId string, bootIndex *int8, task taskman.ITask, guest *SGuest) error
 
+	CanStop(guest *SGuest) error
 	StartGuestStopTask(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict, parentTaskId string) error
 	StartGuestResetTask(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, isHard bool, parentTaskId string) error
-	StartGuestRestartTask(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, isForce bool, parentTaskId string) error
+	StartGuestRestartTask(guest *SGuest, ctx context.Context, userCred mcclient.TokenCredential, isForce bool, timeout *int, parentTaskId string) error
 
 	RequestSoftReset(ctx context.Context, guest *SGuest, task taskman.ITask) error
 
@@ -107,11 +109,14 @@ type IGuestDriver interface {
 	RequestSyncConfigOnHost(ctx context.Context, guest *SGuest, host *SHost, task taskman.ITask) error
 	RequestSyncSecgroupsOnHost(ctx context.Context, guest *SGuest, host *SHost, task taskman.ITask) error
 
+	RequestSetPortMappingOnHost(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, host *SHost, task taskman.ITask, input api.ServerSetPortMappingInput) error
+
 	RequestSyncstatusOnHost(ctx context.Context, guest *SGuest, host *SHost, userCred mcclient.TokenCredential, task taskman.ITask) error
 
 	RequestStartOnHost(ctx context.Context, guest *SGuest, host *SHost, userCred mcclient.TokenCredential, task taskman.ITask) error
 
 	RequestStopOnHost(ctx context.Context, guest *SGuest, host *SHost, task taskman.ITask, syncStatus bool) error
+	RequestChangeBillingType(ctx context.Context, guest *SGuest, task taskman.ITask) error
 
 	StartDeleteGuestTask(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, params *jsonutils.JSONDict, parentTaskId string) error
 
@@ -125,10 +130,11 @@ type IGuestDriver interface {
 	RequestDetachDisksFromGuestForDelete(ctx context.Context, guest *SGuest, task taskman.ITask) error
 
 	RequestUndeployGuestOnHost(ctx context.Context, guest *SGuest, host *SHost, task taskman.ITask) error
+	IsNeedCleanDisksAfterUndeploy() bool
 
 	OnDeleteGuestFinalCleanup(ctx context.Context, guest *SGuest, userCred mcclient.TokenCredential) error
 
-	PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, data *jsonutils.JSONDict) error
+	PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, data *jsonutils.JSONDict, parentTaskId string) error
 
 	CheckDiskTemplateOnStorage(ctx context.Context, userCred mcclient.TokenCredential, imageId string, format string, storageId string, task taskman.ITask) error
 
@@ -140,7 +146,8 @@ type IGuestDriver interface {
 	GetAttachDiskStatus() ([]string, error)
 	GetRebuildRootStatus() ([]string, error)
 	IsAllowSaveImageOnRunning() bool
-	GetChangeConfigStatus(guest *SGuest) ([]string, error)
+	// IsChangeInstanceTypeWhileRunningSupported 是否支持在虚拟机运行（开机）状态下调整 CPU/内存/实例规格
+	IsChangeInstanceTypeWhileRunningSupported(guest *SGuest) (bool, error)
 	GetDeployStatus() ([]string, error)
 	ValidateResizeDisk(guest *SGuest, disk *SDisk, storage *SStorage) error
 	CanKeepDetachDisk() bool
@@ -165,7 +172,7 @@ type IGuestDriver interface {
 
 	AllowReconfigGuest() bool
 	DoGuestCreateDisksTask(ctx context.Context, guest *SGuest, task taskman.ITask) error
-	RequestChangeVmConfig(ctx context.Context, guest *SGuest, task taskman.ITask, instanceType string, vcpuCount, vmemSize int64) error
+	RequestChangeVmConfig(ctx context.Context, guest *SGuest, task taskman.ITask, instanceType string, vcpuCount, cpuSockets, vmemSize int64) error
 
 	NeedRequestGuestHotAddIso(ctx context.Context, guest *SGuest) bool
 	RequestGuestHotAddIso(ctx context.Context, guest *SGuest, path string, boot bool, task taskman.ITask) error
@@ -186,19 +193,20 @@ type IGuestDriver interface {
 	IsSupportPublicIp() bool
 	ValidateCreateEip(ctx context.Context, userCred mcclient.TokenCredential, input api.ServerCreateEipInput) error
 
-	NeedStopForChangeSpec(ctx context.Context, guest *SGuest, cpuChanged, memChanged bool) bool
+	// NeedStopForChangeSpec(ctx context.Context, guest *SGuest, addCpu int, addMemMb int) (bool, int)
 
 	OnGuestChangeCpuMemFailed(ctx context.Context, guest *SGuest, data *jsonutils.JSONDict, task taskman.ITask) error
 	IsSupportGuestClone() bool
 
-	ValidateChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, cpuChanged bool, memChanged bool, newDisks []*api.DiskConfig) error
+	ValidateGuestChangeConfigInput(ctx context.Context, guest *SGuest, input api.ServerChangeConfigInput) (*api.ServerChangeConfigSettings, error)
+	ValidateGuestHotChangeConfigInput(ctx context.Context, guest *SGuest, confs *api.ServerChangeConfigSettings) (*api.ServerChangeConfigSettings, error)
+	// ValidateChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, cpuChanged bool, memChanged bool, newDisks []*api.DiskConfig) error
 	ValidateDetachDisk(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, disk *SDisk) error
 
 	IsNeedInjectPasswordByCloudInit() bool
 	GetUserDataType() string
 	GetWindowsUserDataType() string
 	IsWindowsUserDataTypeNeedEncode() bool
-	CancelExpireTime(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest) error
 
 	IsSupportCdrom(guest *SGuest) (bool, error)
 	IsSupportFloppy(guest *SGuest) (bool, error)
@@ -227,6 +235,8 @@ type IGuestDriver interface {
 	RequestChangeDiskStorage(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, input *api.ServerChangeDiskStorageInternalInput, task taskman.ITask) error
 	RequestSwitchToTargetStorageDisk(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, input *api.ServerChangeDiskStorageInternalInput, task taskman.ITask) error
 
+	RequestResetUefiFirmwareVars(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest) error
+
 	RequestSyncIsolatedDevice(ctx context.Context, guest *SGuest, task taskman.ITask) error
 
 	RequestCPUSet(ctx context.Context, userCred mcclient.TokenCredential, host *SHost, guest *SGuest, input *api.ServerCPUSetInput) (*api.ServerCPUSetResp, error)
@@ -236,14 +246,26 @@ type IGuestDriver interface {
 	QgaRequestSetUserPassword(ctx context.Context, task taskman.ITask, host *SHost, guest *SGuest, input *api.ServerQgaSetPasswordInput) error
 	RequestQgaCommand(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
 	QgaRequestGuestInfoTask(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
-	QgaRequestSetNetwork(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
+	QgaRequestSetNetwork(ctx context.Context, task taskman.ITask, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
 	QgaRequestGetNetwork(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
+	QgaRequestGetOsInfo(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
 
 	FetchMonitorUrl(ctx context.Context, guest *SGuest) string
-	RequestResetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *SHost, guest *SGuest, input *api.ServerNicTrafficLimit) error
-	RequestSetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *SHost, guest *SGuest, input *api.ServerNicTrafficLimit) error
+	RequestResetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *SHost, guest *SGuest, input []api.ServerNicTrafficLimit) error
+	RequestSetNicTrafficLimit(ctx context.Context, task taskman.ITask, host *SHost, guest *SGuest, input []api.ServerNicTrafficLimit) error
 
 	SyncOsInfo(ctx context.Context, userCred mcclient.TokenCredential, g *SGuest, extVM cloudprovider.IOSInfo) error
+
+	ValidateSetOSInfo(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest, input *api.ServerSetOSInfoInput) error
+	ValidateSyncOSInfo(ctx context.Context, userCred mcclient.TokenCredential, guest *SGuest) error
+	RequestStartRescue(ctx context.Context, task taskman.ITask, body jsonutils.JSONObject, host *SHost, guest *SGuest) error
+
+	BeforeDetachIsolatedDevice(ctx context.Context, cred mcclient.TokenCredential, guest *SGuest, dev *SGuestIsolatedDevice) error
+	BeforeAttachIsolatedDevice(ctx context.Context, cred mcclient.TokenCredential, guest *SGuest, dev *SGuestIsolatedDevice) error
+
+	RequestGuestScreenDump(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject, host *SHost, guest *SGuest) (jsonutils.JSONObject, error)
+
+	RequestUploadGuestStatus(ctx context.Context, guest *SGuest, task taskman.ITask) error
 }
 
 var guestDrivers map[string]IGuestDriver
@@ -253,16 +275,17 @@ func init() {
 }
 
 func RegisterGuestDriver(driver IGuestDriver) {
-	guestDrivers[driver.GetHypervisor()] = driver
+	key := fmt.Sprintf("%s-%s", driver.GetHypervisor(), driver.GetProvider())
+	guestDrivers[key] = driver
 }
 
-func GetDriver(hypervisor string) IGuestDriver {
-	driver, ok := guestDrivers[hypervisor]
+func GetDriver(hypervisor, provider string) (IGuestDriver, error) {
+	key := fmt.Sprintf("%s-%s", hypervisor, provider)
+	driver, ok := guestDrivers[key]
 	if ok {
-		return driver
-	} else {
-		panic(fmt.Sprintf("Unsupported hypervisor %q", hypervisor))
+		return driver, nil
 	}
+	return nil, errors.Wrapf(errors.ErrNotFound, "hypervisor: %s provider: %s", hypervisor, provider)
 }
 
 func GetNotSupportAutoRenewHypervisors() []string {

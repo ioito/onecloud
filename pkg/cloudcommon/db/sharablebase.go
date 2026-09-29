@@ -214,12 +214,30 @@ func SharableManagerValidateCreateData(
 	return input, nil
 }
 
-func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func SharableManagerFilterByOwner(ctx context.Context, manager IStandaloneModelManager, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		resScope := manager.ResourceScope()
+		// map unrecognized scopes to the resource's default view
+		if scope != rbacscope.ScopeSystem && scope != rbacscope.ScopeDomain &&
+			scope != rbacscope.ScopeProject &&
+			!(scope == rbacscope.ScopeUser && resScope == rbacscope.ScopeUser) {
+			switch resScope {
+			case rbacscope.ScopeUser:
+				scope = rbacscope.ScopeUser
+			case rbacscope.ScopeDomain:
+				scope = rbacscope.ScopeDomain
+			default:
+				scope = rbacscope.ScopeProject
+			}
+		}
+		// domain-level owner has no project id: use the domain view
+		if scope == rbacscope.ScopeProject && len(owner.GetProjectId()) == 0 &&
+			len(owner.GetProjectDomainId()) > 0 {
+			scope = rbacscope.ScopeDomain
+		}
 		if resScope == rbacscope.ScopeUser {
 			targetProjectId := owner.GetProjectId()
-			if len(targetProjectId) == 0 {
+			if len(targetProjectId) == 0 && userCred != nil {
 				targetProjectId = userCred.GetProjectId()
 			}
 			subq := SharedResourceManager.Query("resource_id")
@@ -254,7 +272,7 @@ func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.S
 				if !result.ObjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ObjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "id", manager.Keyword(), policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "id", manager.Keyword(), policyTagFilters)
 				}
 			}
 		} else if resScope == rbacscope.ScopeProject && scope == rbacscope.ScopeProject {
@@ -289,7 +307,7 @@ func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.S
 					if !result.ObjectTags.IsEmpty() {
 						policyTagFilters := tagutils.STagFilters{}
 						policyTagFilters.AddFilters(result.ObjectTags)
-						q = ObjectIdQueryWithTagFilters(q, "id", manager.Keyword(), policyTagFilters)
+						q = ObjectIdQueryWithTagFilters(ctx, q, "id", manager.Keyword(), policyTagFilters)
 					}
 				}
 			}
@@ -317,17 +335,16 @@ func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.S
 					if !result.ProjectTags.IsEmpty() && resScope == rbacscope.ScopeProject {
 						policyTagFilters := tagutils.STagFilters{}
 						policyTagFilters.AddFilters(result.ProjectTags)
-						q = ObjectIdQueryWithTagFilters(q, "tenant_id", "project", policyTagFilters)
+						q = ObjectIdQueryWithTagFilters(ctx, q, "tenant_id", "project", policyTagFilters)
 					}
 					if !result.ObjectTags.IsEmpty() {
 						policyTagFilters := tagutils.STagFilters{}
 						policyTagFilters.AddFilters(result.ObjectTags)
-						q = ObjectIdQueryWithTagFilters(q, "id", manager.Keyword(), policyTagFilters)
+						q = ObjectIdQueryWithTagFilters(ctx, q, "id", manager.Keyword(), policyTagFilters)
 					}
 				}
 			}
 		} else {
-			log.Debugf("res_scope: %s view_scope: %s", resScope, scope)
 			// system view
 			if userCred != nil {
 				result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionList)
@@ -336,7 +353,7 @@ func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.S
 					subq := manager.Query("id")
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.DomainTags)
-					subq = ObjectIdQueryWithTagFilters(subq, "domain_id", "domain", policyTagFilters)
+					subq = ObjectIdQueryWithTagFilters(ctx, subq, "domain_id", "domain", policyTagFilters)
 					q = q.Filter(sqlchemy.OR(
 						sqlchemy.In(q.Field("id"), subq.SubQuery()),
 						sqlchemy.AND(
@@ -346,14 +363,22 @@ func SharableManagerFilterByOwner(manager IStandaloneModelManager, q *sqlchemy.S
 					))
 				}
 				if !result.ProjectTags.IsEmpty() && resScope == rbacscope.ScopeProject {
+					subq := manager.Query("id")
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ProjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "tenant_id", "project", policyTagFilters)
+					subq = ObjectIdQueryWithTagFilters(ctx, subq, "tenant_id", "project", policyTagFilters)
+					q = q.Filter(sqlchemy.OR(
+						sqlchemy.In(q.Field("id"), subq.SubQuery()),
+						sqlchemy.AND(
+							sqlchemy.IsTrue(q.Field("is_public")),
+							sqlchemy.Equals(q.Field("public_scope"), rbacscope.ScopeSystem),
+						),
+					))
 				}
 				if !result.ObjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ObjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "id", manager.Keyword(), policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "id", manager.Keyword(), policyTagFilters)
 				}
 			}
 		}
@@ -691,6 +716,7 @@ func SharableModelCustomizeCreate(model ISharableBaseModel, ctx context.Context,
 			if managedModel, ok := model.(IManagedResourceBase); ok {
 				isManaged = managedModel.IsManaged()
 			}
+			// log.Debugf("isManaged: %v IsAdminAllowPerform %v ownerId.GetProjectDomainId %s userCred.GetProjectDomainId %s", isManaged, IsAdminAllowPerform(ctx, userCred, model, "public"), ownerId.GetProjectDomainId(), userCred.GetProjectDomainId())
 			if !isManaged && IsAdminAllowPerform(ctx, userCred, model, "public") && ownerId.GetProjectDomainId() == userCred.GetProjectDomainId() {
 				model.SetShare(rbacscope.ScopeSystem)
 				data.(*jsonutils.JSONDict).Set("public_scope", jsonutils.NewString(string(rbacscope.ScopeSystem)))

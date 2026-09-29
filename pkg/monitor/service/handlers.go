@@ -18,7 +18,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"strconv"
 
 	"github.com/gorilla/mux"
@@ -27,69 +26,100 @@ import (
 
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/monitor/models"
+	"yunion.io/x/onecloud/pkg/monitor/options"
 )
 
-func InitHandlers(app *appsrv.Application) {
+var (
+	modelManagers      = []db.IModelManager{}
+	jointModelManagers = []db.IJointModelManager{}
+)
+
+type GetRegisteredModelManagersF func() []db.IModelManager
+type GetRegisteredJointModelManagersF func() []db.IJointModelManager
+
+var (
+	GetRegisteredModelManagers      GetRegisteredModelManagersF      = nil
+	GetRegisteredJointModelManagers GetRegisteredJointModelManagersF = nil
+)
+
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
+
+	app_common.ExportOptionsHandler(app, &options.Options)
 
 	db.RegisterModelManager(db.TenantCacheManager)
 	db.RegisterModelManager(db.UserCacheManager)
 	db.RegisterModelManager(db.RoleCacheManager)
 	db.RegistUserCredCacheUpdater()
 
+	taskman.AddTaskHandler("", app, isSlave)
+
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
 	} {
 		db.RegisterModelManager(manager)
 	}
 
-	for _, manager := range []db.IModelManager{
-		db.OpsLog,
-		db.Metadata,
-		models.DataSourceManager,
-		models.AlertManager,
-		models.NodeAlertManager,
-		models.MeterAlertManager,
-		models.NotificationManager,
-		models.CommonAlertManager,
-		models.MetricMeasurementManager,
-		models.MetricFieldManager,
-		models.AlertRecordManager,
-		models.AlertDashBoardManager,
-		models.GetAlertResourceManager(),
-		models.AlertPanelManager,
-		models.MonitorResourceManager,
-		models.AlertRecordShieldManager,
-		models.GetMigrationAlertManager(),
-	} {
+	if GetRegisteredModelManagers == nil {
+		GetRegisteredModelManagers = func() []db.IModelManager {
+			return []db.IModelManager{
+				db.OpsLog,
+				db.Metadata,
+				models.DataSourceManager,
+				models.AlertManager,
+				models.NodeAlertManager,
+				models.MeterAlertManager,
+				models.NotificationManager,
+				models.CommonAlertManager,
+				models.MetricMeasurementManager,
+				models.MetricFieldManager,
+				models.AlertRecordManager,
+				models.AlertDashBoardManager,
+				models.GetAlertResourceManager(),
+				models.AlertPanelManager,
+				models.MonitorResourceManager,
+				models.AlertRecordShieldManager,
+				models.GetMigrationAlertManager(),
+			}
+		}
+	}
+
+	for _, manager := range GetRegisteredModelManagers() {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 
 	for _, manager := range []db.IModelManager{
 		models.UnifiedMonitorManager,
 	} {
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 
-	for _, manager := range []db.IJointModelManager{
-		models.AlertNotificationManager,
-		models.MetricManager,
-		models.GetAlertResourceAlertManager(),
-		models.AlertDashBoardPanelManager,
-		models.MonitorResourceAlertManager,
-	} {
+	if GetRegisteredJointModelManagers == nil {
+		GetRegisteredJointModelManagers = func() []db.IJointModelManager {
+			return []db.IJointModelManager{
+				models.AlertNotificationManager,
+				models.MetricManager,
+				models.GetAlertResourceAlertManager(),
+				models.AlertDashBoardPanelManager,
+				models.MonitorResourceAlertManager,
+			}
+		}
+	}
+	for _, manager := range GetRegisteredJointModelManagers() {
 		db.RegisterModelManager(manager)
 		handler := db.NewJointModelHandler(manager)
-		dispatcher.AddJointModelDispatcher("", app, handler)
+		dispatcher.AddJointModelDispatcher("", app, handler, isSlave)
 	}
 
 }
@@ -104,10 +134,12 @@ func InitInfluxDBSubscriptionHandlers(app *appsrv.Application, options *common_o
 
 	addr := net.JoinHostPort(options.Address, strconv.Itoa(options.Port))
 	if options.EnableSsl {
-		err := http.ListenAndServeTLS(addr,
+		srv := appsrv.InitHTTPServer(app, addr)
+		srv.Handler = root
+		err := srv.ListenAndServeTLS(
 			options.SslCertfile,
 			options.SslKeyfile,
-			root)
+		)
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("%v", err)
 		}
@@ -126,13 +158,5 @@ func addMiscHandlers(app *appsrv.Application, root *mux.Router) {
 		}
 	}
 	root.HandleFunc("/subscriptions/write", adapterF(performHandler))
-
-	// ref: pkg/appsrv/appsrv:addDefaultHandlers
-	root.HandleFunc("/version", adapterF(appsrv.VersionHandler))
-	root.HandleFunc("/stats", adapterF(appsrv.StatisticHandler))
-	root.HandleFunc("/ping", adapterF(appsrv.PingHandler))
-	root.HandleFunc("/worker_stats", adapterF(appsrv.WorkerStatsHandler))
-
-	// pprof handler
-	root.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
+	appsrv.AddMiscHandlersToMuxRouter(app, root, options.Options.EnableAppProfiling)
 }

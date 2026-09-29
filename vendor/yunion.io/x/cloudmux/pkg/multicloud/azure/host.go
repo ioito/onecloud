@@ -61,14 +61,25 @@ func (self *SHost) Refresh() error {
 }
 
 func (self *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudprovider.ICloudVM, error) {
-	nic, err := self.zone.region.CreateNetworkInterface(desc.ProjectId, fmt.Sprintf("%s-ipconfig", desc.NameEn), desc.IpAddr, desc.ExternalNetworkId, desc.ExternalSecgroupId)
+	secgroupId := ""
+	for _, id := range desc.ExternalSecgroupIds {
+		secgroupId = id
+	}
+	nic, err := self.zone.region.CreateNetworkInterface(desc.ProjectId, fmt.Sprintf("%s-ipconfig", desc.NameEn), desc.IpAddr, desc.ExternalNetworkId, secgroupId)
 	if err != nil {
 		return nil, errors.Wrapf(err, "CreateNetworkInterface")
 	}
 
 	instance, err := self.zone.region._createVM(desc, nic.ID)
 	if err != nil {
-		self.zone.region.DeleteNetworkInterface(nic.ID)
+		cloudprovider.Wait(time.Minute*2, time.Minute*6, func() (bool, error) {
+			e := self.zone.region.DeleteNetworkInterface(nic.ID)
+			if e == nil {
+				return true, nil
+			}
+			log.Errorf("delete nic %s error: %v", nic.ID, err)
+			return false, nil
+		})
 		return nil, err
 	}
 	instance.host = self
@@ -118,7 +129,8 @@ func (self *SRegion) _createVM(desc *cloudprovider.SManagedVMCreateConfig, nicId
 			"NetworkProfile": map[string]interface{}{
 				"NetworkInterfaces": []map[string]string{
 					map[string]string{
-						"Id": nicId,
+						"Id":           nicId,
+						"deleteOption": "Delete",
 					},
 				},
 			},
@@ -266,7 +278,7 @@ func (self *SHost) GetIVMById(instanceId string) (cloudprovider.ICloudVM, error)
 	return instance, nil
 }
 
-func (self *SHost) GetStorageSizeMB() int {
+func (self *SHost) GetStorageSizeMB() int64 {
 	return 0
 }
 
@@ -287,7 +299,6 @@ func (self *SHost) GetIVMs() ([]cloudprovider.ICloudVM, error) {
 	for i := 0; i < len(vms); i++ {
 		vms[i].host = self
 		ivms[i] = &vms[i]
-		log.Debugf("find vm %s for host %s", vms[i].GetName(), self.GetName())
 	}
 	return ivms, nil
 }

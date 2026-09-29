@@ -15,16 +15,25 @@
 package compute
 
 import (
+	"reflect"
 	"time"
 
 	"yunion.io/x/cloudmux/pkg/multicloud/esxi/vcenter"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/fileutils"
 
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/billing"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/httperrors"
 )
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(new(DiskFsFeatures)), func() gotypes.ISerializable {
+		return new(DiskFsFeatures)
+	})
+}
 
 type DiskCreateInput struct {
 	apis.VirtualResourceCreateInput
@@ -39,9 +48,13 @@ type DiskCreateInput struct {
 	// required: false
 	PreferRegion string `json:"prefer_region_id"`
 
-	// 此参数仅适用于未指定storage时进行调度到指定可用区区创建磁盘
+	// 此参数仅适用于未指定storage时进行调度到指定可用区创建磁盘
 	// required: false
-	PreferZone string `json:"prefer_zone_id"`
+	PreferZone string `json:"prefer_zone_id" yunion-deprecated-by:"prefer_zones"`
+
+	// 此参数仅适用于未指定storage时进行调度到指定可用区列表创建磁盘
+	// required: false
+	PreferZones []string `json:"prefer_zones"`
 
 	// swagger:ignore
 	PreferWire string `json:"prefer_wire_id"`
@@ -52,7 +65,7 @@ type DiskCreateInput struct {
 
 	// 此参数仅适用于未指定storage时进行调度到指定平台创建磁盘
 	// default: kvm
-	// enum: kvm, openstack, esxi, aliyun, aws, qcloud, azure, huawei, openstack, ucloud, zstack google, ctyun
+	// enum: ["kvm", "openstack", "esxi", "aliyun", "aws", "qcloud", "azure", "huawei", "ucloud", "zstack", "google", "ctyun"]
 	Hypervisor string `json:"hypervisor"`
 }
 
@@ -63,6 +76,7 @@ func (req *DiskCreateInput) ToServerCreateInput() *ServerCreateInput {
 			PreferManager: req.PreferManager,
 			PreferRegion:  req.PreferRegion,
 			PreferZone:    req.PreferZone,
+			PreferZones:   req.PreferZones,
 			PreferWire:    req.PreferWire,
 			PreferHost:    req.PreferHost,
 			Hypervisor:    req.Hypervisor,
@@ -83,6 +97,7 @@ func (req *ServerCreateInput) ToDiskCreateInput() *DiskCreateInput {
 		PreferRegion: req.PreferRegion,
 		PreferHost:   req.PreferHost,
 		PreferZone:   req.PreferZone,
+		PreferZones:  req.PreferZones,
 		PreferWire:   req.PreferWire,
 		Hypervisor:   req.Hypervisor,
 	}
@@ -117,7 +132,10 @@ type DiskListInput struct {
 	StorageFilterListInput
 
 	SnapshotPolicyFilterListInput
-	ServerFilterListInput
+	// 虚拟机（ID或Name）列表
+	ServerId []string `json:"server_id"`
+	// swagger:ignore
+	Server []string `json:"server" yunion-deprecated-by:"server_id"`
 
 	// filter disk by whether it is being used
 	Unused *bool `json:"unused"`
@@ -160,6 +178,14 @@ type DiskListInput struct {
 	// swagger:ignore
 	// Deprecated
 	Snapshot string `json:"snapshot" yunion-deprecated-by:"snapshot_id"`
+
+	// 根据虚拟机状态过滤
+	GuestStatus string `json:"guest_status"`
+
+	// 根据是否绑定快照策略过滤
+	BindingSnapshotpolicy *bool `json:"binding_snapshotpolicy"`
+	// 根据是否磁盘所在虚拟机是否绑定主机快照策略
+	BindingServerSnapshotpolicy *bool `json:"binding_server_snapshotpolicy"`
 }
 
 type DiskResourceInput struct {
@@ -198,13 +224,28 @@ type SimpleGuest struct {
 	Driver string `json:"driver"`
 	// 缓存模式
 	CacheMode string `json:"cache_mode"`
+	// 磁盘并发数
+	Iops int `json:"iops"`
+	// 磁盘吞吐
+	Bps int `json:"bps"`
+	// 计费类型
+	BillingType string `json:"billing_type"`
+
+	// 磁盘绑定的快照策略列表
+	Snapshotpolicy []SimpleSnapshotPolicy `json:"snapshotpolicy"`
 }
 
 type SimpleSnapshotPolicy struct {
-	Id             string `json:"id"`
-	Name           string `json:"name"`
-	RepeatWeekdays []int  `json:"repeat_weekdays"`
-	TimePoints     []int  `json:"time_points"`
+	// 快照策略ID
+	Id string `json:"id"`
+	// 快照策略名称
+	Name string `json:"name"`
+	// 快照策略类型
+	ResourceType string `json:"resource_type"`
+	// 快照策略重复周期
+	RepeatWeekdays []int `json:"repeat_weekdays"`
+	// 快照策略时间点
+	TimePoints []int `json:"time_points"`
 }
 
 type DiskDetails struct {
@@ -222,19 +263,16 @@ type DiskDetails struct {
 	GuestCount int `json:"guest_count"`
 	// 所挂载虚拟机状态
 	GuestStatus string `json:"guest_status"`
+	// 所挂载虚拟机计费类型
+	GuestBillingType string `json:"guest_billing_type"`
+	// 磁盘所在虚拟机绑定的主机快照策略数量
+	GuestSnapshotpolicyCount int `json:"guest_snapshotpolicy_count"`
 
 	// 自动清理时间
 	AutoDeleteAt time.Time `json:"auto_delete_at"`
-	// 自动快照策略状态
-	SnapshotpolicyStatus string `json:"snapshotpolicy_status,allowempty"`
 
 	// 自动快照策略
 	Snapshotpolicies []SimpleSnapshotPolicy `json:"snapshotpolicies"`
-
-	// 手动快照数量
-	ManualSnapshotCount int `json:"manual_snapshot_count"`
-	// 最多可创建手动快照数量
-	MaxManualSnapshotCount int `json:"max_manual_snapshot_count"`
 }
 
 type DiskResourceInfoBase struct {
@@ -259,14 +297,21 @@ type DiskUpdateInput struct {
 
 	// 磁盘类型
 	DiskType string `json:"disk_type"`
+	// 关机自动重置
+	AutoReset *bool `json:"auto_reset"`
+
+	// 是否跟随主机删除而自动删除
+	// 默认跟随主机创建的磁盘为 true
+	// required: false
+	AutoDelete *bool `json:"auto_delete,omitempty"`
 }
 
 type DiskSaveInput struct {
-	Name   string
-	Format string
+	Name   string `json:"name"`
+	Format string `json:"format"`
 
-	// swagger: ignore
-	ImageId string
+	// swagger:ignore
+	ImageId string `json:"image_id"`
 }
 
 type DiskResizeInput struct {
@@ -283,45 +328,107 @@ func (self DiskResizeInput) SizeMb() (int, error) {
 }
 
 type DiskAllocateInput struct {
-	Format        string
-	DiskSizeMb    int
-	ImageId       string
-	FsFormat      string
-	Rebuild       bool
-	BackingDiskId string
-	SnapshotId    string
+	Format        string          `json:"format"`
+	DiskSizeMb    int             `json:"disk_size_mb"`
+	ImageId       string          `json:"image_id"`
+	ImageFormat   string          `json:"image_format"`
+	FsFormat      string          `json:"fs_format"`
+	FsFeatures    *DiskFsFeatures `json:"fs_features"`
+	Rebuild       bool            `json:"rebuild"`
+	BackingDiskId string          `json:"backing_disk_id"`
+	SnapshotId    string          `json:"snapshot_id"`
 
-	BackupId string
-	Backup   *DiskAllocateFromBackupInput
+	BackupId string                       `json:"backup_id"`
+	Backup   *DiskAllocateFromBackupInput `json:"backup"`
 
-	SnapshotUrl        string
-	SnapshotOutOfChain bool
-	Protocol           string
-	SrcDiskId          string
-	SrcPool            string
-	ExistingPath       string
+	SnapshotUrl  string `json:"snapshot_url"`
+	Protocol     string `json:"protocol"`
+	SrcDiskId    string `json:"src_disk_id"`
+	SrcPool      string `json:"src_pool"`
+	ExistingPath string `json:"existing_path"`
 
 	// vmware
-	HostIp    string
-	Datastore vcenter.SVCenterAccessInfo
+	HostIp    string                     `json:"host_ip"`
+	Datastore vcenter.SVCenterAccessInfo `json:"datastore"`
 
 	// encryption
-	Encryption  bool
-	EncryptInfo apis.SEncryptInfo
+	Encryption  bool              `json:"encryption"`
+	EncryptInfo apis.SEncryptInfo `json:"encrypt_info"`
 }
 
 type DiskAllocateFromBackupInput struct {
-	BackupId                string
-	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
+	BackupId                string                    `json:"backup_id"`
+	BackupStorageId         string                    `json:"backup_storage_id"`
+	BackupStorageAccessInfo *SBackupStorageAccessInfo `json:"backup_storage_access_info"`
+	DiskConfig              *DiskConfig               `json:"disk_config"`
+	BackupAsTar             *DiskBackupAsTarInput     `json:"backup_as_tar"`
+	BackupFilePath          string                    `json:"backup_file_path"`
 }
 
 type DiskDeleteInput struct {
-	SkipRecycle      *bool
-	EsxiFlatFilePath string
+	SkipRecycle      *bool    `json:"skip_recycle"`
+	EsxiFlatFilePath string   `json:"esxi_flat_file_path"`
+	CleanSnapshots   bool     `json:"clean_snapshots"`
+	SnapshotIds      []string `json:"snapshot_ids"`
 }
 
 type DiskResetInput struct {
 	SnapshotId string `json:"snapshot_id"`
 	AutoStart  bool   `json:"auto_start"`
+}
+
+type DiskMigrateInput struct {
+	TargetStorageId string `json:"target_storage_id"`
+}
+
+type DiskChagneStorageTypeInput struct {
+	// 目标存储类型
+	StorageType string `json:"storage_type"`
+}
+
+type DiskSnapshotpolicyInput struct {
+	// 快照策略ID
+	SnapshotpolicyId string `json:"snapshotpolicy_id"`
+}
+
+type DiskRebuildInput struct {
+	BackupId   *string         `json:"backup_id,allowempty"`
+	TemplateId *string         `json:"template_id,allowempty"`
+	Size       *string         `json:"size,allowempty"`
+	Fs         *string         `json:"fs,allowempty"`
+	FsFeatures *DiskFsFeatures `json:"fs_features,allowempty"`
+}
+
+type DiskFsExt4Features struct {
+	CaseInsensitive          bool `json:"case_insensitive"`
+	ReservedBlocksPercentage int  `json:"reserved_blocks_percentage"`
+}
+
+type DiskFsF2fsFeatures struct {
+	CaseInsensitive              bool `json:"case_insensitive"`
+	OverprovisionRatioPercentage int  `json:"overprovision_ratio_percentage"`
+}
+
+type DiskFsFeatures struct {
+	Ext4 *DiskFsExt4Features `json:"ext4"`
+	F2fs *DiskFsF2fsFeatures `json:"f2fs"`
+}
+
+func (d *DiskFsFeatures) String() string {
+	return jsonutils.Marshal(d).String()
+}
+
+func (d *DiskFsFeatures) IsZero() bool {
+	if reflect.DeepEqual(*d, DiskFsFeatures{}) {
+		return true
+	}
+	return false
+}
+
+type DiskChangeBillingTypeInput struct {
+	// 仅在磁盘挂载在虚拟机上时调用
+	// 目前支持阿里云
+	// enmu: [postpaid, prepaid]
+	// required: true
+	BillingType billing_api.TBillingType `json:"billing_type"`
 }

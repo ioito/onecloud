@@ -91,6 +91,16 @@ type SCDNDomain struct {
 	Referer *cloudprovider.SCDNReferer `list:"user" create:"domain_optional"`
 	// 浏览器缓存配置
 	MaxAge *cloudprovider.SCDNMaxAge `list:"user" create:"domain_optional"`
+	// 是否启用DNSSEC
+	DNSSECEnabled bool `default:"false" list:"user" create:"optional"`
+	// SSL加密模式
+	SSLSetting string `list:"user" width:"16" create:"domain_optional"`
+	// 是否启用HTTPS重写
+	HTTPSRewrites bool `default:"false" list:"user" create:"optional"`
+	// 缓存级别
+	CacheLevel string `list:"user" width:"32" create:"domain_optional"`
+	// 浏览器缓存TTL
+	BrowserCacheTTL int `nullable:"true" list:"user"`
 }
 
 func (manager *SCDNDomainManager) GetContextManagers() [][]db.IModelManager {
@@ -180,6 +190,72 @@ func (self *SCloudprovider) SyncCDNDomains(ctx context.Context, userCred mcclien
 	}
 
 	return result
+}
+
+func (self *SCDNDomain) PerformClearCache(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *cloudprovider.CacheClearOptions) (jsonutils.JSONObject, error) {
+	cdn, err := self.GetICloudCDNDomain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = cdn.ClearCache(input)
+	if err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (self *SCDNDomain) PerformChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *cloudprovider.CacheConfig) (jsonutils.JSONObject, error) {
+	cdn, err := self.GetICloudCDNDomain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = cdn.ChangeConfig(input)
+	if err != nil {
+		return nil, err
+	}
+
+	err = self.SyncWithCloudCDNDomain(ctx, userCred, cdn)
+	if err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (self *SCDNDomain) PerformDeleteCustomHostname(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *api.CDNDeleteCustomHostnameInput) (jsonutils.JSONObject, error) {
+	cdn, err := self.GetICloudCDNDomain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = cdn.DeleteCustomHostname(input.Id)
+	if err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (self *SCDNDomain) PerformAddCustomHostname(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *cloudprovider.CustomHostnameCreateOptions) (jsonutils.JSONObject, error) {
+	cdn, err := self.GetICloudCDNDomain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = cdn.AddCustomHostname(input)
+	if err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (self *SCDNDomain) GetDetailsCustomHostnames(ctx context.Context, userCred mcclient.TokenCredential, input jsonutils.JSONObject) (*api.CDNCustomHostnameOutput, error) {
+	cdn, err := self.GetICloudCDNDomain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ret := &api.CDNCustomHostnameOutput{}
+	ret.Data, err = cdn.GetCustomHostnames()
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
 }
 
 // 启用资源
@@ -273,6 +349,12 @@ func (self *SCDNDomain) SyncWithCloudCDNDomain(ctx context.Context, userCred mcc
 		if maxAge, err := ext.GetMaxAge(); err == nil {
 			self.MaxAge = maxAge
 		}
+
+		self.DNSSECEnabled = ext.GetDNSSECEnabled()
+		self.SSLSetting = ext.GetSSLSetting()
+		self.HTTPSRewrites = ext.GetHTTPSRewrites()
+		self.CacheLevel = ext.GetCacheLevel()
+		self.BrowserCacheTTL = ext.GetBrowserCacheTTL()
 		return nil
 	})
 	if err != nil {
@@ -286,9 +368,12 @@ func (self *SCDNDomain) SyncWithCloudCDNDomain(ctx context.Context, userCred mcc
 		})
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
+
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, self.ManagerId)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 
 	return nil
@@ -313,14 +398,19 @@ func (self *SCloudprovider) newFromCloudCDNDomain(ctx context.Context, userCred 
 	domain.ForceRedirect, _ = ext.GetForceRedirect()
 	domain.Referer, _ = ext.GetReferer()
 	domain.MaxAge, _ = ext.GetMaxAge()
+	domain.DNSSECEnabled = ext.GetDNSSECEnabled()
+	domain.SSLSetting = ext.GetSSLSetting()
+	domain.HTTPSRewrites = ext.GetHTTPSRewrites()
+	domain.CacheLevel = ext.GetCacheLevel()
+	domain.BrowserCacheTTL = ext.GetBrowserCacheTTL()
 
 	err := CDNDomainManager.TableSpec().Insert(ctx, &domain)
 	if err != nil {
 		return nil, err
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, &domain, ext)
-	SyncCloudProject(ctx, userCred, &domain, self.GetOwnerId(), ext, self.Id)
+	syncVirtualResourceMetadata(ctx, userCred, &domain, ext, false)
+	SyncCloudProject(ctx, userCred, &domain, self.GetOwnerId(), ext, self)
 
 	db.OpsLog.LogEvent(&domain, db.ACT_CREATE, domain.GetShortDesc(ctx), userCred)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
@@ -341,7 +431,7 @@ func (manager *SCDNDomainManager) ValidateCreateData(
 	if len(input.CloudproviderId) == 0 {
 		return input, httperrors.NewMissingParameterError("cloudprovider_id")
 	}
-	_provider, err := validators.ValidateModel(userCred, CloudproviderManager, &input.CloudproviderId)
+	_provider, err := validators.ValidateModel(ctx, userCred, CloudproviderManager, &input.CloudproviderId)
 	if err != nil {
 		return input, err
 	}
@@ -352,7 +442,7 @@ func (manager *SCDNDomainManager) ValidateCreateData(
 		return input, errors.Wrapf(err, "GetProvider")
 	}
 	if !cloudprovider.IsSupportCDN(pp) {
-		return input, httperrors.NewNotSupportedError("%s not support cdn", provider.Provider)
+		return input, httperrors.NewNotSupportedError("%s does not support cdn", provider.Provider)
 	}
 	input, err = GetRegionDriver(provider.Provider).ValidateCreateCdnData(ctx, userCred, input)
 	if err != nil {
@@ -372,7 +462,7 @@ func (self *SCDNDomain) StartCdnCreateTask(ctx context.Context, userCred mcclien
 	if err != nil {
 		return errors.Wrapf(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_CREATING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -389,14 +479,14 @@ func (self *SCDNDomain) StartDeleteTask(ctx context.Context, userCred mcclient.T
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.CDN_DOMAIN_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.CDN_DOMAIN_STATUS_DELETE_FAILED, err.Error())
 		return nil
 	}
 	return nil
 }
 
 func (self *SCDNDomain) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	self.SetStatus(userCred, api.CDN_DOMAIN_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.CDN_DOMAIN_STATUS_DELETING, "")
 	return nil
 }
 
@@ -449,6 +539,15 @@ func (manager *SCDNDomainManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fi
 		if err == nil {
 			return q, nil
 		}
+	}
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SCDNDomainManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
 	}
 	return q, httperrors.ErrNotFound
 }
@@ -518,7 +617,7 @@ func (self *SCDNDomain) PerformSyncstatus(ctx context.Context, userCred mcclient
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("CDN domain has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("CDN domain has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, self.StartSyncstatus(ctx, userCred, "")
@@ -543,12 +642,12 @@ func (self *SCDNDomain) StartRemoteUpdateTask(ctx context.Context, userCred mccl
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	self.SetStatus(ctx, userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
 func (self *SCDNDomain) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
 		return
 	}
 	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")

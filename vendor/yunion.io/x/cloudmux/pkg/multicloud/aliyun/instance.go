@@ -21,13 +21,14 @@ import (
 	"strings"
 	"time"
 
+	alierr "github.com/aliyun/alibaba-cloud-sdk-go/sdk/errors"
+
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/imagetools"
 	"yunion.io/x/pkg/util/osprofile"
-	"yunion.io/x/pkg/util/seclib"
 	"yunion.io/x/pkg/utils"
 
 	billing_api "yunion.io/x/cloudmux/pkg/apis/billing"
@@ -138,14 +139,11 @@ type SInstance struct {
 
 // {"AutoReleaseTime":"","ClusterId":"","Cpu":1,"CreationTime":"2018-05-23T07:58Z","DedicatedHostAttribute":{"DedicatedHostId":"","DedicatedHostName":""},"Description":"","DeviceAvailable":true,"EipAddress":{"AllocationId":"","InternetChargeType":"","IpAddress":""},"ExpiredTime":"2018-05-30T16:00Z","GPUAmount":0,"GPUSpec":"","HostName":"iZ2ze57isp1ali72tzkjowZ","ImageId":"centos_7_04_64_20G_alibase_201701015.vhd","InnerIpAddress":{"IpAddress":[]},"InstanceChargeType":"PrePaid","InstanceId":"i-2ze57isp1ali72tzkjow","InstanceName":"gaoxianqi-test-7days","InstanceNetworkType":"vpc","InstanceType":"ecs.t5-lc2m1.nano","InstanceTypeFamily":"ecs.t5","InternetChargeType":"PayByBandwidth","InternetMaxBandwidthIn":-1,"InternetMaxBandwidthOut":0,"IoOptimized":true,"Memory":512,"NetworkInterfaces":{"NetworkInterface":[{"MacAddress":"00:16:3e:10:f0:c9","NetworkInterfaceId":"eni-2zecqsagtpztl6x5hu2r","PrimaryIpAddress":"192.168.220.214"}]},"OSName":"CentOS  7.4 64位","OSType":"linux","OperationLocks":{"LockReason":[]},"PublicIpAddress":{"IpAddress":[]},"Recyclable":false,"RegionId":"cn-beijing","ResourceGroupId":"","SaleCycle":"Week","SecurityGroupIds":{"SecurityGroupId":["sg-2zecqsagtpztl6x9zynl"]},"SerialNumber":"df05d9b4-df3d-4400-88d1-5f843f0dd088","SpotPriceLimit":0.000000,"SpotStrategy":"NoSpot","StartTime":"2018-05-23T07:58Z","Status":"Running","StoppedMode":"Not-applicable","VlanId":"","VpcAttributes":{"NatIpAddress":"","PrivateIpAddress":{"IpAddress":["192.168.220.214"]},"VSwitchId":"vsw-2ze9cqwza4upoyujq1thd","VpcId":"vpc-2zer4jy8ix3i8f0coc5uw"},"ZoneId":"cn-beijing-f"}
 
-func (self *SRegion) GetInstances(zoneId string, ids []string, offset int, limit int) ([]SInstance, int, error) {
-	if limit > 50 || limit <= 0 {
-		limit = 50
-	}
+func (self *SRegion) GetInstances(zoneId string, ids []string) ([]SInstance, error) {
 	params := make(map[string]string)
 	params["RegionId"] = self.RegionId
-	params["PageSize"] = fmt.Sprintf("%d", limit)
-	params["PageNumber"] = fmt.Sprintf("%d", (offset/limit)+1)
+	params["MaxResults"] = "100"
+	params["AdditionalAttributes.1"] = "NETWORK_PRIMARY_ENI_IP"
 
 	if len(zoneId) > 0 {
 		params["ZoneId"] = zoneId
@@ -155,20 +153,29 @@ func (self *SRegion) GetInstances(zoneId string, ids []string, offset int, limit
 		params["InstanceIds"] = jsonutils.Marshal(ids).String()
 	}
 
-	body, err := self.ecsRequest("DescribeInstances", params)
-	if err != nil {
-		log.Errorf("GetInstances fail %s", err)
-		return nil, 0, err
+	ret := make([]SInstance, 0)
+	for {
+		resp, err := self.ecsRequest("DescribeInstances", params)
+		if err != nil {
+			return nil, errors.Wrapf(err, "DescribeInstances")
+		}
+		part := struct {
+			Instances struct {
+				Instance []SInstance
+			}
+			NextToken string
+		}{}
+		err = resp.Unmarshal(&part)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Unmarshal")
+		}
+		ret = append(ret, part.Instances.Instance...)
+		if len(part.Instances.Instance) == 0 || len(part.NextToken) == 0 {
+			break
+		}
+		params["NextToken"] = part.NextToken
 	}
-
-	instances := make([]SInstance, 0)
-	err = body.Unmarshal(&instances, "Instances", "Instance")
-	if err != nil {
-		log.Errorf("Unmarshal security group details fail %s", err)
-		return nil, 0, err
-	}
-	total, _ := body.Int("TotalCount")
-	return instances, int(total), nil
+	return ret, nil
 }
 
 func (self *SInstance) GetSecurityGroupIds() ([]string, error) {
@@ -238,21 +245,12 @@ func (a byAttachedTime) Less(i, j int) bool {
 }
 
 func (self *SInstance) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
-	disks := []SDisk{}
-	for {
-		part, total, err := self.host.zone.region.GetDisks(self.InstanceId, "", "", nil, len(disks), 50)
-		if err != nil {
-			return nil, errors.Wrapf(err, "GetDisks for %s", self.InstanceId)
-		}
-		disks = append(disks, part...)
-		if len(disks) >= total {
-			break
-		}
+	disks, err := self.host.zone.region.GetDisks(self.InstanceId, "", "", nil, "")
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetDisks for %s", self.InstanceId)
 	}
 
 	sort.Sort(byAttachedTime(disks))
-
-	log.Debugf("%s", jsonutils.Marshal(&disks))
 
 	idisks := make([]cloudprovider.ICloudDisk, len(disks))
 	for i := 0; i < len(disks); i += 1 {
@@ -277,6 +275,11 @@ func (self *SInstance) GetINics() ([]cloudprovider.ICloudNic, error) {
 			id:       networkInterface.NetworkInterfaceId,
 			ipAddr:   networkInterface.PrimaryIpAddress,
 			macAddr:  networkInterface.MacAddress,
+		}
+		for _, ipv6 := range networkInterface.Ipv6Sets.Ipv6Set {
+			if len(ipv6.Ipv6Address) > 0 {
+				nic.ip6Addr = ipv6.Ipv6Address
+			}
 		}
 		nics = append(nics, &nic)
 	}
@@ -371,69 +374,68 @@ func (self *SInstance) GetStatus() string {
 	}
 }
 
+type SInstanceStatus struct {
+	InstanceId   string
+	HealthStatus struct {
+		Name string
+	}
+}
+
+func (region *SRegion) DescribeInstancesFullStatus(vmId string) (*SInstanceStatus, error) {
+	params := map[string]string{
+		"InstanceId": vmId,
+	}
+	resp, err := region.ecsRequest("DescribeInstancesFullStatus", params)
+	if err != nil {
+		return nil, err
+	}
+	ret := struct {
+		InstanceFullStatusSet struct {
+			InstanceFullStatusType []SInstanceStatus
+		}
+	}{}
+	err = resp.Unmarshal(&ret)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
+	}
+	for i := range ret.InstanceFullStatusSet.InstanceFullStatusType {
+		if ret.InstanceFullStatusSet.InstanceFullStatusType[i].InstanceId == vmId {
+			return &ret.InstanceFullStatusSet.InstanceFullStatusType[i], nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", vmId)
+}
+
+func (self *SInstance) GetHealthStatus() string {
+	status, err := self.host.zone.region.DescribeInstancesFullStatus(self.InstanceId)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(status.HealthStatus.Name)
+}
+
 func (self *SInstance) Refresh() error {
 	ins, err := self.host.zone.region.GetInstance(self.InstanceId)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "GetInstance %s", self.InstanceId)
 	}
 	return jsonutils.Update(self, ins)
 }
-
-/*
-func (self *SInstance) GetRemoteStatus() string {
-	// Running：运行中
-	//Starting：启动中
-	//Stopping：停止中
-	//Stopped：已停止
-	switch self.Status {
-	case InstanceStatusRunning:
-		return cloudprovider.CloudVMStatusRunning
-	case InstanceStatusStarting:
-		return cloudprovider.CloudVMStatusStopped
-	case InstanceStatusStopping:
-		return cloudprovider.CloudVMStatusRunning
-	case InstanceStatusStopped:
-		return cloudprovider.CloudVMStatusStopped
-	default:
-		return cloudprovider.CloudVMStatusOther
-	}
-}
-*/
 
 func (self *SInstance) GetHypervisor() string {
 	return api.HYPERVISOR_ALIYUN
 }
 
 func (self *SInstance) StartVM(ctx context.Context) error {
-	timeout := 300 * time.Second
-	interval := 15 * time.Second
-
-	startTime := time.Now()
-	for time.Now().Sub(startTime) < timeout {
-		err := self.Refresh()
-		if err != nil {
-			return err
-		}
-		log.Debugf("status %s expect %s", self.GetStatus(), api.VM_RUNNING)
-		if self.GetStatus() == api.VM_RUNNING {
-			return nil
-		} else if self.GetStatus() == api.VM_READY {
-			err := self.host.zone.region.StartVM(self.InstanceId)
-			if err != nil {
-				return err
-			}
-		}
-		time.Sleep(interval)
-	}
-	return cloudprovider.ErrTimeout
+	return self.host.zone.region.StartVM(self.InstanceId)
 }
 
 func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerStopOptions) error {
 	err := self.host.zone.region.StopVM(self.InstanceId, opts.IsForce, opts.StopCharging)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "StopVM %s", self.InstanceId)
 	}
-	return cloudprovider.WaitStatus(self, api.VM_READY, 10*time.Second, 300*time.Second) // 5mintues
+	return cloudprovider.WaitStatus(self, api.VM_READY, 10*time.Second, 5*time.Minute)
 }
 
 func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudprovider.ServerVncOutput, error) {
@@ -441,14 +443,8 @@ func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudpr
 	if err != nil {
 		return nil, err
 	}
-	passwd := seclib.RandomPassword(6)
-	err = self.host.zone.region.ModifyInstanceVNCUrlPassword(self.InstanceId, passwd)
-	if err != nil {
-		return nil, err
-	}
 	ret := &cloudprovider.ServerVncOutput{
 		Url:        url,
-		Password:   passwd,
 		Protocol:   "aliyun",
 		InstanceId: self.InstanceId,
 		Hypervisor: api.HYPERVISOR_ALIYUN,
@@ -461,17 +457,8 @@ func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstan
 	return self.host.zone.region.UpdateVM(self.InstanceId, input, self.OSType)
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
-	var keypairName string
-	if len(publicKey) > 0 {
-		var err error
-		keypairName, err = self.host.zone.region.syncKeypair(publicKey)
-		if err != nil {
-			return err
-		}
-	}
-
-	return self.host.zone.region.DeployVM(self.InstanceId, name, password, keypairName, deleteKeypair, description)
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
+	return self.host.zone.region.DeployVM(self.InstanceId, opts)
 }
 
 func (self *SInstance) RebuildRoot(ctx context.Context, desc *cloudprovider.SManagedVMRebuildRootConfig) (string, error) {
@@ -535,6 +522,61 @@ func (self *SInstance) ChangeConfig(ctx context.Context, config *cloudprovider.S
 	return fmt.Errorf("Failed to change vm config, specification not supported")
 }
 
+func (self *SInstance) GetModificationTypes() ([]cloudprovider.SInstanceModificationType, error) {
+	return self.host.zone.region.GetInstanceModificationTypes(self.InstanceId)
+}
+
+func (self *SRegion) GetInstanceModificationTypes(instanceId string) ([]cloudprovider.SInstanceModificationType, error) {
+	params := map[string]string{
+		"RegionId":            self.RegionId,
+		"ResourceId":          instanceId,
+		"DestinationResource": "InstanceType",
+	}
+	body, err := self.ecsRequest("DescribeResourcesModification", params)
+	if err != nil {
+		return nil, errors.Wrapf(err, "DescribeResourcesModification")
+	}
+
+	parsed := struct {
+		AvailableZones struct {
+			AvailableZone []struct {
+				AvailableResources struct {
+					AvailableResource []struct {
+						SupportedResources struct {
+							SupportedResource []struct {
+								Value          string
+								Status         string
+								StatusCategory string
+							}
+						}
+					}
+				}
+			}
+		}
+	}{}
+	if err := body.Unmarshal(&parsed); err != nil {
+		return nil, errors.Wrapf(err, "body.Unmarshal")
+	}
+
+	ret := make([]cloudprovider.SInstanceModificationType, 0)
+	seen := map[string]struct{}{}
+	for _, zone := range parsed.AvailableZones.AvailableZone {
+		for _, resource := range zone.AvailableResources.AvailableResource {
+			for _, supportedResource := range resource.SupportedResources.SupportedResource {
+				if len(supportedResource.Value) == 0 || len(supportedResource.Status) == 0 || strings.ToLower(supportedResource.Status) != "available" {
+					continue
+				}
+				if _, ok := seen[supportedResource.Value]; ok {
+					continue
+				}
+				seen[supportedResource.Value] = struct{}{}
+				ret = append(ret, cloudprovider.SInstanceModificationType{InstanceType: supportedResource.Value})
+			}
+		}
+	}
+	return ret, nil
+}
+
 func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
 	return self.host.zone.region.AttachDisk(self.InstanceId, diskId)
 }
@@ -551,17 +593,19 @@ func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
 }
 
 func (self *SRegion) GetInstance(instanceId string) (*SInstance, error) {
-	instances, _, err := self.GetInstances("", []string{instanceId}, 0, 1)
+	instances, err := self.GetInstances("", []string{instanceId})
 	if err != nil {
 		return nil, err
 	}
-	if len(instances) == 0 {
-		return nil, cloudprovider.ErrNotFound
+	for i := range instances {
+		if instances[i].InstanceId == instanceId {
+			return &instances[i], nil
+		}
 	}
-	return &instances[0], nil
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", instanceId)
 }
 
-func (self *SRegion) CreateInstance(name, hostname string, imageId string, instanceType string, securityGroupId string,
+func (self *SRegion) CreateInstance(name, hostname string, imageId string, instanceType string, securityGroupIds []string,
 	zoneId string, desc string, passwd string, disks []SDisk, vSwitchId string, ipAddr string,
 	keypair string, userData string, bc *billing.SBillingCycle, projectId, osType string,
 	tags map[string]string, publicIp cloudprovider.SPublicIpInfo,
@@ -570,7 +614,9 @@ func (self *SRegion) CreateInstance(name, hostname string, imageId string, insta
 	params["RegionId"] = self.RegionId
 	params["ImageId"] = imageId
 	params["InstanceType"] = instanceType
-	params["SecurityGroupId"] = securityGroupId
+	for _, id := range securityGroupIds {
+		params["SecurityGroupId"] = id
+	}
 	params["ZoneId"] = zoneId
 	params["InstanceName"] = name
 	if len(hostname) > 0 {
@@ -578,10 +624,9 @@ func (self *SRegion) CreateInstance(name, hostname string, imageId string, insta
 	}
 	params["Description"] = desc
 	params["InternetChargeType"] = "PayByTraffic"
-	params["InternetMaxBandwidthIn"] = "200"
-	params["InternetMaxBandwidthOut"] = "100"
 	if publicIp.PublicIpBw > 0 {
 		params["InternetMaxBandwidthOut"] = fmt.Sprintf("%d", publicIp.PublicIpBw)
+		params["InternetMaxBandwidthIn"] = "200"
 	}
 	if publicIp.PublicIpChargeType == cloudprovider.ElasticipChargeTypeByBandwidth {
 		params["InternetChargeType"] = "PayByBandwidth"
@@ -612,6 +657,9 @@ func (self *SRegion) CreateInstance(name, hostname string, imageId string, insta
 				params["SystemDisk.Category"] = api.STORAGE_CLOUD_ESSD
 				params["SystemDisk.PerformanceLevel"] = "PL3"
 			}
+			if d.Category == api.STORAGE_CLOUD_AUTO {
+				params["SystemDisk.BurstingEnabled"] = "true"
+			}
 			params["SystemDisk.Size"] = fmt.Sprintf("%d", d.Size)
 			params["SystemDisk.DiskName"] = d.GetName()
 			params["SystemDisk.Description"] = d.Description
@@ -629,6 +677,9 @@ func (self *SRegion) CreateInstance(name, hostname string, imageId string, insta
 			if d.Category == api.STORAGE_CLOUD_ESSD_PL3 {
 				params[fmt.Sprintf("DataDisk.%d.Category", i)] = api.STORAGE_CLOUD_ESSD
 				params[fmt.Sprintf("DataDisk.%d..PerformanceLevel", i)] = "PL3"
+			}
+			if d.Category == api.STORAGE_CLOUD_AUTO {
+				params[fmt.Sprintf("DataDisk.%d.BurstingEnabled", i)] = "true"
 			}
 			params[fmt.Sprintf("DataDisk.%d.DiskName", i)] = d.GetName()
 			params[fmt.Sprintf("DataDisk.%d.Description", i)] = d.Description
@@ -674,13 +725,32 @@ func (self *SRegion) CreateInstance(name, hostname string, imageId string, insta
 
 	params["ClientToken"] = utils.GenRequestId(20)
 
-	body, err := self.ecsRequest("CreateInstance", params)
+	resp, err := self.ecsRequest("RunInstances", params)
 	if err != nil {
-		log.Errorf("CreateInstance fail %s", err)
-		return "", err
+		return "", errors.Wrapf(err, "RunInstances")
 	}
-	instanceId, _ := body.GetString("InstanceId")
-	return instanceId, nil
+	ids := []string{}
+	err = resp.Unmarshal(&ids, "InstanceIdSets", "InstanceIdSet")
+	if err != nil {
+		return "", errors.Wrapf(err, "Unmarshal")
+	}
+	for _, id := range ids {
+		err = cloudprovider.Wait(time.Second*3, time.Minute, func() (bool, error) {
+			_, err := self.GetInstance(id)
+			if err != nil {
+				if errors.Cause(err) == cloudprovider.ErrNotFound {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		})
+		if err != nil {
+			return "", errors.Wrapf(cloudprovider.ErrNotFound, "after vm %s created", id)
+		}
+		return id, nil
+	}
+	return "", errors.Wrapf(cloudprovider.ErrNotFound, "after created")
 }
 
 func (self *SRegion) AllocatePublicIpAddress(instanceId string) (string, error) {
@@ -723,148 +793,117 @@ func (self *SRegion) doDeleteVM(instanceId string) error {
 	return self.instanceOperation(instanceId, "DeleteInstance", params)
 }
 
-/*func (self *SRegion) waitInstanceStatus(instanceId string, target string, interval time.Duration, timeout time.Duration) error {
-	startTime := time.Now()
-	for time.Now().Sub(startTime) < timeout {
-		status, err := self.GetInstanceStatus(instanceId)
-		if err != nil {
-			return err
-		}
-		if status == target {
-			return nil
-		}
-		time.Sleep(interval)
-	}
-	return cloudprovider.ErrTimeout
-}
-
-func (self *SInstance) waitStatus(target string, interval time.Duration, timeout time.Duration) error {
-	return self.host.zone.region.waitInstanceStatus(self.InstanceId, target, interval, timeout)
-}*/
-
 func (self *SRegion) StartVM(instanceId string) error {
 	status, err := self.GetInstanceStatus(instanceId)
 	if err != nil {
-		log.Errorf("Fail to get instance status on StartVM: %s", err)
-		return err
+		return errors.Wrapf(err, "GetInstanceStatus")
 	}
 	if status != InstanceStatusStopped {
-		log.Errorf("StartVM: vm status is %s expect %s", status, InstanceStatusStopped)
-		return cloudprovider.ErrInvalidStatus
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "vm status is %s expect %s", status, InstanceStatusStopped)
 	}
 	return self.doStartVM(instanceId)
-	// if err != nil {
-	//	return err
-	// }
-	// return self.waitInstanceStatus(instanceId, InstanceStatusRunning, time.Second*5, time.Second*180) // 3 minutes to timeout
 }
 
 func (self *SRegion) StopVM(instanceId string, isForce, stopCharging bool) error {
 	status, err := self.GetInstanceStatus(instanceId)
 	if err != nil {
-		log.Errorf("Fail to get instance status on StopVM: %s", err)
-		return err
+		return errors.Wrapf(err, "GetInstanceStatus")
 	}
 	if status == InstanceStatusStopped {
 		return nil
 	}
 	if status != InstanceStatusRunning {
-		log.Errorf("StopVM: vm status is %s expect %s", status, InstanceStatusRunning)
-		return cloudprovider.ErrInvalidStatus
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "vm status is %s expect %s", status, InstanceStatusRunning)
 	}
 	return self.doStopVM(instanceId, isForce, stopCharging)
-	// if err != nil {
-	//  return err
-	// }
-	// return self.waitInstanceStatus(instanceId, InstanceStatusStopped, time.Second*10, time.Second*300) // 5 minutes to timeout
 }
 
 func (self *SRegion) DeleteVM(instanceId string) error {
 	status, err := self.GetInstanceStatus(instanceId)
 	if err != nil {
-		log.Errorf("Fail to get instance status on DeleteVM: %s", err)
-		return err
+		return errors.Wrapf(err, "GetInstanceStatus")
 	}
-	log.Debugf("Instance status on delete is %s", status)
 	if status != InstanceStatusStopped {
 		log.Warningf("DeleteVM: vm status is %s expect %s", status, InstanceStatusStopped)
 	}
 	return self.doDeleteVM(instanceId)
-	// if err != nil {
-	// 	return err
-	// }
-	// err = self.waitInstanceStatus(instanceId, InstanceStatusRunning, time.Second*10, time.Second*300) // 5 minutes to timeout
-	// if err == cloudprovider.ErrNotFound {
-	// 	return nil
-	// } else if err == nil {
-	// 	return cloudprovider.ErrTimeout
-	// } else {
-	// 	return err
-	// }
 }
 
-func (self *SRegion) DeployVM(instanceId string, name string, password string, keypairName string, deleteKeypair bool, description string) error {
+func (self *SRegion) DeployVM(instanceId string, opts *cloudprovider.SInstanceDeployOptions) error {
 	instance, err := self.GetInstance(instanceId)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "GetInstance")
 	}
 
 	// 修改密钥时直接返回
-	if deleteKeypair {
+	if opts.DeleteKeypair {
 		err = self.DetachKeyPair(instanceId, instance.KeyPairName)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "DetachKeyPair")
 		}
 	}
 
-	if len(keypairName) > 0 {
+	var keypairName string
+	if len(opts.PublicKey) > 0 {
+		var err error
+		keypairName, err = self.syncKeypair(opts.PublicKey)
+		if err != nil {
+			return errors.Wrapf(err, "syncKeypair")
+		}
 		err = self.AttachKeypair(instanceId, keypairName)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "AttachKeypair")
 		}
 	}
 
-	params := make(map[string]string)
-
-	// if resetPassword {
-	//	params["Password"] = seclib2.RandomPassword2(12)
-	// }
 	// 指定密码的情况下，使用指定的密码
-	if len(password) > 0 {
-		params["Password"] = password
-	}
-
-	if len(name) > 0 && instance.InstanceName != name {
-		params["InstanceName"] = name
-	}
-
-	if len(description) > 0 && instance.Description != description {
-		params["Description"] = description
-	}
-
-	if len(params) > 0 {
+	if len(opts.Password) > 0 {
+		params := make(map[string]string)
+		params["Password"] = opts.Password
 		return self.modifyInstanceAttribute(instanceId, params)
-	} else {
-		return nil
 	}
+
+	return nil
 }
 
 func (self *SInstance) DeleteVM(ctx context.Context) error {
+	// 未到期包年包月实例需要先转换到按量计费后, 进行删除
+	if self.GetBillingType() == billing_api.BILLING_TYPE_PREPAID && self.GetExpiredAt().After(time.Now()) {
+		err := self.host.zone.region.ConvertVmPostpaid([]string{self.InstanceId})
+		if err != nil {
+			log.Warningf("convert vm %s to postpaid error: %v", self.InstanceId, err)
+		}
+	}
 	for {
 		err := self.host.zone.region.DeleteVM(self.InstanceId)
-		if err != nil {
-			if isError(err, "IncorrectInstanceStatus.Initializing") {
-				log.Infof("The instance is initializing, try later ...")
-				time.Sleep(10 * time.Second)
-			} else {
-				log.Errorf("DeleteVM fail: %s", err)
-				return err
-			}
-		} else {
+		if err == nil {
 			break
+		}
+		e, ok := errors.Cause(err).(*alierr.ServerError)
+		if !ok {
+			return errors.Wrapf(err, "DeleteVM")
+		}
+		switch e.ErrorCode() {
+		case "IncorrectInstanceStatus.Initializing":
+			time.Sleep(10 * time.Second)
+		case "LastTokenProcessing": // 等待转换按量付费完成
+			time.Sleep(10 * time.Second)
+		default:
+			return errors.Wrapf(err, "DeleteVM")
 		}
 	}
 	return cloudprovider.WaitDeleted(self, 10*time.Second, 300*time.Second) // 5minutes
+}
+
+func (self *SRegion) ConvertVmPostpaid(instanceIds []string) error {
+	params := map[string]string{
+		"RegionId":           self.RegionId,
+		"InstanceIds":        jsonutils.Marshal(instanceIds).String(),
+		"InstanceChargeType": "PostPaid",
+		"ClientToken":        utils.GenRequestId(20),
+	}
+	_, err := self.ecsRequest("ModifyInstanceChargeType", params)
+	return err
 }
 
 func (self *SRegion) UpdateVM(instanceId string, input cloudprovider.SInstanceUpdateOptions, osType string) error {
@@ -874,7 +913,12 @@ func (self *SRegion) UpdateVM(instanceId string, input cloudprovider.SInstanceUp
 	*/
 	params := make(map[string]string)
 	params["InstanceName"] = input.NAME
-	params["Description"] = input.Description
+	if len(input.HostName) > 0 {
+		params["HostName"] = input.HostName
+	}
+	if len(input.Description) > 0 {
+		params["Description"] = input.Description
+	}
 	return self.modifyInstanceAttribute(instanceId, params)
 }
 
@@ -900,9 +944,8 @@ func (self *SRegion) ReplaceSystemDisk(instanceId string, imageId string, passwd
 	}
 	body, err := self.ecsRequest("ReplaceSystemDisk", params)
 	if err != nil {
-		return "", err
+		return "", errors.Wrapf(err, "ReplaceSystemDisk")
 	}
-	// log.Debugf("%s", body.String())
 	return body.GetString("DiskId")
 }
 
@@ -953,12 +996,11 @@ func (self *SRegion) AttachDisk(instanceId string, diskId string) error {
 	params := make(map[string]string)
 	params["InstanceId"] = instanceId
 	params["DiskId"] = diskId
+	params["DeleteWithInstance"] = "true"
 	_, err := self.ecsRequest("AttachDisk", params)
 	if err != nil {
-		log.Errorf("AttachDisk %s to %s fail %s", diskId, instanceId, err)
-		return err
+		return errors.Wrapf(err, "AttachDisk %s => %s", diskId, instanceId)
 	}
-
 	return nil
 }
 
@@ -983,16 +1025,59 @@ func (self *SInstance) GetIEIP() (cloudprovider.ICloudEIP, error) {
 	return nil, nil
 }
 
-func (self *SInstance) AssignSecurityGroup(secgroupId string) error {
-	return self.host.zone.region.AssignSecurityGroup(secgroupId, self.InstanceId)
-}
-
 func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
 	return self.host.zone.region.SetSecurityGroups(secgroupIds, self.InstanceId)
 }
 
 func (self *SInstance) GetBillingType() string {
 	return convertChargeType(self.InstanceChargeType)
+}
+
+func (self *SInstance) ChangeBillingType(billingType string) error {
+	return self.host.zone.region.ModifyInstanceChargeType(self.InstanceId, billingType)
+}
+
+func (region *SRegion) ModifyInstanceChargeType(vmId string, billingType string) error {
+	params := map[string]string{
+		"RegionId":         region.RegionId,
+		"IncludeDataDisks": "true",
+		"AutoPay":          "true",
+		"ClientToken":      utils.GenRequestId(20),
+		"InstanceIds":      jsonutils.Marshal([]string{vmId}).String(),
+	}
+	switch billingType {
+	case billing_api.BILLING_TYPE_POSTPAID:
+		params["InstanceChargeType"] = "PostPaid"
+	case billing_api.BILLING_TYPE_PREPAID:
+		params["InstanceChargeType"] = "PrePaid"
+		params["Period"] = "1"
+		params["PeriodUnit"] = "Month"
+	default:
+		return fmt.Errorf("invalid billing_type %s", billingType)
+	}
+	_, err := region.ecsRequest("ModifyInstanceChargeType", params)
+	if err != nil {
+		return errors.Wrapf(err, "ModifyInstanceChargeType %v", params)
+	}
+	if billingType == billing_api.BILLING_TYPE_PREPAID {
+		cycle := billing.SBillingCycle{
+			AutoRenew: true,
+			Count:     1,
+			Unit:      billing.BillingCycleMonth,
+		}
+		err = cloudprovider.Wait(time.Second*10, time.Minute*3, func() (bool, error) {
+			err = region.SetInstanceAutoRenew(vmId, cycle)
+			if err != nil {
+				log.Errorf("set auto renew for instance %s error: %v", vmId, err)
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			log.Errorf("set auto renew for %s error: %v", vmId, err)
+		}
+	}
+	return nil
 }
 
 func (self *SInstance) GetCreatedAt() time.Time {
@@ -1037,13 +1122,12 @@ func (region *SRegion) RenewInstance(instanceId string, bc billing.SBillingCycle
 	params["InstanceId"] = instanceId
 	err := billingCycle2Params(&bc, params)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "billingCycle2Params %v", params)
 	}
 	params["ClientToken"] = utils.GenRequestId(20)
 	_, err = region.ecsRequest("RenewInstance", params)
 	if err != nil {
-		log.Errorf("RenewInstance fail %s", err)
-		return err
+		return errors.Wrapf(err, "RenewInstance %v", params)
 	}
 	return nil
 }

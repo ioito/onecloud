@@ -15,6 +15,8 @@
 package monitor
 
 import (
+	"yunion.io/x/jsonutils"
+
 	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/compute"
 )
@@ -39,11 +41,14 @@ type MonitorResourceListInput struct {
 	apis.EnabledResourceBaseListInput
 	compute.ManagedResourceListInput
 
-	ResId     []string `json:"res_id"`
-	ResType   string   `json:"res_type"`
-	OnlyResId bool     `json:"only_res_id"`
+	ResId       []string `json:"res_id"`
+	ResType     string   `json:"res_type"`
+	OnlyResId   bool     `json:"only_res_id"`
+	AlertStates []string `json:"alert_states"`
 
 	ResName string `json:"res_name"`
+	// Top 查询参数（用于统计报警数量最多的资源）
+	TopQueryInput
 }
 
 type MonitorResourceDetails struct {
@@ -55,4 +60,9 @@ type MonitorResourceDetails struct {
 
 	AttachAlertCount int64  `json:"attach_alert_count"`
 	Hypervisor       string `json:"hypervisor"`
+}
+
+type MonitorResourceDoActionInput struct {
+	Action string               `json:"action"`
+	Data   jsonutils.JSONObject `json:"data"`
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +29,8 @@ import (
 	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/version"
 
-	"yunion.io/x/onecloud/pkg/esxi/options"
+	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 )
@@ -56,6 +58,8 @@ type SSkuResourcesMeta struct {
 	CloudpolicyBase string `json:"cloudpolicy_base"`
 
 	RateBase string `json:"rate_base"`
+	// 汇率转换
+	CurrencyExchangeBase string `json:"currency_exchange_base"`
 
 	// 3天过期, 重新刷新
 	expire time.Time
@@ -102,6 +106,28 @@ func (self *SSkuResourcesMeta) request(url string) (jsonutils.JSONObject, error)
 	return resp, err
 }
 
+func (self *SSkuResourcesMeta) head(url string) (http.Header, jsonutils.JSONObject, error) {
+	client := httputils.GetAdaptiveTimeoutClient()
+
+	header := http.Header{}
+	header.Set("User-Agent", "vendor/yunion-OneCloud@"+version.Get().GitVersion)
+	_header, resp, err := httputils.JSONRequest(client, context.TODO(), httputils.HEAD, url, header, nil, false)
+	return _header, resp, err
+}
+
+func (self *SSkuResourcesMeta) GetCurrencyRate(src, dest string) (float64, error) {
+	url := fmt.Sprintf("%s/%s-%s", self.CurrencyExchangeBase, src, dest)
+	header, _, err := self.head(url)
+	if err != nil {
+		return 0.0, errors.Wrapf(err, "head %s", url)
+	}
+	rate := header.Get("x-oss-meta-rate")
+	if len(rate) == 0 {
+		return 0.0, errors.Wrapf(cloudprovider.ErrNotFound, "x-oss-meta-rate %s -> %s", src, dest)
+	}
+	return strconv.ParseFloat(rate, 64)
+}
+
 func (self *SSkuResourcesMeta) _get(url string) ([]jsonutils.JSONObject, error) {
 	objs, err := self.request(url)
 	if err != nil {
@@ -141,7 +167,7 @@ func (self *SSkuResourcesMeta) Index(resType string) (map[string]string, error) 
 	case "cloudrate":
 		url = fmt.Sprintf("%s/index.json", self.RateBase)
 	default:
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, resType)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%v", resType)
 	}
 	ret := map[string]string{}
 	resp, err := self.request(url)
@@ -152,12 +178,16 @@ func (self *SSkuResourcesMeta) Index(resType string) (map[string]string, error) 
 }
 
 func (self *SSkuResourcesMeta) List(resType string, regionId string, retVal interface{}) error {
+	if strings.HasPrefix(regionId, api.CLOUD_PROVIDER_HUAWEI) && strings.Contains(regionId, "_") {
+		idx := strings.Index(regionId, "_")
+		regionId = regionId[:idx]
+	}
 	var url string
 	switch resType {
 	case "dbinstance_sku":
 		url = fmt.Sprintf("%s/%s.status.json", self.DBInstanceBase, regionId)
 	case "serversku":
-		url = fmt.Sprintf("%s/%s.status.json", self.ServerBase, regionId)
+		url = fmt.Sprintf("%s/%s.status.new.json", self.ServerBase, regionId)
 	case "elasticcachesku":
 		url = fmt.Sprintf("%s/%s.status.json", self.ElasticCacheBase, regionId)
 	case "cloudimage":
@@ -171,11 +201,11 @@ func (self *SSkuResourcesMeta) List(resType string, regionId string, retVal inte
 	case "cloudpolicy":
 		url = fmt.Sprintf("%s/%s.json", self.CloudpolicyBase, regionId)
 	default:
-		return errors.Wrapf(cloudprovider.ErrNotFound, resType)
+		return errors.Wrapf(cloudprovider.ErrNotFound, "%v", resType)
 	}
 	resp, err := self._get(url)
 	if err != nil {
-		return errors.Wrapf(err, resType)
+		return errors.Wrapf(err, "%v", resType)
 	}
 	return jsonutils.Update(retVal, resp)
 }

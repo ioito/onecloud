@@ -1,0 +1,666 @@
+package llm_container
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
+
+	commonapi "yunion.io/x/onecloud/pkg/apis"
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/llm/models"
+	"yunion.io/x/onecloud/pkg/mcclient"
+)
+
+func init() {
+	models.RegisterLLMContainerDriver(newVLLM())
+}
+
+type vllm struct {
+	baseDriver
+}
+
+func newVLLM() models.ILLMContainerDriver {
+	return &vllm{baseDriver: newBaseDriver(api.LLM_CONTAINER_VLLM)}
+}
+
+// escapeShellSingleQuoted escapes s for use inside a single-quoted shell string (each ' becomes '\”).
+func escapeShellSingleQuoted(s string) string {
+	return strings.ReplaceAll(s, "'", "'\\''")
+}
+
+func shellQuoteSingle(s string) string {
+	return "'" + escapeShellSingleQuoted(s) + "'"
+}
+
+var protectedVLLMArgKeys = map[string]struct{}{
+	"model":                {},
+	"served-model-name":    {},
+	"port":                 {},
+	"tensor-parallel-size": {},
+}
+
+func validateVLLMArgKey(key string) error {
+	if key == "" {
+		return errors.Error("vllm arg key is empty")
+	}
+	if strings.HasPrefix(key, "--") {
+		return errors.Errorf("invalid vllm arg key %q: do not include leading --", key)
+	}
+	for _, r := range key {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' {
+			continue
+		}
+		return errors.Errorf("invalid vllm arg key %q", key)
+	}
+	if _, ok := protectedVLLMArgKeys[key]; ok {
+		return errors.Errorf("vllm arg key %q is protected", key)
+	}
+	return nil
+}
+
+func normalizeVLLMCustomizedArgs(args []*api.VllmCustomizedArg) ([]*api.VllmCustomizedArg, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	out := make([]*api.VllmCustomizedArg, 0, len(args))
+	indexByKey := make(map[string]int, len(args))
+	for _, arg := range args {
+		if arg == nil {
+			continue
+		}
+		key := strings.TrimSpace(arg.Key)
+		if err := validateVLLMArgKey(key); err != nil {
+			return nil, err
+		}
+		next := &api.VllmCustomizedArg{
+			Key:   key,
+			Value: arg.Value,
+		}
+		if idx, ok := indexByKey[key]; ok {
+			out[idx] = next
+			continue
+		}
+		indexByKey[key] = len(out)
+		out = append(out, next)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func mergeVLLMCustomizedArgs(base, overrides []*api.VllmCustomizedArg) ([]*api.VllmCustomizedArg, error) {
+	out := make([]*api.VllmCustomizedArg, 0, len(base)+len(overrides))
+	indexByKey := make(map[string]int, len(base)+len(overrides))
+	appendNormalized := func(items []*api.VllmCustomizedArg) error {
+		normalized, err := normalizeVLLMCustomizedArgs(items)
+		if err != nil {
+			return err
+		}
+		for _, arg := range normalized {
+			if idx, ok := indexByKey[arg.Key]; ok {
+				out[idx] = arg
+				continue
+			}
+			indexByKey[arg.Key] = len(out)
+			out = append(out, arg)
+		}
+		return nil
+	}
+	if err := appendNormalized(base); err != nil {
+		return nil, err
+	}
+	if err := appendNormalized(overrides); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func appendVLLMCustomizedFlags(flags []string, effSpec *api.LLMSpecVllm) []string {
+	if effSpec == nil || len(effSpec.CustomizedArgs) == 0 {
+		return flags
+	}
+	normalizedArgs, err := normalizeVLLMCustomizedArgs(effSpec.CustomizedArgs)
+	if err != nil {
+		log.Errorf("normalize vllm customized args: %v", err)
+		return flags
+	}
+	for _, arg := range normalizedArgs {
+		flagName := "--" + arg.Key
+		if arg.Value == "" {
+			flags = append(flags, flagName)
+			continue
+		}
+		flags = append(flags, fmt.Sprintf("%s %s", flagName, shellQuoteSingle(arg.Value)))
+	}
+	return flags
+}
+
+func vllmCustomizedArgsToRuntime(args []*api.VllmCustomizedArg) []runtimeArg {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]runtimeArg, 0, len(args))
+	for _, arg := range args {
+		if arg == nil {
+			continue
+		}
+		out = append(out, runtimeArg{Key: arg.Key, Value: arg.Value})
+	}
+	return out
+}
+
+func appendVLLMRuntimeFlags(flags []string, backendParameters []string, effSpec *api.LLMSpecVllm) []string {
+	backendArgs, err := parseBackendParameterArgs(backendParameters, validateVLLMArgKey)
+	if err != nil {
+		log.Errorf("parse vllm backend parameters: %v", err)
+	}
+	var customizedArgs []runtimeArg
+	if effSpec != nil {
+		customizedArgs = vllmCustomizedArgsToRuntime(effSpec.CustomizedArgs)
+	}
+	mergedArgs, err := mergeRuntimeArgs(backendArgs, customizedArgs, validateVLLMArgKey)
+	if err != nil {
+		log.Errorf("merge vllm runtime args: %v", err)
+		return flags
+	}
+	return appendRuntimeFlags(flags, mergedArgs)
+}
+
+func buildVLLMServeFlagsWithModelExpr(modelExpr string, servedModelNameExpr string, tensorParallelSize int, backendParameters []string, effSpec *api.LLMSpecVllm) []string {
+	flags := []string{
+		fmt.Sprintf("--model %s", modelExpr),
+		fmt.Sprintf("--served-model-name %s", servedModelNameExpr),
+		fmt.Sprintf("--port %d", api.LLM_VLLM_DEFAULT_PORT),
+		fmt.Sprintf("--tensor-parallel-size %d", tensorParallelSize),
+	}
+	return appendVLLMRuntimeFlags(flags, backendParameters, effSpec)
+}
+
+func buildVLLMServeFlags(modelPath string, tensorParallelSize int, backendParameters []string, effSpec *api.LLMSpecVllm) []string {
+	modelQuoted := shellQuoteSingle(modelPath)
+	return buildVLLMServeFlagsWithModelExpr(
+		modelQuoted,
+		fmt.Sprintf(`"$(basename %s)"`, modelQuoted),
+		tensorParallelSize,
+		backendParameters,
+		effSpec,
+	)
+}
+
+func buildHygonVLLMEnvSourceLines() []string {
+	return []string{
+		"if [ -f /opt/dtk/env.sh ]; then",
+		"  . /opt/dtk/env.sh",
+		"else",
+		"  _dtk_env=$(ls /opt/dtk-*/env.sh 2>/dev/null | head -1)",
+		"  if [ -n \"$_dtk_env\" ] && [ -f \"$_dtk_env\" ]; then",
+		"    . \"$_dtk_env\"",
+		"  fi",
+		"fi",
+	}
+}
+
+func buildVLLMEntrypointScript(modelPath string, tensorParallelSize int, backendParameters []string, effSpec *api.LLMSpecVllm, hygon bool) string {
+	modelPath = strings.TrimSpace(modelPath)
+	if modelPath == "" {
+		return "exec sleep infinity"
+	}
+	serveCmd := strings.Join(buildVLLMServeFlags(modelPath, tensorParallelSize, backendParameters, effSpec), " ")
+	lines := []string{"set -e"}
+	if hygon {
+		lines = append(lines, buildHygonVLLMEnvSourceLines()...)
+	}
+	lines = append(lines, fmt.Sprintf("exec %s %s", api.LLM_VLLM_EXEC_PATH, serveCmd))
+	return strings.Join(lines, "\n")
+}
+
+func (v *vllm) GetSpec(sku *models.SLLMSku) interface{} {
+	if sku == nil || sku.LLMType != string(api.LLM_CONTAINER_VLLM) || sku.LLMSpec == nil || sku.LLMSpec.Vllm == nil {
+		return nil
+	}
+	return sku.LLMSpec.Vllm
+}
+
+func (v *vllm) GetEffectiveSpec(llm *models.SLLM, sku *models.SLLMSku) interface{} {
+	var skuSpec *api.LLMSpecVllm
+	if s := v.GetSpec(sku); s != nil {
+		skuSpec = s.(*api.LLMSpecVllm)
+	}
+	var llmSpec *api.LLMSpecVllm
+	if llm != nil && llm.LLMSpec != nil && llm.LLMSpec.Vllm != nil {
+		llmSpec = llm.LLMSpec.Vllm
+	}
+	if skuSpec == nil && llmSpec == nil {
+		return nil
+	}
+	out := &api.LLMSpecVllm{}
+	if skuSpec != nil {
+		out.PreferredModel = skuSpec.PreferredModel
+		out.CustomizedArgs = skuSpec.CustomizedArgs
+	}
+	if llmSpec != nil {
+		if llmSpec.PreferredModel != "" {
+			out.PreferredModel = llmSpec.PreferredModel
+		}
+	}
+	mergedArgs, err := normalizeVLLMCustomizedArgs(out.CustomizedArgs)
+	if err != nil {
+		log.Errorf("normalize sku vllm customized args: %v", err)
+		out.CustomizedArgs = nil
+	} else {
+		out.CustomizedArgs = mergedArgs
+	}
+	if llmSpec != nil {
+		mergedArgs, err = mergeVLLMCustomizedArgs(out.CustomizedArgs, llmSpec.CustomizedArgs)
+		if err != nil {
+			log.Errorf("merge vllm customized args: %v", err)
+		} else {
+			out.CustomizedArgs = mergedArgs
+		}
+	}
+	return out
+}
+
+func (v *vllm) ValidateLLMCreateData(ctx context.Context, userCred mcclient.TokenCredential, sku *models.SLLMSku, input *api.LLMCreateInput) (*api.LLMCreateInput, error) {
+	llmType := string(api.LLM_CONTAINER_VLLM)
+	if err := models.ValidateRequireDevices(llmType, input.Devices, nil, sku); err != nil {
+		return input, err
+	}
+	if err := models.ValidateRequireMountedModels(llmType, input.MountedModels, nil, sku); err != nil {
+		return input, err
+	}
+	return input, nil
+}
+
+func (v *vllm) ValidateLLMUpdateData(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, sku *models.SLLMSku, input *api.LLMUpdateInput) (*api.LLMUpdateInput, error) {
+	llmType := string(api.LLM_CONTAINER_VLLM)
+	if err := models.ValidateRequireDevices(llmType, input.Devices, llm.Devices, sku); err != nil {
+		return input, err
+	}
+	if err := models.ValidateRequireMountedModels(llmType, input.MountedModels, llm.MountedModels, sku); err != nil {
+		return input, err
+	}
+	return input, nil
+}
+
+func (v *vllm) ValidateLLMSkuCreateData(ctx context.Context, userCred mcclient.TokenCredential, input *api.LLMSkuCreateInput) (*api.LLMSkuCreateInput, error) {
+	input, err := v.baseDriver.ValidateLLMSkuCreateData(ctx, userCred, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyVLLMToolCallDefaults(ctx, input); err != nil {
+		return nil, err
+	}
+
+	// Reuse ValidateLLMCreateSpec; ensure llm_spec.vllm always exists for vLLM SKU.
+	spec, err := v.ValidateLLMCreateSpec(ctx, userCred, nil, input.LLMSpec)
+	if err != nil {
+		return nil, err
+	}
+	if spec == nil {
+		spec = &api.LLMSpec{Vllm: &api.LLMSpecVllm{}}
+	} else if spec.Vllm == nil {
+		spec.Vllm = &api.LLMSpecVllm{}
+	}
+	input.LLMSpec = spec
+	return input, nil
+}
+
+func (v *vllm) ValidateLLMSkuUpdateData(ctx context.Context, userCred mcclient.TokenCredential, sku *models.SLLMSku, input *api.LLMSkuUpdateInput) (*api.LLMSkuUpdateInput, error) {
+	input, err := v.baseDriver.ValidateLLMSkuUpdateData(ctx, userCred, sku, input)
+	if err != nil {
+		return nil, err
+	}
+	if input.LLMSpec == nil {
+		return input, nil
+	}
+
+	// Reuse ValidateLLMUpdateSpec by treating current SKU spec as the "current llm spec".
+	fakeLLM := &models.SLLM{LLMSpec: sku.LLMSpec}
+	spec, err := v.ValidateLLMUpdateSpec(ctx, userCred, fakeLLM, input.LLMSpec)
+	if err != nil {
+		return nil, err
+	}
+	input.LLMSpec = spec
+	if input.LLMSpec != nil && input.LLMSpec.Vllm == nil {
+		input.LLMSpec.Vllm = &api.LLMSpecVllm{}
+	}
+	return input, nil
+}
+
+// ValidateLLMCreateSpec implements ILLMContainerDriver. Merges preferred_model from SKU when input's is empty.
+func (v *vllm) ValidateLLMCreateSpec(ctx context.Context, userCred mcclient.TokenCredential, sku *models.SLLMSku, input *api.LLMSpec) (*api.LLMSpec, error) {
+	if input == nil {
+		return nil, nil
+	}
+	if input.Vllm == nil {
+		input.Vllm = &api.LLMSpecVllm{}
+	}
+
+	preferred := input.Vllm.PreferredModel
+	if preferred == "" && sku != nil && sku.LLMSpec != nil && sku.LLMSpec.Vllm != nil {
+		preferred = sku.LLMSpec.Vllm.PreferredModel
+	}
+
+	spec := &api.LLMSpecVllm{}
+	if sku != nil && sku.LLMSpec != nil && sku.LLMSpec.Vllm != nil {
+		base := *sku.LLMSpec.Vllm
+		spec = &base
+	}
+	// Apply create overrides
+	if preferred != "" {
+		spec.PreferredModel = preferred
+	}
+	mergedArgs, err := mergeVLLMCustomizedArgs(spec.CustomizedArgs, input.Vllm.CustomizedArgs)
+	if err != nil {
+		return nil, err
+	}
+	spec.CustomizedArgs = mergedArgs
+
+	return &api.LLMSpec{Vllm: spec}, nil
+}
+
+// ValidateLLMUpdateSpec implements ILLMContainerDriver. Merges preferred_model with current LLM spec; customized_args is replaced when provided.
+func (v *vllm) ValidateLLMUpdateSpec(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, input *api.LLMSpec) (*api.LLMSpec, error) {
+	if input == nil || input.Vllm == nil {
+		return input, nil
+	}
+	base := &api.LLMSpecVllm{}
+	if llm != nil && llm.LLMSpec != nil && llm.LLMSpec.Vllm != nil {
+		b := *llm.LLMSpec.Vllm
+		base = &b
+	}
+
+	// preferred_model: only overwrite when non-empty
+	if input.Vllm.PreferredModel != "" {
+		base.PreferredModel = input.Vllm.PreferredModel
+	}
+	customizedArgs, err := normalizeVLLMCustomizedArgs(base.CustomizedArgs)
+	if err != nil {
+		return nil, err
+	}
+	base.CustomizedArgs = customizedArgs
+	if input.Vllm.CustomizedArgs != nil {
+		customizedArgs, err = normalizeVLLMCustomizedArgs(input.Vllm.CustomizedArgs)
+		if err != nil {
+			return nil, err
+		}
+		base.CustomizedArgs = customizedArgs
+	}
+
+	return &api.LLMSpec{Vllm: base}, nil
+}
+
+func (v *vllm) GetContainerSpec(ctx context.Context, llm *models.SLLM, image *models.SLLMImage, sku *models.SLLMSku, props []string, devices []computeapi.SIsolatedDevice, diskId string) *computeapi.PodContainerCreateInput {
+	var postOverlays []*commonapi.ContainerVolumeMountDiskPostOverlay
+	if llm != nil {
+		var err error
+		postOverlays, err = llm.GetMountedModelsPostOverlay()
+		if err != nil {
+			log.Errorf("GetMountedModelsPostOverlay failed %s", err)
+		}
+	}
+	tensorParallelSize := 1
+	if sku != nil && sku.Devices != nil && len(*sku.Devices) > 0 {
+		tensorParallelSize = len(*sku.Devices)
+	}
+	effSpec := (*api.LLMSpecVllm)(nil)
+	if eff := v.GetEffectiveSpec(llm, sku); eff != nil {
+		effSpec = eff.(*api.LLMSpecVllm)
+	}
+	var backendParameters []string
+	if sku != nil {
+		backendParameters = sku.BackendParameters
+	}
+	preferred := ""
+	if effSpec != nil {
+		preferred = effSpec.PreferredModel
+	}
+	modelPath := models.PickContainerModelMountPath(models.CollectContainerModelMountPaths(llm, sku), preferred)
+	hasMountedModels := modelPath != "" || len(postOverlays) > 0 || models.SkuHasLocalHostPathModel(sku)
+	hygon := models.HasHygonDevices(llm, sku)
+	iluvatar := models.HasIluvatarDevices(llm, sku)
+	thead := models.HasTHeadDevices(llm, sku)
+	kunlunxin := models.HasKunlunxinDevices(llm, sku)
+	startScript := buildVLLMEntrypointScript(modelPath, tensorParallelSize, backendParameters, effSpec, hygon)
+	envs := []*commonapi.ContainerKeyValue{
+		{
+			Key:   "HUGGING_FACE_HUB_CACHE",
+			Value: api.LLM_VLLM_CACHE_DIR,
+		},
+		{
+			Key:   "HF_ENDPOINT",
+			Value: api.LLM_VLLM_HF_ENDPOINT,
+		},
+		// // Fix Error 803
+		// {
+		// 	Key:   "LD_LIBRARY_PATH",
+		// 	Value: "/lib64:/usr/local/cuda/lib64:/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}",
+		// },
+		// // Fix Error 803
+		// {
+		// 	Key:   "LD_PRELOAD",
+		// 	Value: "/lib/libcuda.so.1 /lib/libnvidia-ptxjitcompiler.so.1 /lib/libnvidia-gpucomp.so",
+		// },
+	}
+	spec := computeapi.ContainerSpec{
+		ContainerSpec: commonapi.ContainerSpec{
+			Image:             image.ToContainerImage(),
+			ImageCredentialId: image.CredentialId,
+			Command:           []string{"/bin/sh", "-c"},
+			Args:              []string{startScript},
+			EnableLxcfs:       true,
+			AlwaysRestart:     true,
+			Envs:              envs,
+		},
+	}
+	if hygon || iluvatar || thead || kunlunxin {
+		spec.Command = []string{"/bin/bash", "-c"}
+	}
+	if hasMountedModels {
+		spec.StartupProbe = newLLMHTTPStartupProbe(api.LLM_VLLM_DEFAULT_PORT, "/v1/models")
+	}
+
+	// GPU Devices
+	appendContainerIsolatedDevices(&spec, llm, sku, devices)
+
+	if hygon {
+		spec.Capabilities = &commonapi.ContainerCapability{
+			Add: []string{"SYS_PTRACE"},
+		}
+		spec.SecurityContext = &commonapi.ContainerSecurityContext{
+			SupplementalGroupNames: []string{"video"},
+		}
+	}
+
+	// Volume Mounts
+	diskIndex := 0
+	ctrVols := []*commonapi.ContainerVolumeMount{
+		{
+			Disk: &commonapi.ContainerVolumeMountDisk{
+				SubDirectory: api.LLM_VLLM,
+				Index:        &diskIndex,
+				PostOverlay:  postOverlays,
+			},
+			Type:        commonapi.CONTAINER_VOLUME_MOUNT_TYPE_DISK,
+			MountPath:   api.LLM_VLLM_BASE_PATH,
+			ReadOnly:    false,
+			Propagation: commonapi.MOUNTPROPAGATION_PROPAGATION_HOST_TO_CONTAINER,
+		},
+		{
+			// Mount cache dir to save HF cache
+			Disk: &commonapi.ContainerVolumeMountDisk{
+				SubDirectory: "cache",
+				Index:        &diskIndex,
+			},
+			Type:      commonapi.CONTAINER_VOLUME_MOUNT_TYPE_DISK,
+			MountPath: "/root/.cache",
+			ReadOnly:  false,
+		},
+	}
+	spec.VolumeMounts = append(spec.VolumeMounts, ctrVols...)
+
+	return &computeapi.PodContainerCreateInput{
+		ContainerSpec: spec,
+	}
+}
+
+func (v *vllm) GetContainerSpecs(ctx context.Context, llm *models.SLLM, image *models.SLLMImage, sku *models.SLLMSku, props []string, devices []computeapi.SIsolatedDevice, diskId string) []*computeapi.PodContainerCreateInput {
+	return []*computeapi.PodContainerCreateInput{
+		v.GetContainerSpec(ctx, llm, image, sku, props, devices, diskId),
+	}
+}
+
+func (v *vllm) GetLLMAccessUrlInfo(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, input *models.LLMAccessInfoInput) (*api.LLMAccessUrlInfo, error) {
+	return models.GetLLMAccessUrlInfo(ctx, userCred, llm, input, "http", api.LLM_VLLM_DEFAULT_PORT)
+}
+
+// StartLLM is a no-op for vLLM because the container entrypoint starts the server.
+func (v *vllm) StartLLM(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM) error {
+	return nil
+}
+
+// ILLMContainerInstantApp implementation
+
+func (v *vllm) GetProbedInstantModelsExt(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, mdlIds ...string) (map[string]api.LLMInternalInstantMdlInfo, error) {
+	lc, err := llm.GetLLMContainer()
+	if err != nil {
+		return nil, errors.Wrap(err, "get llm container")
+	}
+
+	// List directories in models path
+	cmd := fmt.Sprintf("du -sk %s/*/", api.LLM_VLLM_MODELS_PATH)
+	output, err := exec(ctx, lc.CmpId, cmd, 10)
+	if err != nil {
+		// If ls fails, maybe no directory yet, return empty
+		return make(map[string]api.LLMInternalInstantMdlInfo), nil
+	}
+
+	modelsMap := make(map[string]api.LLMInternalInstantMdlInfo)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// Size is in KB
+		sizeKB, _ := strconv.ParseInt(fields[0], 10, 64)
+		fullPath := fields[1]
+		name := path.Base(fullPath)
+		if name == "" {
+			continue
+		}
+		// We treat the directory name as the model name
+		// For vLLM, name usually implies "organization/model" if downloaded from HF, but here we just list local dirs
+		modelsMap[name] = api.LLMInternalInstantMdlInfo{
+			Name:    name,
+			ModelId: name,
+			Tag:     "latest",
+			Size:    sizeKB * 1024,
+		}
+	}
+	return modelsMap, nil
+}
+
+func (v *vllm) DetectModelPaths(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, pkgInfo api.LLMInternalInstantMdlInfo) ([]string, error) {
+	lc, err := llm.GetLLMContainer()
+	if err != nil {
+		return nil, errors.Wrap(err, "get llm container")
+	}
+
+	modelPath := path.Join(api.LLM_VLLM_MODELS_PATH, pkgInfo.Name)
+	checkCmd := fmt.Sprintf("[ -d '%s' ] && echo 'EXIST' || echo 'MISSING'", modelPath)
+	output, err := exec(ctx, lc.CmpId, checkCmd, 10)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to check file existence")
+	}
+
+	if !strings.Contains(output, "EXIST") {
+		return nil, errors.Errorf("model directory %s missing", modelPath)
+	}
+
+	return []string{modelPath}, nil
+}
+
+func (v *vllm) GetImageInternalPathMounts(sApp *models.SInstantModel) map[string]string {
+	// Map host paths to container paths
+	// For vLLM simple volume mount, this might be 1:1 or based on the base path
+	res := make(map[string]string)
+	for _, mount := range sApp.Mounts {
+		relPath := strings.TrimPrefix(mount, api.LLM_VLLM_BASE_PATH)
+		res[relPath] = path.Join(api.LLM_VLLM, relPath)
+	}
+	return res
+}
+
+func (v *vllm) GetSaveDirectories(sApp *models.SInstantModel) (string, []string, error) {
+	var filteredMounts []string
+	for _, mount := range sApp.Mounts {
+		if strings.HasPrefix(mount, api.LLM_VLLM_BASE_PATH) {
+			relPath := strings.TrimPrefix(mount, api.LLM_VLLM_BASE_PATH)
+			filteredMounts = append(filteredMounts, relPath)
+		}
+	}
+	return "", filteredMounts, nil
+}
+
+func (v *vllm) ValidateMounts(mounts []string, mdlName string, mdlTag string) ([]string, error) {
+	return mounts, nil
+}
+
+func (v *vllm) CheckDuplicateMounts(errStr string, dupIndex int) string {
+	return "Duplicate mounts detected"
+}
+
+func (v *vllm) GetInstantModelIdByPostOverlay(postOverlay *commonapi.ContainerVolumeMountDiskPostOverlay, mdlNameToId map[string]string) string {
+	return ""
+}
+
+func (v *vllm) GetDirPostOverlay(dir api.LLMMountDirInfo) *commonapi.ContainerVolumeMountDiskPostOverlay {
+	uid := int64(1000)
+	gid := int64(1000)
+	ov := dir.ToOverlay()
+	ov.FsUser = &uid
+	ov.FsGroup = &gid
+	return &ov
+}
+
+func (v *vllm) PreInstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, instMdl *models.SLLMInstantModel) error {
+	lc, err := llm.GetLLMContainer()
+	if err != nil {
+		return errors.Wrap(err, "get llm container")
+	}
+	// Create base directory
+	cmd := fmt.Sprintf("mkdir -p %s", api.LLM_VLLM_MODELS_PATH)
+	_, err = exec(ctx, lc.CmpId, cmd, 10)
+	return err
+}
+
+func (v *vllm) InstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, dirs []string, mdlIds []string) error {
+	return nil
+}
+
+func (v *vllm) UninstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, instMdl *models.SLLMInstantModel) error {
+	// Optionally remove the model directory
+	// For safety, we might just log or leave it
+	return nil
+}
+
+func (v *vllm) DownloadModel(ctx context.Context, userCred mcclient.TokenCredential, llm *models.SLLM, tmpDir string, input api.InstantModelImportInput, progress func(progress float32)) (string, []string, error) {
+	source := strings.ToLower(strings.TrimSpace(input.Source))
+	if source == api.InstantModelSourceModelScope {
+		return downloadModelScopeSnapshot(ctx, llm, tmpDir, input, api.LLM_VLLM_MODELS_PATH, progress)
+	}
+	return downloadHuggingFaceSnapshot(ctx, llm, tmpDir, input, api.LLM_VLLM_HF_ENDPOINT, api.LLM_VLLM_MODELS_PATH, progress)
+}

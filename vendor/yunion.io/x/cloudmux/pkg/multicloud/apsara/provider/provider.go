@@ -63,9 +63,6 @@ func (self *SApsaraProviderFactory) ValidateCreateCloudaccountData(ctx context.C
 		return output, errors.Wrapf(cloudprovider.ErrMissingParameter, "endpoint")
 	}
 	output.AccessUrl = input.Endpoint
-	if len(input.DefaultRegion) == 0 {
-		return output, errors.Wrapf(cloudprovider.ErrMissingParameter, "default_region")
-	}
 	return output, nil
 }
 
@@ -134,7 +131,7 @@ func (self *SApsaraProvider) WithClient(client *apsara.SApsaraClient) *SApsaraPr
 }
 
 func (self *SApsaraProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(apsara.APSARA_API_VERSION), "api_version")
@@ -153,7 +150,7 @@ func (self *SApsaraProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SApsaraProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SApsaraProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -231,12 +228,8 @@ func (self *SApsaraProvider) CreateICloudgroup(name, desc string) (cloudprovider
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SApsaraProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SApsaraProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SApsaraProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SApsaraProvider) CreateICloudpolicy(opts *cloudprovider.SCloudpolicyCreateOptions) (cloudprovider.ICloudpolicy, error) {

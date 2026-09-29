@@ -54,7 +54,7 @@ func toQrcode(secret string, token mcclient.TokenCredential) (string, error) {
 
 	c, err := qrcode.Encode(uri, qrcode.High, 256)
 	if err != nil {
-		log.Errorf(err.Error())
+		log.Errorf("%s", err.Error())
 		return "", httperrors.NewInternalServerError("generate totp qrcode failed")
 	}
 
@@ -317,8 +317,12 @@ func listTotpRecoveryQuestions(ctx context.Context, w http.ResponseWriter, req *
 	s := auth.GetAdminSession(ctx, FetchRegion(req))
 	// 做缓存？
 	ss, err := modules.Credentials.GetRecoverySecrets(s, t.GetUserId())
+	if err != nil {
+		log.Errorf("ListTotpRecoveryQuestions %s", err)
+		httperrors.GeneralServerError(ctx, w, err)
+		return
+	}
 	if len(ss) == 0 {
-		log.Errorf("ListTotpRecoveryQuestions %s", err.Error())
 		httperrors.NotFoundError(ctx, w, "no revocery questions.")
 		return
 	}

@@ -47,6 +47,9 @@ type SVpc struct {
 			State string `xml:"state"`
 		} `xml:"cidrBlockState"`
 	} `xml:"cidrBlockAssociationSet>item"`
+	IPv6CidrBlockAssociationSet []struct {
+		IPv6CidrBlock string `xml:"ipv6CidrBlock"`
+	} `xml:"ipv6CidrBlockAssociationSet>item"`
 	IsDefault       bool   `xml:"isDefault"`
 	Status          string `xml:"state"`
 	InstanceTenancy string `xml:"instanceTenancy"`
@@ -101,6 +104,16 @@ func (self *SVpc) GetCidrBlock() string {
 		}
 	}
 	return strings.Join(cidr, ",")
+}
+
+func (self *SVpc) GetCidrBlock6() string {
+	ret := []string{}
+	for _, cidr := range self.IPv6CidrBlockAssociationSet {
+		if len(cidr.IPv6CidrBlock) > 0 {
+			ret = append(ret, cidr.IPv6CidrBlock)
+		}
+	}
+	return strings.Join(ret, ",")
 }
 
 func (self *SVpc) GetIWires() ([]cloudprovider.ICloudWire, error) {
@@ -200,7 +213,7 @@ func (self *SVpc) GetIWireById(wireId string) (cloudprovider.ICloudWire, error) 
 			return wires[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, wireId)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", wireId)
 }
 
 func (self *SVpc) GetICloudVpcPeeringConnections() ([]cloudprovider.ICloudVpcPeeringConnection, error) {
@@ -255,7 +268,7 @@ func (self *SVpc) AcceptICloudVpcPeeringConnection(id string) error {
 func (self *SVpc) GetAuthorityOwnerId() string {
 	identity, err := self.region.client.GetCallerIdentity()
 	if err != nil {
-		log.Errorf(err.Error() + "self.region.client.GetCallerIdentity()")
+		log.Errorf("GetCallerIdentity error: %v", err)
 		return ""
 	}
 	return identity.Account
@@ -380,7 +393,7 @@ func (self *SRegion) getVpc(vpcId string) (*SVpc, error) {
 			return &vpcs[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, vpcId)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", vpcId)
 }
 
 func (self *SRegion) assignSecurityGroups(secgroupIds []string, instanceId string) error {

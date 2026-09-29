@@ -25,11 +25,13 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
 	"yunion.io/x/onecloud/pkg/hostman/storageman/backupstorage"
+	"yunion.io/x/onecloud/pkg/hostman/storageman/lvmutils"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
@@ -56,14 +58,17 @@ func AddStorageHandler(prefix string, app *appsrv.Application) {
 			fmt.Sprintf("%s/%s/<storageId>/delete-snapshots", prefix, keyWords),
 			auth.Authenticate(storageDeleteSnapshots))
 		app.AddHandler("POST",
-			fmt.Sprintf("%s/%s/<storageId>/snapshots-recycle", prefix, keyWords),
-			auth.Authenticate(storageSnapshotsRecycle))
+			fmt.Sprintf("%s/%s/<storageId>/delete-snapshot", prefix, keyWords),
+			auth.Authenticate(storageDeleteSnapshot))
 		app.AddHandler("GET",
 			fmt.Sprintf("%s/%s/is-mount-point", prefix, keyWords),
 			auth.Authenticate(storageVerifyMountPoint))
 		app.AddHandler("GET",
 			fmt.Sprintf("%s/%s/is-local-mount-point", prefix, keyWords),
 			auth.Authenticate(storageIsLocalMountPoint))
+		app.AddHandler("GET",
+			fmt.Sprintf("%s/%s/is-vg-exist", prefix, keyWords),
+			auth.Authenticate(storageIsVgExist))
 		app.AddHandler("POST",
 			fmt.Sprintf("%s/%s/delete-backup", prefix, keyWords),
 			auth.Authenticate(storageDeleteBackup))
@@ -79,6 +84,9 @@ func AddStorageHandler(prefix string, app *appsrv.Application) {
 		app.AddHandler("POST",
 			fmt.Sprintf("%s/%s/sync-backup-storage", prefix, keyWords),
 			auth.Authenticate(storageSyncBackupStorage))
+		app.AddHandler("POST",
+			fmt.Sprintf("%s/%s/<storageId>/clean-recycle-diskfiles", prefix, keyWords),
+			auth.Authenticate(storageCleanRecycleDiskfiles))
 	}
 }
 
@@ -90,8 +98,7 @@ func storageIsLocalMountPoint(ctx context.Context, w http.ResponseWriter, r *htt
 		return
 	}
 	fs, err := procutils.NewRemoteCommandAsFarAsPossible(
-		"sh", "-c",
-		fmt.Sprintf("df -T %s | awk 'NR==2{print $2}'", mountPoint),
+		"findmnt", "-n", "-o", "FSTYPE", "--target", mountPoint,
 	).Output()
 	if err != nil {
 		log.Errorf("failed get source of mountpoint %s: %s", mountPoint, err)
@@ -106,6 +113,21 @@ func storageIsLocalMountPoint(ctx context.Context, w http.ResponseWriter, r *htt
 	} else {
 		appsrv.SendStruct(w, map[string]interface{}{"is_local_mount_point": false})
 	}
+}
+
+func storageIsVgExist(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	_, query, _ := appsrv.FetchEnv(ctx, w, r)
+	vgName, err := query.GetString("vg_name")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("vg_name"))
+		return
+	}
+	if _, err := lvmutils.VgDisplay(vgName); err != nil {
+		log.Errorf("vg %s display failed %s", vgName, err)
+		hostutils.Response(ctx, w, httperrors.NewInternalServerError("%s", err.Error()))
+		return
+	}
+	hostutils.ResponseOk(ctx, w)
 }
 
 func storageVerifyMountPoint(ctx context.Context, w http.ResponseWriter, r *http.Request) {
@@ -248,12 +270,19 @@ func storageSyncBackup(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_access_info"))
 		return
 	}
-	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo.(*jsonutils.JSONDict))
+	accessInfo := compute.SBackupStorageAccessInfo{}
+	err = backupStorageAccessInfo.Unmarshal(&accessInfo)
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("unmarshal backup_storage_access_info failed %s", err))
+		return
+	}
+	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, &accessInfo)
 	if err != nil {
 		hostutils.Response(ctx, w, err)
 		return
 	}
-	exist, err := backupStorage.IsExists(backupId)
+	backupFilePath, _ := body.GetString("backup_file_path")
+	exist, _, reason, err := backupStorage.IsBackupExists(backupId, backupFilePath)
 	if err != nil {
 		hostutils.Response(ctx, w, err)
 		return
@@ -264,13 +293,16 @@ func storageSyncBackup(ctx context.Context, w http.ResponseWriter, r *http.Reque
 	)
 	if exist {
 		status = compute.BACKUP_EXIST
-	} else if !exist && err == nil {
-		status = compute.BACKUP_NOT_EXIST
 	} else {
-		log.Errorf("fetch snapshot exist failed %s", err)
-		status = compute.BACKUP_STATUS_UNKNOWN
+		if len(reason) == 0 {
+			status = compute.BACKUP_NOT_EXIST
+		} else {
+			log.Errorf("fetch snapshot exist failed reason:%s", reason)
+			status = compute.BACKUP_STATUS_UNKNOWN
+		}
 	}
 	ret.Set("status", jsonutils.NewString(status))
+	ret.Set("reason", jsonutils.NewString(reason))
 	hostutils.Response(ctx, w, ret)
 }
 
@@ -286,7 +318,13 @@ func storageSyncBackupStorage(ctx context.Context, w http.ResponseWriter, r *htt
 		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_access_info"))
 		return
 	}
-	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo.(*jsonutils.JSONDict))
+	accessInfo := compute.SBackupStorageAccessInfo{}
+	err = backupStorageAccessInfo.Unmarshal(&accessInfo)
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("unmarshal backup_storage_access_info failed %s", err))
+		return
+	}
+	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, &accessInfo)
 	if err != nil {
 		hostutils.Response(ctx, w, err)
 		return
@@ -315,10 +353,10 @@ func storagePackInstanceBackup(ctx context.Context, w http.ResponseWriter, r *ht
 	if !checkOptions(ctx, w, body, "package_name", "backup_ids", "backup_storage_id", "backup_storage_access_info", "metadata") {
 		return
 	}
-	pb := storageman.SStoragePackInstanceBackup{}
+	pb := compute.SStoragePackInstanceBackup{}
 	err := body.Unmarshal(&pb)
 	if err != nil {
-		hostutils.Response(ctx, w, httperrors.NewInputParameterError(err.Error()))
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("%s", err.Error()))
 		return
 	}
 
@@ -334,7 +372,7 @@ func storageUnpackInstanceBackup(ctx context.Context, w http.ResponseWriter, r *
 	pb := storageman.SStorageUnpackInstanceBackup{}
 	err := body.Unmarshal(&pb)
 	if err != nil {
-		hostutils.Response(ctx, w, httperrors.NewInputParameterError(err.Error()))
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("%s", err.Error()))
 		return
 	}
 
@@ -343,14 +381,10 @@ func storageUnpackInstanceBackup(ctx context.Context, w http.ResponseWriter, r *
 }
 
 func packInstanceBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
-	sbParams := params.(*storageman.SStoragePackInstanceBackup)
-	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+	sbParams := params.(*compute.SStoragePackInstanceBackup)
+	packFileName, err := storageman.DoInstancePackBackup(ctx, *sbParams)
 	if err != nil {
-		return nil, errors.Wrap(err, "GetBackupStorage")
-	}
-	packFileName, err := backupStorage.InstancePack(ctx, sbParams.PackageName, sbParams.BackupIds, &sbParams.Metadata)
-	if err != nil {
-		return nil, errors.Wrap(err, "InstancePack")
+		return nil, errors.Wrap(err, "DoInstancePackBackup")
 	}
 	ret := jsonutils.NewDict()
 	ret.Set("pack_file_name", jsonutils.NewString(packFileName))
@@ -359,15 +393,12 @@ func packInstanceBackup(ctx context.Context, params interface{}) (jsonutils.JSON
 
 func unpackInstanceBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	sbParams := params.(*storageman.SStorageUnpackInstanceBackup)
-	backupStorage, err := backupstorage.GetBackupStorage(sbParams.BackupStorageId, sbParams.BackupStorageAccessInfo)
+
+	diskBackupIds, metadata, err := storageman.DoInstanceUnpackBackup(ctx, *sbParams)
 	if err != nil {
-		return nil, errors.Wrap(err, "GetBackupStorage")
+		return nil, errors.Wrap(err, "DoInstanceUnpackBackup")
 	}
-	metadataOnly := (sbParams.MetadataOnly != nil && *sbParams.MetadataOnly)
-	diskBackupIds, metadata, err := backupStorage.InstanceUnpack(ctx, sbParams.PackageName, metadataOnly)
-	if err != nil {
-		return nil, errors.Wrap(err, "InstanceUnpack")
-	}
+
 	ret := jsonutils.NewDict()
 	if diskBackupIds != nil {
 		ret.Set("disk_backup_ids", jsonutils.Marshal(diskBackupIds))
@@ -393,10 +424,18 @@ func storageDeleteBackup(ctx context.Context, w http.ResponseWriter, r *http.Req
 		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("backup_storage_access_info"))
 		return
 	}
+	accessInfo := compute.SBackupStorageAccessInfo{}
+	err = backupStorageAccessInfo.Unmarshal(&accessInfo)
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewInputParameterError("unmarshal backup_storage_access_info failed %s", err))
+		return
+	}
+	backupFilePath, _ := body.GetString("backup_file_path")
 	hostutils.DelayTask(ctx, deleteBackup, &storageman.SStorageBackup{
 		BackupId:                backupId,
 		BackupStorageId:         backupStorageId,
-		BackupStorageAccessInfo: backupStorageAccessInfo.(*jsonutils.JSONDict),
+		BackupStorageAccessInfo: &accessInfo,
+		BackupFilePath:          backupFilePath,
 	})
 	hostutils.ResponseOk(ctx, w)
 }
@@ -418,14 +457,14 @@ func deleteBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject
 	if err != nil {
 		return nil, err
 	}
-	err = backupStorage.RemoveBackup(sbParams.BackupId)
+	err = backupStorage.RemoveBackup(ctx, sbParams.BackupId, sbParams.BackupFilePath)
 	if err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
-func storageDeleteSnapshots(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+func storageDeleteSnapshot(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	params, _, body := appsrv.FetchEnv(ctx, w, r)
 	var storageId = params["<storageId>"]
 	storage := storageman.GetManager().GetStorage(storageId)
@@ -435,21 +474,78 @@ func storageDeleteSnapshots(ctx context.Context, w http.ResponseWriter, r *http.
 	}
 	diskId, err := body.GetString("disk_id")
 	if err != nil {
-		hostutils.Response(ctx, w, httperrors.NewImageNotFoundError("disk_id"))
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("disk_id"))
 		return
 	}
-	hostutils.DelayTask(ctx, storage.DeleteSnapshots, diskId)
+
+	snapshotId, err := body.GetString("delete_snapshot")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("snapshot_id"))
+		return
+	}
+
+	input := &storageman.SStorageDeleteSnapshot{
+		DiskId:     diskId,
+		SnapshotId: snapshotId,
+	}
+	if snapshotIds, err := body.GetArray("snapshot_ids"); err == nil {
+		for _, snapshotId := range snapshotIds {
+			if id, err := snapshotId.GetString(); err == nil {
+				input.SnapshotIds = append(input.SnapshotIds, id)
+			}
+		}
+	}
+
+	if body.Contains("encrypt_info") {
+		encryptInfo := apis.SEncryptInfo{}
+		if err = body.Unmarshal(&encryptInfo, "encrypt_info"); err != nil {
+			hostutils.Response(ctx, w, httperrors.NewInputParameterError("unmarshal encrypt_info failed %s", err))
+			return
+		}
+		input.EncryptInfo = encryptInfo
+	}
+
+	hostutils.DelayTask(ctx, storage.DeleteSnapshot, input)
 	hostutils.ResponseOk(ctx, w)
 }
 
-func storageSnapshotsRecycle(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+func storageDeleteSnapshots(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	params, _, body := appsrv.FetchEnv(ctx, w, r)
+	var storageId = params["<storageId>"]
+	storage := storageman.GetManager().GetStorage(storageId)
+	if storage == nil {
+		hostutils.Response(ctx, w, httperrors.NewNotFoundError("Storage Not found"))
+		return
+	}
+	diskId, err := body.GetString("disk_id")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewImageNotFoundError("disk_id"))
+		return
+	}
+	snapshotIds := []string{}
+	err = body.Unmarshal(&snapshotIds, "snapshot_ids")
+	if err != nil {
+		hostutils.Response(ctx, w, httperrors.NewMissingParameterError("snapshot_ids"))
+		return
+	}
+
+	input := &storageman.SStorageDeleteSnapshots{
+		DiskId:      diskId,
+		SnapshotIds: snapshotIds,
+	}
+
+	hostutils.DelayTask(ctx, storage.DeleteSnapshots, input)
+	hostutils.ResponseOk(ctx, w)
+}
+
+func storageCleanRecycleDiskfiles(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	params, _, _ := appsrv.FetchEnv(ctx, w, r)
 	var storageId = params["<storageId>"]
 	storage := storageman.GetManager().GetStorage(storageId)
 	if storage == nil {
-		hostutils.Response(ctx, w, httperrors.NewNotFoundError("Stroage Not found"))
+		hostutils.Response(ctx, w, httperrors.NewNotFoundError("Storage Not found"))
 		return
 	}
-	go storageman.StorageRequestSnapshotRecycle(ctx, auth.AdminCredential(), storage)
+	go storage.CleanRecycleDiskfiles(ctx)
 	hostutils.ResponseOk(ctx, w)
 }

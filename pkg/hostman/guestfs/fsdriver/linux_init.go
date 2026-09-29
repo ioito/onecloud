@@ -16,10 +16,9 @@ package fsdriver
 
 import (
 	"fmt"
+	"strings"
 
 	"yunion.io/x/pkg/errors"
-
-	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
 const (
@@ -31,9 +30,9 @@ func (d *sLinuxRootFs) isSupportSystemd() bool {
 	return d.rootFs.Exists(unitDirPath, false) && d.rootFs.Exists(enableDirPath, false)
 }
 
-func (d *sLinuxRootFs) installInitScript(name, cmd string) error {
+func (d *sLinuxRootFs) installInitScript(name, cmd string, oneshot bool) error {
 	if d.isSupportSystemd() {
-		return d.installSystemd(name, cmd)
+		return d.installSystemd(name, cmd, oneshot)
 	} else {
 		return d.installCrond(cmd)
 	}
@@ -41,36 +40,48 @@ func (d *sLinuxRootFs) installInitScript(name, cmd string) error {
 
 func (d *sLinuxRootFs) installCrond(cmd string) error {
 	cronJob := fmt.Sprintf("@reboot %s", cmd)
-	if procutils.NewCommand("chroot", d.rootFs.GetMountPath(), "crontab", "-l", "|", "grep", cronJob).Run() == nil {
-		// if cronjob exist, return success
-		return nil
-	}
-	output, err := procutils.NewCommand("chroot", d.rootFs.GetMountPath(), "sh", "-c",
-		fmt.Sprintf("(crontab -l 2>/dev/null; echo '%s') |crontab -", cronJob),
-	).Output()
+	outs, err := d.rootFs.ExecCommand("crontab", "-l")
 	if err != nil {
-		return errors.Wrapf(err, "add crontab %s", output)
+		return errors.Wrapf(err, "exec crontab -l: %v", outs)
+	}
+	for _, line := range outs {
+		if strings.Contains(line, cronJob) {
+			// if cronjob exist, return success
+			return nil
+		}
+	}
+	outs, err = d.rootFs.ExecCommand("sh", "-c", fmt.Sprintf("(crontab -l 2>/dev/null; echo '%s') |crontab -", cronJob))
+	if err != nil {
+		return errors.Wrapf(err, "add crontab %v", outs)
 	}
 	return nil
 }
 
-func (d *sLinuxRootFs) installSystemd(name, cmd string) error {
+func (d *sLinuxRootFs) installSystemd(name, cmd string, oneshot bool) error {
 	var serviceName = fmt.Sprintf("%s.service", name)
 	var unitPath = fmt.Sprintf("%s/%s", unitDirPath, serviceName)
 	var enablePath = fmt.Sprintf("%s/%s", enableDirPath, serviceName)
+	var serviceType = "simple"
+	if oneshot {
+		serviceType = "oneshot"
+	}
+
 	var unitContent = fmt.Sprintf(`[Unit]
 Description=Run once
 After=local-fs.target
 After=network.target
 
 [Service]
+LimitNOFILE=65535
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 ExecStart=%s
 RemainAfterExit=true
-Type=oneshot
+Type=%s
 
 [Install]
 WantedBy=multi-user.target
-`, cmd)
+`, cmd, serviceType)
 	err := d.rootFs.FilePutContents(unitPath, unitContent, false, false)
 	if err != nil {
 		return errors.Wrap(err, "save user_data unit fail")
@@ -79,6 +90,29 @@ WantedBy=multi-user.target
 	err = d.rootFs.Symlink(unitPath, enablePath, false)
 	if err != nil {
 		return errors.Wrap(err, "create user_data symlink fail")
+	}
+
+	return nil
+}
+
+func (d *sLinuxRootFs) InstallQemuGuestAgentSystemd() error {
+	var serviceName = "qemu-guest-agent.service"
+	var unitPath = fmt.Sprintf("%s/%s", unitDirPath, serviceName)
+	var unitContent = fmt.Sprintf(`[Unit]
+Description=QEMU Guest Agent
+BindsTo=dev-virtio\x2dports-org.qemu.guest_agent.0.device
+After=dev-virtio\x2dports-org.qemu.guest_agent.0.device
+
+[Service]
+ExecStart=/usr/bin/qemu-ga
+Restart=always
+RestartSec=0
+
+[Install]
+`)
+	err := d.rootFs.FilePutContents(unitPath, unitContent, false, false)
+	if err != nil {
+		return errors.Wrap(err, "save qemu-guest-agent.service unit fail")
 	}
 
 	return nil

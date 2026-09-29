@@ -15,6 +15,8 @@
 package identity
 
 import (
+	"time"
+
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/rbacscope"
@@ -164,6 +166,9 @@ type ProjectListInput struct {
 
 	// project tags filter imposed by policy
 	PolicyProjectTags tagutils.TTagSetList `json:"policy_project_tags"`
+
+	// 通过项目管理员id过滤
+	AdminId []string `json:"admin_id"`
 }
 
 type DomainListInput struct {
@@ -194,11 +199,11 @@ type UserListInput struct {
 	RoleAssignmentProjectId string `json:"role_assignment_project_id"`
 
 	// email
-	Email string `json:"email"`
+	Email []string `json:"email"`
 	// mobile
-	Mobile string `json:"mobile"`
+	Mobile []string `json:"mobile"`
 	// displayname
-	Displayname string `json:"displayname"`
+	Displayname []string `json:"displayname"`
 
 	// 是否允许web控制台登录
 	AllowWebConsole *bool `json:"allow_web_console"`
@@ -229,6 +234,8 @@ type EndpointListInput struct {
 type SJoinProjectsInput struct {
 	Projects []string `json:"projects"`
 	Roles    []string `json:"roles"`
+	// 启用用户, 仅用户禁用时生效
+	Enabled bool `json:"enabled"`
 }
 
 func (input SJoinProjectsInput) Validate() error {
@@ -266,9 +273,10 @@ func (input SLeaveProjectsInput) Validate() error {
 }
 
 type SProjectAddUserGroupInput struct {
-	Users  []string
-	Groups []string
-	Roles  []string
+	Users          []string `json:"users"`
+	Groups         []string `json:"groups"`
+	Roles          []string `json:"roles"`
+	EnableAllUsers bool     `json:"enable_all_users"`
 }
 
 func (input SProjectAddUserGroupInput) Validate() error {
@@ -282,17 +290,17 @@ func (input SProjectAddUserGroupInput) Validate() error {
 }
 
 type SUserRole struct {
-	User string
-	Role string
+	User string `json:"user"`
+	Role string `json:"role"`
 }
 type SGroupRole struct {
-	Group string
-	Role  string
+	Group string `json:"group"`
+	Role  string `json:"role"`
 }
 
 type SProjectRemoveUserGroupInput struct {
-	UserRoles  []SUserRole
-	GroupRoles []SGroupRole
+	UserRoles  []SUserRole  `json:"user_roles"`
+	GroupRoles []SGroupRole `json:"group_roles"`
 }
 
 func (input SProjectRemoveUserGroupInput) Validate() error {
@@ -334,7 +342,7 @@ type IdentityProviderListInput struct {
 
 	// 过滤支持SSO的认证源，如果值为all，则列出所有的全局认证源，否则可出sso为域ID的域认证源
 	// example: all
-	SsoDomain string `json:"sso"`
+	SsoDomain string `json:"sso_domain"`
 
 	AutoCreateProject *bool `json:"auto_create_project"`
 	AutoCreateUser    *bool `json:"auto_create_user"`
@@ -363,7 +371,7 @@ type PolicyListInput struct {
 
 	// filter policies by role id
 	RoleId string `json:"role_id"`
-	// swagger: ignore
+	// swagger:ignore
 	// Deprecated
 	Role string `json:"role" yunion-deprecated-by:"role_id"`
 }
@@ -426,11 +434,14 @@ type IdentityProviderUpdateInput struct {
 
 type PolicyTagInput struct {
 	// 匹配的资源标签
-	ObjectTags tagutils.TTagSet `json:"object_tags"`
+	ObjectTags tagutils.TTagSet `json:"object_tags,allowempty"`
 	// 匹配的项目标签
-	ProjectTags tagutils.TTagSet `json:"project_tags"`
+	ProjectTags tagutils.TTagSet `json:"project_tags,allowempty"`
 	// 匹配的域标签
-	DomainTags tagutils.TTagSet `json:"domain_tags"`
+	DomainTags tagutils.TTagSet `json:"domain_tags,allowempty"`
+
+	// 组织架构节点ID
+	OrgNodeId []string `json:"org_node_id,allowempty"`
 }
 
 type PolicyUpdateInput struct {
@@ -492,6 +503,12 @@ type UserUpdateInput struct {
 	SkipPasswordComplexityCheck *bool `json:"skip_password_complexity_check"`
 
 	Lang string `json:"lang"`
+
+	// 过期时间
+	ExpiredAt *time.Time `json:"expired_at"`
+
+	// 清除过期时间
+	ClearExpire *bool `json:"clear_expire"`
 }
 
 type UserCreateInput struct {
@@ -518,6 +535,8 @@ type UserCreateInput struct {
 	IdpEntityId string `json:"idp_entity_id"`
 
 	Lang string `json:"lang"`
+
+	ExpiredAt *time.Time `json:"expired_at"`
 }
 
 type ProjectCreateInput struct {
@@ -551,12 +570,7 @@ type PolicyCreateInput struct {
 	// 是否为系统权限
 	IsSystem *bool `json:"is_system"`
 
-	// 匹配的资源标签
-	ResourceTags tagutils.TTagSet `json:"resource_tags"`
-	// 匹配的项目标签
-	ProjectTags tagutils.TTagSet `json:"project_tags"`
-	// 匹配的域标签
-	DomainTags tagutils.TTagSet `json:"domain_tags"`
+	PolicyTagInput
 }
 
 type RoleCreateInput struct {
@@ -589,5 +603,5 @@ type UserLinkIdpInput struct {
 type UserUnlinkIdpInput UserLinkIdpInput
 
 type SProjectSetAdminInput struct {
-	UserId string
+	UserId string `json:"user_id"`
 }

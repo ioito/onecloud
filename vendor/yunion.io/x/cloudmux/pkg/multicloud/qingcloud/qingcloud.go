@@ -39,6 +39,7 @@ import (
 
 const (
 	CLOUD_PROVIDER_QINGCLOUD_CN = "青云"
+	CLOUD_PROVIDER_QINGCLOUD_EN = "QingCloud"
 	QINGCLOUD_DEFAULT_REGION    = "pek3"
 	ISO8601                     = "2006-01-02T15:04:05Z"
 )
@@ -117,7 +118,7 @@ func (self *SQingCloudClient) getUrl(service string) (string, error) {
 	case "ec2":
 		return fmt.Sprintf("https://api.qingcloud.com/iaas/"), nil
 	default:
-		return "", errors.Wrapf(cloudprovider.ErrNotSupported, service)
+		return "", errors.Wrapf(cloudprovider.ErrNotSupported, "%s", service)
 	}
 }
 
@@ -131,7 +132,7 @@ func (cli *SQingCloudClient) getDefaultClient() *http.Client {
 	httputils.SetClientProxyFunc(cli.client, cli.cpcfg.ProxyFunc)
 	ts, _ := cli.client.Transport.(*http.Transport)
 	ts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if cli.cpcfg.ReadOnly {
 			if req.Method == "GET" {
 				return nil, nil
@@ -233,15 +234,16 @@ func (self *SQingCloudClient) request(service, action, regionId string, params m
 	if retCode > 0 {
 		// https://docs.qingcloud.com/product/api/common/error_code.html
 		if retCode == 1200 {
-			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, resp.String())
+			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", resp.String())
 		}
-		return nil, errors.Errorf(resp.String())
+		return nil, errors.Errorf("%s", resp.String())
 	}
 	return resp, nil
 }
 
 func (self *SQingCloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = self.GetAccountId()
 	subAccount.Name = self.cpcfg.Name
 	subAccount.Account = self.accessKeyId
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL

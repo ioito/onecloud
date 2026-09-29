@@ -39,11 +39,11 @@ func (d *SAliyunSMSDriver) Name() string {
 }
 
 func (d *SAliyunSMSDriver) Verify(config *api.NotifyConfig) error {
-	err := d.Send(api.SSMSSendParams{}, true, config)
-	if err == ErrSignnameInvalid || err == ErrSignatureDoesNotMatch || err == ErrAccessKeyIdNotFound {
-		return nil
-	}
-	return errors.Wrap(err, "Verify")
+	return d.Send(api.SSMSSendParams{
+		RemoteTemplate:      config.VerifiyCode,
+		To:                  config.PhoneNumber,
+		RemoteTemplateParam: api.SRemoteTemplateParam{Code: "0000"},
+	}, true, config)
 }
 
 func (d *SAliyunSMSDriver) Send(args api.SSMSSendParams, isVerify bool, config *api.NotifyConfig) error {
@@ -60,13 +60,49 @@ func (d *SAliyunSMSDriver) Send(args api.SSMSSendParams, isVerify bool, config *
 	return d.sendSms(args)
 }
 
+func aliyunTemplateParam(args api.SSMSSendParams) string {
+	if dict := parseSmsTemplateParas(args.TemplateParas); dict != nil && dict.Length() > 0 {
+		return dict.String()
+	}
+	return jsonutils.Marshal(args.RemoteTemplateParam).String()
+}
+
+func parseSmsTemplateParas(s string) *jsonutils.JSONDict {
+	if len(s) == 0 {
+		return nil
+	}
+	p, err := jsonutils.ParseString(s)
+	if err != nil {
+		return nil
+	}
+	if dict, ok := p.(*jsonutils.JSONDict); ok {
+		return dict
+	}
+	arr, err := p.GetArray()
+	if err != nil || len(arr) == 0 {
+		return nil
+	}
+	dict := jsonutils.NewDict()
+	for _, item := range arr {
+		kv, err := item.GetArray()
+		if err != nil || len(kv) < 2 {
+			continue
+		}
+		k, _ := kv[0].GetString()
+		v, _ := kv[1].GetString()
+		if k != "" {
+			dict.Set(k, jsonutils.NewString(v))
+		}
+	}
+	return dict
+}
+
 func (d *SAliyunSMSDriver) sendSms(args api.SSMSSendParams) error {
 	// lock and update
 	client, err := sdk.NewClientWithAccessKey("default", args.AppKey, args.AppSecret)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "NewClientWithAccessKey")
 	}
-
 	m := parser.FindStringSubmatch(args.To)
 	if len(m) > 0 {
 		if m[1] == "86" {
@@ -86,7 +122,7 @@ func (d *SAliyunSMSDriver) sendSms(args api.SSMSSendParams) error {
 	request.QueryParams["SignName"] = args.Signature
 
 	request.QueryParams["TemplateCode"] = args.TemplateId
-	request.QueryParams["TemplateParam"] = jsonutils.Marshal(args.RemoteTemplateParam).String()
+	request.QueryParams["TemplateParam"] = aliyunTemplateParam(args)
 
 	return d.checkResponseAndError(client.ProcessCommonRequest(request))
 }

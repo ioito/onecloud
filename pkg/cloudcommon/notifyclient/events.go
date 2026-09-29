@@ -45,6 +45,7 @@ var (
 	ActionCreate         = api.ActionCreate
 	ActionDelete         = api.ActionDelete
 	ActionUpdate         = api.ActionUpdate
+	ActionReset          = api.ActionReset
 	ActionRebuildRoot    = api.ActionRebuildRoot
 	ActionResetPassword  = api.ActionResetPassword
 	ActionChangeConfig   = api.ActionChangeConfig
@@ -61,12 +62,18 @@ var (
 	ActionServiceAbnormal    = api.ActionServiceAbnormal
 	ActionServerPanicked     = api.ActionServerPanicked
 
+	ActionHostDown            = api.ActionHostDown
+	ActionHostDownAutoMigrate = api.ActionHostDownAutoMigrate
+
 	ActionPendingDelete = api.ActionPendingDelete
 
-	ActionSyncCreate        = api.ActionSyncCreate
-	ActionSyncUpdate        = api.ActionSyncUpdate
-	ActionSyncDelete        = api.ActionSyncDelete
-	ActionSyncAccountStatus = api.ActionSyncAccountStatus
+	ActionSyncCreate           = api.ActionSyncCreate
+	ActionSyncUpdate           = api.ActionSyncUpdate
+	ActionSyncDelete           = api.ActionSyncDelete
+	ActionSyncAccountStatus    = api.ActionSyncAccountStatus
+	ActionIsolatedDeviceCreate = api.ActionIsolatedDeviceCreate
+	ActionIsolatedDeviceUpdate = api.ActionIsolatedDeviceUpdate
+	ActionIsolatedDeviceDelete = api.ActionIsolatedDeviceDelete
 )
 
 type SEvent struct {

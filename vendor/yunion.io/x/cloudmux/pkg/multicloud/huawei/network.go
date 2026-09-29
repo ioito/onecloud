@@ -15,15 +15,17 @@
 package huawei
 
 import (
+	"fmt"
+	"net/url"
+
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/util/rbacscope"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
-	"yunion.io/x/cloudmux/pkg/multicloud/huawei/client/modules"
 )
 
 /*
@@ -32,15 +34,17 @@ Subnets
 
 // https://support.huaweicloud.com/api-vpc/zh-cn_topic_0020090590.html
 type SNetwork struct {
-	multicloud.SResourceBase
+	multicloud.SNetworkBase
 	HuaweiTags
 	wire *SWire
 
 	AvailabilityZone string   `json:"availability_zone"`
 	CIDR             string   `json:"cidr"`
+	CIDRV6           string   `json:"cidr_v6"`
 	DHCPEnable       bool     `json:"dhcp_enable"`
 	DNSList          []string `json:"dnsList"`
 	GatewayIP        string   `json:"gateway_ip"`
+	GatewayIPv6      string   `json:"gateway_ip_v6"`
 	ID               string   `json:"id"`
 	Ipv6Enable       bool     `json:"ipv6_enable"`
 	Name             string   `json:"name"`
@@ -81,20 +85,133 @@ func (self *SNetwork) GetStatus() string {
 }
 
 func (self *SNetwork) Refresh() error {
-	log.Debugf("network refresh %s", self.GetId())
-	new, err := self.wire.region.getNetwork(self.GetId())
+	net, err := self.wire.vpc.region.GetNetwork(self.GetId())
 	if err != nil {
 		return err
 	}
-	return jsonutils.Update(self, new)
-}
-
-func (self *SNetwork) IsEmulated() bool {
-	return false
+	return jsonutils.Update(self, net)
 }
 
 func (self *SNetwork) GetIWire() cloudprovider.ICloudWire {
 	return self.wire
+}
+
+func (self *SNetwork) GetTags() (map[string]string, error) {
+	res := fmt.Sprintf("subnets/%s/tags", self.ID)
+	resp, err := self.wire.vpc.region.list(SERVICE_VPC_V2_0, res, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list tags")
+	}
+	ret := []struct {
+		Key   string
+		Value string
+	}{}
+	err = resp.Unmarshal(&ret, "tags")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
+	}
+	result := map[string]string{}
+	for _, tag := range ret {
+		result[tag.Key] = tag.Value
+	}
+	return result, nil
+
+}
+
+func (self *SNetwork) SetTags(tags map[string]string, replace bool) error {
+	existedTags, err := self.GetTags()
+	if err != nil {
+		return errors.Wrapf(err, "GetTags")
+	}
+	return self.wire.vpc.region.SetNetworkTags(self.ID, existedTags, tags, replace)
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=DeleteSubnetTag
+func (self *SRegion) DeleteNetworkTag(subnetId string, key string) error {
+	res := fmt.Sprintf("subnets/%s/tags/%s", subnetId, key)
+	_, err := self.delete(SERVICE_VPC_V2_0, res)
+	return err
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=CreateSubnetTag
+func (self *SRegion) CreateNetworkTag(subnetId string, tags map[string]string) error {
+	params := map[string]interface{}{
+		"action": "create",
+	}
+	add := []map[string]string{}
+	for k, v := range tags {
+		add = append(add, map[string]string{"key": k, "value": v})
+	}
+	params["tags"] = add
+	res := fmt.Sprintf("subnets/%s/tags/action", subnetId)
+	_, err := self.post(SERVICE_VPC_V2_0, res, params)
+	return err
+}
+
+func (self *SRegion) SetNetworkTags(netId string, existedTags map[string]string, tags map[string]string, replace bool) error {
+	deleteTagsKey := []string{}
+	for k := range existedTags {
+		if replace {
+			deleteTagsKey = append(deleteTagsKey, k)
+		} else {
+			if _, ok := tags[k]; ok {
+				deleteTagsKey = append(deleteTagsKey, k)
+			}
+		}
+	}
+	if len(deleteTagsKey) > 0 {
+		for _, k := range deleteTagsKey {
+			err := self.DeleteNetworkTag(netId, k)
+			if err != nil {
+				return errors.Wrapf(err, "remove tags")
+			}
+		}
+	}
+	if len(tags) > 0 {
+		err := self.CreateNetworkTag(netId, tags)
+		if err != nil {
+			return errors.Wrapf(err, "add tags")
+		}
+	}
+	return nil
+}
+
+func (net *SNetwork) GetIp6Start() string {
+	if len(net.CIDRV6) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.CIDRV6)
+		if err != nil {
+			return ""
+		}
+		return prefix.Address.NetAddr(prefix.MaskLen).StepUp().StepUp().String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6End() string {
+	if len(net.CIDRV6) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.CIDRV6)
+		if err != nil {
+			return ""
+		}
+		end := prefix.Address.NetAddr(prefix.MaskLen).BroadcastAddr(prefix.MaskLen)
+		return end.StepDown().StepDown().StepDown().StepDown().StepDown().String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6Mask() uint8 {
+	if len(net.CIDRV6) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.CIDRV6)
+		if err != nil {
+			return 0
+		}
+		return prefix.MaskLen
+	}
+	return 0
+}
+
+func (net *SNetwork) GetGateway6() string {
+	return net.GatewayIPv6
 }
 
 func (self *SNetwork) GetIpStart() string {
@@ -139,34 +256,58 @@ func (self *SNetwork) GetPublicScope() rbacscope.TRbacScope {
 }
 
 func (self *SNetwork) Delete() error {
-	return self.wire.region.deleteNetwork(self.VpcID, self.GetId())
+	return self.wire.vpc.region.deleteNetwork(self.VpcID, self.GetId())
 }
 
 func (self *SNetwork) GetAllocTimeoutSeconds() int {
 	return 120 // 2 minutes
 }
 
-func (self *SRegion) getNetwork(networkId string) (*SNetwork, error) {
-	network := SNetwork{}
-	err := DoGet(self.ecsClient.Subnets.Get, networkId, nil, &network)
-	return &network, err
-}
-
-// https://support.huaweicloud.com/api-vpc/zh-cn_topic_0020090592.html
-func (self *SRegion) GetNetwroks(vpcId string) ([]SNetwork, error) {
-	querys := map[string]string{}
-	if len(vpcId) > 0 {
-		querys["vpc_id"] = vpcId
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=ShowSubnet
+func (self *SRegion) GetNetwork(networkId string) (*SNetwork, error) {
+	resp, err := self.list(SERVICE_VPC, "subnets/"+networkId, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "show subnet")
 	}
-
-	networks := make([]SNetwork, 0)
-	err := doListAllWithMarker(self.ecsClient.Subnets.List, querys, &networks)
-	return networks, err
+	network := &SNetwork{}
+	err = resp.Unmarshal(&network, "subnet")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
+	}
+	return network, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=ListSubnets
+func (self *SRegion) GetNetworks(vpcId string) ([]SNetwork, error) {
+	ret := []SNetwork{}
+	query := url.Values{}
+	if len(vpcId) > 0 {
+		query.Set("vpc_id", vpcId)
+	}
+	for {
+		resp, err := self.list(SERVICE_VPC, "subnets", query)
+		if err != nil {
+			return nil, err
+		}
+		part := []SNetwork{}
+		err = resp.Unmarshal(&part, "subnets")
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, part...)
+		if len(part) == 0 {
+			break
+		}
+		query.Set("marker", part[len(part)-1].ID)
+	}
+	return ret, nil
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/VPC/doc?version=v2&api=DeleteSubnet
 func (self *SRegion) deleteNetwork(vpcId string, networkId string) error {
-	ctx := &modules.SManagerContext{InstanceId: vpcId, InstanceManager: self.ecsClient.Vpcs}
-	return DoDeleteWithSpec(self.ecsClient.Subnets.DeleteInContextWithSpec, ctx, networkId, "", nil, nil)
+	res := fmt.Sprintf("vpcs/%s/subnets/%s", vpcId, networkId)
+	_, err := self.delete(SERVICE_VPC, res)
+	return err
 }
 
 func (self *SNetwork) GetProjectId() string {

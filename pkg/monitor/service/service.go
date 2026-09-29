@@ -30,6 +30,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -44,6 +45,7 @@ import (
 	"yunion.io/x/onecloud/pkg/monitor/registry"
 	"yunion.io/x/onecloud/pkg/monitor/subscriptionmodel"
 	_ "yunion.io/x/onecloud/pkg/monitor/tsdb/driver/influxdb"
+	_ "yunion.io/x/onecloud/pkg/monitor/tsdb/driver/victoriametrics"
 	"yunion.io/x/onecloud/pkg/monitor/worker"
 )
 
@@ -68,33 +70,38 @@ func StartService() {
 
 	cloudcommon.InitDB(dbOpts)
 
-	InitHandlers(app)
+	InitHandlers(app, opts.IsSlaveNode)
 
 	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
 	defer cloudcommon.CloseDB()
 
-	go startServices()
+	if !opts.IsSlaveNode {
+		go startServices()
 
-	cron := cronman.InitCronJobManager(true, opts.CronJobWorkerCount)
-	cron.AddJobAtIntervalsWithStartRun("InitAlertResourceAdminRoleUsers", time.Duration(opts.InitAlertResourceAdminRoleUsersIntervalSeconds)*time.Second, models.GetAlertResourceManager().GetAdminRoleUsers, true)
-	cron.AddJobEveryFewDays("DeleteRecordsOfThirtyDaysAgoRecords", 1, 0, 0, 0,
-		models.AlertRecordManager.DeleteRecordsOfThirtyDaysAgo, false)
-	//cron.AddJobAtIntervalsWithStartRun("MonitorResourceSync", time.Duration(opts.MonitorResourceSyncIntervalSeconds)*time.Minute*60, models.MonitorResourceManager.SyncResources, true)
-	cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
+		err := taskman.TaskManager.InitializeData()
+		if err != nil {
+			log.Fatalf("TaskManager.InitializeData fail %s", err)
+		}
 
-	cron.Start()
-	defer cron.Stop()
+		cron := cronman.InitCronJobManager(true, opts.CronJobWorkerCount, opts.TimeZone)
+		cron.AddJobAtIntervalsWithStartRun("InitAlertResourceAdminRoleUsers", time.Duration(opts.InitAlertResourceAdminRoleUsersIntervalSeconds)*time.Second, models.GetAlertResourceManager().GetAdminRoleUsers, true)
+		cron.AddJobEveryFewDays("DeleteRecordsOfThirtyDaysAgoRecords", 1, 0, 0, 0,
+			models.AlertRecordManager.DeleteRecordsOfThirtyDaysAgo, false)
+		//cron.AddJobAtIntervalsWithStartRun("MonitorResourceSync", time.Duration(opts.MonitorResourceSyncIntervalSeconds)*time.Minute*60, models.MonitorResourceManager.SyncResources, true)
+		cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
 
-	subscriptionmodel.SubscriptionManager.AddSubscription()
-	models.CommonAlertManager.SetSubscriptionManager(subscriptionmodel.SubscriptionManager)
+		cron.AddJobAtIntervalsWithStartRun("TaskCleanupJob", time.Duration(options.Options.TaskArchiveIntervalMinutes)*time.Minute, taskman.TaskManager.TaskCleanupJob, true)
 
-	worker, err := worker.NewWorker(opts)
-	if err != nil {
-		log.Fatalf("new worker failed: %v", err)
+		cron.Start()
+		defer cron.Stop()
+
+		worker, err := worker.NewWorker(opts)
+		if err != nil {
+			log.Fatalf("new worker failed: %v", err)
+		}
+		go worker.Start(app.GetContext(), app, "")
 	}
-	go worker.Start(app.GetContext(), app, "")
 
-	//common_app.ServeForever(app, baseOpts)
 	InitInfluxDBSubscriptionHandlers(app, baseOpts)
 
 	// start migration recover routine
@@ -113,11 +120,14 @@ func startServices() {
 			continue
 		}
 
-		log.Infof("Initializing " + svc.Name)
+		log.Infof("Initializing %s", svc.Name)
 		if err := svc.Instance.Init(); err != nil {
-			log.Fatalf("Service %s init failed", svc.Name)
+			log.Fatalf("Service %s init failed: %v", svc.Name, err)
 		}
 	}
+
+	subscriptionmodel.SubscriptionManager.AddSubscription()
+	models.CommonAlertManager.SetSubscriptionManager(subscriptionmodel.SubscriptionManager)
 
 	childRoutines, ctx := errgroup.WithContext(context.Background())
 	// Start background services

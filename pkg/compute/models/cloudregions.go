@@ -17,7 +17,6 @@ package models
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strings"
 	"time"
 
@@ -38,6 +37,7 @@ import (
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
@@ -65,7 +65,6 @@ func init() {
 type SCloudregion struct {
 	db.SEnabledStatusStandaloneResourceBase
 	SI18nResourceBase
-	SManagedResourceBase
 	db.SExternalizedResourceBase
 
 	cloudprovider.SGeographicInfo
@@ -88,7 +87,7 @@ func (self *SCloudregion) CustomizeCreate(ctx context.Context, userCred mcclient
 
 func (self *SCloudregion) ValidateDeleteCondition(ctx context.Context, info *api.CloudregionDetails) error {
 	if self.Id == api.DEFAULT_REGION_ID {
-		return httperrors.NewProtectedResourceError("not allow to delete default cloud region")
+		return httperrors.NewProtectedResourceError("not allowed to delete default cloud region")
 	}
 	if gotypes.IsNil(info) {
 		info = &api.CloudregionDetails{}
@@ -157,11 +156,12 @@ func (self *SCloudregion) GetZoneBySuffix(suffix string) (*SZone, error) {
 	if err != nil {
 		return nil, err
 	}
+	msg := suffix
 	if count == 0 {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, suffix)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", msg)
 	}
 	if count > 1 {
-		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, suffix)
+		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%s", msg)
 	}
 	zone := &SZone{}
 	zone.SetModelManager(ZoneManager, zone)
@@ -170,6 +170,50 @@ func (self *SCloudregion) GetZoneBySuffix(suffix string) (*SZone, error) {
 
 func (self *SCloudregion) GetGuestCount() (int, error) {
 	return self.getGuestCountInternal(false)
+}
+
+func (self *SCloudregion) GetManagedGuestsQuery(managerId string) *sqlchemy.SQuery {
+	q := GuestManager.Query().IsNotEmpty("external_id")
+	hosts := HostManager.Query().Equals("manager_id", managerId).SubQuery()
+	zones := ZoneManager.Query().Equals("cloudregion_id", self.Id).SubQuery()
+	q = q.Join(hosts, sqlchemy.Equals(q.Field("host_id"), hosts.Field("id")))
+	q = q.Join(zones, sqlchemy.Equals(hosts.Field("zone_id"), zones.Field("id")))
+	return q
+}
+
+func (self *SCloudregion) GetManagedGuests(managerId string) ([]SGuest, error) {
+	q := self.GetManagedGuestsQuery(managerId)
+	ret := []SGuest{}
+	err := db.FetchModelObjects(GuestManager, q, &ret)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+func (self *SCloudregion) GetManagedGuestsCount(managerId string) (int, error) {
+	return self.GetManagedGuestsQuery(managerId).CountWithError()
+}
+
+func (self *SCloudregion) GetManagedLoadbalancerQuery(managerId string) *sqlchemy.SQuery {
+	return LoadbalancerManager.Query().
+		IsNotEmpty("external_id").
+		Equals("cloudregion_id", self.Id).
+		Equals("manager_id", managerId)
+}
+
+func (self *SCloudregion) GetManagedLoadbalancers(managerId string) ([]SLoadbalancer, error) {
+	q := self.GetManagedLoadbalancerQuery(managerId)
+	ret := []SLoadbalancer{}
+	err := db.FetchModelObjects(LoadbalancerManager, q, &ret)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+func (self *SCloudregion) GetManagedLoadbalancerCount(managerId string) (int, error) {
+	return self.GetManagedLoadbalancerQuery(managerId).CountWithError()
 }
 
 func (self *SCloudregion) GetGuestIncrementCount() (int, error) {
@@ -217,19 +261,14 @@ func (self *SCloudregion) GetDBInstanceBackups(provider *SCloudprovider, instanc
 
 func (self *SCloudregion) GetElasticcaches(provider *SCloudprovider) ([]SElasticcache, error) {
 	instances := []SElasticcache{}
-	// .IsFalse("pending_deleted")
-	vpcs := VpcManager.Query().SubQuery()
-	q := ElasticcacheManager.Query()
-	q = q.Join(vpcs, sqlchemy.Equals(q.Field("vpc_id"), vpcs.Field("id")))
-	q = q.Filter(sqlchemy.Equals(vpcs.Field("cloudregion_id"), self.Id))
+	q := ElasticcacheManager.Query().Equals("cloudregion_id", self.Id)
 	if provider != nil {
-		q = q.Filter(sqlchemy.Equals(vpcs.Field("manager_id"), provider.Id))
+		q = q.Equals("manager_id", provider.Id)
 	}
 	err := db.FetchModelObjects(ElasticcacheManager, q, &instances)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetElasticcaches for region %s", self.Id)
 	}
-
 	return instances, nil
 }
 
@@ -297,12 +336,12 @@ func (self *SCloudregion) GetDriver() IRegionDriver {
 	return GetRegionDriver(provider)
 }
 
-func (self *SCloudregion) getUsage() api.SCloudregionUsage {
+func (self *SCloudregion) getUsage(ctx context.Context) api.SCloudregionUsage {
 	out := api.SCloudregionUsage{}
 	out.VpcCount, _ = self.GetVpcCount()
 	out.ZoneCount, _ = self.GetZoneCount()
 	out.GuestCount, _ = self.GetGuestCount()
-	out.NetworkCount, _ = self.GetNetworkCount()
+	out.NetworkCount, _ = self.GetNetworkCount(ctx)
 	out.GuestIncrementCount, _ = self.GetGuestIncrementCount()
 	return out
 }
@@ -435,16 +474,16 @@ func (self *SCloudregion) GetServerSkus() ([]SServerSku, error) {
 }
 
 func (self *SCloudprovider) GetRegionByExternalIdPrefix(prefix string) ([]SCloudregion, error) {
-	factory, err := self.GetProviderFactory()
-	if err != nil {
-		return nil, err
-	}
+	prefix = strings.TrimSuffix(prefix, "/")
 	regions := make([]SCloudregion, 0)
-	q := CloudregionManager.Query().Startswith("external_id", prefix)
-	if !factory.IsPublicCloud() && !strings.Contains(prefix, "/") {
-		q = CloudregionManager.Query().Equals("manager_id", self.Id)
-	}
-	err = db.FetchModelObjects(CloudregionManager, q, &regions)
+	q := CloudregionManager.Query()
+	q = q.Filter(
+		sqlchemy.OR(
+			sqlchemy.Startswith(q.Field("external_id"), prefix+"/"),
+			sqlchemy.Equals(q.Field("external_id"), prefix),
+		),
+	)
+	err := db.FetchModelObjects(CloudregionManager, q, &regions)
 	if err != nil {
 		return nil, err
 	}
@@ -456,17 +495,7 @@ func (manager *SCloudregionManager) GetRegionByProvider(provider string) ([]SClo
 	q := manager.Query().Equals("provider", provider)
 	err := db.FetchModelObjects(manager, q, &regions)
 	if err != nil {
-		log.Errorf("%s", err)
-		return nil, err
-	}
-	return regions, nil
-}
-
-func (manager *SCloudregionManager) getCloudregionsByProviderId(providerId string) ([]SCloudregion, error) {
-	regions := []SCloudregion{}
-	err := fetchByManagerId(manager, providerId, &regions)
-	if err != nil {
-		return nil, errors.Wrap(err, "fetchByManagerId")
+		return nil, errors.Wrapf(err, "db.FetchModelObjects")
 	}
 	return regions, nil
 }
@@ -483,8 +512,8 @@ func (manager *SCloudregionManager) SyncRegions(
 	[]SCloudproviderregion,
 	compare.SyncResult,
 ) {
-	lockman.LockRawObject(ctx, "cloudregions", externalIdPrefix)
-	defer lockman.ReleaseRawObject(ctx, "cloudregions", externalIdPrefix)
+	lockman.LockRawObject(ctx, manager.Keyword(), externalIdPrefix)
+	defer lockman.ReleaseRawObject(ctx, manager.Keyword(), externalIdPrefix)
 
 	syncResult := compare.SyncResult{}
 	localRegions := make([]SCloudregion, 0)
@@ -496,7 +525,7 @@ func (manager *SCloudregionManager) SyncRegions(
 		syncResult.Error(err)
 		return nil, nil, nil, syncResult
 	}
-	log.Debugf("Region with provider %s %d", externalIdPrefix, len(dbRegions))
+	log.Debugf("Region with provider %s %d -> %d", externalIdPrefix, len(regions), len(dbRegions))
 
 	removed := make([]SCloudregion, 0)
 	commondb := make([]SCloudregion, 0)
@@ -517,14 +546,17 @@ func (manager *SCloudregionManager) SyncRegions(
 	}
 	for i := 0; i < len(commondb); i += 1 {
 		// update
-		err = commondb[i].syncWithCloudRegion(ctx, userCred, commonext[i], cloudProvider)
+		err = commondb[i].syncWithCloudRegion(ctx, userCred, commonext[i])
 		if err != nil {
 			syncResult.UpdateError(err)
 		} else {
-			syncMetadata(ctx, userCred, &commondb[i], commonext[i])
-			cpr := CloudproviderRegionManager.FetchByIdsOrCreate(cloudProvider.Id, commondb[i].Id)
-			cpr.setCapabilities(ctx, userCred, commonext[i].GetCapabilities())
-			cloudProviderRegions = append(cloudProviderRegions, *cpr)
+			cpr, err := CloudproviderRegionManager.FetchByIdsOrCreate(cloudProvider.Id, commondb[i].Id)
+			if err != nil {
+				syncResult.UpdateError(err)
+			} else {
+				cpr.setCapabilities(ctx, userCred, commonext[i].GetCapabilities())
+				cloudProviderRegions = append(cloudProviderRegions, *cpr)
+			}
 			localRegions = append(localRegions, commondb[i])
 			remoteRegions = append(remoteRegions, commonext[i])
 			syncResult.Update()
@@ -535,10 +567,13 @@ func (manager *SCloudregionManager) SyncRegions(
 		if err != nil {
 			syncResult.AddError(err)
 		} else {
-			syncMetadata(ctx, userCred, new, added[i])
-			cpr := CloudproviderRegionManager.FetchByIdsOrCreate(cloudProvider.Id, new.Id)
-			cpr.setCapabilities(ctx, userCred, added[i].GetCapabilities())
-			cloudProviderRegions = append(cloudProviderRegions, *cpr)
+			cpr, err := CloudproviderRegionManager.FetchByIdsOrCreate(cloudProvider.Id, new.Id)
+			if err != nil {
+				syncResult.AddError(err)
+			} else {
+				cpr.setCapabilities(ctx, userCred, added[i].GetCapabilities())
+				cloudProviderRegions = append(cloudProviderRegions, *cpr)
+			}
 			localRegions = append(localRegions, *new)
 			remoteRegions = append(remoteRegions, added[i])
 			syncResult.Add()
@@ -554,15 +589,10 @@ func (self *SCloudregion) syncRemoveCloudRegion(ctx context.Context, userCred mc
 	return self.purgeAll(ctx, cloudProvider.Id)
 }
 
-func (self *SCloudregion) syncWithCloudRegion(ctx context.Context, userCred mcclient.TokenCredential, cloudRegion cloudprovider.ICloudRegion, provider *SCloudprovider) error {
+func (self *SCloudregion) syncWithCloudRegion(ctx context.Context, userCred mcclient.TokenCredential, cloudRegion cloudprovider.ICloudRegion) error {
 	err := CloudregionManager.SyncI18ns(ctx, userCred, self, cloudRegion.GetI18n())
 	if err != nil {
 		return errors.Wrap(err, "SyncI18ns")
-	}
-
-	factory, err := provider.GetProviderFactory()
-	if err != nil {
-		return err
 	}
 
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
@@ -579,10 +609,6 @@ func (self *SCloudregion) syncWithCloudRegion(ctx context.Context, userCred mccl
 		self.SetEnabled(true)
 
 		self.IsEmulated = cloudRegion.IsEmulated()
-
-		if !factory.IsPublicCloud() && !factory.IsOnPremise() && !factory.IsMultiTenant() {
-			self.ManagerId = provider.Id
-		}
 
 		return nil
 	})
@@ -607,14 +633,7 @@ func (manager *SCloudregionManager) newFromCloudRegion(ctx context.Context, user
 
 	region.IsEmulated = cloudRegion.IsEmulated()
 
-	factory, err := provider.GetProviderFactory()
-	if err != nil {
-		return nil, err
-	}
-	if !factory.IsOnPremise() && !factory.IsPublicCloud() {
-		region.ManagerId = provider.Id
-	}
-
+	var err error
 	err = func() error {
 		lockman.LockRawObject(ctx, manager.Keyword(), "name")
 		defer lockman.ReleaseRawObject(ctx, manager.Keyword(), "name")
@@ -692,6 +711,7 @@ func (manager *SCloudregionManager) InitializeData() error {
 			defRegion.Description = "Default Region"
 			defRegion.Status = api.CLOUD_REGION_STATUS_INSERVER
 			defRegion.Provider = api.CLOUD_PROVIDER_ONECLOUD
+			defRegion.SetModelManager(manager, &defRegion)
 			err := manager.TableSpec().Insert(context.TODO(), &defRegion)
 			if err != nil {
 				return errors.Wrap(err, "insert default region")
@@ -890,6 +910,9 @@ func (manager *SCloudregionManager) ListItemFilter(
 	}
 
 	domainId, err := db.FetchQueryDomain(ctx, userCred, jsonutils.Marshal(query))
+	if err != nil {
+		return nil, err
+	}
 	if len(domainId) > 0 {
 		q = q.In("id", getCloudRegionIdByDomainId(domainId))
 	}
@@ -941,6 +964,20 @@ func (manager *SCloudregionManager) ListItemFilter(
 			q = q.In("id", regionSQ)
 		default:
 			break
+		}
+	}
+
+	if query.ReadOnly != nil {
+		sq := CloudaccountManager.Query("provider").Equals("read_only", *query.ReadOnly).SubQuery()
+		if *query.ReadOnly {
+			q = q.In("provider", sq)
+		} else {
+			q = q.Filter(
+				sqlchemy.OR(
+					sqlchemy.In(q.Field("provider"), sq),
+					sqlchemy.Equals(q.Field("provider"), api.CLOUD_PROVIDER_ONECLOUD),
+				),
+			)
 		}
 	}
 
@@ -1028,7 +1065,7 @@ func (self *SCloudregion) GetRegionExtId() string {
 }
 
 func (self *SCloudregion) ValidateUpdateCondition(ctx context.Context) error {
-	if len(self.ExternalId) > 0 && len(self.ManagerId) == 0 {
+	if len(self.ExternalId) > 0 {
 		return httperrors.NewConflictError("Cannot update external resource")
 	}
 	return self.SEnabledStatusStandaloneResourceBase.ValidateUpdateCondition(ctx)
@@ -1056,8 +1093,8 @@ func (self *SCloudregion) GetDetailsDiskCapability(ctx context.Context, userCred
 	return jsonutils.Marshal(&capa), nil
 }
 
-func (self *SCloudregion) GetNetworkCount() (int, error) {
-	return getNetworkCount(nil, nil, rbacscope.ScopeSystem, self, nil)
+func (self *SCloudregion) GetNetworkCount(ctx context.Context) (int, error) {
+	return getNetworkCount(ctx, nil, nil, rbacscope.ScopeSystem, self, nil)
 }
 
 func (self *SCloudregion) getMinNicCount() int {
@@ -1101,7 +1138,7 @@ func (self *SCloudregion) PerformSetSchedtag(ctx context.Context, userCred mccli
 
 func (self *SCloudregion) PerformPurge(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *api.CloudregionPurgeInput) (jsonutils.JSONObject, error) {
 	if self.Id == api.DEFAULT_REGION_ID {
-		return nil, httperrors.NewProtectedResourceError("not allow to delete default cloud region")
+		return nil, httperrors.NewProtectedResourceError("not allowed to delete default cloud region")
 	}
 	if len(input.ManagerId) == 0 {
 		return nil, httperrors.NewMissingParameterError("manager_id")
@@ -1224,10 +1261,14 @@ func (self *SCloudregion) GetStoragecaches() ([]SStoragecache, error) {
 }
 
 func (self *SCloudregion) newCloudimage(ctx context.Context, userCred mcclient.TokenCredential, iImage SCachedimage) error {
-	_, err := db.FetchByExternalId(CachedimageManager, iImage.GetGlobalId())
+	externalId := iImage.GetGlobalId()
+	lockman.LockRawObject(ctx, CachedimageManager.Keyword(), externalId)
+	defer lockman.ReleaseRawObject(ctx, CachedimageManager.Keyword(), externalId)
+
+	_, err := db.FetchByExternalId(CachedimageManager, externalId)
 	if err != nil {
 		if errors.Cause(err) != sql.ErrNoRows {
-			return errors.Wrapf(err, "db.FetchModelObjects(%s)", iImage.GetGlobalId())
+			return errors.Wrapf(err, "db.FetchModelObjects(%s)", externalId)
 		}
 		image := &iImage
 		image.SetModelManager(CachedimageManager, image)
@@ -1236,14 +1277,15 @@ func (self *SCloudregion) newCloudimage(ctx context.Context, userCred mcclient.T
 			return err
 		}
 
-		skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.ImageBase, self.ExternalId, iImage.GetGlobalId())
+		skuUrl := self.getMetaUrl(meta.ImageBase, externalId)
 		err = meta.Get(skuUrl, image)
 		if err != nil {
 			return errors.Wrapf(err, "Get")
 		}
 
 		image.IsPublic = true
-		image.ProjectId = "system"
+		s := auth.GetAdminSession(ctx, options.Options.Region)
+		image.ProjectId = s.GetProjectId()
 		err = CachedimageManager.TableSpec().Insert(ctx, image)
 		if err != nil {
 			return errors.Wrapf(err, "Insert cachedimage")
@@ -1253,7 +1295,7 @@ func (self *SCloudregion) newCloudimage(ctx context.Context, userCred mcclient.T
 	cloudimage.SetModelManager(CloudimageManager, cloudimage)
 	cloudimage.Name = iImage.Name
 	cloudimage.CloudregionId = self.Id
-	cloudimage.ExternalId = iImage.GetGlobalId()
+	cloudimage.ExternalId = externalId
 	err = CloudimageManager.TableSpec().Insert(ctx, cloudimage)
 	if err != nil {
 		return errors.Wrapf(err, "Insert cloudimage")
@@ -1292,13 +1334,14 @@ func (self *SCloudregion) StartSyncSkusTask(ctx context.Context, userCred mcclie
 	return task.ScheduleRun(nil)
 }
 
-func (self *SCloudregion) GetCloudprovider() (*SCloudprovider, error) {
-	if len(self.ManagerId) == 0 {
-		return nil, sql.ErrNoRows
-	}
-	provider, err := CloudproviderManager.FetchById(self.ManagerId)
+func (self *SCloudregion) GetCloudproviders() ([]SCloudprovider, error) {
+	sq := CloudproviderRegionManager.Query().Equals("cloudregion_id", self.Id).SubQuery()
+	q := CloudproviderManager.Query()
+	q = q.Join(sq, sqlchemy.Equals(sq.Field("cloudprovider_id"), q.Field("id")))
+	ret := []SCloudprovider{}
+	err := db.FetchModelObjects(CloudproviderManager, q, &ret)
 	if err != nil {
-		return nil, errors.Wrapf(err, "FetchByI(%s)", self.ManagerId)
+		return nil, err
 	}
-	return provider.(*SCloudprovider), nil
+	return ret, nil
 }

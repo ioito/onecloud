@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 
 	"yunion.io/x/pkg/errors"
@@ -31,11 +32,12 @@ import (
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
-var local Storage = &LocalStorage{}
-var s3Instance Storage = &S3Storage{}
-var storage Storage
+var local IImageStorage = &LocalStorage{}
+var s3Instance IImageStorage = &S3Storage{}
+var nfsInstance IImageStorage = &NFSStorage{}
+var storage IImageStorage
 
-func GetStorage() Storage {
+func GetStorage() IImageStorage {
 	return storage
 }
 
@@ -43,6 +45,8 @@ func GetImage(ctx context.Context, location string) (int64, io.ReadCloser, error
 	switch {
 	case strings.HasPrefix(location, image.S3Prefix):
 		return s3Instance.GetImage(ctx, location[len(image.S3Prefix):])
+	case strings.HasPrefix(location, image.NfsPrefix):
+		return nfsInstance.GetImage(ctx, location[len(image.NfsPrefix):])
 	case strings.HasPrefix(location, image.LocalFilePrefix):
 		return local.GetImage(ctx, location[len(image.LocalFilePrefix):])
 	default:
@@ -54,6 +58,8 @@ func RemoveImage(ctx context.Context, location string) error {
 	switch {
 	case strings.HasPrefix(location, image.S3Prefix):
 		return s3Instance.RemoveImage(ctx, location[len(image.S3Prefix):])
+	case strings.HasPrefix(location, image.NfsPrefix):
+		return nfsInstance.RemoveImage(ctx, location[len(image.NfsPrefix):])
 	case strings.HasPrefix(location, image.LocalFilePrefix):
 		return local.RemoveImage(ctx, location[len(image.LocalFilePrefix):])
 	default:
@@ -65,6 +71,8 @@ func IsCheckStatusEnabled(img *SImage) bool {
 	switch {
 	case strings.HasPrefix(img.Location, image.S3Prefix):
 		return s3Instance.IsCheckStatusEnabled()
+	case strings.HasPrefix(img.Location, image.NfsPrefix):
+		return nfsInstance.IsCheckStatusEnabled()
 	case strings.HasPrefix(img.Location, image.LocalFilePrefix):
 		return local.IsCheckStatusEnabled()
 	default:
@@ -76,6 +84,8 @@ func Init(storageBackend string) {
 	switch storageBackend {
 	case image.IMAGE_STORAGE_DRIVER_LOCAL:
 		storage = &LocalStorage{}
+	case image.IMAGE_STORAGE_DRIVER_NFS:
+		storage = &NFSStorage{}
 	case image.IMAGE_STORAGE_DRIVER_S3:
 		storage = &S3Storage{}
 	default:
@@ -83,15 +93,15 @@ func Init(storageBackend string) {
 	}
 }
 
-type Storage interface {
+type IImageStorage interface {
 	Type() string
-	SaveImage(context.Context, string) (string, error)
+	SaveImage(context.Context, string, func(int64)) (string, error)
 	CleanTempfile(string) error
 	GetImage(context.Context, string) (int64, io.ReadCloser, error)
 	RemoveImage(context.Context, string) error
 
 	IsCheckStatusEnabled() bool
-	ConvertImage(ctx context.Context, image *SImage, targetFormat string) (*SConverImageInfo, error)
+	ConvertImage(ctx context.Context, image *SImage, targetFormat string, progresser func(saved int64)) (*SConverImageInfo, error)
 }
 
 type LocalStorage struct{}
@@ -100,7 +110,7 @@ func (s *LocalStorage) Type() string {
 	return image.IMAGE_STORAGE_DRIVER_LOCAL
 }
 
-func (s *LocalStorage) SaveImage(ctx context.Context, imagePath string) (string, error) {
+func (s *LocalStorage) SaveImage(ctx context.Context, imagePath string, progresser func(saved int64)) (string, error) {
 	return fmt.Sprintf("%s%s", LocalFilePrefix, imagePath), nil
 }
 
@@ -120,7 +130,7 @@ func (s *LocalStorage) GetImage(ctx context.Context, imagePath string) (int64, i
 	return fstat.Size(), f, nil
 }
 
-func (s *LocalStorage) ConvertImage(ctx context.Context, image *SImage, targetFormat string) (*SConverImageInfo, error) {
+func (s *LocalStorage) ConvertImage(ctx context.Context, image *SImage, targetFormat string, progresser func(saved int64)) (*SConverImageInfo, error) {
 	location := image.GetPath(targetFormat)
 	img, err := image.getQemuImage()
 	if err != nil {
@@ -144,6 +154,41 @@ func (s *LocalStorage) RemoveImage(ctx context.Context, imagePath string) error 
 	return os.Remove(imagePath)
 }
 
+type NFSStorage struct {
+	LocalStorage
+}
+
+func (s *NFSStorage) Type() string {
+	return image.IMAGE_STORAGE_DRIVER_NFS
+}
+
+func (s *NFSStorage) SaveImage(ctx context.Context, imagePath string, progresser func(saved int64)) (string, error) {
+	imageName := imagePathToName(imagePath)
+	imageNewpath := path.Join(options.Options.NfsMountPoint, image.NfsSubDirName, imageName)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("cp", imagePath, imageNewpath).Output()
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to copy %s to %s: %s", imagePath, imageNewpath, out)
+	}
+
+	return fmt.Sprintf("%s%s", image.NfsPrefix, path.Join(image.NfsSubDirName, imageName)), nil
+}
+
+func (s *NFSStorage) ConvertImage(ctx context.Context, oimg *SImage, targetFormat string, progresser func(saved int64)) (*SConverImageInfo, error) {
+	location := oimg.GetPath(targetFormat)
+	img, err := oimg.getQemuImage()
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to image.getQemuImage")
+	}
+	nimg, err := img.Clone(location, qemuimgfmt.String2ImageFormat(targetFormat), true)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to img.Clone")
+	}
+	return &SConverImageInfo{
+		Location:  fmt.Sprintf("%s%s", image.NfsPrefix, location),
+		SizeBytes: nimg.ActualSizeBytes,
+	}, nil
+}
+
 type S3Storage struct{}
 
 func imagePathToName(imagePath string) string {
@@ -155,11 +200,11 @@ func (s *S3Storage) Type() string {
 	return image.IMAGE_STORAGE_DRIVER_S3
 }
 
-func (s *S3Storage) SaveImage(ctx context.Context, imagePath string) (string, error) {
+func (s *S3Storage) SaveImage(ctx context.Context, imagePath string, progresser func(saved int64)) (string, error) {
 	if !fileutils2.IsFile(imagePath) {
 		return "", fmt.Errorf("%s not valid file", imagePath)
 	}
-	return s3.Put(ctx, imagePath, imagePathToName(imagePath))
+	return s3.Put(ctx, imagePath, imagePathToName(imagePath), options.Options.S3UploadPartSizeMb, options.Options.S3UploadParallel, progresser)
 }
 
 func (s *S3Storage) CleanTempfile(filePath string) error {
@@ -191,7 +236,7 @@ type SConverImageInfo struct {
 	SizeBytes int64
 }
 
-func (s *S3Storage) ConvertImage(ctx context.Context, image *SImage, targetFormat string) (*SConverImageInfo, error) {
+func (s *S3Storage) ConvertImage(ctx context.Context, image *SImage, targetFormat string, progresser func(saved int64)) (*SConverImageInfo, error) {
 	tempDir, err := s.getTempDir()
 	if err != nil {
 		return nil, err
@@ -206,7 +251,7 @@ func (s *S3Storage) ConvertImage(ctx context.Context, image *SImage, targetForma
 		return nil, errors.Wrap(err, "unable to img.Clone")
 	}
 	defer s.CleanTempfile(location)
-	s3Location, err := s.SaveImage(ctx, location)
+	s3Location, err := s.SaveImage(ctx, location, progresser)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to SaveImage")
 	}

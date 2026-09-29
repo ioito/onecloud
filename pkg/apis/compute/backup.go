@@ -20,8 +20,12 @@ import (
 	"yunion.io/x/onecloud/pkg/apis"
 )
 
+type TBackupStorageType string
+
 const (
-	BACKUPSTORAGE_TYPE_NFS       = "nfs"
+	BACKUPSTORAGE_TYPE_NFS            = TBackupStorageType("nfs")
+	BACKUPSTORAGE_TYPE_OBJECT_STORAGE = TBackupStorageType("object")
+
 	BACKUPSTORAGE_STATUS_ONLINE  = "online"
 	BACKUPSTORAGE_STATUS_OFFLINE = "offline"
 
@@ -39,6 +43,9 @@ const (
 	BACKUP_STATUS_RECOVERY                = "recovery"
 	BACKUP_STATUS_RECOVERY_FAILED         = "recovery_failed"
 	BACKUP_STATUS_UNKNOWN                 = "unknown"
+	BACKUP_STATUS_START_IMPORT            = "start_import"
+	BACKUP_STATUS_IMPORTING               = "importing"
+	BACKUP_STATUS_IMPORT_FAILED           = "import_failed"
 
 	BACKUP_EXIST     = "exist"
 	BACKUP_NOT_EXIST = "not_exist"
@@ -52,34 +59,38 @@ type BackupStorageCreateInput struct {
 	apis.EnabledStatusInfrasResourceBaseCreateInput
 
 	// description: storage type
-	// enum: nfs
+	// enum: ["nfs"]
 	StorageType string `json:"storage_type"`
 
-	// description: host of nfs, storage_type 为 nfs 时, 此参数必传
-	// example: 192.168.222.2
-	NfsHost string `json:"nfs_host"`
-
-	// description: shared dir of nfs, storage_type 为 nfs 时, 此参数必传
-	// example: /nfs_root/
-	NfsSharedDir string `json:"nfs_shared_dir"`
+	SBackupStorageAccessInfo
 
 	// description: Capacity size in MB
 	CapacityMb int `json:"capacity_mb"`
 }
 
-type BackupStorageAccessInfo struct {
-	AccessUrl string
+type BackupStorageUpdateInput struct {
+	apis.EnabledStatusInfrasResourceBaseUpdateInput
+
+	SBackupStorageAccessInfo
 }
+
+/*type BackupStorageAccessInfo struct {
+	AccessUrl string
+}*/
 
 type BackupStorageDetails struct {
 	apis.EnabledStatusInfrasResourceBaseDetails
 
-	NfsHost      string
-	NfsSharedDir string
+	SBackupStorageAccessInfo
 }
 
 type BackupStorageListInput struct {
 	apis.EnabledStatusInfrasResourceBaseListInput
+
+	// filter by server_id
+	ServerId string `json:"server_id"`
+	// filter by disk_id
+	DiskId string `json:"disk_id"`
 }
 
 type DiskBackupListInput struct {
@@ -95,6 +106,8 @@ type DiskBackupListInput struct {
 	IsInstanceBackup *bool `json:"is_instance_backup"`
 	// 按硬盘名称排序
 	OrderByDiskName string `json:"order_by_disk_name"`
+	// description: 主机ID
+	ServerId string `json:"server_id"`
 }
 
 type DiskBackupDetails struct {
@@ -109,56 +122,137 @@ type DiskBackupDetails struct {
 	BackupStorageName string `json:"backup_storage_name"`
 	// description: 是否是子备份
 	IsSubBackup bool `json:"is_sub_backup"`
+
+	SDiskBackup
+}
+
+type DiskBackupAsTarInput struct {
+	IncludeFiles       []string `json:"include_files"`
+	IncludePatterns    []string `json:"include_patterns"`
+	ExcludeFiles       []string `json:"exclude_files"`
+	ContainerId        string   `json:"container_id"`
+	IgnoreNotExistFile bool     `json:"ignore_not_exist_file"`
 }
 
 type DiskBackupCreateInput struct {
 	apis.VirtualResourceCreateInput
 	apis.EncryptedResourceCreateInput
 
+	// swagger:ignore
+	SizeMb int `json:"size_mb"`
+	// path to find backup file, in case of create backup from a backup file
+	BackupFilePath string `json:"backup_file_path"`
 	// description: disk id
 	DiskId string `json:"disk_id"`
+	// swagger:ignore
+	BackStorageId string `json:"back_storage_id" yunion-deprecated-by:"backup_storage_id"`
 	// description: backup storage id
-	BackupStorageId string `json:"back_storage_id"`
-	// swagger: ignore
+	BackupStorageId string `json:"backup_storage_id"`
+	// swagger:ignore
 	CloudregionId string `json:"cloudregion_id"`
 	// swagger:ignore
-	ManagerId string `json:"manager_id"`
+	ManagerId   string                `json:"manager_id"`
+	BackupAsTar *DiskBackupAsTarInput `json:"backup_as_tar"`
 }
 
 type DiskBackupRecoveryInput struct {
 	// description: name of disk
-	Name string
+	Name string `json:"name"`
 }
 
 type DiskBackupSyncstatusInput struct {
 }
 
 type DiskBackupPackMetadata struct {
-	OsArch     string
-	SizeMb     int
-	DiskSizeMb int
-	DiskType   string
+	OsArch     string `json:"os_arch"`
+	SizeMb     int    `json:"size_mb"`
+	DiskSizeMb int    `json:"disk_size_mb"`
+	DiskType   string `json:"disk_type"`
 	// 操作系统类型
-	OsType     string
-	DiskConfig *SBackupDiskConfig
+	OsType     string             `json:"os_type"`
+	DiskConfig *SBackupDiskConfig `json:"disk_config"`
+
+	// 备份文件路径
+	BackupFilePath string `json:"backup_file_path"`
+}
+
+type DiskBackupExportInfo struct {
+	DiskBackupPackMetadata
+
+	DiskBackupImportTaskInput
+}
+
+type DiskBackupImportTaskInput struct {
+	AccessUrl string `json:"access_url"`
 }
 
 type InstanceBackupPackMetadata struct {
-	OsArch         string
-	ServerConfig   jsonutils.JSONObject
-	ServerMetadata jsonutils.JSONObject
-	SecGroups      jsonutils.JSONObject
-	KeypairId      string
-	OsType         string
-	InstanceType   string
-	SizeMb         int
-	DiskMetadatas  []DiskBackupPackMetadata
+	OsArch         string                   `json:"os_arch"`
+	ServerConfig   jsonutils.JSONObject     `json:"server_config"`
+	ServerMetadata jsonutils.JSONObject     `json:"server_metadata"`
+	SecGroups      jsonutils.JSONObject     `json:"sec_groups"`
+	KeypairId      string                   `json:"keypair_id"`
+	OsType         string                   `json:"os_type"`
+	InstanceType   string                   `json:"instance_type"`
+	SizeMb         int                      `json:"size_mb"`
+	DiskMetadatas  []DiskBackupPackMetadata `json:"disk_metadatas"`
 
 	// 加密密钥ID
-	EncryptKeyId string
+	EncryptKeyId string `json:"encrypt_key_id"`
 	// Instance Backup metadata
 	Metadata map[string]string `json:"metadata"`
 }
 
 type InstanceBackupManagerSyncstatusInput struct {
+}
+
+type SBackupStorageAccessInfo struct {
+	// description: host of nfs, storage_type 为 nfs 时, 此参数必传
+	// example: 192.168.222.2
+	NfsHost string `json:"nfs_host"`
+
+	// description: shared dir of nfs, storage_type 为 nfs 时, 此参数必传
+	// example: /nfs_root/
+	NfsSharedDir string `json:"nfs_shared_dir"`
+
+	// description: access url of object storage bucket
+	// example: https://qxxxxxo.tos-cn-beijing.volces.com
+	ObjectBucketUrl string `json:"object_bucket_url"`
+	// description: access key of object storage
+	ObjectAccessKey string `json:"object_access_key"`
+	// description: secret of object storage
+	ObjectSecret string `json:"object_secret"`
+	// description: signing version, can be v2/v4, default is v4
+	ObjectSignVer string `json:"object_sign_ver"`
+	// description: external access url of object storage bucket
+	ObjectBucketUrlExt string `json:"object_bucket_url_ext"`
+}
+
+func (ba *SBackupStorageAccessInfo) String() string {
+	return jsonutils.Marshal(ba).String()
+}
+
+func (ba *SBackupStorageAccessInfo) IsZero() bool {
+	return ba == nil
+}
+
+type ServerCreateInstanceBackupInput struct {
+	// 主机备份名称
+	Name string `json:"name"`
+	// 主机备份的生成名称
+	GenerateName string `json:"generate_name"`
+	// 备份存储ID
+	BackupStorageId string `json:"backup_storage_id"`
+}
+
+type DiskBackupImportInput struct {
+	Name string `json:"name"`
+
+	GenerateName string `json:"generate_name"`
+
+	apis.ProjectizedResourceCreateInput
+
+	DiskBackupExportInfo
+
+	BackupStorageId string `json:"backup_storage_id"`
 }

@@ -28,7 +28,7 @@ import (
 )
 
 type SNetwork struct {
-	multicloud.SResourceBase
+	multicloud.SNetworkBase
 	multicloud.STagBase
 	wire *SWire
 
@@ -171,7 +171,7 @@ func (self *SWire) GetINetworkById(id string) (cloudprovider.ICloudNetwork, erro
 			return networks[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetNetworks(id, clusterId, vpcId string) ([]SNetwork, error) {

@@ -24,7 +24,9 @@ import (
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/appctx"
+	"yunion.io/x/pkg/util/httputils"
 
+	"yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -33,11 +35,18 @@ import (
 
 type SBackendServiceProxyHandler struct {
 	prefix string
+
+	readWorker  *appsrv.SWorkerManager
+	writeWorker *appsrv.SWorkerManager
 }
 
-func NewBackendServiceProxyHandler(prefix string) *SBackendServiceProxyHandler {
+func NewBackendServiceProxyHandler(prefix string, readWorkerCount, writeWorkerCount int) *SBackendServiceProxyHandler {
+	log.Infof("NewBackendServiceProxyHandler: %s, readWorkerCount: %d, writeWorkerCount: %d", prefix, readWorkerCount, writeWorkerCount)
 	return &SBackendServiceProxyHandler{
 		prefix: prefix,
+
+		readWorker:  appsrv.NewWorkerManager("apigateway-backend-api-read", readWorkerCount, appsrv.DEFAULT_BACKLOG, false),
+		writeWorker: appsrv.NewWorkerManager("apigateway-backend-api-write", writeWorkerCount, appsrv.DEFAULT_BACKLOG, false),
 	}
 }
 
@@ -56,6 +65,10 @@ func (h *SBackendServiceProxyHandler) requestManipulator(ctx context.Context, r 
 	if slashPos <= 0 {
 		return r, httperrors.NewBadRequestError("invalid request URL %s", r.URL.Path)
 	}
+	serviceName := path[:slashPos]
+	// Tell upstream (e.g. mcp-server SSE) the external path prefix so endpoint
+	// events point clients back through the gateway: /api/s/<service>/message
+	r.Header.Set("X-Forwarded-Prefix", "/api/s/"+serviceName)
 	path = path[slashPos:]
 	if strings.HasPrefix(path, "/r/") {
 		path = path[len("/r/"):]
@@ -96,9 +109,9 @@ func (h *SBackendServiceProxyHandler) Bind(app *appsrv.Application) {
 			}
 			var worker *appsrv.SWorkerManager
 			if method == "GET" || method == "HEAD" {
-				worker = appsrv.NewWorkerManager("apigateway-backend-api-read", 8, appsrv.DEFAULT_BACKLOG, false)
+				worker = h.readWorker
 			} else {
-				worker = appsrv.NewWorkerManager("apigateway-backend-api-write", 4, appsrv.DEFAULT_BACKLOG, false)
+				worker = h.writeWorker
 			}
 			hi.SetWorkerManager(worker)
 			return hi
@@ -142,12 +155,11 @@ func (h *SBackendServiceProxyHandler) fetchReverseEndpoint() *proxy.SEndpointFac
 				zone = path[:slashPos]
 			}
 		}
-		endpointType := "internalURL"
 		session := auth.GetAdminSession(ctx, region)
 		if len(zone) > 0 {
 			session.SetZone(zone)
 		}
-		ep, err := session.GetServiceURL(serviceName, endpointType)
+		ep, err := session.GetServiceURL(serviceName, identity.EndpointInterfaceInternal, httputils.THttpMethod(r.Method))
 		if err != nil {
 			return "", httperrors.NewBadRequestError("invalid service %s: %s", serviceName, err)
 		}

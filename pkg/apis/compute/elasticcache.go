@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 )
 
 type ElasticcacheDetails struct {
@@ -53,11 +54,13 @@ func (self ElasticcacheDetails) GetMetricTags() map[string]string {
 		"tenant":         self.Project,
 		"tenant_id":      self.ProjectId,
 		"brand":          self.Brand,
+		"account":        self.Account,
+		"account_id":     self.AccountId,
 		"domain_id":      self.DomainId,
 		"project_domain": self.ProjectDomain,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self ElasticcacheDetails) GetMetricPairs() map[string]string {
@@ -181,7 +184,7 @@ type ElasticcacheCreateInput struct {
 	// 主可用区名称或Id
 	ZoneId string `json:"zone_id"`
 
-	// swagger: ignore
+	// swagger:ignore
 	Zone string `json:"zone" yunion-deprecated-by:"zone_id"`
 
 	// 备可用区名称或Id列表, split by: ,
@@ -194,16 +197,16 @@ type ElasticcacheCreateInput struct {
 	// required: true
 	NetworkId string `json:"network_id"`
 
-	// swagger: ignore
+	// swagger:ignore
 	Network string `json:"network" yunion-deprecated-by:"network_id"`
 
 	// 网络类型
-	//  enum: vpc, cLassic
+	//  enum: ["vpc", "cLassic"]
 	// required: true
 	NetworkType string `json:"network_type"`
 
 	// 弹性缓存Engine
-	//  enum: redis, memcached
+	//  enum: ["redis", "memcached"]
 	// required: true
 	Engine string `json:"engine"`
 
@@ -217,7 +220,7 @@ type ElasticcacheCreateInput struct {
 
 	NodeType string `json:"node_type"`
 
-	// swagger: ignore
+	// swagger:ignore
 	MemorySizeMb int `json:"memory_size_mb" yunion-deprecated-by:"capacity_mb"`
 
 	// 初始密码
@@ -236,30 +239,30 @@ type ElasticcacheCreateInput struct {
 	PrivateIp string `json:"private_ip"`
 
 	// swagger:ignore
-	VpcId string
+	VpcId string `json:"vpc_id"`
 
 	// swagger:ignore
-	ManagerId string
+	ManagerId string `json:"manager_id"`
 
 	// 包年包月时间周期
 	Duration string `json:"duration"`
+
+	// 到期释放时间
+	ReleaseAt time.Time `json:"release_at"`
 
 	// 是否自动续费(仅包年包月时生效)
 	// default: false
 	AutoRenew bool `json:"auto_renew"`
 
-	// swagger:ignore
-	ExpiredAt time.Time `json:"expired_at"`
-
 	// 计费方式
-	// enum: postpaid, prepaid
-	BillingType string
+	// enum: ["postpaid", "prepaid"]
+	BillingType billing_api.TBillingType `json:"billing_type"`
 	// swagger:ignore
-	BillingCycle string
+	BillingCycle string `json:"billing_cycle"`
 
 	// 弹性缓存维护时间段
 	// 华为云此参数可选,其它云该参数无效
-	// enum: 22:00:00, 02:00:00, 06:00:00, 10:00:00, 14:00:00, 18:00:00
+	// enum: ["22:00:00", "02:00:00", "06:00:00", "10:00:00", "14:00:00", "18:00:00"]
 	// required: false
 	MaintainStartTime string `json:"maintain_start_time"`
 

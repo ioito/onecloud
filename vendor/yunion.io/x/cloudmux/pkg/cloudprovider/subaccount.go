@@ -22,6 +22,7 @@ import (
 )
 
 type SSubAccount struct {
+	Id string // 账号ID
 	// 若Account不为空，可不传
 	Name string
 	// 描述信息
@@ -30,6 +31,8 @@ type SSubAccount struct {
 	Account          string
 	HealthStatus     string // 云端服务健康状态。例如欠费、项目冻结都属于不健康状态。
 	DefaultProjectId string // 默认云订阅项目Id
+
+	Tags map[string]string
 }
 
 // +onecloud:model-api-gen
@@ -45,12 +48,12 @@ type SubAccounts struct {
 	}
 }
 
-func (self SubAccounts) IsZero() bool {
-	return len(self.Accounts) == 0
+func (accounts SubAccounts) IsZero() bool {
+	return len(accounts.Accounts) == 0
 }
 
-func (self SubAccounts) String() string {
-	return jsonutils.Marshal(self).String()
+func (accounts SubAccounts) String() string {
+	return jsonutils.Marshal(accounts).String()
 }
 
 func init() {

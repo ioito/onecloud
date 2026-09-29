@@ -35,12 +35,13 @@ import (
 
 // InstallHandler is an interface that registes route and
 // handles scheduler's services.
-func InstallHandler(r *gin.Engine) {
+func InstallHandler(r *gin.Engine, enableProfiling bool) {
 	r.POST("/scheduler", timer(scheduleHandler))
 	r.POST("/scheduler/:action", timer(schedulerActionHandler))
 	r.POST("/scheduler/:action/:ident", timer(schedulerActionIdentHandler))
 	InstallPingHandler(r)
 	InstallVersionHandler(r)
+	InstallProfiling(r, enableProfiling)
 }
 
 func timer(f gin.HandlerFunc) gin.HandlerFunc {
@@ -168,7 +169,7 @@ func doCandidateDetail(c *gin.Context, id string) {
 		return
 	}
 
-	hs, err := computemodels.HostManager.FetchByIdOrName(userCred, id)
+	hs, err := computemodels.HostManager.FetchByIdOrName(c.Request.Context(), userCred, id)
 	if err != nil {
 		c.AbortWithError(http.StatusInternalServerError, err)
 		return

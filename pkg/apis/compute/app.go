@@ -14,7 +14,11 @@
 
 package compute
 
-import "yunion.io/x/onecloud/pkg/apis"
+import (
+	"time"
+
+	"yunion.io/x/onecloud/pkg/apis"
+)
 
 const (
 	APP_TYPE_WEB = "web"
@@ -38,16 +42,72 @@ type AppDetails struct {
 	apis.VirtualResourceDetails
 	ManagedResourceInfo
 	CloudregionResourceInfo
+	Network string `json:"network"`
+	VpcId   string `json:"vpc_id"`
+	Vpc     string `json:"vpc"`
 }
 
 type AppEnvironmentListInput struct {
 	apis.VirtualResourceListInput
 	apis.ExternalizedResourceBaseListInput
 
-	AppId        string
-	InstanceType string
+	AppId        string `json:"app_id"`
+	InstanceType string `json:"instance_type"`
 }
 
 type AppEnvironmentDetails struct {
 	apis.VirtualResourceDetails
+}
+
+type AppHybirdConnection struct {
+	Id        string `json:"id"`
+	Name      string `json:"name"`
+	Hostname  string `json:"hostname"`
+	Namespace string `json:"namespace"`
+	Port      int    `json:"port"`
+}
+
+type AppHybirdConnectionOutput struct {
+	Data []AppHybirdConnection `json:"data"`
+}
+
+type AppBackup struct {
+	Id   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type AppBackupOutput struct {
+	Data         []AppBackup `json:"data"`
+	BackupConfig struct {
+		Enabled               bool   `json:"enabled"`
+		FrequencyInterval     int    `json:"frequency_interval"`
+		FrequencyUnit         string `json:"frequency_unit"`
+		RetentionPeriodInDays int    `json:"retention_period_in_days"`
+	} `json:"backup_config"`
+}
+
+type AppCertificate struct {
+	Id          string    `json:"id"`
+	Name        string    `json:"name"`
+	SubjectName string    `json:"subject_name"`
+	Issuer      string    `json:"issuer"`
+	IssueDate   time.Time `json:"issue_date"`
+	Thumbprint  string    `json:"thumbprint"`
+	ExpireTime  time.Time `json:"expire_time"`
+}
+
+type AppCertificateOutput struct {
+	Data []AppCertificate `json:"data"`
+}
+
+type AppDomain struct {
+	Id       string `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	SslState string `json:"ssl_state"`
+}
+
+type AppDomainOutput struct {
+	Data []AppDomain `json:"data"`
 }

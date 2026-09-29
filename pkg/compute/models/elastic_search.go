@@ -91,13 +91,13 @@ type SElasticSearch struct {
 
 	// 存储类型
 	// example: local_ssd
-	StorageType string `nullable:"false" list:"user" create:"required"`
+	StorageType string `width:"16" charset:"utf8" nullable:"false" list:"user" create:"required"`
 	// 存储大小
 	// example: 1024
 	DiskSizeGb int `nullable:"false" list:"user" create:"required"`
 	// 实例类型
 	// example: ha
-	Category string `nullable:"false" list:"user" create:"optional"`
+	Category string `width:"16" charset:"ascii" nullable:"false" list:"user" create:"optional"`
 
 	VpcId     string `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional" json:"vpc_id"`
 	NetworkId string `width:"36" charset:"ascii" nullable:"true" list:"user" create:"optional" json:"network_id"`
@@ -189,6 +189,15 @@ func (man *SElasticSearchManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fi
 		return q, nil
 	}
 	q, err = man.SVpcResourceBaseManager.QueryDistinctExtraField(q, field)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SElasticSearchManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
 	if err == nil {
 		return q, nil
 	}
@@ -330,6 +339,7 @@ type SEsCountStat struct {
 }
 
 func (man *SElasticSearchManager) TotalCount(
+	ctx context.Context,
 	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
@@ -340,7 +350,7 @@ func (man *SElasticSearchManager) TotalCount(
 	esq = scopeOwnerIdFilter(esq, scope, ownerId)
 	esq = CloudProviderFilter(esq, esq.Field("manager_id"), providers, brands, cloudEnv)
 	esq = RangeObjectsFilter(esq, rangeObjs, esq.Field("cloudregion_id"), nil, esq.Field("manager_id"), nil, nil)
-	esq = db.ObjectIdQueryWithPolicyResult(esq, man, policyResult)
+	esq = db.ObjectIdQueryWithPolicyResult(ctx, esq, man, policyResult)
 
 	sq := esq.SubQuery()
 	q := sq.Query(sqlchemy.COUNT("total_es_count"),
@@ -378,7 +388,7 @@ func (self *SElasticSearch) StartDeleteTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.ELASTIC_SEARCH_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_SEARCH_STATUS_DELETING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -438,11 +448,11 @@ func (self *SElasticSearch) SyncWithCloudElasticSearch(ctx context.Context, user
 		self.VmemSizeGb = ext.GetVmemSizeGb()
 		self.IsMultiAz = ext.IsMultiAz()
 
-		self.BillingType = ext.GetBillingType()
+		self.BillingType = billing_api.TBillingType(ext.GetBillingType())
+		self.ExpiredAt = time.Time{}
+		self.AutoRenew = false
 		if self.BillingType == billing_api.BILLING_TYPE_PREPAID {
-			if expiredAt := ext.GetExpiredAt(); !expiredAt.IsZero() {
-				self.ExpiredAt = expiredAt
-			}
+			self.ExpiredAt = ext.GetExpiredAt()
 			self.AutoRenew = ext.IsAutoRenew()
 		}
 
@@ -507,9 +517,12 @@ func (self *SElasticSearch) SyncWithCloudElasticSearch(ctx context.Context, user
 		})
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
+
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -581,11 +594,11 @@ func (self *SCloudregion) newFromCloudElasticSearch(ctx context.Context, userCre
 		es.CreatedAt = createdAt
 	}
 
-	es.BillingType = ext.GetBillingType()
+	es.BillingType = billing_api.TBillingType(ext.GetBillingType())
+	es.ExpiredAt = time.Time{}
+	es.AutoRenew = false
 	if es.BillingType == billing_api.BILLING_TYPE_PREPAID {
-		if expired := ext.GetExpiredAt(); !expired.IsZero() {
-			es.ExpiredAt = expired
-		}
+		es.ExpiredAt = ext.GetExpiredAt()
 		es.AutoRenew = ext.IsAutoRenew()
 	}
 
@@ -610,9 +623,9 @@ func (self *SCloudregion) newFromCloudElasticSearch(ctx context.Context, userCre
 		Action: notifyclient.ActionSyncCreate,
 	})
 	// 同步标签
-	syncVirtualResourceMetadata(ctx, userCred, &es, ext)
+	syncVirtualResourceMetadata(ctx, userCred, &es, ext, false)
 	// 同步项目归属
-	SyncCloudProject(ctx, userCred, &es, provider.GetOwnerId(), ext, provider.Id)
+	SyncCloudProject(ctx, userCred, &es, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(&es, db.ACT_CREATE, es.GetShortDesc(ctx), userCred)
 
@@ -656,7 +669,7 @@ func (self *SElasticSearch) PerformSyncstatus(ctx context.Context, userCred mccl
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("ElasticSearch has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("ElasticSearch has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, self, "ElasticSearchSyncstatusTask", "")
@@ -686,14 +699,17 @@ func (self *SElasticSearch) StartRemoteUpdateTask(ctx context.Context, userCred 
 	if task, err := taskman.TaskManager.NewTask(ctx, "ElasticSearchRemoteUpdateTask", self, userCred, data, parentTaskId, "", nil); err != nil {
 		return errors.Wrap(err, "Start ElasticSearchRemoteUpdateTask")
 	} else {
-		self.SetStatus(userCred, api.ELASTIC_SEARCH_UPDATE_TAGS, "StartRemoteUpdateTask")
+		self.SetStatus(ctx, userCred, api.ELASTIC_SEARCH_UPDATE_TAGS, "StartRemoteUpdateTask")
 		task.ScheduleRun(nil)
 	}
 	return nil
 }
 
 func (self *SElasticSearch) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := self.GetCloudaccount(); account != nil && account.ReadOnly {
 		return
 	}
 	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")

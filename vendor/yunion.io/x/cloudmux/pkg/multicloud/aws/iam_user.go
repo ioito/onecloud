@@ -21,6 +21,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
+	api "yunion.io/x/cloudmux/pkg/apis/cloudid"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
@@ -51,20 +52,12 @@ func (user *SUser) GetInviteUrl() string {
 	return ""
 }
 
-func (user *SUser) AttachSystemPolicy(policyArn string) error {
-	return user.client.AttachUserPolicy(user.UserName, user.client.getIamArn(policyArn))
+func (user *SUser) AttachPolicy(policyArn string, policyType api.TPolicyType) error {
+	return user.client.AttachUserPolicy(user.UserName, policyArn)
 }
 
-func (user *SUser) AttachCustomPolicy(policyArn string) error {
-	return user.client.AttachUserPolicy(user.UserName, user.client.getIamArn(policyArn))
-}
-
-func (user *SUser) DetachSystemPolicy(policyArn string) error {
-	return user.client.DetachUserPolicy(user.UserName, user.client.getIamArn(policyArn))
-}
-
-func (user *SUser) DetachCustomPolicy(policyArn string) error {
-	return user.client.DetachUserPolicy(user.UserName, user.client.getIamArn(policyArn))
+func (user *SUser) DetachPolicy(policyArn string, policyType api.TPolicyType) error {
+	return user.client.DetachUserPolicy(user.UserName, policyArn)
 }
 
 func (user *SUser) GetGlobalId() string {
@@ -85,6 +78,15 @@ func (user *SUser) IsConsoleLogin() bool {
 		return false
 	}
 	return true
+}
+
+func (user *SUser) SetDisable() error {
+	return user.client.DeleteLoginProfile(user.UserName)
+}
+
+func (user *SUser) SetEnable(opts *cloudprovider.SClouduserEnableOptions) error {
+	_, err := user.client.CreateLoginProfile(user.UserName, opts.Password, opts.PasswordResetRequired)
+	return err
 }
 
 func (user *SUser) GetICloudgroups() ([]cloudprovider.ICloudgroup, error) {
@@ -120,40 +122,14 @@ func (self *SUser) ListPolicies() ([]SAttachedPolicy, error) {
 	return policies, nil
 }
 
-func (self *SUser) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (self *SUser) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	policies, err := self.ListPolicies()
 	if err != nil {
 		return nil, errors.Wrapf(err, "ListPolicies")
 	}
-	customMaps, err := self.client.GetCustomPolicyMaps()
-	if err != nil {
-		return nil, errors.Wrapf(err, "GetCustomPolicyMaps")
-	}
 	ret := []cloudprovider.ICloudpolicy{}
 	for i := range policies {
-		_, ok := customMaps[policies[i].PolicyName]
-		if !ok {
-			ret = append(ret, &policies[i])
-		}
-	}
-	return ret, nil
-}
-
-func (self *SUser) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	policies, err := self.ListPolicies()
-	if err != nil {
-		return nil, errors.Wrapf(err, "ListPolicies")
-	}
-	customMaps, err := self.client.GetCustomPolicyMaps()
-	if err != nil {
-		return nil, errors.Wrapf(err, "GetCustomPolicyMaps")
-	}
-	ret := []cloudprovider.ICloudpolicy{}
-	for i := range policies {
-		_, ok := customMaps[policies[i].PolicyName]
-		if ok {
-			ret = append(ret, &policies[i])
-		}
+		ret = append(ret, &policies[i])
 	}
 	return ret, nil
 }
@@ -272,7 +248,7 @@ func (self *SAwsClient) CreateIClouduser(conf *cloudprovider.SClouduserCreateCon
 		return nil, errors.Wrap(err, "CreateUser")
 	}
 	if len(conf.Password) > 0 {
-		_, err := self.CreateLoginProfile(conf.Name, conf.Password)
+		_, err := self.CreateLoginProfile(conf.Name, conf.Password, false)
 		if err != nil {
 			log.Errorf("failed to create loginProfile for user %s error: %v", conf.Name, err)
 		}
@@ -346,10 +322,13 @@ func (self *SAwsClient) DeleteLoginProfile(name string) error {
 	return self.iamRequest("DeleteLoginProfile", params, nil)
 }
 
-func (self *SAwsClient) CreateLoginProfile(name, password string) (*SLoginProfile, error) {
+func (self *SAwsClient) CreateLoginProfile(name, password string, reset bool) (*SLoginProfile, error) {
 	params := map[string]string{
 		"UserName": name,
 		"Password": password,
+	}
+	if reset {
+		params["PasswordResetRequired"] = "true"
 	}
 	loginProfile := &SLoginProfile{}
 	err := self.iamRequest("CreateLoginProfile", params, loginProfile)
@@ -371,7 +350,7 @@ func (self *SAwsClient) ResetUserPassword(name, password string) error {
 	_, err := self.GetLoginProfile(name)
 	if err != nil {
 		if errors.Cause(err) == cloudprovider.ErrNotFound {
-			_, err = self.CreateLoginProfile(name, password)
+			_, err = self.CreateLoginProfile(name, password, false)
 			return err
 		}
 		return errors.Wrap(err, "GetLoginProfile")

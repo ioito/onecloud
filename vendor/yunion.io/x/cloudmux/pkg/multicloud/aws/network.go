@@ -30,7 +30,7 @@ import (
 )
 
 type SNetwork struct {
-	multicloud.SResourceBase
+	multicloud.SNetworkBase
 	AwsTags
 	wire *SWire
 
@@ -41,6 +41,10 @@ type SNetwork struct {
 	SubnetId                string `xml:"subnetId"`
 	VpcId                   string `xml:"vpcId"`
 	AvailabilityZone        string `xml:"availabilityZone"`
+
+	IPv6CidrBlockAssociationSet []struct {
+		IPv6CidrBlock string `xml:"ipv6CidrBlock"`
+	} `xml:"ipv6CidrBlockAssociationSet>item"`
 }
 
 func (self *SNetwork) GetId() string {
@@ -93,8 +97,78 @@ func (self *SNetwork) GetSysTags() map[string]string {
 	return data
 }
 
+func (self *SNetwork) SetTags(tags map[string]string, replace bool) error {
+	return self.wire.zone.region.setTags("subnet", self.SubnetId, tags, replace)
+}
+
 func (self *SNetwork) GetIWire() cloudprovider.ICloudWire {
 	return self.wire
+}
+
+func (net *SNetwork) GetIp6Start() string {
+	for _, ipv6 := range net.IPv6CidrBlockAssociationSet {
+		if len(ipv6.IPv6CidrBlock) == 0 {
+			continue
+		}
+		prefix, err := netutils.NewIPV6Prefix(ipv6.IPv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		return prefix.Address.NetAddr(prefix.MaskLen).
+			StepUp(). // 1
+			StepUp(). // 2
+			StepUp(). // 3
+			StepUp(). // 4
+			String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6End() string {
+	for _, ipv6 := range net.IPv6CidrBlockAssociationSet {
+		if len(ipv6.IPv6CidrBlock) == 0 {
+			continue
+		}
+		prefix, err := netutils.NewIPV6Prefix(ipv6.IPv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		end := prefix.Address.NetAddr(prefix.MaskLen).BroadcastAddr(prefix.MaskLen)
+		return end.
+			StepDown(). // fffe
+			String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6Mask() uint8 {
+	for _, ipv6 := range net.IPv6CidrBlockAssociationSet {
+		if len(ipv6.IPv6CidrBlock) == 0 {
+			continue
+		}
+		prefix, err := netutils.NewIPV6Prefix(ipv6.IPv6CidrBlock)
+		if err != nil {
+			return 0
+		}
+		return prefix.MaskLen
+	}
+	return 0
+}
+
+func (net *SNetwork) GetGateway6() string {
+	for _, ipv6 := range net.IPv6CidrBlockAssociationSet {
+		if len(ipv6.IPv6CidrBlock) == 0 {
+			continue
+		}
+		prefix, err := netutils.NewIPV6Prefix(ipv6.IPv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		return prefix.Address.NetAddr(prefix.MaskLen).
+			StepUp(). // 1
+			String()
+	}
+	return ""
 }
 
 // 每个子网 CIDR 块中的前四个 IP 地址和最后一个 IP 地址无法使用
@@ -197,7 +271,7 @@ func (self *SRegion) getNetwork(networkId string) (*SNetwork, error) {
 			return &networks[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, networkId)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", networkId)
 }
 
 func (self *SRegion) DeleteNetwork(id string) error {

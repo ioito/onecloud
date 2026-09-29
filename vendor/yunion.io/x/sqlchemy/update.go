@@ -130,6 +130,7 @@ func (us *SUpdateSession) SaveUpdateSql(dt interface{}) (*SUpdateSQLResult, erro
 	updatedFields := make([]string, 0)
 	primaries := make([]sPrimaryKeyValue, 0)
 	setters := make([]SUpdateDiff, 0)
+	forceUpdate := false
 	for _, c := range us.tableSpec.Columns() {
 		k := c.Name()
 		of, _ := ofields.GetInterface(k)
@@ -159,19 +160,23 @@ func (us *SUpdateSession) SaveUpdateSql(dt interface{}) (*SUpdateSQLResult, erro
 		}
 		if c.IsAutoVersion() {
 			versionFields = append(versionFields, k)
-			continue
 		}
 		if c.IsUpdatedAt() {
 			updatedFields = append(updatedFields, k)
-			continue
 		}
 		if reflect.DeepEqual(of, nf) {
+			continue
+		} else if c.IsAutoVersion() || c.IsUpdatedAt() {
+			forceUpdate = true
 			continue
 		}
 		if of != nil && nf != nil {
 			ofJsonStr := jsonutils.Marshal(of).String()
 			nfJsonStr := jsonutils.Marshal(nf).String()
 			if ofJsonStr == nfJsonStr {
+				continue
+			}
+			if EqualsGrossValue(of, nf) {
 				continue
 			}
 		}
@@ -181,7 +186,7 @@ func (us *SUpdateSession) SaveUpdateSql(dt interface{}) (*SUpdateSQLResult, erro
 		setters = append(setters, SUpdateDiff{old: of, new: nf, col: c})
 	}
 
-	if len(setters) == 0 {
+	if len(setters) == 0 && !forceUpdate {
 		return nil, ErrNoDataToUpdate
 	}
 
@@ -189,29 +194,38 @@ func (us *SUpdateSession) SaveUpdateSql(dt interface{}) (*SUpdateSQLResult, erro
 		return nil, ErrEmptyPrimaryKey
 	}
 
+	qChar := us.tableSpec.Database().backend.QuoteChar()
+
 	vars := make([]interface{}, 0)
 	colsets := make([]string, 0)
 	conditions := make([]string, 0)
 	for _, udif := range setters {
 		if gotypes.IsNil(udif.new) {
-			colsets = append(colsets, fmt.Sprintf("`%s` = NULL", udif.col.Name()))
+			colsets = append(colsets, fmt.Sprintf("%s%s%s = NULL", qChar, udif.col.Name(), qChar))
 		} else {
-			colsets = append(colsets, fmt.Sprintf("`%s` = ?", udif.col.Name()))
+			// validate text length
+			if udif.col.IsString() && udif.col.GetWidth() > 0 {
+				newStr, ok := udif.new.(string)
+				if ok && len(newStr) > udif.col.GetWidth() {
+					udif.new = newStr[:udif.col.GetWidth()]
+				}
+			}
+			colsets = append(colsets, fmt.Sprintf("%s%s%s = ?", qChar, udif.col.Name(), qChar))
 			vars = append(vars, udif.col.ConvertFromValue(udif.new))
 		}
 	}
 	for _, versionField := range versionFields {
-		colsets = append(colsets, fmt.Sprintf("`%s` = `%s` + 1", versionField, versionField))
+		colsets = append(colsets, fmt.Sprintf("%s%s%s = %s%s%s + 1", qChar, versionField, qChar, qChar, versionField, qChar))
 	}
 	for _, updatedField := range updatedFields {
-		colsets = append(colsets, fmt.Sprintf("`%s` = %s", updatedField, us.tableSpec.Database().backend.CurrentUTCTimeStampString()))
+		colsets = append(colsets, fmt.Sprintf("%s%s%s = %s", qChar, updatedField, qChar, us.tableSpec.Database().backend.CurrentUTCTimeStampString()))
 	}
 	for _, pkv := range primaries {
-		conditions = append(conditions, fmt.Sprintf("`%s` = ?", pkv.key))
+		conditions = append(conditions, fmt.Sprintf("%s%s%s = ?", qChar, pkv.key, qChar))
 		vars = append(vars, pkv.value)
 	}
 
-	updateSql := templateEval(us.tableSpec.Database().backend.UpdateSQLTemplate(), struct {
+	updateSql := TemplateEval(us.tableSpec.Database().backend.UpdateSQLTemplate(), struct {
 		Table      string
 		Columns    string
 		Conditions string
@@ -222,7 +236,7 @@ func (us *SUpdateSession) SaveUpdateSql(dt interface{}) (*SUpdateSQLResult, erro
 	})
 
 	if DEBUG_SQLCHEMY {
-		log.Infof("Update: %s %s", updateSql, vars)
+		log.Infof("Update: %s", _sqlDebug(updateSql, vars))
 	}
 
 	return &SUpdateSQLResult{
@@ -268,7 +282,7 @@ func (ts *STableSpec) execUpdateSql(dt interface{}, result *SUpdateSQLResult) er
 	}
 	err = q.First(dt)
 	if err != nil {
-		return errors.Wrap(err, "query after update failed")
+		return errors.Wrapf(err, "query after update failed %s", q.DebugString())
 	}
 	return nil
 }

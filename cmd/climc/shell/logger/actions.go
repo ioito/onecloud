@@ -24,14 +24,15 @@ import (
 )
 
 type BaseActionListOptions struct {
-	Scope         string   `help:"scope" choices:"project|domain|system"`
+	Scope         string   `help:"RBAC scope" choices:"project|domain|system"`
 	Since         string   `help:"Show logs since specific date" metavar:"DATETIME"`
 	Until         string   `help:"Show logs until specific date" metavar:"DATETIME"`
 	Limit         int64    `help:"Limit number of logs" default:"20"`
-	Offset        int64    `help:"Offset"`
+	Offset        int64    `help:"Offset for pagination"`
 	Ascending     bool     `help:"Ascending order"`
 	Descending    bool     `help:"Descending order"`
-	Action        []string `help:"Log action"`
+	Field         []string `help:"Fields to return"`
+	Action        []string `help:"Filter by log action"`
 	Search        string   `help:"Filter action logs by obj_name, using 'like' syntax."`
 	Admin         bool     `help:"admin mode"`
 	Succ          bool     `help:"Show success action log only"`
@@ -46,15 +47,17 @@ type BaseActionListOptions struct {
 }
 
 type ActionListOptions struct {
+	_ struct{} `mcp-desc:"查询操作日志（谁在何时对资源做了什么）。可按对象类型 type（如 server/disk/host）、对象 id、时间 since/until、action、user、project、succ/fail 过滤；默认 limit=20。排查创建失败、误操作、审计时优先调用"`
+
 	BaseActionListOptions
-	Service []string `help:"service name`
-	Id      string   `help:"" metavar:"OBJ_ID"`
+	Service []string `help:"service name"`
+	Id      string   `help:"filter by object id" metavar:"OBJ_ID"`
 	Type    []string `help:"Type of relevant object" metavar:"OBJ_TYPE"`
 }
 
 type TypeActionListOptions struct {
 	BaseActionListOptions
-	ID string `help:"" metavar:"OBJ_ID"`
+	ID string `help:"Object ID" metavar:"OBJ_ID"`
 }
 
 func doActionList(s *mcclient.ClientSession, args *ActionListOptions) error {
@@ -94,6 +97,9 @@ func doActionList(s *mcclient.ClientSession, args *ActionListOptions) error {
 	}
 	if args.Offset > 0 {
 		params.Add(jsonutils.NewInt(args.Offset), "offset")
+	}
+	if args.Field != nil {
+		params.Add(jsonutils.NewStringArray(args.Field), "field")
 	}
 	if args.Ascending && !args.Descending {
 		params.Add(jsonutils.NewString("asc"), "order")

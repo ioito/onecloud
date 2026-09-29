@@ -16,17 +16,22 @@ package jsonutils
 
 import (
 	"bytes"
+	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/sortedmap"
 )
 
+// swagger:type object
 type JSONObject interface {
 	gotypes.ISerializable
 
@@ -68,6 +73,7 @@ var (
 	JSONFalse = &JSONBool{data: false}
 )
 
+// swagger:type object
 type JSONDict struct {
 	JSONValue
 	data sortedmap.SSortedMap
@@ -112,6 +118,11 @@ func skipEmpty(str []byte, offset int) int {
 		}
 	}
 	return i
+}
+
+// isFiniteFloat reports whether the value has a json representation
+func isFiniteFloat(val float64) bool {
+	return !math.IsNaN(val) && !math.IsInf(val, 0)
 }
 
 func hexchar2num(v byte) (byte, error) {
@@ -180,9 +191,22 @@ ret:
 					if e != nil {
 						return "", i, NewJSONError(str, i, e.Error())
 					}
+					i += 4
+					if utf16.IsSurrogate(r) {
+						// a character outside the BMP is written as a
+						// surrogate pair, e.g. 😀
+						if i+6 <= len(str) && str[i] == '\\' && str[i+1] == 'u' {
+							r2, e2 := hexstr2rune(str[i+2 : i+6])
+							if e2 == nil {
+								if combined := utf16.DecodeRune(r, r2); combined != utf8.RuneError {
+									r = combined
+									i += 6
+								}
+							}
+						}
+					}
 					runen = utf8.EncodeRune(runebytes, r)
 					buffer = append(buffer, runebytes[0:runen]...)
-					i += 4
 				case 'x':
 					i++
 					if i+2 >= len(str) {
@@ -250,13 +274,23 @@ ret2:
 	return string(str[offset:i]), false, i, nil
 }
 
+// isNodeReference reports whether the token has the form of a node
+// reference, that is a bare <N> with an integer N
+func isNodeReference(val string) bool {
+	if len(val) < 3 || val[0] != '<' || val[len(val)-1] != '>' {
+		return false
+	}
+	_, err := strconv.ParseInt(val[1:len(val)-1], 10, 64)
+	return err == nil
+}
+
 func (s *sJsonParseSession) parseJSONValue(str []byte, offset int) (JSONObject, int, error) {
 	val, quote, i, e := parseString(str, offset)
 	if e != nil {
 		return nil, i, errors.Wrap(e, "parseString")
 	} else if quote {
 		return &JSONString{data: val}, i, nil
-	} else if val[0] == '<' && val[len(val)-1] == '>' {
+	} else if s.allowNodeReference && len(val) > 1 && val[0] == '<' && val[len(val)-1] == '>' {
 		// Pointer <nnnn>
 		val = val[1 : len(val)-1]
 		ival, err := strconv.ParseInt(val, 10, 64)
@@ -269,6 +303,10 @@ func (s *sJsonParseSession) parseJSONValue(str []byte, offset int) (JSONObject, 
 		}
 		s.saveReferer(nodeId, ptr)
 		return ptr, i, nil
+	} else if !s.allowNodeReference && isNodeReference(val) {
+		// a node reference can not be left unresolved and kept as a plain
+		// value: a caller could not tell it apart from a real string
+		return nil, i, errors.Wrap(ErrNodeReferenceDisabled, val)
 	} else {
 		lval := strings.ToLower(val)
 		if len(lval) == 0 || lval == "null" || lval == "none" {
@@ -285,35 +323,35 @@ func (s *sJsonParseSession) parseJSONValue(str []byte, offset int) (JSONObject, 
 			return &JSONInt{data: ival}, i, nil
 		}
 		fval, err := strconv.ParseFloat(val, 64)
-		if err == nil {
+		if err == nil && isFiniteFloat(fval) {
 			return &JSONFloat{data: fval}, i, nil
 		}
+		// nan and +-inf have no json representation, keep them as strings
 		return &JSONString{data: val}, i, nil
 	}
 }
 
 // https://www.ietf.org/rfc/rfc4627.txt
 //
-//         string = quotation-mark *char quotation-mark
+//	string = quotation-mark *char quotation-mark
 //
-//         char = unescaped /
-//                escape (
-//                    %x22 /          ; "    quotation mark  U+0022
-//                    %x5C /          ; \    reverse solidus U+005C
-//                    %x2F /          ; /    solidus         U+002F
-//                    %x62 /          ; b    backspace       U+0008
-//                    %x66 /          ; f    form feed       U+000C
-//                    %x6E /          ; n    line feed       U+000A
-//                    %x72 /          ; r    carriage return U+000D
-//                    %x74 /          ; t    tab             U+0009
-//                    %x75 4HEXDIG )  ; uXXXX                U+XXXX
+//	char = unescaped /
+//	       escape (
+//	           %x22 /          ; "    quotation mark  U+0022
+//	           %x5C /          ; \    reverse solidus U+005C
+//	           %x2F /          ; /    solidus         U+002F
+//	           %x62 /          ; b    backspace       U+0008
+//	           %x66 /          ; f    form feed       U+000C
+//	           %x6E /          ; n    line feed       U+000A
+//	           %x72 /          ; r    carriage return U+000D
+//	           %x74 /          ; t    tab             U+0009
+//	           %x75 4HEXDIG )  ; uXXXX                U+XXXX
 //
-//         escape = %x5C              ; \
+//	escape = %x5C              ; \
 //
-//         quotation-mark = %x22      ; "
+//	quotation-mark = %x22      ; "
 //
-//         unescaped = %x20-21 / %x23-5B / %x5D-10FFFF
-//
+//	unescaped = %x20-21 / %x23-5B / %x5D-10FFFF
 func escapeJsonChar(sb *strings.Builder, ch byte) {
 	switch ch {
 	case '"':
@@ -331,6 +369,12 @@ func escapeJsonChar(sb *strings.Builder, ch byte) {
 	case '\t':
 		sb.Write([]byte{'\\', 't'})
 	default:
+		// RFC 8259: U+0000–U+001F must be escaped as \uXXXX.
+		if ch < 0x20 {
+			const hexdigits = "0123456789abcdef"
+			sb.Write([]byte{'\\', 'u', '0', '0', hexdigits[ch>>4], hexdigits[ch&0xf]})
+			return
+		}
 		sb.WriteByte(ch)
 		/*if ((ch >= 0x20 && ch <= 0x21) || (ch >= 0x23 || ch <= 0x5B) || (ch >= 0x5D && ch <= 0x10FFFF)) && ch != 0x81 && ch != 0x8d && ch != 0x8f && ch != 0x90 && ch != 0x9d {
 			sb.WriteRune(ch)
@@ -349,12 +393,33 @@ func escapeJsonChar(sb *strings.Builder, ch byte) {
 	}
 }
 
+// escapeJsonByte writes a byte that is not part of a valid utf-8 sequence
+// as a \xXX escape, which parseQuoteString reads back unchanged
+func escapeJsonByte(sb *strings.Builder, ch byte) {
+	const hexdigits = "0123456789abcdef"
+	sb.Write([]byte{'\\', 'x', hexdigits[ch>>4], hexdigits[ch&0xf]})
+}
+
 func quoteString(str string) string {
 	sb := &strings.Builder{}
 	sb.Grow(len(str) + 2)
 	sb.WriteByte('"')
-	for i := 0; i < len(str); i += 1 {
-		escapeJsonChar(sb, str[i])
+	for i := 0; i < len(str); {
+		ch := str[i]
+		if ch < utf8.RuneSelf {
+			escapeJsonChar(sb, ch)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(str[i:])
+		if r == utf8.RuneError && size <= 1 {
+			// keep a non utf-8 byte reversible instead of writing it out
+			escapeJsonByte(sb, ch)
+			i++
+			continue
+		}
+		sb.WriteString(str[i : i+size])
+		i += size
 	}
 	sb.WriteByte('"')
 	return sb.String()
@@ -423,6 +488,11 @@ func (s *sJsonParseSession) parseDict(str []byte, offset int) (sortedmap.SSorted
 	var e error = nil
 	var key string
 	var stop = false
+	// collect the keys first so that the sorted map can be built in key
+	// order: adding to a sorted map out of order shifts the whole tail
+	// on every insert
+	values := make(map[string]JSONObject)
+	keys := make([]string, 0)
 	for !stop && i < len(str) {
 		i = skipEmpty(str, i)
 		if i >= len(str) {
@@ -466,11 +536,18 @@ func (s *sJsonParseSession) parseDict(str []byte, offset int) (sortedmap.SSorted
 		if e != nil {
 			return smap, i, nodeId, errors.Wrap(e, "parse misc")
 		}
-		if key == jsonPointerKey {
+		if s.allowNodeReference && key == jsonPointerKey {
 			// node id
-			nodeId = int(val.(*JSONInt).data)
+			jval, ok := val.(*JSONInt)
+			if !ok {
+				return smap, i, nodeId, errors.Wrap(ErrInvalidNodeId, jsonPointerKey)
+			}
+			nodeId = int(jval.data)
 		} else {
-			smap = sortedmap.Add(smap, key, val)
+			if _, ok := values[key]; !ok {
+				keys = append(keys, key)
+			}
+			values[key] = val
 		}
 		i = skipEmpty(str, i)
 		if i >= len(str) {
@@ -485,6 +562,10 @@ func (s *sJsonParseSession) parseDict(str []byte, offset int) (sortedmap.SSorted
 		default:
 			return smap, i, nodeId, NewJSONError(str, i, "Unexpected char")
 		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		smap = sortedmap.Add(smap, key, values[key])
 	}
 	return smap, i, nodeId, nil
 }
@@ -544,12 +625,20 @@ func (s *sJsonParseSession) parseArray(str []byte, offset int) ([]JSONObject, in
 }
 
 func (this *JSONDict) parse(s *sJsonParseSession, str []byte, offset int) (int, error) {
+	e := s.enter()
+	if e != nil {
+		return offset, errors.Wrap(e, "enter")
+	}
+	defer s.leave()
 	smap, i, nodeId, e := s.parseDict(str, offset)
 	if e == nil {
 		this.nodeId = nodeId
 		this.data = smap
 		if this.nodeId > 0 {
-			s.saveNode(nodeId, this)
+			e = s.saveNode(nodeId, this)
+			if e != nil {
+				return i, errors.Wrap(e, "saveNode")
+			}
 		}
 		return i, nil
 	}
@@ -583,17 +672,21 @@ func (this *JSONDict) prettyString(level int) string {
 		buffer.WriteByte('\n')
 		buffer.WriteString(tab)
 		buffer.WriteString("  ")
-		buffer.WriteByte('"')
-		buffer.WriteString(k)
-		buffer.WriteString("\":")
-		_, okdict := v.(*JSONDict)
-		_, okarray := v.(*JSONArray)
-		if okdict || okarray {
-			buffer.WriteByte('\n')
-			buffer.WriteString(v.prettyString(level + 2))
-		} else {
+		buffer.WriteString(quoteString(k))
+		buffer.WriteByte(':')
+		if gotypes.IsNil(v) {
 			buffer.WriteByte(' ')
-			buffer.WriteString(v.String())
+			buffer.WriteString("null")
+		} else {
+			_, okdict := v.(*JSONDict)
+			_, okarray := v.(*JSONArray)
+			if okdict || okarray {
+				buffer.WriteByte('\n')
+				buffer.WriteString(v.prettyString(level + 2))
+			} else {
+				buffer.WriteByte(' ')
+				buffer.WriteString(v.String())
+			}
 		}
 		idx++
 	}
@@ -606,6 +699,11 @@ func (this *JSONDict) prettyString(level int) string {
 }
 
 func (this *JSONArray) parse(s *sJsonParseSession, str []byte, offset int) (int, error) {
+	e := s.enter()
+	if e != nil {
+		return offset, errors.Wrap(e, "enter")
+	}
+	defer s.leave()
 	val, i, e := s.parseArray(str, offset)
 	if e == nil {
 		this.data = val
@@ -631,7 +729,12 @@ func (this *JSONArray) prettyString(level int) string {
 			buffer.WriteString(",")
 		}
 		buffer.WriteByte('\n')
-		buffer.WriteString(v.prettyString(level + 1))
+		if gotypes.IsNil(v) {
+			buffer.WriteString(tab)
+			buffer.WriteString("  null")
+		} else {
+			buffer.WriteString(v.prettyString(level + 1))
+		}
 	}
 	if len(this.data) > 0 {
 		buffer.WriteByte('\n')
@@ -646,8 +749,47 @@ func ParseString(str string) (JSONObject, error) {
 }
 
 func Parse(str []byte) (JSONObject, error) {
-	s := newJsonParseSession()
-	var i = 0
+	json, offset, err := ParseStream(str, 0)
+	if err != nil {
+		return nil, err
+	}
+	if i := skipEmpty(str, offset); i < len(str) {
+		return nil, NewJSONError(str, i, "Unexpected content after the value")
+	}
+	return json, nil
+}
+
+// ParseStream parses one value starting at offset, it returns the value and
+// the offset just after it, so that a stream of concatenated values can be
+// walked.  Node references are not resolved, see ParseTrusted.
+func ParseStream(str []byte, offset int) (JSONObject, int, error) {
+	return parseStream(str, offset, false)
+}
+
+// ParseTrusted parses a document from a trusted source, resolving the node
+// references that Marshal writes for a cyclic object: the ___jnid_ key inside
+// an object and a bare <N> value referring to it.
+//
+// A document from an untrusted source must be parsed with Parse instead.  A
+// resolved reference makes two fields of the target struct point at the same
+// object, which is what the round trip of a cyclic object needs, but it also
+// lets a forged document do the same.
+//
+// Note that Marshal needs this syntax to terminate on a cyclic object, so it
+// keeps writing it either way.
+func ParseTrusted(str []byte) (JSONObject, error) {
+	json, _, err := parseStream(str, 0, true)
+	return json, err
+}
+
+// ParseTrustedString is ParseTrusted for a string
+func ParseTrustedString(str string) (JSONObject, error) {
+	return ParseTrusted([]byte(str))
+}
+
+func parseStream(str []byte, offset int, allowNodeReference bool) (JSONObject, int, error) {
+	s := newJsonParseSession(allowNodeReference)
+	i := offset
 	i = skipEmpty(str, i)
 	var val JSONObject = nil
 	var e error = nil
@@ -664,11 +806,40 @@ func Parse(str []byte) (JSONObject, error) {
 			// return nil, NewJSONError(str, i, "Invalid JSON string")
 		}
 		if e != nil {
-			return nil, errors.Wrap(e, "parse misc")
+			return nil, i, errors.Wrap(e, "parse misc")
 		} else {
-			return val, nil
+			return val, i, nil
 		}
 	} else {
-		return nil, NewJSONError(str, i, "Empty string")
+		return nil, i, NewJSONError(str, i, "Empty string")
 	}
+}
+
+func ParseJsonStreams(stream []byte) ([]JSONObject, error) {
+	ret := make([]JSONObject, 0)
+	errs := make([]error, 0)
+	offset := 0
+	for offset < len(stream) {
+		for offset < len(stream) && stream[offset] != '[' && stream[offset] != '{' {
+			offset++
+		}
+		if offset >= len(stream) {
+			break
+		}
+		json, noffset, err := ParseStream(stream, offset)
+		if err != nil {
+			errs = append(errs, errors.Wrapf(err, "jsonutils.ParseStream fail at %d", offset))
+			offset++
+		} else {
+			ret = append(ret, json)
+			offset = noffset
+		}
+	}
+	if len(errs) > 0 && len(ret) == 0 {
+		return nil, errors.NewAggregate(errs)
+	}
+	if len(errs) > 0 {
+		log.Warningf("jsonutils.ParseJsonStreams: %d errors, %s", len(errs), errors.NewAggregate(errs))
+	}
+	return ret, nil
 }

@@ -69,6 +69,7 @@ type IModelManager interface {
 	// OrderByExtraFields dynmically called by dispatcher
 	// OrderByExtraFields(ctx context.Context, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (*sqlchemy.SQuery, error)
 
+	NewQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, useRawQuery bool) *sqlchemy.SQuery
 	// fetch hook
 	Query(val ...string) *sqlchemy.SQuery
 	RawQuery(val ...string) *sqlchemy.SQuery
@@ -78,7 +79,6 @@ type IModelManager interface {
 	FilterByName(q *sqlchemy.SQuery, name string) *sqlchemy.SQuery
 
 	FilterByOwnerProvider
-	//FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery
 
 	FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery
 	FilterByHiddenSystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery
@@ -86,10 +86,10 @@ type IModelManager interface {
 
 	// GetOwnerId(userCred mcclient.IIdentityProvider) mcclient.IIdentityProvider
 
-	// RawFetchById(idStr string) (IModel, error)
+	RawFetchById(idStr string) (IModel, error)
 	FetchById(idStr string) (IModel, error)
-	FetchByName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error)
-	FetchByIdOrName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error)
+	FetchByName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error)
+	FetchByIdOrName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error)
 
 	// create hooks
 	// AllowCreateItem(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) bool
@@ -132,6 +132,7 @@ type IModelManager interface {
 
 	// 如果error为非空，说明没有匹配的field，如果为空，说明匹配上了
 	QueryDistinctExtraField(q *sqlchemy.SQuery, field string) (*sqlchemy.SQuery, error)
+	QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error)
 
 	GetPagingConfig() *SPagingConfig
 
@@ -142,6 +143,17 @@ type IModelManager interface {
 	CreateByInsertOrUpdate() bool
 
 	CustomizedTotalCount(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, totalQ *sqlchemy.SQuery) (int, jsonutils.JSONObject, error)
+
+	PrepareQueryContext(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) context.Context
+
+	RegisterExtraHook(eh IModelManagerExtraHook)
+	GetExtraHook() IModelManagerExtraHook
+}
+
+type IModelManagerExtraHook interface {
+	AfterPostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, model IModel, query jsonutils.JSONObject, data jsonutils.JSONObject) error
+	AfterPostUpdate(ctx context.Context, userCred mcclient.TokenCredential, model IModel, query jsonutils.JSONObject, data jsonutils.JSONObject) error
+	AfterPostDelete(ctx context.Context, userCred mcclient.TokenCredential, model IModel, query jsonutils.JSONObject) error
 }
 
 type IModel interface {
@@ -282,6 +294,8 @@ type IStandaloneModel interface {
 	// GetExternalId() string
 
 	SetName(name string)
+	MarkPendingDeleted()
+	CancelPendingDeleted()
 
 	StandaloneModelManager() IStandaloneModelManager
 
@@ -295,9 +309,9 @@ type IStandaloneModel interface {
 
 	SetUserMetadataValues(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error
 	SetUserMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error
-	SetCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error
+	SetCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error
 	SetOrganizationMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error
-	SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential) error
+	SetSysCloudMetadataAll(ctx context.Context, dictstore map[string]string, userCred mcclient.TokenCredential, readOnly bool) error
 
 	RemoveMetadata(ctx context.Context, key string, userCred mcclient.TokenCredential) error
 	RemoveAllMetadata(ctx context.Context, userCred mcclient.TokenCredential) error

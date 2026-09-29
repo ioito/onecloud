@@ -17,38 +17,26 @@ package db
 import (
 	"context"
 
+	"yunion.io/x/jsonutils"
+
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
 
 var (
-	updateNotifyHook updateNotifyHookFunc
-	createNotifyHook createNotifyHookFunc
-	deleteNotifyHook deleteNotifyHookFunc
+	updateNotifyHook        updateNotifyHookFunc
+	statusChangedNotifyHook statusChangedNotifyHookFunc
+	customizeNotifyHook     customizeNotifyHookFunc
 )
 
 type updateNotifyHookFunc func(ctx context.Context, userCred mcclient.TokenCredential, obj IModel)
-type createNotifyHookFunc func(ctx context.Context, userCred mcclient.TokenCredential, obj IModel)
-type deleteNotifyHookFunc func(ctx context.Context, userCred mcclient.TokenCredential, obj IModel)
+type statusChangedNotifyHookFunc func(ctx context.Context, userCred mcclient.TokenCredential, oldStatus, status string, obj IModel)
+type customizeNotifyHookFunc func(ctx context.Context, userCred mcclient.TokenCredential, action string, obj IModel, moreDetails jsonutils.JSONObject)
 
 func SetUpdateNotifyHook(f updateNotifyHookFunc) {
 	if updateNotifyHook != nil {
 		panic("updateNotifyHook already set")
 	}
 	updateNotifyHook = f
-}
-
-func SetCreateNotifyHook(f createNotifyHookFunc) {
-	if createNotifyHook != nil {
-		panic("createNotifyHook already set")
-	}
-	createNotifyHook = f
-}
-
-func SetDeleteNotifyHook(f deleteNotifyHookFunc) {
-	if deleteNotifyHook != nil {
-		panic("deleteNotifyHook already set")
-	}
-	deleteNotifyHook = f
 }
 
 func CallUpdateNotifyHook(ctx context.Context, userCred mcclient.TokenCredential, obj IModel) {
@@ -58,16 +46,30 @@ func CallUpdateNotifyHook(ctx context.Context, userCred mcclient.TokenCredential
 	updateNotifyHook(ctx, userCred, obj)
 }
 
-func CallCreateNotifyHook(ctx context.Context, userCred mcclient.TokenCredential, obj IModel) {
-	if createNotifyHook == nil {
-		return
+func SetCustomizeNotifyHook(f customizeNotifyHookFunc) {
+	if customizeNotifyHook != nil {
+		panic("updateNotifyHook already set")
 	}
-	createNotifyHook(ctx, userCred, obj)
+	customizeNotifyHook = f
 }
 
-func CallDeleteNotifyHook(ctx context.Context, userCred mcclient.TokenCredential, obj IModel) {
-	if deleteNotifyHook == nil {
+func CallCustomizeNotifyHook(ctx context.Context, userCred mcclient.TokenCredential, action string, obj IModel, customizeDetails jsonutils.JSONObject) {
+	if customizeNotifyHook == nil {
 		return
 	}
-	deleteNotifyHook(ctx, userCred, obj)
+	customizeNotifyHook(ctx, userCred, action, obj, customizeDetails)
+}
+
+func SetStatusChangedNotifyHook(f statusChangedNotifyHookFunc) {
+	if statusChangedNotifyHook != nil {
+		panic("updateNotifyHook already set")
+	}
+	statusChangedNotifyHook = f
+}
+
+func CallStatusChanegdNotifyHook(ctx context.Context, userCred mcclient.TokenCredential, oldStatis, newStatus string, obj IModel) {
+	if statusChangedNotifyHook == nil {
+		return
+	}
+	statusChangedNotifyHook(ctx, userCred, oldStatis, newStatus, obj)
 }

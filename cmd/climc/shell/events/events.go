@@ -25,15 +25,15 @@ import (
 )
 
 type BaseEventListOptions struct {
-	Scope      string   `help:"scope" choices:"project|domain|system"`
+	Scope      string   `help:"RBAC scope" choices:"project|domain|system"`
 	Since      string   `help:"Show logs since specific date" metavar:"DATETIME"`
 	Until      string   `help:"Show logs until specific date" metavar:"DATETIME"`
 	Limit      int64    `help:"Limit number of logs" default:"20"`
-	Offset     int64    `help:"Offset"`
+	Offset     int64    `help:"Offset for pagination"`
 	Ascending  bool     `help:"Ascending order"`
 	Descending bool     `help:"Descending order"`
 	OrderBy    string   `help:"order by specific field"`
-	Action     []string `help:"Log action"`
+	Action     []string `help:"Filter by log action"`
 
 	User    string `help:"filter by operator user"`
 	Project string `help:"filter by operator user's project"`
@@ -81,6 +81,10 @@ func doNotifyEventList(s *mcclient.ClientSession, args *EventListOptions) error 
 
 func doK8sEventList(s *mcclient.ClientSession, args *EventListOptions) error {
 	return DoEventList(*k8s.Logs.ResourceManager, s, args)
+}
+
+func doHostDmesgList(s *mcclient.ClientSession, args *EventListOptions) error {
+	return DoEventList(modules.DmesgLogs, s, args)
 }
 
 func DoEventList(man modulebase.ResourceManager, s *mcclient.ClientSession, args *EventListOptions) error {
@@ -157,14 +161,30 @@ func init() {
 	R(&EventListOptions{}, "monitor-event-show", "Show operation event logs", doMonitorEventList)
 	R(&EventListOptions{}, "notify-event-show", "Show operation event logs", doNotifyEventList)
 	R(&EventListOptions{}, "kube-event-show", "Show operation event logs", doK8sEventList)
+	R(&EventListOptions{}, "host-dmesg-show", "Show host dmesgs", doHostDmesgList)
 
 	R(&TypeEventListOptions{}, "server-event", "Show operation event logs of server", func(s *mcclient.ClientSession, args *TypeEventListOptions) error {
 		nargs := EventListOptions{BaseEventListOptions: args.BaseEventListOptions, Id: args.ID, Type: []string{"server"}}
 		return doComputeEventList(s, &nargs)
 	})
 
+	R(&TypeEventListOptions{}, "container-event", "Show operation event logs of container", func(s *mcclient.ClientSession, args *TypeEventListOptions) error {
+		nargs := EventListOptions{BaseEventListOptions: args.BaseEventListOptions, Id: args.ID, Type: []string{"container"}}
+		return doComputeEventList(s, &nargs)
+	})
+
 	R(&TypeEventListOptions{}, "disk-event", "Show operation event logs of disk", func(s *mcclient.ClientSession, args *TypeEventListOptions) error {
 		nargs := EventListOptions{BaseEventListOptions: args.BaseEventListOptions, Id: args.ID, Type: []string{"disk"}}
+		return doComputeEventList(s, &nargs)
+	})
+
+	R(&TypeEventListOptions{}, "dbinstance-event", "Show operation event logs of disk", func(s *mcclient.ClientSession, args *TypeEventListOptions) error {
+		nargs := EventListOptions{BaseEventListOptions: args.BaseEventListOptions, Id: args.ID, Type: []string{"dbinstance"}}
+		return doComputeEventList(s, &nargs)
+	})
+
+	R(&TypeEventListOptions{}, "lb-event", "Show operation event logs of disk", func(s *mcclient.ClientSession, args *TypeEventListOptions) error {
+		nargs := EventListOptions{BaseEventListOptions: args.BaseEventListOptions, Id: args.ID, Type: []string{"loadbalancer"}}
 		return doComputeEventList(s, &nargs)
 	})
 

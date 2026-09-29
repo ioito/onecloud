@@ -15,18 +15,23 @@
 package fileutils2
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/regutils"
 
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
@@ -143,12 +148,16 @@ func IsBlockDeviceUsed(dev string) bool {
 
 func GetAllBlkdevsIoSchedulers() ([]string, error) {
 	if _, err := os.Stat("/sys/block"); !os.IsNotExist(err) {
-		blockDevs, err := ioutil.ReadDir("/sys/block")
+		blockDevs, err := os.ReadDir("/sys/block")
 		if err != nil {
 			log.Errorf("ReadDir /sys/block error: %s", err)
 			return nil, errors.Wrap(err, "ioutil.ReadDir(/sys/block)")
 		}
 		for _, b := range blockDevs {
+			// check is a block device
+			if !Exists(path.Join("/sys/block", b.Name(), "device")) {
+				continue
+			}
 			if IsBlockDevMounted(b.Name()) {
 				conf, err := GetBlkdevConfig(b.Name(), "queue/scheduler")
 				if err != nil {
@@ -183,10 +192,63 @@ func ChangeAllBlkdevsParams(params map[string]string) {
 			return
 		}
 		for _, b := range blockDevs {
-			if IsBlockDevMounted(b.Name()) {
-				for k, v := range params {
-					ChangeBlkdevParameter(b.Name(), k, v)
-				}
+			if !Exists(path.Join("/sys/block", b.Name(), "device")) {
+				continue
+			}
+			for k, v := range params {
+				ChangeBlkdevParameter(b.Name(), k, v)
+			}
+		}
+	}
+}
+
+func BlockDevIsSsd(dev string) bool {
+	rotational := path.Join("/sys/block", dev, "queue", "rotational")
+	res, err := FileGetContents(rotational)
+	if err != nil {
+		log.Errorf("FileGetContents fail %s %s", rotational, err)
+		return false
+	}
+	return strings.TrimSpace(res) == "0"
+}
+
+func ChangeSsdBlkdevsParams(params map[string]string) {
+	if _, err := os.Stat("/sys/block"); !os.IsNotExist(err) {
+		blockDevs, err := os.ReadDir("/sys/block")
+		if err != nil {
+			log.Errorf("ReadDir /sys/block error: %s", err)
+			return
+		}
+		for _, b := range blockDevs {
+			if !Exists(path.Join("/sys/block", b.Name(), "device")) {
+				continue
+			}
+			if !BlockDevIsSsd(b.Name()) {
+				continue
+			}
+			for k, v := range params {
+				ChangeBlkdevParameter(b.Name(), k, v)
+			}
+		}
+	}
+}
+
+func ChangeHddBlkdevsParams(params map[string]string) {
+	if _, err := os.Stat("/sys/block"); !os.IsNotExist(err) {
+		blockDevs, err := os.ReadDir("/sys/block")
+		if err != nil {
+			log.Errorf("ReadDir /sys/block error: %s", err)
+			return
+		}
+		for _, b := range blockDevs {
+			if !Exists(path.Join("/sys/block", b.Name(), "device")) {
+				continue
+			}
+			if BlockDevIsSsd(b.Name()) {
+				continue
+			}
+			for k, v := range params {
+				ChangeBlkdevParameter(b.Name(), k, v)
 			}
 		}
 	}
@@ -220,6 +282,18 @@ func FileGetContents(file string) (string, error) {
 	return string(content), nil
 }
 
+func FileGetIntContent(file string) (int, error) {
+	content, err := FileGetContents(file)
+	if err != nil {
+		return -1, errors.Wrap(err, "FileGetContents")
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(content))
+	if err != nil {
+		return -1, errors.Wrapf(err, "convert %s to int", content)
+	}
+	return val, nil
+}
+
 func GetFsFormat(diskPath string) string {
 	ret, err := procutils.NewCommand("blkid", "-o", "value", "-s", "TYPE", diskPath).Output()
 	if err != nil {
@@ -241,10 +315,15 @@ func CleanFailedMountpoints() {
 	f, err := os.Open(mtfile)
 	if err != nil {
 		log.Errorf("CleanFailedMountpoints error: %s", err)
+		return
 	}
+	defer f.Close()
 	reader := bufio.NewReader(f)
-	line, _, err := reader.ReadLine()
-	for err != nil {
+	for {
+		line, _, err := reader.ReadLine()
+		if err != nil {
+			break
+		}
 		m := strings.Split(string(line), " ")
 		if len(m) > 1 {
 			mp := m[1]
@@ -285,11 +364,30 @@ func (hf HostsFile) String() string {
 	return ret
 }
 
+func FormatHostsFile(content string, ips []string, hostname, hostdomain string) string {
+	hf := make(HostsFile, 0)
+	hf.Parse(content)
+	hf.Add("127.0.0.1", "localhost")
+	isV6 := false
+	for _, ip := range ips {
+		if regutils.MatchIP6Addr(ip) {
+			isV6 = true
+		}
+	}
+	if isV6 {
+		hf.Add("::1", "localhost", "ip6-localhost", "ip6-loopback")
+	}
+	for _, ip := range ips {
+		hf.Add(ip, hostdomain, hostname)
+	}
+	return hf.String()
+}
+
 func FsFormatToDiskType(fsFormat string) string {
 	switch {
 	case fsFormat == "swap":
 		return "linux-swap"
-	case strings.HasPrefix(fsFormat, "ext") || fsFormat == "xfs":
+	case strings.HasPrefix(fsFormat, "ext") || fsFormat == "xfs" || fsFormat == "f2fs":
 		return "ext2"
 	case strings.HasPrefix(fsFormat, "fat"):
 		return "fat32"
@@ -388,4 +486,37 @@ func IsIsoFile(sPath string) bool {
 		return false
 	}
 	return bytes.Equal(buffer, []byte("CD001"))
+}
+
+func IsTarGzipFile(fPath string) bool {
+	f, err := os.Open(fPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	gzf, err := gzip.NewReader(f)
+	if err != nil {
+		return false
+	}
+
+	return IsTarStream(gzf)
+}
+
+func IsTarStream(f io.Reader) bool {
+	tarReader := tar.NewReader(f)
+	_, err := tarReader.Next()
+	if err != nil {
+		return false
+	}
+	return true
+}
+
+func IsTarFile(fPath string) bool {
+	f, err := os.Open(fPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return IsTarStream(f)
 }

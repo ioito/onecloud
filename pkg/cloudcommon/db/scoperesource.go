@@ -36,7 +36,7 @@ type SScopedResourceBaseManager struct {
 
 // +onecloud:model-api-gen
 type SScopedResourceBase struct {
-	SProjectizedResourceBase `"domain_id->default":""`
+	SProjectizedResourceBase `domain_id->default:"" nullable:"true" tenant_id->default:"" nullable:"true"`
 }
 
 type sUniqValues struct {
@@ -110,14 +110,14 @@ func (m *SScopedResourceBase) IsOwner(userCred mcclient.TokenCredential) bool {
 	return userCred.HasSystemAdminPrivilege()
 }
 
-func (m *SScopedResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (m *SScopedResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner == nil {
 		return q
 	}
 	switch scope {
 	case rbacscope.ScopeDomain:
 		q = q.Equals("domain_id", owner.GetProjectDomainId())
-	case rbacscope.ScopeProject:
+	default:
 		q = q.Equals("tenant_id", owner.GetProjectId())
 	}
 	return q

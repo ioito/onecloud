@@ -26,11 +26,6 @@ type ScopedResourceInput struct {
 }
 
 type DomainizedResourceListInput struct {
-	// swagger:ignore
-	// Is an admin call? equivalent to scope=system
-	// Deprecated
-	Admin *bool `json:"admin"`
-
 	ScopedResourceInput
 
 	DomainizedResourceInput
@@ -173,6 +168,8 @@ type ModelBaseListInput struct {
 	ExportKeys string `json:"export_keys" help:"Export field keys"`
 	// 返回结果携带delete_fail_reason和update_fail_reason字段
 	ShowFailReason *bool `json:"show_fail_reason"`
+	// 是否返回状态统计信息，默认为False
+	SummaryStats *bool `json:"summary_stats"`
 }
 
 func (o ModelBaseListInput) GetExportKeys() string {
@@ -386,6 +383,14 @@ type OpsLogListInput struct {
 	Until time.Time `json:"until"`
 }
 
+type HostDmesgLogListInput struct {
+	OpsLogListInput
+
+	LogLevels []string `json:"log_levels"`
+
+	ShowDmesgLog bool `json:"show_dmesg_log"`
+}
+
 type IdNameDetails struct {
 	Id   string `json:"id"`
 	Name string `json:"name"`
@@ -393,4 +398,10 @@ type IdNameDetails struct {
 
 type TotalCountBase struct {
 	Count int `json:"count"`
+}
+
+type LogBaseListInput struct {
+	ModelBaseListInput
+
+	Id []string `json:"id"`
 }

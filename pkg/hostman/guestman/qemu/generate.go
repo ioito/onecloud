@@ -16,7 +16,6 @@ package qemu
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"yunion.io/x/pkg/errors"
@@ -93,10 +92,14 @@ func generateSpiceOptions(port uint, spice *desc.SSpiceDesc) []string {
 	// intel-hda and codec hda-duplex
 	opts = append(opts, generatePCIDeviceOption(spice.IntelHDA.PCIDevice))
 	codec := spice.IntelHDA.Codec
-	opts = append(opts,
-		fmt.Sprintf("-device %s,id=%s,bus=%s.0,cad=%d",
-			codec.Type, codec.Id, spice.IntelHDA.Id, codec.Cad),
-	)
+	codecOpts := fmt.Sprintf("-device %s,id=%s,bus=%s.0,cad=%d", codec.Type, codec.Id, spice.IntelHDA.Id, codec.Cad)
+	if spice.IntelHDA.Audio != nil {
+		opts = append(opts,
+			fmt.Sprintf("-audiodev %s,id=%s", spice.IntelHDA.Audio.Type, spice.IntelHDA.Audio.Id),
+		)
+		codecOpts = fmt.Sprintf("%s,audiodev=%s", codecOpts, spice.IntelHDA.Audio.Id)
+	}
+	opts = append(opts, codecOpts)
 
 	// serial port
 	opts = append(opts, generatePCIDeviceOption(spice.VdagentSerial.PCIDevice))
@@ -136,8 +139,25 @@ func generatePciControllerOptions(controllers []*desc.PCIController) []string {
 	return opts
 }
 
-func generateNumaOption(memId string) string {
-	return fmt.Sprintf("-numa node,memdev=%s", memId)
+func generateNumaOption(memId string, nodeId *uint16, cpus *string) string {
+	cmd := fmt.Sprintf("-numa node,memdev=%s", memId)
+	if nodeId != nil {
+		cmd += fmt.Sprintf(",nodeid=%d", *nodeId)
+	}
+	if cpus != nil {
+		cpuSegs := strings.Split(*cpus, ",")
+		for _, cpuSeg := range cpuSegs {
+			cmd += fmt.Sprintf(",cpus=%s", cpuSeg)
+		}
+	}
+	return cmd
+}
+
+func generateMemObjectWithNumaOptions(mem *desc.SMemDesc) string {
+	cmds := []string{}
+	cmds = append(cmds, generateObjectOption(mem.Object))
+	cmds = append(cmds, generateNumaOption(mem.Id, mem.NodeId, mem.Cpus))
+	return strings.Join(cmds, " ")
 }
 
 func generateMemoryOption(memDesc *desc.SGuestMem) string {
@@ -147,32 +167,55 @@ func generateMemoryOption(memDesc *desc.SGuestMem) string {
 		memDesc.SizeMB, memDesc.Slots, memDesc.MaxMem,
 	))
 	if memDesc.Mem != nil {
-		cmds = append(cmds, generateObjectOption(memDesc.Mem))
-		cmds = append(cmds, generateNumaOption(memDesc.Mem.Id))
+		cmds = append(cmds, generateMemObjectWithNumaOptions(&memDesc.Mem.SMemDesc))
+		for i := range memDesc.Mem.Mems {
+			cmds = append(cmds, generateMemObjectWithNumaOptions(&memDesc.Mem.Mems[i]))
+		}
 	}
 	for i := 0; i < len(memDesc.MemSlots); i++ {
 		memDev := memDesc.MemSlots[i].MemDev
 		memObj := memDesc.MemSlots[i].MemObj
-		cmds = append(cmds, generateObjectOption(memObj))
+		cmds = append(cmds, generateObjectOption(memObj.Object))
 		cmds = append(cmds, fmt.Sprintf("-device %s,id=%s,memdev=%s", memDev.Type, memDev.Id, memObj.Id))
 	}
 	return strings.Join(cmds, " ")
 }
 
-func generateMachineOption(machine string, machineDesc *desc.SGuestMachine) string {
-	cmd := fmt.Sprintf("-machine %s,accel=%s", machine, machineDesc.Accel)
-	if machineDesc.GicVersion != nil {
-		cmd += fmt.Sprintf(",gic-version=%s", *machineDesc.GicVersion)
+func generateMachineOption(drvOpt QemuOptions, desc *desc.SGuestDesc) string {
+	cmd := fmt.Sprintf("-machine %s,accel=%s", desc.Machine, desc.MachineDesc.Accel)
+	if desc.MachineDesc.GicVersion != nil {
+		cmd += fmt.Sprintf(",gic-version=%s", *desc.MachineDesc.GicVersion)
+	}
+	if desc.NoHpet != nil && *desc.NoHpet {
+		machineOpts, noHpetCmd := drvOpt.NoHpet()
+		if machineOpts {
+			cmd += fmt.Sprintf(",%s", noHpetCmd)
+		} else if noHpetCmd != "" {
+			cmd += fmt.Sprintf(" %s", noHpetCmd)
+		}
 	}
 
 	return cmd
 }
 
-func generateSMPOption(cpu *desc.SGuestCpu) string {
-	return fmt.Sprintf(
-		"-smp cpus=%d,sockets=%d,cores=%d,maxcpus=%d",
-		cpu.Cpus, cpu.Sockets, cpu.Cores, cpu.MaxCpus,
-	)
+func generateSMPOption(guestDesc *desc.SGuestDesc, isSupportHotplug bool) string {
+	cpu := guestDesc.CpuDesc
+	startCpus := cpu.Cpus
+	if guestDesc.MemDesc.Mem != nil {
+		if len(guestDesc.MemDesc.Mem.Mems) > 0 && isSupportHotplug {
+			startCpus = 1
+		}
+	}
+	if cpu.MaxCpus%2 > 0 {
+		return fmt.Sprintf(
+			"-smp cpus=%d,maxcpus=%d", startCpus, cpu.MaxCpus,
+		)
+	} else {
+		return fmt.Sprintf(
+			"-smp cpus=%d,sockets=%d,cores=%d,maxcpus=%d",
+			startCpus, cpu.Sockets, cpu.Cores, cpu.MaxCpus,
+		)
+	}
 }
 
 func generateCPUOption(cpu *desc.SGuestCpu) string {
@@ -213,7 +256,28 @@ func generateScsiOptions(scsi *desc.SGuestVirtioScsi) string {
 	return opt
 }
 
-func generateDisksOptions(drvOpt QemuOptions, disks []*desc.SGuestDisk, isEncrypt, isMaster bool) []string {
+func generateInitrdOptions(drvOpt QemuOptions, initrdPath, kernel string) []string {
+	opts := make([]string, 0)
+	opts = append(opts, drvOpt.Initrd(initrdPath))
+	opts = append(opts, drvOpt.Kernel(kernel))
+	opts = append(opts, "-append yn_rescue_mode=true")
+
+	return opts
+}
+
+func generateKickstartBootOptions(drvOpt QemuOptions, kickstartBoot *KickstartBootInfo) []string {
+	opts := make([]string, 0)
+	opts = append(opts, drvOpt.Kernel(kickstartBoot.KernelPath))
+	opts = append(opts, drvOpt.Initrd(kickstartBoot.InitrdPath))
+	if kickstartBoot.KernelArgs != "" {
+		// due to blank space in kickstart args, '' is needed
+		opts = append(opts, fmt.Sprintf("-append '%s'", kickstartBoot.KernelArgs))
+	}
+
+	return opts
+}
+
+func generateDisksOptions(drvOpt QemuOptions, disks []*desc.SGuestDisk, isEncrypt, isMaster bool, osName, machineType string) []string {
 	opts := make([]string, 0)
 	for _, disk := range disks {
 		if disk.Driver == api.DISK_DRIVER_VFIO {
@@ -225,7 +289,7 @@ func generateDisksOptions(drvOpt QemuOptions, disks []*desc.SGuestDisk, isEncryp
 		} else {
 			opts = append(opts, getDiskDriveOption(drvOpt, disk, isEncrypt))
 		}
-		opts = append(opts, getDiskDeviceOption(drvOpt, disk))
+		opts = append(opts, getDiskDeviceOption(drvOpt, disk, osName, machineType))
 	}
 	return opts
 }
@@ -277,30 +341,34 @@ func getDiskDriveOption(drvOpt QemuOptions, disk *desc.SGuestDisk, isEncrypt boo
 	if isEncrypt {
 		opt += ",encrypt.format=luks,encrypt.key-secret=sec0"
 	}
+	if disk.AutoReset {
+		opt += ",snapshot=on"
+	}
 	// #opt += ",media=disk"
 	return drvOpt.Drive(opt)
 }
 
 func isLocalStorage(disk *desc.SGuestDisk) bool {
-	if disk.StorageType == api.STORAGE_LOCAL || len(disk.StorageType) == 0 {
+	if disk.StorageType == api.STORAGE_LOCAL || disk.StorageType == api.STORAGE_LVM || len(disk.StorageType) == 0 {
 		return true
 	} else {
 		return false
 	}
 }
 
-func getDiskDeviceOption(optDrv QemuOptions, disk *desc.SGuestDisk) string {
+func getDiskDeviceOption(optDrv QemuOptions, disk *desc.SGuestDisk, osName, machineType string) string {
 	diskIndex := disk.Index
 	diskDriver := disk.Driver
 	numQueues := disk.NumQueues
 	isSsd := disk.IsSSD
 
-	if numQueues == 0 {
-		numQueues = 4
-	}
-
 	var opt = ""
 	opt += GetDiskDeviceModel(diskDriver)
+	if osName != OS_NAME_VMWARE {
+		serial := strings.ReplaceAll(disk.DiskId, "-", "")
+		opt += fmt.Sprintf(",serial=%s", serial)
+		opt += optDrv.ScsiDeviceId(serial, diskDriver)
+	}
 	opt += fmt.Sprintf(",drive=drive_%d", diskIndex)
 	if diskDriver == DISK_DRIVER_VIRTIO {
 		// virtio-blk
@@ -309,12 +377,19 @@ func getDiskDeviceOption(optDrv QemuOptions, disk *desc.SGuestDisk) string {
 		}
 		// opt += fmt.Sprintf(",num-queues=%d,vectors=%d,iothread=iothread0", numQueues, numQueues+1)
 		opt += ",iothread=iothread0"
+		if numQueues > 0 {
+			opt += fmt.Sprintf(",num-queues=%d,vectors=%d", numQueues, numQueues+1)
+		}
 	} else if utils.IsInStringArray(diskDriver, []string{DISK_DRIVER_SCSI, DISK_DRIVER_PVSCSI}) {
 		opt += ",bus=scsi.0"
 	} else if diskDriver == DISK_DRIVER_IDE {
-		opt += fmt.Sprintf(",bus=ide.%d,unit=%d", diskIndex/2, diskIndex%2)
+		if machineType == api.VM_MACHINE_TYPE_Q35 {
+			opt += fmt.Sprintf(",bus=ide.%d,unit=%d", diskIndex, 0)
+		} else {
+			opt += fmt.Sprintf(",bus=ide.%d,unit=%d", diskIndex/2, diskIndex%2)
+		}
 	} else if diskDriver == DISK_DRIVER_SATA {
-		opt += fmt.Sprintf(",bus=ide.%d", diskIndex)
+		opt += fmt.Sprintf(",bus=ahci0.%d", diskIndex)
 	}
 	opt += fmt.Sprintf(",id=drive_%d", diskIndex)
 	if isSsd {
@@ -328,10 +403,16 @@ func getDiskDeviceOption(optDrv QemuOptions, disk *desc.SGuestDisk) string {
 	return optDrv.Device(opt)
 }
 
-func generateCdromOptions(optDrv QemuOptions, cdroms []*desc.SGuestCdrom) []string {
+func generateCdromOptions(optDrv QemuOptions, cdroms []*desc.SGuestCdrom, disks []*desc.SGuestDisk, machine string) []string {
 	opts := make([]string, 0)
+	ideDisksCnt := 0
+	for _, disk := range disks {
+		if disk.Driver == DISK_DRIVER_IDE {
+			ideDisksCnt += 1
+		}
+	}
 
-	for _, cdrom := range cdroms {
+	for idx, cdrom := range cdroms {
 		//cdromDriveId := cdrom
 		driveOpt := fmt.Sprintf("id=%s", cdrom.Id)
 		driveOpt += desc.OptionsToString(cdrom.DriveOptions)
@@ -342,9 +423,21 @@ func generateCdromOptions(optDrv QemuOptions, cdroms []*desc.SGuestCdrom) []stri
 		}
 
 		if cdrom.Ide != nil {
+			var devOpt string
 			opts = append(opts, optDrv.Drive(driveOpt))
-			devOpt := fmt.Sprintf("%s,drive=%s,bus=ide.1",
-				cdrom.Ide.DevType, cdrom.Id)
+			if machine == api.VM_MACHINE_TYPE_Q35 {
+				busNum := idx + ideDisksCnt
+				if busNum == 0 {
+					busNum = 1
+				}
+				devOpt = fmt.Sprintf("%s,drive=%s,bus=ide.%d",
+					cdrom.Ide.DevType, cdrom.Id, busNum)
+			} else {
+				devOpt = fmt.Sprintf("%s,drive=%s,bus=ide.1",
+					cdrom.Ide.DevType, cdrom.Id)
+
+			}
+
 			if len(cdromPath) > 0 {
 				if cdrom.BootIndex != nil && *cdrom.BootIndex >= 0 {
 					devOpt += fmt.Sprintf(",bootindex=%d", *cdrom.BootIndex)
@@ -403,7 +496,7 @@ func GetDiskDeviceModel(driver string) string {
 	} else if driver == DISK_DRIVER_IDE {
 		return "ide-hd"
 	} else if driver == DISK_DRIVER_SATA {
-		return "ide-drive"
+		return "ide-hd"
 	} else {
 		return "None"
 	}
@@ -420,8 +513,8 @@ func generateNicOptions(drvOpt QemuOptions, input *GenerateStartOptionsInput) ([
 		}
 		var nicTrafficExceed = false
 		if input.NicTraffics != nil {
-			nicTraffic, ok := input.NicTraffics[strconv.Itoa(int(nics[idx].Index))]
-			if ok {
+			nicTraffic, ok := input.NicTraffics[nics[idx].Mac]
+			if ok && nicTraffic != nil {
 				if nics[idx].TxTrafficLimit > 0 && nicTraffic.TxTraffic > nics[idx].TxTrafficLimit {
 					nicTrafficExceed = true
 				}
@@ -482,7 +575,7 @@ func getNicDeviceOption(
 
 	if nic.Driver == "virtio" {
 		if nic.NumQueues > 1 {
-			cmd += fmt.Sprintf(",mq=on")
+			cmd += ",mq=on"
 		}
 		if nic.Vectors != nil {
 			cmd += fmt.Sprintf(",vectors=%d", *nic.Vectors)
@@ -506,7 +599,7 @@ func GetNicDeviceModel(name string) string {
 }
 
 func generateUsbDeviceOption(usbControllerId string, usb *desc.UsbDevice) string {
-	cmd := fmt.Sprintf("-device %s,bus=%s.0", usb.DevType, usbControllerId)
+	cmd := fmt.Sprintf("-device %s,bus=%s.0,id=%s", usb.DevType, usbControllerId, usb.Id)
 	cmd += desc.OptionsToString(usb.Options)
 	return cmd
 }
@@ -577,20 +670,48 @@ func generateISASerialOptions(isaSerial *desc.SGuestIsaSerial) []string {
 	return opts
 }
 
+func generateKickstartSerialOptions(kickstartBoot *KickstartBootInfo) []string {
+	if kickstartBoot == nil || kickstartBoot.SerialFilePath == "" {
+		return nil
+	}
+
+	opts := make([]string, 0)
+	chardevId := "kickstart_serial"
+
+	// Create chardev with file backend
+	chardevOpt := fmt.Sprintf("-chardev file,path=%s,id=%s", kickstartBoot.SerialFilePath, chardevId)
+	opts = append(opts, chardevOpt)
+
+	// Create ISA serial device
+	serialOpt := fmt.Sprintf("-device isa-serial,chardev=%s,id=kickstart_serial_device", chardevId)
+	opts = append(opts, serialOpt)
+
+	return opts
+}
+
 func generatePvpanicDeviceOption(pvpanic *desc.SGuestPvpanic) string {
 	return fmt.Sprintf("-device pvpanic,id=%s,ioport=0x%x", pvpanic.Id, pvpanic.Ioport)
+}
+
+func generateTpmDevOptions(tpm *desc.SGuestTpm, arch Arch) []string {
+	opts := make([]string, 0)
+	opts = append(opts, chardevOption(tpm.TpmSock))
+	opts = append(opts, fmt.Sprintf("-tpmdev emulator,id=%s,chardev=%s", tpm.Id, tpm.TpmSock.Id))
+	// tpm-tis is ISA/LPC (x86). ARM/RISC-V virt uses the sysbus tpm-tis-device.
+	devModel := "tpm-tis"
+	if !arch.IsX86() {
+		devModel = "tpm-tis-device"
+	}
+	opts = append(opts, fmt.Sprintf("-device %s,tpmdev=%s", devModel, tpm.Id))
+	return opts
 }
 
 func getMigrateOptions(drvOpt QemuOptions, input *GenerateStartOptionsInput) []string {
 	opts := make([]string, 0)
 	if input.NeedMigrate {
-		if input.LiveMigrateUseTLS {
-			opts = append(opts, fmt.Sprintf("-incoming defer"))
-		} else {
-			opts = append(opts, fmt.Sprintf("-incoming tcp:0:%d", input.LiveMigratePort))
-		}
+		opts = append(opts, "-incoming defer")
 	} else if input.GuestDesc.IsSlave {
-		opts = append(opts, fmt.Sprintf("-incoming tcp:0:%d", input.LiveMigratePort))
+		opts = append(opts, fmt.Sprintf("-incoming tcp:[::]:%d", input.LiveMigratePort))
 	}
 	return opts
 }
@@ -601,16 +722,18 @@ type GenerateStartOptionsInput struct {
 
 	GuestDesc    *desc.SGuestDesc
 	IsKVMSupport bool
-	NicTraffics  map[string]api.SNicTrafficRecord
+	NicTraffics  map[string]*api.SNicTrafficRecord
 
 	EnableUUID       bool
 	OsName           string
 	HugepagesEnabled bool
 	EnableMemfd      bool
+	EnableTpm        bool
 
 	OVNIntegrationBridge string
 	Devices              []string
 	OVMFPath             string
+	OVMFVarsPath         string
 	VNCPort              uint
 	VNCPassword          bool
 	EnableLog            bool
@@ -627,8 +750,23 @@ type GenerateStartOptionsInput struct {
 	LiveMigratePort      uint
 	LiveMigrateUseTLS    bool
 	EnablePvpanic        bool
+	IsSupportCpuHotplug  bool
 
 	EncryptKeyPath string
+
+	RescueInitrdPath string // rescue initramfs path
+	RescueKernelPath string // rescue kernel path
+
+	KickstartBoot *KickstartBootInfo
+}
+type KickstartBootInfo struct {
+	Config         *api.KickstartConfig
+	MountPath      string
+	KernelPath     string
+	InitrdPath     string
+	KernelArgs     string
+	SerialFilePath string
+	ConfigIsoPath  string
 }
 
 func (input *GenerateStartOptionsInput) HasBootIndex() bool {
@@ -670,9 +808,6 @@ func GenerateStartOptions(
 		opts = append(opts, getMonitorOptions(drvOpt, input.QMPMonitor)...)
 	}
 
-	if input.GuestDesc.NoHpet != nil && *input.GuestDesc.NoHpet {
-		opts = append(opts, drvOpt.NoHpet())
-	}
 	opts = append(opts,
 		drvOpt.RTC(),
 		// drvOpt.Daemonize(),
@@ -680,9 +815,9 @@ func GenerateStartOptions(
 		drvOpt.Nodefconfig(),
 		// drvOpt.NoKVMPitReinjection(),
 		drvOpt.Global(),
-		generateMachineOption(input.GuestDesc.Machine, input.GuestDesc.MachineDesc),
+		generateMachineOption(drvOpt, input.GuestDesc),
 		drvOpt.KeyboardLayoutLanguage("en-us"),
-		generateSMPOption(input.GuestDesc.CpuDesc),
+		generateSMPOption(input.GuestDesc, input.IsSupportCpuHotplug),
 		drvOpt.Name(input.GuestDesc.Name),
 		drvOpt.UUID(input.EnableUUID, input.GuestDesc.Uuid),
 		generateMemoryOption(input.GuestDesc.MemDesc),
@@ -709,7 +844,7 @@ func GenerateStartOptions(
 		if input.OVMFPath == "" {
 			return "", errors.Errorf("input OVMF path is empty")
 		}
-		fmOpt, err := drvOpt.BIOS(input.OVMFPath, input.HomeDir)
+		fmOpt, err := drvOpt.BIOS(input.OVMFPath, input.OVMFVarsPath, input.HomeDir)
 		if err != nil {
 			return "", errors.Wrap(err, "bios option")
 		}
@@ -751,12 +886,30 @@ func GenerateStartOptions(
 	} else if input.GuestDesc.PvScsi != nil {
 		opts = append(opts, generatePCIDeviceOption(input.GuestDesc.PvScsi.PCIDevice))
 	}
+	if input.GuestDesc.SataController != nil {
+		opts = append(opts, generatePCIDeviceOption(input.GuestDesc.SataController.PCIDevice))
+	}
+
+	// generate initrd and kernel options
+	if input.GuestDesc.LightMode {
+		opts = append(opts, generateInitrdOptions(
+			drvOpt,
+			input.RescueInitrdPath,
+			input.RescueKernelPath,
+		)...)
+	} else if input.KickstartBoot != nil {
+		opts = append(opts, generateKickstartBootOptions(
+			drvOpt,
+			input.KickstartBoot,
+		)...)
+	}
+
 	// generate disk options
 	opts = append(opts, generateDisksOptions(
-		drvOpt, input.GuestDesc.Disks, isEncrypt, input.GuestDesc.IsMaster)...)
+		drvOpt, input.GuestDesc.Disks, isEncrypt, input.GuestDesc.IsMaster, input.OsName, input.GuestDesc.Machine)...)
 
 	// cdrom
-	opts = append(opts, generateCdromOptions(drvOpt, input.GuestDesc.Cdroms)...)
+	opts = append(opts, generateCdromOptions(drvOpt, input.GuestDesc.Cdroms, input.GuestDesc.Disks, input.GuestDesc.Machine)...)
 
 	//floppy
 	opts = append(opts, generateFloppyOptions(drvOpt, input.GuestDesc.Floppys)...)
@@ -768,35 +921,32 @@ func GenerateStartOptions(
 	}
 	opts = append(opts, nicOpts...)
 
-	if input.QemuArch == Arch_aarch64 {
-		if input.GuestDesc.Usb != nil {
-			opts = append(opts, generatePCIDeviceOption(input.GuestDesc.Usb.PCIDevice))
+	if !input.GuestDesc.LightMode {
+		if !input.QemuArch.IsX86() {
+			if input.GuestDesc.Usb != nil {
+				opts = append(opts, generatePCIDeviceOption(input.GuestDesc.Usb.PCIDevice))
+				for _, device := range input.Devices {
+					opts = append(opts, drvOpt.Device(device))
+				}
+			}
+		} else {
+			opts = append(opts, drvOpt.USB())
 			for _, device := range input.Devices {
 				opts = append(opts, drvOpt.Device(device))
 			}
-		}
-	} else {
-		opts = append(opts, drvOpt.USB())
-		for _, device := range input.Devices {
-			opts = append(opts, drvOpt.Device(device))
-		}
-		if input.GuestDesc.Usb != nil {
-			opts = append(opts, generatePCIDeviceOption(input.GuestDesc.Usb.PCIDevice))
+			if input.GuestDesc.Usb != nil {
+				opts = append(opts, generatePCIDeviceOption(input.GuestDesc.Usb.PCIDevice))
+			}
 		}
 	}
 
 	// isolated devices
-	if len(input.GuestDesc.IsolatedDevices) > 0 {
+	if len(input.GuestDesc.IsolatedDevices) > 0 && !input.GuestDesc.LightMode {
 		opts = append(opts, generateIsolatedDeviceOptions(input.GuestDesc)...)
 	}
 
 	// pidfile
 	opts = append(opts, drvOpt.Pidfile(input.PidFilePath))
-
-	// extra options
-	if len(input.ExtraOptions) != 0 {
-		opts = append(opts, input.ExtraOptions...)
-	}
 
 	// qga
 	// opts = append(opts, drvOpt.QGA(input.HomeDir)...)
@@ -814,12 +964,26 @@ func GenerateStartOptions(
 		opts = append(opts, generateISASerialOptions(input.GuestDesc.IsaSerial)...)
 	}
 
+	// kickstart serial device
+	if input.KickstartBoot != nil {
+		opts = append(opts, generateKickstartSerialOptions(input.KickstartBoot)...)
+	}
+
 	// migrate options
 	opts = append(opts, getMigrateOptions(drvOpt, input)...)
 
 	// pvpanic device
 	if input.GuestDesc.Pvpanic != nil {
 		opts = append(opts, generatePvpanicDeviceOption(input.GuestDesc.Pvpanic))
+	}
+
+	if input.GuestDesc.Tpm != nil {
+		opts = append(opts, generateTpmDevOptions(input.GuestDesc.Tpm, input.QemuArch)...)
+	}
+
+	// move extra options to end of cmdline
+	if len(input.ExtraOptions) != 0 {
+		opts = append(opts, input.ExtraOptions...)
 	}
 
 	return strings.Join(opts, " "), nil

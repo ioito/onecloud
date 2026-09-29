@@ -38,6 +38,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=dbinstanceaccount
+// +onecloud:swagger-gen-model-plural=dbinstanceaccounts
 type SDBInstanceAccountManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	SDBInstanceResourceBaseManager
@@ -99,7 +101,7 @@ func (manager *SDBInstanceAccountManager) FetchOwnerId(ctx context.Context, data
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SDBInstanceAccountManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SDBInstanceAccountManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		sq := DBInstanceManager.Query("id")
 		switch scope {
@@ -121,7 +123,7 @@ func (self *SDBInstanceAccount) ValidateUpdateData(ctx context.Context, userCred
 		return input, errors.Wrapf(err, "SStatusStandaloneResourceBase.ValidateUpdateData")
 	}
 	if len(input.Name) > 0 && input.Name != self.Name {
-		return input, httperrors.NewForbiddenError("not allow update rds account name")
+		return input, httperrors.NewForbiddenError("updating RDS account name is not allowed")
 	}
 	return input, nil
 }
@@ -293,7 +295,7 @@ func (manager *SDBInstanceAccountManager) ValidateCreateData(ctx context.Context
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -303,7 +305,7 @@ func (manager *SDBInstanceAccountManager) ValidateCreateData(ctx context.Context
 	instance := _instance.(*SDBInstance)
 	input.DBInstanceId = instance.Id
 	if instance.Status != api.DBINSTANCE_RUNNING {
-		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s require status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
+		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s; required status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
 	}
 	region, err := instance.GetRegion()
 	if err != nil {
@@ -359,7 +361,7 @@ func (self *SDBInstanceAccount) PostCreate(ctx context.Context, userCred mcclien
 }
 
 func (self *SDBInstanceAccount) StartDBInstanceAccountCreateTask(ctx context.Context, userCred mcclient.TokenCredential, data *jsonutils.JSONDict, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_CREATING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountCreateTask", self, userCred, data, parentTaskId, "", nil)
 	if err != nil {
 		return err
@@ -460,7 +462,7 @@ func (self *SDBInstanceAccount) PerformSetPrivileges(ctx context.Context, userCr
 }
 
 func (self *SDBInstanceAccount) StartSetPrivilegesTask(ctx context.Context, userCred mcclient.TokenCredential, data jsonutils.JSONObject) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_SET_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_SET_PRIVILEGE, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountSetPrivilegesTask", self, userCred, data.(*jsonutils.JSONDict), "", "", nil)
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
@@ -471,7 +473,7 @@ func (self *SDBInstanceAccount) StartSetPrivilegesTask(ctx context.Context, user
 }
 
 func (self *SDBInstanceAccount) StartGrantPrivilegeTask(ctx context.Context, userCred mcclient.TokenCredential, database string, privilege string, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_GRANT_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_GRANT_PRIVILEGE, "")
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(database), "database")
 	params.Add(jsonutils.NewString(privilege), "privilege")
@@ -518,7 +520,7 @@ func (self *SDBInstanceAccount) PerformRevokePrivilege(ctx context.Context, user
 }
 
 func (self *SDBInstanceAccount) StartRevokePrivilegeTask(ctx context.Context, userCred mcclient.TokenCredential, database string, privilege string, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_REVOKE_PRIVILEGE, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_REVOKE_PRIVILEGE, "")
 	params := jsonutils.NewDict()
 	params.Add(jsonutils.NewString(database), "database")
 	params.Add(jsonutils.NewString(privilege), "privilege")
@@ -560,7 +562,7 @@ func (self *SDBInstanceAccount) StartDBInstanceAccountResetPasswordTask(ctx cont
 	} else {
 		params.Add(jsonutils.NewString(seclib2.RandomPassword2(20)), "password")
 	}
-	self.SetStatus(userCred, api.DBINSTANCE_USER_RESET_PASSWD, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_RESET_PASSWD, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountResetPasswordTask", self, userCred, params, "", "", nil)
 	if err != nil {
 		return errors.Wrapf(err, "NewTask")
@@ -728,7 +730,7 @@ func (self *SDBInstanceAccount) CustomizeDelete(ctx context.Context, userCred mc
 }
 
 func (self *SDBInstanceAccount) StartDBInstanceAccountDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_USER_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_USER_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceAccountDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err

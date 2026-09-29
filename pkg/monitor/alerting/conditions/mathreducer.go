@@ -21,7 +21,6 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/onecloud/pkg/apis/monitor"
-	"yunion.io/x/onecloud/pkg/monitor/tsdb"
 )
 
 type mathReducer struct {
@@ -36,11 +35,11 @@ func (s *mathReducer) GetParams() []float64 {
 	return s.Params
 }
 
-func (s *mathReducer) GetType() string {
-	return s.Type
+func (s *mathReducer) GetType() monitor.ReducerType {
+	return monitor.ReducerType(s.Type)
 }
 
-func (s *mathReducer) Reduce(series *tsdb.TimeSeries) (*float64, []string) {
+func (s *mathReducer) Reduce(series *monitor.TimeSeries) (*float64, []string) {
 	if len(series.Points) == 0 {
 		return nil, nil
 	}
@@ -149,6 +148,8 @@ func (s *mathReducer) Reduce(series *tsdb.TimeSeries) (*float64, []string) {
 		}
 	case "diff":
 		allNull, value = calculateDiff(series, allNull, value, diff)
+	case "delta":
+		allNull, value = calculateDelta(series, allNull, value)
 	case "percent_diff":
 		allNull, value = calculateDiff(series, allNull, value, percentDiff)
 	case "count_non_null":

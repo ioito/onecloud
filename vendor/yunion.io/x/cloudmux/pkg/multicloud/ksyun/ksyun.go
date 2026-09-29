@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -29,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
@@ -39,8 +42,13 @@ import (
 )
 
 const (
-	CLOUD_PROVIDER_KSYUN_CN = "金山云"
-	KSYUN_DEFAULT_REGION    = "cn-beijing-6"
+	CLOUD_PROVIDER_KSYUN_CN   = "金山云"
+	CLOUD_PROVIDER_KSYUN_EN   = "KSyun"
+	KSYUN_DEFAULT_REGION      = "cn-beijing-6"
+	KSYUN_DEFAULT_API_VERSION = "2016-03-04"
+	KSYUN_RDS_API_VERSION     = "2016-07-01"
+	KSYUN_SKS_API_VERSION     = "2015-11-01"
+	KSYUN_MONITOR_API_VERSION = "2018-11-14"
 )
 
 type KsyunClientConfig struct {
@@ -71,14 +79,14 @@ func NewKsyunClientConfig(accessKeyId, accessKeySecret string) *KsyunClientConfi
 	return cfg
 }
 
-func (self *KsyunClientConfig) Debug(debug bool) *KsyunClientConfig {
-	self.debug = debug
-	return self
+func (cli *KsyunClientConfig) Debug(debug bool) *KsyunClientConfig {
+	cli.debug = debug
+	return cli
 }
 
-func (self *KsyunClientConfig) CloudproviderConfig(cpcfg cloudprovider.ProviderConfig) *KsyunClientConfig {
-	self.cpcfg = cpcfg
-	return self
+func (cli *KsyunClientConfig) CloudproviderConfig(cpcfg cloudprovider.ProviderConfig) *KsyunClientConfig {
+	cli.cpcfg = cpcfg
+	return cli
 }
 
 func NewKsyunClient(cfg *KsyunClientConfig) (*SKsyunClient, error) {
@@ -92,8 +100,8 @@ func NewKsyunClient(cfg *KsyunClientConfig) (*SKsyunClient, error) {
 	return client, err
 }
 
-func (self *SKsyunClient) GetRegions() ([]SRegion, error) {
-	resp, err := self.ec2Request("", "DescribeRegions", nil)
+func (cli *SKsyunClient) GetRegions() ([]SRegion, error) {
+	resp, err := cli.ec2Request("", "DescribeRegions", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -105,32 +113,34 @@ func (self *SKsyunClient) GetRegions() ([]SRegion, error) {
 		return nil, err
 	}
 	for i := range ret.RegionSet {
-		ret.RegionSet[i].client = self
+		ret.RegionSet[i].client = cli
 	}
 	return ret.RegionSet, nil
 }
 
-func (self *SKsyunClient) GetRegion(id string) (*SRegion, error) {
-	for i := range self.regions {
-		if self.regions[i].Region == id {
-			self.regions[i].client = self
-			return &self.regions[i], nil
+func (cli *SKsyunClient) GetRegion(id string) (*SRegion, error) {
+	for i := range cli.regions {
+		if cli.regions[i].GetGlobalId() == id || cli.regions[i].GetId() == id {
+			cli.regions[i].client = cli
+			return &cli.regions[i], nil
 		}
 	}
 	return nil, cloudprovider.ErrNotFound
 }
 
-func (self *SKsyunClient) getUrl(service, regionId string) string {
+func (cli *SKsyunClient) getUrl(service, regionId string) (string, error) {
 	if len(regionId) == 0 {
 		regionId = KSYUN_DEFAULT_REGION
 	}
 	switch service {
-	case "kingpay":
-		return "http://kingpay.api.ksyun.com"
-	case "kec":
-		return fmt.Sprintf("https://kec.%s.api.ksyun.com", regionId)
+	case "kingpay", "iam", "vpc", "ebs", "eip", "sks":
+		return fmt.Sprintf("http://%s.api.ksyun.com", service), nil
+	case "kec", "tag", "krds":
+		return fmt.Sprintf("https://%s.%s.api.ksyun.com", service, regionId), nil
+	case "monitor":
+		return fmt.Sprintf("https://%s.api.ksyun.com", service), nil
 	}
-	return ""
+	return "", errors.Wrapf(cloudprovider.ErrNotSupported, "service %s", service)
 }
 
 func (cli *SKsyunClient) getDefaultClient() *http.Client {
@@ -143,7 +153,7 @@ func (cli *SKsyunClient) getDefaultClient() *http.Client {
 	httputils.SetClientProxyFunc(cli.client, cli.cpcfg.ProxyFunc)
 	ts, _ := cli.client.Transport.(*http.Transport)
 	ts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		params, err := url.ParseQuery(req.URL.RawQuery)
 		if err != nil {
 			return nil, errors.Wrapf(err, "ParseQuery(%s)", req.URL.RawQuery)
@@ -155,6 +165,10 @@ func (cli *SKsyunClient) getDefaultClient() *http.Client {
 				return nil, nil
 			}
 		}
+		// ks3
+		if len(action) == 0 && strings.Contains(req.URL.String(), "ks3-") {
+			return nil, nil
+		}
 		if cli.cpcfg.ReadOnly {
 			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
 		}
@@ -163,9 +177,11 @@ func (cli *SKsyunClient) getDefaultClient() *http.Client {
 	return cli.client
 }
 
+// {"RequestId":"51aee78d-8c35-4778-92fb-a622c40fa5ae","Error":{"Code":"INVALID_ACTION","Message":"Not Found"}}
 type sKsyunError struct {
-	StatusCode int    `json:"StatusCode"`
-	RequestId  string `json:"RequestId"`
+	Params     map[string]interface{} `json:"Params"`
+	StatusCode int                    `json:"StatusCode"`
+	RequestId  string                 `json:"RequestId"`
 	ErrorMsg   struct {
 		Code    string `json:"Code"`
 		Message string `json:"Message"`
@@ -173,19 +189,22 @@ type sKsyunError struct {
 	} `json:"Error"`
 }
 
-func (self *sKsyunError) Error() string {
-	return jsonutils.Marshal(self).String()
+func (cli *sKsyunError) Error() string {
+	return jsonutils.Marshal(cli).String()
 }
 
-func (self *sKsyunError) ParseErrorFromJsonResponse(statusCode int, status string, body jsonutils.JSONObject) error {
+func (cli *sKsyunError) ParseErrorFromJsonResponse(statusCode int, status string, body jsonutils.JSONObject) error {
 	if body != nil {
-		body.Unmarshal(self)
+		body.Unmarshal(cli)
 	}
-	self.StatusCode = statusCode
-	return self
+	if cli.ErrorMsg.Message == "Not Found" {
+		return errors.Wrapf(cloudprovider.ErrNotFound, "%s", jsonutils.Marshal(cli.ErrorMsg).String())
+	}
+	cli.StatusCode = statusCode
+	return cli
 }
 
-func (self *SKsyunClient) sign(req *http.Request) (string, error) {
+func (cli *SKsyunClient) sign(req *http.Request) (string, error) {
 	query, err := url.ParseQuery(req.URL.RawQuery)
 	if err != nil {
 		return "", err
@@ -206,15 +225,53 @@ func (self *SKsyunClient) sign(req *http.Request) (string, error) {
 	}
 	buf.Truncate(buf.Len() - 1)
 
-	hashed := hmac.New(sha256.New, []byte(self.accessKeySecret))
-	hashed.Write([]byte(buf.String()))
+	hashed := hmac.New(sha256.New, []byte(cli.accessKeySecret))
+	hashed.Write(buf.Bytes())
 	return hex.EncodeToString(hashed.Sum(nil)), nil
 }
 
-func (self *SKsyunClient) Do(req *http.Request) (*http.Response, error) {
-	client := self.getDefaultClient()
+func (cli *SKsyunClient) Do(req *http.Request) (*http.Response, error) {
+	client := cli.getDefaultClient()
+	req.Header.Set("Accept", "application/json")
 
-	signature, err := self.sign(req)
+	if req.Method == "POST" || req.Method == "PUT" || req.Method == "DELETE" && req.Body != nil {
+		cred := credentials.NewStaticCredentials(cli.accessKeyId, cli.accessKeySecret, "")
+		sig := v4.NewSigner(cred)
+		var body io.ReadSeeker = nil
+		bodyBytes, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, errors.Wrapf(err, "ReadAll")
+		}
+		body = bytes.NewReader(bodyBytes)
+
+		v4Req, err := http.NewRequestWithContext(cli.ctx, req.Method, req.URL.String(), body)
+		if err != nil {
+			return nil, errors.Wrapf(err, "NewRequestWithContext")
+		}
+		v4Req.Header.Set("Accept", "application/json")
+		v4Req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))
+		v4Req.Header.Set("Content-Type", req.Header.Get("Content-Type"))
+		v4Req.Header.Set("Host", req.URL.Host)
+		v4Req.Header.Set("User-Agent", req.Header.Get("User-Agent"))
+		v4Req.ContentLength = int64(len(bodyBytes))
+
+		service, regionId := "", KSYUN_DEFAULT_REGION
+		urlInfo := strings.Split(req.URL.Host, ".")
+		if len(urlInfo) < 2 {
+			return nil, errors.Wrapf(errors.ErrInvalidStatus, "urlInfo")
+		}
+		service = urlInfo[0]
+		if urlInfo[1] != "api" {
+			regionId = urlInfo[1]
+		}
+		_, err = sig.Sign(v4Req, body, service, regionId, time.Now())
+		if err != nil {
+			return nil, errors.Wrapf(err, "sign")
+		}
+		return client.Do(v4Req)
+	}
+
+	signature, err := cli.sign(req)
 	if err != nil {
 		return nil, errors.Wrapf(err, "sign")
 	}
@@ -226,53 +283,142 @@ func (self *SKsyunClient) Do(req *http.Request) (*http.Response, error) {
 
 	query.Set("Signature", signature)
 	req.URL.RawQuery = query.Encode()
-	req.Header.Set("Accept", "application/json")
+
 	return client.Do(req)
 }
 
-func (self *SKsyunClient) ec2Request(regionId, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
-	return self.request("kec", regionId, apiName, "2016-03-04", params)
+func (cli *SKsyunClient) ec2Request(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("kec", regionId, apiName, KSYUN_DEFAULT_API_VERSION, params)
 }
 
-func (self *SKsyunClient) request(service, regionId, apiName, apiVersion string, params map[string]string) (jsonutils.JSONObject, error) {
-	uri := self.getUrl(service, regionId)
-	if params == nil {
-		params = map[string]string{}
+func (cli *SKsyunClient) iamRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("iam", regionId, apiName, "2015-11-01", params)
+}
+
+func (cli *SKsyunClient) tagRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("tag", regionId, apiName, KSYUN_DEFAULT_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) eipRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("eip", regionId, apiName, KSYUN_DEFAULT_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) ebsRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("ebs", regionId, apiName, KSYUN_DEFAULT_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) sksRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("sks", regionId, apiName, KSYUN_SKS_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) rdsRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("krds", regionId, apiName, KSYUN_RDS_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) vpcRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	return cli.request("vpc", regionId, apiName, KSYUN_DEFAULT_API_VERSION, params)
+}
+
+func (cli *SKsyunClient) request(service, regionId, apiName, apiVersion string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	isQueryApi := strings.HasPrefix(apiName, "Get") || strings.HasPrefix(apiName, "Describe") || strings.HasPrefix(apiName, "List")
+	if !isQueryApi {
+		return cli._request(service, regionId, apiName, apiVersion, params)
 	}
-	params["Action"] = apiName
-	params["Version"] = apiVersion
-	params["Accesskey"] = self.accessKeyId
-	params["SignatureMethod"] = "HMAC-SHA256"
-	params["Service"] = service
-	params["Format"] = "json"
-	params["SignatureVersion"] = "1.0"
-	params["Timestamp"] = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	for i := 0; i < 2; i++ {
+		resp, err := cli._request(service, regionId, apiName, apiVersion, params)
+		if err != nil {
+			retry := false
+			for _, key := range []string{
+				"EOF",
+				"i/o timeout",
+				"TLS handshake timeout",
+				"connection reset by peer",
+			} {
+				if strings.Contains(err.Error(), key) {
+					retry = true
+					break
+				}
+			}
+			if !retry {
+				return nil, errors.Wrapf(err, "request")
+			}
+			time.Sleep(time.Second * 10)
+			continue
+		}
+		return resp, nil
+	}
+	return cli._request(service, regionId, apiName, apiVersion, params)
+}
+
+func (cli *SKsyunClient) _request(service, regionId, apiName, apiVersion string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	uri, err := cli.getUrl(service, regionId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "getUrl")
+	}
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+
 	values := url.Values{}
-	for k, v := range params {
-		values.Set(k, v)
+	values.Set("Action", apiName)
+	values.Set("Version", apiVersion)
+	values.Set("Service", service)
+
+	method := httputils.GET
+	if apiName == "GetMetricStatisticsBatch" {
+		method = httputils.POST
+	}
+
+	if method == httputils.GET {
+		values.Set("Accesskey", cli.accessKeyId)
+		values.Set("SignatureMethod", "HMAC-SHA256")
+		values.Set("Format", "json")
+		values.Set("SignatureVersion", "1.0")
+		values.Set("Timestamp", time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		if len(regionId) > 0 {
+			values.Set("Region", regionId)
+		}
+	}
+
+	ksErr := &sKsyunError{Params: params}
+	if method == httputils.GET {
+		for k, v := range params {
+			values.Set(k, fmt.Sprintf("%v", v))
+		}
+		params = nil
 	}
 	uri = fmt.Sprintf("%s?%s", uri, values.Encode())
-	req := httputils.NewJsonRequest(httputils.GET, uri, nil)
-	ksErr := &sKsyunError{}
-	client := httputils.NewJsonClient(self)
-	_, resp, err := client.Send(self.ctx, req, ksErr, self.debug)
-	return resp, err
+	req := httputils.NewJsonRequest(method, uri, params)
+	client := httputils.NewJsonClient(cli)
+	_, resp, err := client.Send(cli.ctx, req, ksErr, cli.debug)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := resp.GetMap(); err == nil {
+		for k, v := range info {
+			if strings.HasSuffix(k, "Result") {
+				return v, nil
+			}
+		}
+	}
+	return resp, nil
 }
 
-func (self *SKsyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
+func (cli *SKsyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{}
-	subAccount.Name = self.cpcfg.Name
-	subAccount.Account = self.accessKeyId
+	subAccount.Id = cli.GetAccountId()
+	subAccount.Name = cli.cpcfg.Name
+	subAccount.Account = cli.accessKeyId
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
 	return []cloudprovider.SSubAccount{subAccount}, nil
 }
 
-func (self *SKsyunClient) GetAccountId() string {
-	if len(self.customerId) > 0 {
-		return self.customerId
+func (cli *SKsyunClient) GetAccountId() string {
+	if len(cli.customerId) > 0 {
+		return cli.customerId
 	}
-	self.QueryCashWalletAction()
-	return self.customerId
+	cli.QueryCashWalletAction()
+	return cli.customerId
 }
 
 type CashWalletDetail struct {
@@ -283,8 +429,8 @@ type CashWalletDetail struct {
 	Currency        string
 }
 
-func (self *SKsyunClient) QueryCashWalletAction() (*CashWalletDetail, error) {
-	resp, err := self.request("kingpay", "", "QueryCashWalletAction", "V1", nil)
+func (cli *SKsyunClient) QueryCashWalletAction() (*CashWalletDetail, error) {
+	resp, err := cli.request("kingpay", "", "QueryCashWalletAction", "V1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -293,13 +439,20 @@ func (self *SKsyunClient) QueryCashWalletAction() (*CashWalletDetail, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "resp.Unmarshal")
 	}
-	self.customerId = ret.CustomerId
+	cli.customerId = ret.CustomerId
 	return ret, nil
 }
 
-func (self *SKsyunClient) GetCapabilities() []string {
+func (cli *SKsyunClient) GetCapabilities() []string {
 	caps := []string{
-		cloudprovider.CLOUD_CAPABILITY_COMPUTE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
+		cloudprovider.CLOUD_CAPABILITY_PROJECT,
+		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
+		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
+		cloudprovider.CLOUD_CAPABILITY_EIP,
+		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
+		cloudprovider.CLOUD_CAPABILITY_RDS + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

@@ -15,8 +15,12 @@
 package compute
 
 import (
-	"yunion.io/x/jsonutils"
+	"os"
 
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
 )
 
@@ -55,12 +59,45 @@ func (opts *DiskBackupDeleteOptions) QueryParams() (jsonutils.JSONObject, error)
 
 type DiskBackupCreateOptions struct {
 	options.BaseCreateOptions
+	AsTarContainerId        string   `help:"container id of tar process"`
+	AsTarIncludeFile        []string `help:"include file path of tar process"`
+	AsTarIncludePattern     []string `help:"include pattern of tar process"`
+	AsTarExcludeFile        []string `help:"exclude file path of tar process"`
+	AsTarIgnoreNotExistFile bool     `help:"ignore not exist file when using tar"`
+
 	DISKID          string `help:"disk id" json:"disk_id"`
-	BACKUPSTORAGEID string `help:"back storage id" json:"backup_storage_id"`
+	BACKUPSTORAGEID string `help:"backup storage id" json:"backup_storage_id"`
+
+	BackupPath string `help:"backup path" json:"backup_path"`
 }
 
 func (opts *DiskBackupCreateOptions) Params() (jsonutils.JSONObject, error) {
-	return jsonutils.Marshal(opts), nil
+	input := &computeapi.DiskBackupCreateInput{
+		DiskId:          opts.DISKID,
+		BackupStorageId: opts.BACKUPSTORAGEID,
+		BackupAsTar:     new(computeapi.DiskBackupAsTarInput),
+	}
+	input.Name = opts.NAME
+	input.Description = opts.Desc
+	if opts.AsTarContainerId != "" {
+		input.BackupAsTar.ContainerId = opts.AsTarContainerId
+	}
+	if len(opts.AsTarIncludeFile) > 0 {
+		input.BackupAsTar.IncludeFiles = opts.AsTarIncludeFile
+	}
+	if len(opts.AsTarIncludePattern) > 0 {
+		input.BackupAsTar.IncludePatterns = opts.AsTarIncludePattern
+	}
+	if len(opts.AsTarExcludeFile) > 0 {
+		input.BackupAsTar.ExcludeFiles = opts.AsTarExcludeFile
+	}
+	if opts.AsTarIgnoreNotExistFile {
+		input.BackupAsTar.IgnoreNotExistFile = opts.AsTarIgnoreNotExistFile
+	}
+	if opts.BackupPath != "" {
+		input.BackupFilePath = opts.BackupPath
+	}
+	return jsonutils.Marshal(input), nil
 }
 
 type DiskBackupRecoveryOptions struct {
@@ -112,13 +149,40 @@ func (opts *BackupStorageIdOptions) Params() (jsonutils.JSONObject, error) {
 
 type BackupStorageCreateOptions struct {
 	options.BaseCreateOptions
-	StorageType  string `help:"storage type" choices:"nfs"`
+	StorageType string `help:"storage type" choices:"nfs|object"`
+
 	NfsHost      string `help:"nfs host, required when storage_type is nfs"`
 	NfsSharedDir string `help:"nfs shared dir, required when storage_type is nfs" `
-	CapacityMb   int    `help:"capacity, unit mb"`
+
+	ObjectBucketUrl string `help:"object bucket url, required when storage_type is object"`
+	ObjectAccessKey string `help:"object storage access key, required when storage_type is object"`
+	ObjectSecret    string `help:"object storage secret, required when storage_type is object"`
+	ObjectSignVer   string `help:"object storage signing algorithm version, optional" choices:"v2|v4"`
+
+	ObjectBucketUrlExt string `help:"object storage external access url, optional"`
+
+	CapacityMb int `help:"capacity, unit mb"`
 }
 
 func (opts *BackupStorageCreateOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
+type BackupStorageUpdateOptions struct {
+	options.BaseUpdateOptions
+
+	NfsHost      string `help:"nfs host, required when storage_type is nfs"`
+	NfsSharedDir string `help:"nfs shared dir, required when storage_type is nfs" `
+
+	ObjectBucketUrl string `help:"object bucket url, required when storage_type is object"`
+	ObjectAccessKey string `help:"object storage access key, required when storage_type is object"`
+	ObjectSecret    string `help:"object storage secret, required when storage_type is object"`
+	ObjectSignVer   string `help:"object storage signing algorithm version, optional" choices:"v2|v4"`
+
+	ObjectBucketUrlExt string `help:"object storage external access url, optional"`
+}
+
+func (opts *BackupStorageUpdateOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(opts), nil
 }
 
@@ -184,4 +248,75 @@ type InstanceBackupManagerCreateFromPackageOptions struct {
 
 func (opts *InstanceBackupManagerCreateFromPackageOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(opts), nil
+}
+
+type HostBackupStorageListOptions struct {
+	options.BaseListOptions
+	Host          string `json:"-" help:"filter by host"`
+	Backupstorage string `json:"-" help:"filter by backupstorage"`
+}
+
+func (opts HostBackupStorageListOptions) GetMasterOpt() string {
+	return opts.Host
+}
+
+func (opts HostBackupStorageListOptions) GetSlaveOpt() string {
+	return opts.Backupstorage
+}
+
+func (opts *HostBackupStorageListOptions) Params() (jsonutils.JSONObject, error) {
+	return options.ListStructToParams(opts)
+}
+
+type HostBackupStorageJoinOptions struct {
+	HOST          string `json:"-" help:"host id"`
+	BACKUPSTORAGE string `json:"-" help:"backup storage id"`
+}
+
+func (opts HostBackupStorageJoinOptions) GetMasterId() string {
+	return opts.HOST
+}
+
+func (opts HostBackupStorageJoinOptions) GetSlaveId() string {
+	return opts.BACKUPSTORAGE
+}
+
+func (opts HostBackupStorageJoinOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.NewDict(), nil
+}
+
+type DiskBackupExportOptions struct {
+	DiskBackupIdOptions
+
+	Output string `help:"output file path" json:"output"`
+}
+
+type DiskBackupImportOptions struct {
+	NAME            string `help:"backup name" json:"name"`
+	BACKUPSTORAGEID string `help:"backup storage id" json:"backup_storage_id"`
+	IMPORT          string `help:"backup info" json:"-"`
+
+	TenantId string `help:"tenant id" json:"tenant_id"`
+}
+
+func (opts *DiskBackupImportOptions) Params() (jsonutils.JSONObject, error) {
+	content, err := os.ReadFile(opts.IMPORT)
+	if err != nil {
+		return nil, errors.Wrap(err, "os.ReadFile")
+	}
+	inputJson, err := jsonutils.Parse(content)
+	if err != nil {
+		return nil, errors.Wrap(err, "jsonutils.Parse")
+	}
+	info := &computeapi.DiskBackupImportInput{}
+	err = inputJson.Unmarshal(info)
+	if err != nil {
+		return nil, errors.Wrap(err, "jsonutils.Unmarshal")
+	}
+	info.Name = opts.NAME
+	info.BackupStorageId = opts.BACKUPSTORAGEID
+	if len(opts.TenantId) > 0 {
+		info.ProjectId = opts.TenantId
+	}
+	return jsonutils.Marshal(info), nil
 }

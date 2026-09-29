@@ -21,8 +21,8 @@ import (
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/imagetools"
-	"yunion.io/x/pkg/util/qemuimgfmt"
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/image"
@@ -188,13 +188,13 @@ func (self *SRegion) GetImage(id string) (*SImage, error) {
 }
 
 func (self *SRegion) UploadImage(ctx context.Context, opts *cloudprovider.SImageCreateOption, callback func(progress float32)) (string, error) {
-	reader, sizeByte, err := opts.GetReader(opts.ImageId, string(qemuimgfmt.QCOW2))
+	reader, sizeByte, err := opts.GetReader(opts.ImageId, "")
 	if err != nil {
-		return "", err
+		return "", errors.Wrapf(err, "GetReader")
 	}
 
 	params := map[string]interface{}{
-		"name": opts.ImageName,
+		"generate_name": opts.ImageName,
 		"properties": map[string]string{
 			"os_type":         opts.OsType,
 			"os_distribution": opts.OsDistribution,

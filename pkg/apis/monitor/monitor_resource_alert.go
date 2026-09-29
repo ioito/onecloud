@@ -28,18 +28,25 @@ type MonitorResourceJointListInput struct {
 	MonitorResourceId string  `json:"monitor_resource_id"`
 	AlertId           string  `json:"alert_id"`
 	JointId           []int64 `json:"joint_id"`
-	Alerting          bool    `json:"alertinng"`
+	Alerting          bool    `json:"alerting"`
+	AlertState        string  `json:"alert_state"`
 	SendState         string  `json:"send_state"`
 	ResType           string  `json:"res_type"`
+	Metric            string  `json:"metric"`
 	ResName           string  `json:"res_name"`
 	AlertName         string  `json:"alert_name"`
 	Level             string  `json:"level"`
+	// 查询所有状态
+	AllState bool `json:"all_state"`
+	// Top 查询参数（用于统计各监控指标报警资源最多的资源）
+	TopQueryInput
 }
 
 type MonitorResourceJointCreateInput struct {
 	apis.Meta
 	MonitorResourceId string `json:"monitor_resource_id"`
 	AlertId           string `json:"alert_id"`
+	Metric            string `json:"metric"`
 
 	AlertRecordId string    `width:"36" charset:"ascii" list:"user"  update:"user"`
 	AlertState    string    `width:"18" charset:"ascii" list:"user"  update:"user"`
@@ -48,13 +55,15 @@ type MonitorResourceJointCreateInput struct {
 }
 
 type MonitorResourceJointDetails struct {
-	ResName     string               `json:"res_name"`
-	ResId       string               `json:"res_id"`
-	ResType     string               `json:"res_type"`
-	AlertName   string               `json:"alert_name"`
-	AlertRule   jsonutils.JSONObject `json:"alert_rule"`
-	Level       string               `json:"level"`
-	SendState   string               `json:"send_state"`
-	State       string               `json:"state"`
-	IsSetShield bool                 `json:"is_set_shield"`
+	MonitorResourceObjectId string               `json:"monitor_resource_object_id"`
+	ResName                 string               `json:"res_name"`
+	ResId                   string               `json:"res_id"`
+	ResType                 string               `json:"res_type"`
+	AlertName               string               `json:"alert_name"`
+	AlertRule               jsonutils.JSONObject `json:"alert_rule"`
+	Level                   string               `json:"level"`
+	SendState               string               `json:"send_state"`
+	State                   string               `json:"state"`
+	IsSetShield             bool                 `json:"is_set_shield"`
+	AlertCount              int                  `json:"alert_count"`
 }

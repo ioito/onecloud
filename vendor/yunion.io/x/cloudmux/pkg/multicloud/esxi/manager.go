@@ -241,7 +241,7 @@ func (cli *SESXiClient) connect() error {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		}
-		httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 			if cli.debug {
 				dump, _ := httputil.DumpRequestOut(req, false)
 				yellow(string(dump))
@@ -251,7 +251,7 @@ func (cli *SESXiClient) connect() error {
 					cyan("CURL:", curlCmd, "\n")
 				}
 			}
-			respCheck := func(resp *http.Response) {
+			respCheck := func(resp *http.Response) error {
 				if cli.debug {
 					dump, _ := httputil.DumpResponse(resp, true)
 					body := string(dump)
@@ -269,6 +269,7 @@ func (cli *SESXiClient) connect() error {
 						red(body)
 					}
 				}
+				return nil
 			}
 			return respCheck, nil
 		})
@@ -309,6 +310,7 @@ func (cli *SESXiClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 		return nil, err
 	}
 	subAccount := cloudprovider.SSubAccount{
+		Id:           cli.GetGlobalId(),
 		Account:      cli.account,
 		Name:         cli.cpcfg.Name,
 		HealthStatus: api.CLOUD_PROVIDER_HEALTH_NORMAL,
@@ -431,7 +433,7 @@ func (cli *SESXiClient) scanAllMObjects(props []string, dst interface{}) error {
 }
 
 func (cli *SESXiClient) SearchVM(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.config.uuid"] = id
 	var movms []mo.VirtualMachine
 	err := cli.scanMObjectsWithFilter(cli.client.ServiceContent.RootFolder, VIRTUAL_MACHINE_PROPS, &movms, filter)
@@ -451,20 +453,20 @@ func (cli *SESXiClient) SearchVM(id string) (*SVirtualMachine, error) {
 }
 
 func (cli *SESXiClient) SearchTemplateVM(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	uuid := toTemplateUuid(id)
 	filter["summary.config.uuid"] = uuid
 	var movms []mo.VirtualMachine
 	err := cli.scanMObjectsWithFilter(cli.client.ServiceContent.RootFolder, VIRTUAL_MACHINE_PROPS, &movms, filter)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "scanMObjectsWithFilter")
 	}
 	if len(movms) == 0 {
-		return nil, errors.ErrNotFound
+		return nil, errors.Wrapf(errors.ErrNotFound, "empty templates")
 	}
 	vm := NewVirtualMachine(cli, &movms[0], nil)
 	if !vm.IsTemplate() {
-		return nil, errors.ErrNotFound
+		return nil, errors.Wrapf(errors.ErrNotFound, "%s is not template", vm.GetName())
 	}
 	dc, err := vm.fetchDatacenter()
 	if err != nil {
@@ -474,7 +476,7 @@ func (cli *SESXiClient) SearchTemplateVM(id string) (*SVirtualMachine, error) {
 	return vm, nil
 }
 
-func (cli *SESXiClient) scanMObjectsWithFilter(folder types.ManagedObjectReference, props []string, dst interface{}, filter property.Filter) error {
+func (cli *SESXiClient) scanMObjectsWithFilter(folder types.ManagedObjectReference, props []string, dst interface{}, filter property.Match) error {
 	dstValue := reflect.Indirect(reflect.ValueOf(dst))
 	dstType := dstValue.Type()
 	dstEleType := dstType.Elem()
@@ -582,22 +584,6 @@ func findDatacenterByMoId(dcs []*SDatacenter, dcId string) (*SDatacenter, error)
 		}
 	}
 	return nil, cloudprovider.ErrNotFound
-}
-
-func (cli *SESXiClient) GetIProjects() ([]cloudprovider.ICloudProject, error) {
-	dcs, err := cli.GetDatacenters()
-	if err != nil {
-		return nil, errors.Wrap(err, "GetDatacenters")
-	}
-	ret := []cloudprovider.ICloudProject{}
-	for i := 0; i < len(dcs); i++ {
-		iprojects, err := dcs[i].GetResourcePools()
-		if err != nil {
-			return nil, errors.Wrap(err, "GetResourcePools")
-		}
-		ret = append(ret, iprojects...)
-	}
-	return ret, nil
 }
 
 func (cli *SESXiClient) FindHostByMoId(moId string) (cloudprovider.ICloudHost, error) {

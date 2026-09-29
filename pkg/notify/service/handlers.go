@@ -17,9 +17,11 @@ package service
 import (
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/notify/models"
+	"yunion.io/x/onecloud/pkg/notify/options"
 	_ "yunion.io/x/onecloud/pkg/notify/sender"
 )
 
@@ -27,7 +29,7 @@ const (
 	API_VERSION = "v2"
 )
 
-func InitHandlers(app *appsrv.Application) {
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
 
 	models.InitEventLog()
@@ -35,13 +37,17 @@ func InitHandlers(app *appsrv.Application) {
 
 	db.RegistUserCredCacheUpdater()
 
+	app_common.ExportOptionsHandlerWithPrefix(app, API_VERSION, &options.Options)
+
+	taskman.AddTaskHandler(API_VERSION, app, isSlave)
+
 	db.AddScopeResourceCountHandler(API_VERSION, app)
 
-	taskman.AddTaskHandler(API_VERSION, app)
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
 
 		db.UserCacheManager,
 		db.TenantCacheManager,
@@ -51,6 +57,8 @@ func InitHandlers(app *appsrv.Application) {
 		models.VerificationManager,
 		models.EventManager,
 		models.EmailQueueStatusManager,
+		models.TopicActionManager,
+		models.TopicResourceManager,
 	} {
 		db.RegisterModelManager(manager)
 	}
@@ -70,7 +78,7 @@ func InitHandlers(app *appsrv.Application) {
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher(API_VERSION, app, handler)
+		dispatcher.AddModelDispatcher(API_VERSION, app, handler, isSlave)
 	}
 	for _, manager := range []db.IJointModelManager{
 		models.SubscriberReceiverManager,
@@ -82,6 +90,6 @@ func InitHandlers(app *appsrv.Application) {
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewJointModelHandler(manager)
-		dispatcher.AddJointModelDispatcher(API_VERSION, app, handler)
+		dispatcher.AddJointModelDispatcher(API_VERSION, app, handler, isSlave)
 	}
 }

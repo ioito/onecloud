@@ -28,14 +28,16 @@ import (
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis"
-	"yunion.io/x/onecloud/pkg/appsrv"
+	identity_api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/identity"
+	"yunion.io/x/onecloud/pkg/util/ctx"
 	"yunion.io/x/onecloud/pkg/util/hashcache"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/tagutils"
@@ -75,7 +77,7 @@ type SPolicyManager struct {
 	policyCache     *hashcache.Cache // policy cache
 	permissionCache *hashcache.Cache // permission cache
 
-	fetchWorker *appsrv.SWorkerManager
+	// fetchWorker *appsrv.SWorkerManager
 
 	lock *sync.Mutex
 }
@@ -92,11 +94,34 @@ type sPolicyData struct {
 	Policy        jsonutils.JSONObject `json:"policy"`
 	DomainTags    tagutils.TTagSet     `json:"domain_tags"`
 	ProjectTags   tagutils.TTagSet     `json:"project_tags"`
-	ResourceTags  tagutils.TTagSet     `json:"resource_tags"`
+	ObjectTags    tagutils.TTagSet     `json:"resource_tags"`
+
+	OrgNodes []identity_api.SOrganizationNodeInfo `json:"org_nodes"`
 }
 
 func (data sPolicyData) getPolicy() (*rbacutils.SPolicy, error) {
-	return rbacutils.DecodePolicyData(data.DomainTags, data.ProjectTags, data.ResourceTags, data.Policy)
+	var domainTags, projectTags, objectTags tagutils.TTagSetList
+	if len(data.DomainTags) > 0 {
+		domainTags = domainTags.Append(data.DomainTags)
+	}
+	if len(data.ProjectTags) > 0 {
+		projectTags = projectTags.Append(data.ProjectTags)
+	}
+	if len(data.ObjectTags) > 0 {
+		objectTags = objectTags.Append(data.ObjectTags)
+	}
+	for i := range data.OrgNodes {
+		orgNode := data.OrgNodes[i]
+		switch orgNode.Type {
+		case identity_api.OrgTypeDomain:
+			domainTags = domainTags.Append(orgNode.Tags)
+		case identity_api.OrgTypeProject:
+			projectTags = projectTags.Append(orgNode.Tags)
+		case identity_api.OrgTypeObject:
+			objectTags = objectTags.Append(orgNode.Tags)
+		}
+	}
+	return rbacutils.DecodePolicyData(domainTags, projectTags, objectTags, data.Policy)
 }
 
 func (manager *SPolicyManager) init(refreshInterval time.Duration, workerCount int) {
@@ -122,19 +147,19 @@ func (manager *SPolicyManager) init(refreshInterval time.Duration, workerCount i
 	defaultFetcherFuncAddr := reflect.ValueOf(DefaultPolicyFetcher).Pointer()
 	remoteFetcherFuncAddr := reflect.ValueOf(auth.FetchMatchPolicies).Pointer()
 	log.Debugf("DefaultPolicyFetcher: %x RemotePolicyFetcher: %x", defaultFetcherFuncAddr, remoteFetcherFuncAddr)
-	var isDB bool
-	if defaultFetcherFuncAddr == remoteFetcherFuncAddr {
-		// remote fetcher, so start watcher
-		isDB = false
-	} else {
-		isDB = true
-	}
+	// var isDB bool
+	// if defaultFetcherFuncAddr == remoteFetcherFuncAddr {
+	// remote fetcher, so start watcher
+	// isDB = false
+	// } else {
+	// 	isDB = true
+	// }
 
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	log.Infof("policy fetch worker count %d", workerCount)
-	manager.fetchWorker = appsrv.NewWorkerManager("policyFetchWorker", workerCount, 2048, isDB)
+	// if workerCount <= 0 {
+	//	workerCount = 1
+	// }
+	// log.Infof("policy fetch worker count %d", workerCount)
+	// manager.fetchWorker = appsrv.NewWorkerManager("policyFetchWorker", workerCount, 2048, isDB)
 }
 
 func getMaskedLoginIp(userCred mcclient.TokenCredential) string {
@@ -143,7 +168,7 @@ func getMaskedLoginIp(userCred mcclient.TokenCredential) string {
 }
 
 func policyKey(userCred mcclient.TokenCredential) string {
-	if userCred == nil || auth.IsGuestToken(userCred) {
+	if userCred == nil || len(userCred.GetTokenString()) == 0 || auth.IsGuestToken(userCred) {
 		return auth.GUEST_TOKEN
 	}
 	keys := []string{userCred.GetProjectId()}
@@ -231,62 +256,25 @@ func (manager *SPolicyManager) Allow(targetScope rbacscope.TRbacScope, userCred 
 	return rbacutils.PolicyDeny
 }
 
-type fetchResult struct {
-	output *mcclient.SFetchMatchPoliciesOutput
-	err    error
-}
-
-type policyTask struct {
-	manager  *SPolicyManager
-	key      string
-	userCred mcclient.TokenCredential
-	resChan  chan fetchResult
-}
-
-func (t *policyTask) Run() {
-	val := t.manager.policyCache.AtomicGet(t.key)
-	result := fetchResult{}
-	if gotypes.IsNil(val) {
-		pg, err := DefaultPolicyFetcher(context.Background(), t.userCred)
-		if err != nil {
-			result.err = errors.Wrap(err, "DefaultPolicyFetcher")
-		} else {
-			t.manager.policyCache.AtomicSet(t.key, pg)
-			result.output = pg
-		}
-	} else {
-		result.output = val.(*mcclient.SFetchMatchPoliciesOutput)
-	}
-	t.resChan <- result
-}
-
-func (t *policyTask) Dump() string {
-	return ""
-}
-
 func (manager *SPolicyManager) fetchMatchedPolicies(userCred mcclient.TokenCredential) (*mcclient.SFetchMatchPoliciesOutput, error) {
 	key := policyKey(userCred)
 
-	task := policyTask{
-		manager:  manager,
-		key:      key,
-		userCred: userCred,
+	val := manager.policyCache.AtomicGet(key)
+	if !gotypes.IsNil(val) {
+		// cache hit
+		return val.(*mcclient.SFetchMatchPoliciesOutput), nil
 	}
-	task.resChan = make(chan fetchResult)
 
-	manager.fetchWorker.Run(&task, nil, nil)
+	pg, err := DefaultPolicyFetcher(ctx.CtxWithTime(), userCred)
+	if err != nil {
+		return nil, errors.Wrap(err, "DefaultPolicyFetcher")
+	}
 
-	res := <-task.resChan
-	return res.output, res.err
+	manager.policyCache.AtomicSet(key, pg)
+	return pg, nil
 }
 
 func (manager *SPolicyManager) allow(scope rbacscope.TRbacScope, userCred mcclient.TokenCredential, service string, resource string, action string, extra ...string) rbacutils.SPolicyResult {
-	// first download userCred policy
-	policies, err := manager.fetchMatchedPolicies(userCred)
-	if err != nil {
-		log.Errorf("fetchMatchedPolicyGroup fail %s", err)
-		return rbacutils.PolicyDeny
-	}
 	// check permission
 	key := permissionKey(scope, userCred, service, resource, action, extra...)
 	val := manager.permissionCache.AtomicGet(key)
@@ -297,6 +285,12 @@ func (manager *SPolicyManager) allow(scope rbacscope.TRbacScope, userCred mcclie
 		return val.(rbacutils.SPolicyResult)
 	}
 
+	// first download userCred policy
+	policies, err := manager.fetchMatchedPolicies(userCred)
+	if err != nil {
+		log.Errorf("fetchMatchedPolicyGroup fail %s", err)
+		return rbacutils.PolicyDeny
+	}
 	policySet, ok := policies.Policies[scope]
 	if !ok {
 		policySet = rbacutils.TPolicySet{}
@@ -336,9 +330,17 @@ func (manager *SPolicyManager) allowWithoutCache(policies rbacutils.TPolicySet, 
 	matchRules := rbacutils.TPolicyMatches{}
 
 	if len(policies) == 0 {
-		log.Warningf("no policies fetched for scope %s", scope)
+		user, token := auth.GUEST_USER, auth.GUEST_TOKEN
+		if userCred != nil {
+			user = userCred.GetUserName()
+			token = userCred.GetTokenString()
+		}
+		log.Warningf("no policies fetched for scope %s user %s token %s key %s", scope, user, utils.TruncateString(token, 16), policyKey(userCred))
 	} else {
 		matchRules = policies.GetMatchRules(service, resource, action, extra...)
+		if consts.IsRbacDebug() {
+			log.Debugf("service %s resource %s action %s extra %s matchRules: %s", service, resource, action, jsonutils.Marshal(extra), jsonutils.Marshal(matchRules))
+		}
 	}
 
 	scopedDeny := false
@@ -369,26 +371,31 @@ func (manager *SPolicyManager) allowWithoutCache(policies rbacutils.TPolicySet, 
 		matchRules = append(matchRules, rule)
 	}
 
-	// try default policies
-	defaultPolicies, ok := manager.defaultPolicies[scope]
-	if ok {
-		for i := range defaultPolicies {
-			isMatched, _ := defaultPolicies[i].Match(userCred)
-			if !isMatched {
-				continue
-			}
-			rule := defaultPolicies[i].Rules.GetMatchRule(service, resource, action, extra...)
-			if rule != nil {
-				matchRules = append(matchRules,
-					rbacutils.SPolicyMatch{
-						Rule: *rule,
-					},
-				)
+	result := matchRules.GetResult()
+	if result.Result.IsDeny() {
+		// denied, try default policies
+		defaultPolicies, ok := manager.defaultPolicies[scope]
+		if ok {
+			for i := range defaultPolicies {
+				isMatched, _ := defaultPolicies[i].Match(userCred)
+				if !isMatched {
+					continue
+				}
+				rule := defaultPolicies[i].Rules.GetMatchRule(service, resource, action, extra...)
+				if rule != nil {
+					if consts.IsRbacDebug() {
+						log.Debugf("service: %s resource: %s action: %s extra: %s match default policy: %s match rule: %s", service, resource, action, jsonutils.Marshal(extra), jsonutils.Marshal(defaultPolicies[i]), jsonutils.Marshal(rule))
+					}
+					matchRules = append(matchRules,
+						rbacutils.SPolicyMatch{
+							Rule: *rule,
+						},
+					)
+				}
 			}
 		}
+		result = matchRules.GetResult()
 	}
-
-	result := matchRules.GetResult()
 	if consts.IsRbacDebug() {
 		log.Debugf("[RBAC: %s] %s %s %s %s permission %s userCred: %s MatchRules: %d(%s)", scope, service, resource, action, jsonutils.Marshal(extra), result, userCred, len(matchRules), jsonutils.Marshal(matchRules))
 	}
@@ -464,9 +471,9 @@ func explainPolicyInternal(userCred mcclient.TokenCredential, policyReq jsonutil
 			result = rbacutils.PolicyDeny
 			if match != nil {
 				result.Result = match.Rule.Result
-				result.DomainTags = tagutils.TTagSetList{match.DomainTags}
-				result.ProjectTags = tagutils.TTagSetList{match.ProjectTags}
-				result.ObjectTags = tagutils.TTagSetList{match.ObjectTags}
+				result.DomainTags = match.DomainTags
+				result.ProjectTags = match.ProjectTags
+				result.ObjectTags = match.ObjectTags
 			}
 		}
 	}

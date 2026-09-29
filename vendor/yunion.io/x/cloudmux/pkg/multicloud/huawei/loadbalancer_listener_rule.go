@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/log"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
 
@@ -85,7 +86,7 @@ func (self *SElbListenerPolicy) GetStatus() string {
 }
 
 func (self *SElbListenerPolicy) Refresh() error {
-	resp, err := self.lb.region.lbGet("")
+	resp, err := self.lb.region.list(SERVICE_ELB, "elb/l7policies/"+self.ID, nil)
 	if err != nil {
 		return err
 	}
@@ -116,6 +117,18 @@ func (self *SElbListenerPolicy) GetRules() ([]SElbListenerPolicyRule, error) {
 	}
 
 	return ret, nil
+}
+
+func (self *SElbListenerPolicy) GetBackendGroups() ([]string, error) {
+	return nil, cloudprovider.ErrNotImplemented
+}
+
+func (self *SElbListenerPolicy) GetRedirectPool() (cloudprovider.SRedirectPool, error) {
+	return cloudprovider.SRedirectPool{}, cloudprovider.ErrNotImplemented
+}
+
+func (self *SElbListenerPolicy) Update(ctx context.Context, opts *cloudprovider.SLoadbalancerListenerRule) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 func (self *SElbListenerPolicy) GetDomain() string {
@@ -161,6 +174,6 @@ func (self *SElbListenerPolicy) Delete(ctx context.Context) error {
 }
 
 func (self *SRegion) DeleteLoadBalancerPolicy(policyId string) error {
-	_, err := self.lbDelete("elb/l7policies/" + policyId)
+	_, err := self.delete(SERVICE_ELB, "elb/l7policies/"+policyId)
 	return err
 }

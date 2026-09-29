@@ -1,0 +1,185 @@
+package models
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"strings"
+
+	"yunion.io/x/pkg/errors"
+
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
+)
+
+func isLocalPathSkuCreate(input *api.LLMSkuCreateInput) bool {
+	if input == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(input.Source), api.LLM_MODEL_SOURCE_LOCAL_PATH)
+}
+
+// ValidateLocalPathSkuCreate validates SKU create requests that mount an on-host model directory.
+func ValidateLocalPathSkuCreate(input *api.LLMSkuCreateInput) error {
+	if input == nil {
+		return errors.Wrap(httperrors.ErrInputParameter, "empty sku input")
+	}
+	llmType := strings.TrimSpace(input.LLMType)
+	if llmType != string(api.LLM_CONTAINER_VLLM) && llmType != string(api.LLM_CONTAINER_SGLANG) {
+		return errors.Wrapf(httperrors.ErrInputParameter, "local_path import supports vllm and sglang only, got %q", llmType)
+	}
+	localPath := strings.TrimSpace(input.LocalPath)
+	if localPath == "" {
+		return errors.Wrap(httperrors.ErrMissingParameter, "local_path is required for local_path source")
+	}
+	if !strings.HasPrefix(localPath, "/") {
+		return errors.Wrap(httperrors.ErrInputParameter, "local_path must be an absolute path")
+	}
+	if input.ModelSpec != nil {
+		return errors.Wrap(httperrors.ErrInputParameter, "model_spec is not allowed for local_path import")
+	}
+	if input.HostPaths == nil || input.HostPaths.IsZero() {
+		return errors.Wrap(httperrors.ErrMissingParameter, "host_paths is required for local_path source")
+	}
+	if !hostPathsHasContainerMount(*input.HostPaths, 0) {
+		return errors.Wrap(httperrors.ErrInputParameter, "host_paths must include a mount for container index 0")
+	}
+	if len(normalizePreferHostInputs(input.PreferHosts)) == 0 {
+		return errors.Wrap(httperrors.ErrMissingParameter, "prefer_hosts is required for local_path source")
+	}
+	input.Source = api.LLM_MODEL_SOURCE_LOCAL_PATH
+	input.LocalPath = localPath
+	return nil
+}
+
+// validateLocalPathSkuUpdatePreferHosts validates prefer_hosts on SKU update.
+// Omitted PreferHosts (nil) leaves the stored list unchanged. An explicit empty
+// list is rejected for local_path SKUs; non-local_path SKUs may not set the field.
+func validateLocalPathSkuUpdatePreferHosts(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	sku *SLLMSku,
+	input *api.LLMSkuUpdateInput,
+) error {
+	if input == nil || input.PreferHosts == nil {
+		return nil
+	}
+	if sku == nil || !SkuHasLocalHostPathModel(sku) {
+		return errors.Wrap(httperrors.ErrInputParameter, "prefer_hosts can only be updated on local_path SKU")
+	}
+	if len(normalizePreferHostInputs(input.PreferHosts)) == 0 {
+		return errors.Wrap(httperrors.ErrMissingParameter, "prefer_hosts is required for local_path source")
+	}
+	resolved, err := resolvePreferHosts(ctx, userCred, input.PreferHosts)
+	if err != nil {
+		return err
+	}
+	input.PreferHosts = resolved
+	return nil
+}
+
+func hostPathsHasContainerMount(paths api.HostPaths, containerIndex int) bool {
+	key := fmt.Sprintf("%d", containerIndex)
+	for _, hp := range paths {
+		if hp.IsZero() {
+			continue
+		}
+		if hp.Containers == nil {
+			continue
+		}
+		rel, ok := hp.Containers[key]
+		if !ok || rel == nil {
+			continue
+		}
+		if strings.TrimSpace(rel.MountPath) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// SkuHasLocalHostPathModel reports whether sku carries a host-mounted local model (no InstantModel import).
+func SkuHasLocalHostPathModel(sku *SLLMSku) bool {
+	if sku == nil {
+		return false
+	}
+	if strings.TrimSpace(sku.Source) != api.LLM_MODEL_SOURCE_LOCAL_PATH {
+		return false
+	}
+	if strings.TrimSpace(sku.LocalPath) == "" {
+		return false
+	}
+	if sku.HostPaths == nil || sku.HostPaths.IsZero() {
+		return false
+	}
+	return hostPathsHasContainerMount(*sku.HostPaths, 0)
+}
+
+func effectiveLLMPreferredModel(llm *SLLM, sku *SLLMSku) string {
+	if llm != nil && llm.LLMSpec != nil {
+		if llm.LLMSpec.Vllm != nil {
+			if p := strings.TrimSpace(llm.LLMSpec.Vllm.PreferredModel); p != "" {
+				return p
+			}
+		}
+		if llm.LLMSpec.SGLang != nil {
+			if p := strings.TrimSpace(llm.LLMSpec.SGLang.PreferredModel); p != "" {
+				return p
+			}
+		}
+	}
+	if sku != nil && sku.LLMSpec != nil {
+		if sku.LLMSpec.Vllm != nil {
+			if p := strings.TrimSpace(sku.LLMSpec.Vllm.PreferredModel); p != "" {
+				return p
+			}
+		}
+		if sku.LLMSpec.SGLang != nil {
+			if p := strings.TrimSpace(sku.LLMSpec.SGLang.PreferredModel); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// UpstreamModelKeyFromLocalPathSku returns the served model name vLLM/SGLang expose
+// for a local_path SKU (basename of the selected container model mount path).
+func UpstreamModelKeyFromLocalPathSku(llm *SLLM, sku *SLLMSku) string {
+	if !SkuHasLocalHostPathModel(sku) {
+		return ""
+	}
+	preferred := effectiveLLMPreferredModel(llm, sku)
+	modelPath := PickContainerModelMountPath(CollectContainerModelMountPaths(llm, sku), preferred)
+	if modelPath != "" {
+		return path.Base(modelPath)
+	}
+	if lp := strings.TrimSpace(sku.LocalPath); lp != "" {
+		return path.Base(lp)
+	}
+	return ""
+}
+
+// ValidateLocalPathHamiDevicesRequireMemoryMb requires every HAMi device to set
+// memory_mb for local_path SKUs (no InstantModel VRAM estimate available).
+// Devices are normalized first so empty SharingMode (default HAMi) is treated
+// the same as pod create.
+func ValidateLocalPathHamiDevicesRequireMemoryMb(devices *api.Devices) error {
+	if devices == nil || len(*devices) == 0 {
+		return nil
+	}
+	for i := range *devices {
+		dev := (*devices)[i]
+		normalizeLLMSkuDevice(&dev)
+		if strings.TrimSpace(dev.SharingMode) != computeapi.DEVICE_SHARING_MODE_HAMI {
+			continue
+		}
+		if dev.MemoryMb <= 0 {
+			return httperrors.NewInputParameterError(
+				"local_path SKU with HAMi requires per-GPU VRAM: set devices[].memory_mb on the LLM SKU")
+		}
+	}
+	return nil
+}

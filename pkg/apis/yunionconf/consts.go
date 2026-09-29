@@ -17,10 +17,17 @@ package yunionconf
 import "yunion.io/x/onecloud/pkg/apis"
 
 const (
-	SERVICE_TYPE = apis.SERVICE_TYPE_YUNIONCONF
+	SERVICE_TYPE    = apis.SERVICE_TYPE_YUNIONCONF
+	SERVICE_VERSION = ""
 )
 
 const (
 	ANY_DOMAIN_ID  = "[any_domain_id]"
 	ANY_PROJECT_ID = "[any_project_id]"
+)
+
+const (
+	NAMESPACE_USER       = "user"
+	NAMESPACE_SERVICE    = "service"
+	NAMESPACE_BUG_REPORT = "bug-report"
 )

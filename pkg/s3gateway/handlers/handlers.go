@@ -17,7 +17,6 @@ package handlers
 import (
 	"context"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -31,6 +30,7 @@ import (
 	"yunion.io/x/s3cli"
 
 	"yunion.io/x/onecloud/pkg/appsrv"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -39,6 +39,8 @@ import (
 )
 
 func InitHandlers(app *appsrv.Application) {
+	app_common.ExportOptionsHandler(app, &options.Options)
+
 	h := app.AddHandler2("HEAD", "", s3authenticate(headHandler), nil, "head", nil)
 	h.SetProcessTimeoutCallback(s3HandlerTimeoutInfo)
 	h = app.AddHandler2("GET", "", s3authenticate(readHandler), nil, "get", nil)
@@ -112,11 +114,10 @@ func getObjectRequest(r *http.Request) (SObjectRequest, error) {
 	} else {
 		return o, errors.Error("invalid S3 request")
 	}
-	var err error
-	o.Key, err = url.PathUnescape(o.Key)
-	if err != nil {
-		return o, errors.Wrap(err, "url.PathUnescape")
-	}
+	// r.URL.Path is already percent-decoded once by net/http, and the
+	// signature covers exactly this form. Decoding again would let a valid
+	// signature for one key be replayed against a different key
+	// (e.g. %252e%252e%252f would resolve to ../)
 	return o, o.Validate()
 }
 

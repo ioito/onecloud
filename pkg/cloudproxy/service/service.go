@@ -21,7 +21,7 @@ import (
 	_ "yunion.io/x/sqlchemy/backends"
 
 	"yunion.io/x/onecloud/pkg/cloudcommon"
-	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
+	common_app "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
@@ -37,7 +37,7 @@ func StartService() {
 		baseOpts = &opts.BaseOptions
 	)
 
-	app := app_common.InitApp(baseOpts, true).
+	app := common_app.InitApp(baseOpts, true).
 		OnException(func(method, path string, body jsonutils.JSONObject, err error) {
 			ctx := context.Background()
 			session := auth.GetAdminSession(ctx, baseOpts.Region)
@@ -46,10 +46,10 @@ func StartService() {
 
 	cloudcommon.InitDB(dbOpts)
 
-	InitHandlers(app)
+	InitHandlers(app, opts.IsSlaveNode)
 
 	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
 	defer cloudcommon.CloseDB()
 
-	app_common.ServeForever(app, baseOpts)
+	common_app.ServeForever(app, baseOpts)
 }

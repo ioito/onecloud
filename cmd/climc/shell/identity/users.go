@@ -64,12 +64,14 @@ func init() {
 		return nil
 	})*/
 
-	type UserDetailOptions struct {
+	type UserShowOptions struct {
+		_ struct{} `mcp-desc:"查询用户详情。ID 可用 climc_user_list 返回的 id/name；跨域时可传 domain"`
+
 		ID     string `help:"ID of user"`
-		Domain string `help:"Domain"`
-		System bool   `help:"show system user"`
+		Domain string `help:"Domain" mcp:"true"`
+		System bool   `help:"show system user" mcp:"true"`
 	}
-	R(&UserDetailOptions{}, "user-show", "Show details of user", func(s *mcclient.ClientSession, args *UserDetailOptions) error {
+	R(&UserShowOptions{}, "user-show", "Show details of user", func(s *mcclient.ClientSession, args *UserShowOptions) error {
 		query := jsonutils.NewDict()
 		if len(args.Domain) > 0 {
 			domainId, err := modules.Domains.GetId(s, args.Domain, nil)
@@ -89,7 +91,14 @@ func init() {
 		return nil
 	})
 
-	R(&UserDetailOptions{}, "user-delete", "Delete user", func(s *mcclient.ClientSession, args *UserDetailOptions) error {
+	type UserDeleteOptions struct {
+		_ struct{} `mcp-desc:"删除用户。若尚不知 id，先用 climc_user_list 定位；跨域时可传 domain"`
+
+		ID     string `help:"ID of user"`
+		Domain string `help:"Domain" mcp:"true"`
+		System bool   `help:"show system user" mcp:"true"`
+	}
+	R(&UserDeleteOptions{}, "user-delete", "Delete user", func(s *mcclient.ClientSession, args *UserDeleteOptions) error {
 		query := jsonutils.NewDict()
 		if len(args.Domain) > 0 {
 			domainId, err := modules.Domains.GetId(s, args.Domain, nil)
@@ -109,6 +118,11 @@ func init() {
 		return nil
 	})
 
+	type UserDetailOptions struct {
+		ID     string `help:"ID of user"`
+		Domain string `help:"Domain"`
+		System bool   `help:"show system user"`
+	}
 	R(&UserDetailOptions{}, "user-project-list", "List projects of user", func(s *mcclient.ClientSession, args *UserDetailOptions) error {
 		query := jsonutils.NewDict()
 		if len(args.Domain) > 0 {
@@ -170,27 +184,31 @@ func init() {
 	})
 
 	type UserCreateOptions struct {
-		NAME        string  `help:"Name of the new user"`
-		Domain      string  `help:"Domain"`
-		Desc        string  `help:"Description"`
-		Password    *string `help:"Password"`
-		Displayname string  `help:"Displayname"`
-		Email       string  `help:"Email"`
-		Mobile      string  `help:"Mobile"`
-		Enabled     bool    `help:"Enabled"`
-		Disabled    bool    `help:"Disabled"`
+		_ struct{} `mcp-desc:"创建用户。NAME 必填；建议传 password；可选 domain/email/mobile/displayname"`
 
-		SkipPasswordComplexityCheck bool `help:"do password complexity check, default is false"`
+		NAME        string  `help:"Name of the new user"`
+		Domain      string  `help:"Domain" mcp:"true"`
+		Desc        string  `help:"Description" mcp:"true"`
+		Password    *string `help:"Password" mcp:"true"`
+		Displayname string  `help:"Displayname" mcp:"true"`
+		Email       string  `help:"Email" mcp:"true"`
+		Mobile      string  `help:"Mobile" mcp:"true"`
+		Enabled     bool    `help:"Enabled" mcp:"true"`
+		Disabled    bool    `help:"Disabled" mcp:"true"`
+
+		SkipPasswordComplexityCheck bool `help:"skip password complexity check" mcp:"true"`
 
 		// DefaultProject string `help:"Default project"`
-		SystemAccount bool `help:"is a system account?"`
-		NoWebConsole  bool `help:"allow web console access"`
-		EnableMfa     bool `help:"enable TOTP mfa"`
+		SystemAccount bool `help:"is a system account?" mcp:"true"`
+		NoWebConsole  bool `help:"disallow web console access" mcp:"true"`
+		EnableMfa     bool `help:"enable TOTP mfa" mcp:"true"`
 
-		IdpId       string `help:"Id of identity provider to link with"`
-		IdpEntityId string `help:"Entity id of identity provider to link with"`
+		IdpId       string `help:"Id of identity provider to link with" mcp:"true"`
+		IdpEntityId string `help:"Entity id of identity provider to link with" mcp:"true"`
 
-		Lang string `help:"user default language"`
+		Lang string `help:"user default language" mcp:"true"`
+
+		Expire string `help:"user expired at" mcp:"true"`
 	}
 	R(&UserCreateOptions{}, "user-create", "Create a user", func(s *mcclient.ClientSession, args *UserCreateOptions) error {
 		params := jsonutils.NewDict()
@@ -245,6 +263,10 @@ func init() {
 			params.Add(jsonutils.NewString(args.Lang), "lang")
 		}
 
+		if len(args.Expire) > 0 {
+			params.Add(jsonutils.NewString(args.Expire), "expired_at")
+		}
+
 		/*if len(args.DefaultProject) > 0 {
 			projId, err := modules.Projects.GetId(s, args.DefaultProject, nil)
 			if err != nil {
@@ -288,6 +310,10 @@ func init() {
 		SkipPasswordComplexityCheck bool `help:"skip_password_complexity_check"`
 
 		Lang string `help:"update user language"`
+
+		Expire string `help:"user expired at"`
+
+		ClearExpire bool `help:"clear user expired at"`
 	}
 	R(&UserUpdateOptions{}, "user-update", "Update a user", func(s *mcclient.ClientSession, args *UserUpdateOptions) error {
 		query := jsonutils.NewDict()
@@ -346,6 +372,11 @@ func init() {
 		}
 		if len(args.Lang) > 0 {
 			params.Add(jsonutils.NewString(args.Lang), "lang")
+		}
+		if args.ClearExpire {
+			params.Add(jsonutils.JSONTrue, "clear_expire")
+		} else if len(args.Expire) > 0 {
+			params.Add(jsonutils.NewString(args.Expire), "expired_at")
 		}
 		// if len(args.DefaultProject) > 0 {
 		// 	projId, err := modules.Projects.GetId(s, args.DefaultProject, nil)
@@ -413,15 +444,32 @@ func init() {
 		return nil
 	})
 
+	type UserGroupsOptions struct {
+		USER    string   `help:"User ID or Name"`
+		Gids    []string `help:"group ID or Name"`
+		Action  string   `default:"join" choices:"join|leave"`
+		Enabled bool
+	}
+
+	R(&UserGroupsOptions{}, "user-join-groups", "Add a user to groups", func(s *mcclient.ClientSession, args *UserGroupsOptions) error {
+		_, err := modules.UsersV3.DoJoinGroups(s, args.USER, jsonutils.Marshal(args))
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+
 	type UserJoinProjectOptions struct {
 		User    string   `help:"User Id or name" optional:"false" positional:"true"`
 		Project []string `help:"Projects to join" nargs:"+"`
 		Role    []string `help:"User join project with roles" nargs:"+"`
+		Enabled bool
 	}
 	R(&UserJoinProjectOptions{}, "user-join-project", "User join projects with roles", func(s *mcclient.ClientSession, args *UserJoinProjectOptions) error {
 		input := api.SJoinProjectsInput{}
 		input.Projects = args.Project
 		input.Roles = args.Role
+		input.Enabled = args.Enabled
 		result, err := modules.UsersV3.PerformAction(s, args.User, "join", jsonutils.Marshal(input))
 		if err != nil {
 			return err

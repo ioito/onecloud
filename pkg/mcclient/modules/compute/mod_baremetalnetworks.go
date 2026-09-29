@@ -28,8 +28,8 @@ func init() {
 		"baremetalnetwork",
 		"baremetalnetworks",
 		[]string{"Baremetal_ID", "Host",
-			"Network_ID", "Network", "IP_addr", "Mac_addr",
-			"Nic_Type"},
+			"Network_ID", "Network", "IP_addr", "IP6_addr", "Mac_addr",
+			"Nic_Type", "Vlan_ID"},
 		[]string{},
 		&Hosts,
 		&Networks)

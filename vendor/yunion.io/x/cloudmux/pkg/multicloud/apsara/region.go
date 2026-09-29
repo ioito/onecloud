@@ -158,7 +158,7 @@ func (self *SRegion) lbRequest(apiName string, params map[string]string) (jsonut
 	return self.productRequest(client, APSARA_PRODUCT_SLB, domain, APSARA_API_VERSION_LB, apiName, params, self.client.debug)
 }
 
-/////////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////
 func (self *SRegion) GetId() string {
 	return self.RegionId
 }
@@ -283,8 +283,43 @@ func (self *SRegion) getZoneById(id string) (*SZone, error) {
 	return nil, fmt.Errorf("no such zone %s", id)
 }
 
+func (self *SRegion) getOrCreateZone(zoneId string, cache map[string]*SZone) (*SZone, error) {
+	if len(zoneId) == 0 {
+		return nil, fmt.Errorf("empty zone")
+	}
+	if cache != nil {
+		if zone, ok := cache[zoneId]; ok {
+			return zone, nil
+		}
+	}
+	zone := &SZone{
+		region: self,
+		ZoneId: zoneId,
+	}
+	if cache != nil {
+		cache[zoneId] = zone
+	}
+	return zone, nil
+}
+
+func (self *SRegion) initInstanceHost(vm *SInstance, zoneCache map[string]*SZone) error {
+	zone, err := self.getOrCreateZone(vm.ZoneId, zoneCache)
+	if err != nil {
+		return err
+	}
+	vm.host = zone.getHost()
+	return nil
+}
+
 func (self *SRegion) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
-	return self.GetInstance(id)
+	instance, err := self.GetInstance(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := self.initInstanceHost(instance, nil); err != nil {
+		return nil, err
+	}
+	return instance, nil
 }
 
 func (self *SRegion) GetIDiskById(id string) (cloudprovider.ICloudDisk, error) {
@@ -322,7 +357,7 @@ func (self *SRegion) fetchIVpcs() error {
 			return err
 		}
 		vpcs = append(vpcs, part...)
-		if len(vpcs) >= total {
+		if len(vpcs) >= total || len(part) == 0 {
 			break
 		}
 	}
@@ -711,6 +746,9 @@ func (self *SRegion) GetIEips() ([]cloudprovider.ICloudEIP, error) {
 			return nil, err
 		}
 		eips = append(eips, parts...)
+		if len(parts) == 0 {
+			break
+		}
 	}
 	ret := make([]cloudprovider.ICloudEIP, len(eips))
 	for i := 0; i < len(eips); i += 1 {
@@ -734,51 +772,18 @@ func (self *SRegion) GetIEipById(eipId string) (cloudprovider.ICloudEIP, error) 
 }
 
 func (region *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroup, err := region.GetSecurityGroupDetails(secgroupId)
+	secgroup, err := region.GetSecurityGroup(secgroupId)
 	if err != nil {
 		return nil, err
 	}
-	vpc, err := region.getVpc(secgroup.VpcId)
-	if err != nil {
-		return nil, errors.Wrapf(err, "region.getVpc(%s)", secgroup.VpcId)
-	}
-	secgroup.vpc = vpc
+	secgroup.region = region
 	return secgroup, nil
 }
 
-func (region *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, total, err := region.GetSecurityGroups(opts.VpcId, opts.Name, []string{}, 0, 0)
+func (region *SRegion) CreateISecurityGroup(opts *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
+	externalId, err := region.CreateSecurityGroup(opts.VpcId, opts.Name, opts.Desc, opts.ProjectId)
 	if err != nil {
 		return nil, err
-	}
-	if total == 0 {
-		return nil, cloudprovider.ErrNotFound
-	}
-	if total > 1 {
-		return nil, cloudprovider.ErrDuplicateId
-	}
-	return &secgroups[0], nil
-}
-
-func (region *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
-	externalId, err := region.CreateSecurityGroup(conf.VpcId, conf.Name, conf.Desc, conf.ProjectId)
-	if err != nil {
-		return nil, err
-	}
-	if conf.OnCreated != nil {
-		conf.OnCreated(externalId)
-	}
-	outRules := conf.OutRules
-	if len(outRules) > 0 && outRules[0].String() == "out:allow any" {
-		outRules = outRules[1:]
-	}
-	rules := append(conf.InRules, conf.OutRules...)
-	for _, rule := range rules {
-		rule.Priority = 101 - rule.Priority
-		err = region.addSecurityGroupRule(externalId, rule.SecurityRule)
-		if err != nil {
-			return nil, err
-		}
 	}
 	return region.GetISecurityGroupById(externalId)
 }
@@ -1088,7 +1093,7 @@ func (self *SRegion) GetIBucketById(name string) (cloudprovider.ICloudBucket, er
 			return &buckets[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, name)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", name)
 }
 
 func (region *SRegion) GetIBucketByName(name string) (cloudprovider.ICloudBucket, error) {
@@ -1112,4 +1117,27 @@ func (self *SRegion) GetIElasticcaches() ([]cloudprovider.ICloudElasticcache, er
 
 func (region *SRegion) GetCapabilities() []string {
 	return region.client.GetCapabilities()
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	vms := make([]SInstance, 0)
+	for {
+		parts, total, err := region.GetInstances("", nil, len(vms), 50)
+		if err != nil {
+			return nil, err
+		}
+		vms = append(vms, parts...)
+		if len(vms) >= total || len(parts) == 0 {
+			break
+		}
+	}
+	ivms := make([]cloudprovider.ICloudVM, len(vms))
+	zoneCache := make(map[string]*SZone)
+	for i := 0; i < len(vms); i += 1 {
+		if err := region.initInstanceHost(&vms[i], zoneCache); err != nil {
+			return nil, err
+		}
+		ivms[i] = &vms[i]
+	}
+	return ivms, nil
 }

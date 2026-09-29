@@ -19,6 +19,8 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -72,7 +74,16 @@ func FetchJointByIds(manager IJointModelManager, masterId, slaveId string, query
 }
 
 func FetchById(manager IModelManager, idStr string) (IModel, error) {
-	q := manager.Query()
+	return FetchById2(manager, idStr, false)
+}
+
+func FetchById2(manager IModelManager, idStr string, rawQuery bool) (IModel, error) {
+	var q *sqlchemy.SQuery
+	if rawQuery {
+		q = manager.RawQuery()
+	} else {
+		q = manager.Query()
+	}
 	q = manager.FilterById(q, idStr)
 	count, err := q.CountWithError()
 	if err != nil {
@@ -96,7 +107,7 @@ func FetchById(manager IModelManager, idStr string) (IModel, error) {
 	}
 }
 
-func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+func FetchByName(ctx context.Context, manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
 	q := manager.Query()
 	q = manager.FilterByName(q, idStr)
 	count, err := q.CountWithError()
@@ -104,7 +115,7 @@ func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idS
 		return nil, err
 	}
 	if count > 0 && userCred != nil {
-		q = manager.FilterByOwner(q, manager, nil, userCred, manager.NamespaceScope())
+		q = manager.FilterByOwner(ctx, q, manager, nil, userCred, manager.NamespaceScope())
 		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
 		count, err = q.CountWithError()
 		if err != nil {
@@ -129,29 +140,46 @@ func FetchByName(manager IModelManager, userCred mcclient.IIdentityProvider, idS
 	}
 }
 
-func FetchByIdOrName(manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+func FetchByIdOrName(ctx context.Context, manager IModelManager, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
 	if stringutils2.IsUtf8(idStr) {
-		return FetchByName(manager, userCred, idStr)
+		return FetchByName(ctx, manager, userCred, idStr)
 	}
 	obj, err := FetchById(manager, idStr)
 	if err == sql.ErrNoRows {
-		return FetchByName(manager, userCred, idStr)
+		return FetchByName(ctx, manager, userCred, idStr)
 	} else {
 		return obj, err
 	}
 }
 
-func fetchItemById(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, idStr string, query jsonutils.JSONObject) (IModel, error) {
-	q := manager.Query()
+func isRawQuery(manager IModelManager, userCred mcclient.TokenCredential, query jsonutils.JSONObject, action string) bool {
+	if query == nil || !query.Contains("delete") {
+		return false
+	}
+	var useRawQuery bool
+	// query senders are responsible for clear up other constraint
+	// like setting "pendinge_delete" to "all"
+	queryDelete, _ := query.GetString("delete")
+	if queryDelete == "all" && policy.PolicyManager.Allow(rbacscope.ScopeSystem, userCred, consts.GetServiceType(), manager.KeywordPlural(), action).Result.IsAllow() {
+		useRawQuery = true
+	}
+	return useRawQuery
+}
+
+func fetchItemById(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, idStr string, query jsonutils.JSONObject, useRawQuery bool) (IModel, error) {
+	var q *sqlchemy.SQuery
 	var err error
 	if query != nil && !query.IsZero() {
 		// if isListRbacAllowed(manager, userCred, true) {
 		// 	query.(*jsonutils.JSONDict).Set("admin", jsonutils.JSONTrue)
 		// }
+		q = manager.NewQuery(ctx, userCred, query, useRawQuery)
 		q, err = listItemQueryFilters(manager, ctx, q, userCred, query, policy.PolicyActionGet, false)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		q = manager.Query()
 	}
 	q = manager.FilterById(q, idStr)
 	count, err := q.CountWithError()
@@ -175,14 +203,17 @@ func fetchItemById(manager IModelManager, ctx context.Context, userCred mcclient
 	}
 }
 
-func fetchItemByName(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, idStr string, query jsonutils.JSONObject) (IModel, error) {
-	q := manager.Query()
+func fetchItemByName(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, idStr string, query jsonutils.JSONObject, useRawQuery bool) (IModel, error) {
+	var q *sqlchemy.SQuery
 	var err error
 	if query != nil && !query.IsZero() {
+		q = manager.NewQuery(ctx, userCred, query, useRawQuery)
 		q, err = listItemQueryFilters(manager, ctx, q, userCred, query, policy.PolicyActionGet, false)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		q = manager.Query()
 	}
 	q = manager.FilterByName(q, idStr)
 	count, err := q.CountWithError()
@@ -197,7 +228,7 @@ func fetchItemByName(manager IModelManager, ctx context.Context, userCred mcclie
 		if err != nil {
 			return nil, httperrors.NewGeneralError(err)
 		}
-		q = manager.FilterByOwner(q, manager, userCred, ownerId, manager.NamespaceScope())
+		q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, manager.NamespaceScope())
 		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
 		count, err = q.CountWithError()
 		if err != nil {
@@ -222,9 +253,10 @@ func fetchItemByName(manager IModelManager, ctx context.Context, userCred mcclie
 }
 
 func fetchItem(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, idStr string, query jsonutils.JSONObject) (IModel, error) {
-	item, err := fetchItemById(manager, ctx, userCred, idStr, query)
+	useRawQuery := isRawQuery(manager, userCred, query, policy.PolicyActionGet)
+	item, err := fetchItemById(manager, ctx, userCred, idStr, query, useRawQuery)
 	if err != nil {
-		item, err = fetchItemByName(manager, ctx, userCred, idStr, query)
+		item, err = fetchItemByName(manager, ctx, userCred, idStr, query, useRawQuery)
 	}
 	if err != nil {
 		return nil, err
@@ -271,7 +303,7 @@ var (
 		"project_domain_id",
 		"domain_id",
 		"project_domain",
-		"domain",
+		// "domain",
 	}
 )
 
@@ -405,21 +437,9 @@ func FetchCheckQueryOwnerScope(
 	} else {
 		ownerId = userCred
 		reqScopeStr, _ := data.GetString("scope")
-		if len(reqScopeStr) > 0 {
-			queryScope = rbacscope.String2Scope(reqScopeStr)
-		} else if data.Contains("admin") {
-			isAdmin := jsonutils.QueryBoolean(data, "admin", false)
-			if isAdmin && allowScope.HigherThan(rbacscope.ScopeProject) {
-				queryScope = allowScope
-			}
-		} else if action == policy.PolicyActionGet {
-			queryScope = allowScope
-		} else {
-			queryScope = resScope
-		}
-		// if resScope.HigherThan(queryScope) {
-		// 	queryScope = resScope
-		// }
+		hasAdmin := data.Contains("admin")
+		isAdmin := hasAdmin && jsonutils.QueryBoolean(data, "admin", false)
+		queryScope = resolveQueryScope(reqScopeStr, hasAdmin, isAdmin, allowScope, resScope, action)
 		requireScope = queryScope
 	}
 	if doCheckRbac && (requireScope.HigherThan(allowScope) || policyTagFilters.Result.IsDeny()) {
@@ -428,6 +448,49 @@ func FetchCheckQueryOwnerScope(
 			requireScope, allowScope, queryScope), policyTagFilters
 	}
 	return ownerId, queryScope, nil, policyTagFilters
+}
+
+// resolveQueryScope computes the scope at which a list/get query is filtered
+// when the request carries no explicit owner (no project_id/domain_id/user_id
+// filter).
+//
+// Semantics:
+//   - an explicit scope=system/domain/project selects that view; the RBAC
+//     caller check (requireScope) enforces the caller is allowed that scope.
+//     Querying a resource below its natural scope (e.g. project scope on a
+//     domain-scoped resource, resolved by custom FilterByOwner overrides) is
+//     a supported feature, so no blanket clamping to resScope is done here.
+//   - scope=max/maxallowed selects the widest scope the caller is allowed.
+//   - admin=true selects the widest allowed scope for callers above project
+//     scope; project-level callers fall back to the default resource view.
+//   - an unset (empty) or none scope, and a user scope on a non user-scoped
+//     resource, fall back to the natural scope of the resource.
+func resolveQueryScope(reqScopeStr string, hasAdmin, isAdmin bool, allowScope, resScope rbacscope.TRbacScope, action string) rbacscope.TRbacScope {
+	var queryScope rbacscope.TRbacScope
+	if len(reqScopeStr) > 0 {
+		if reqScopeStr == "max" || reqScopeStr == "maxallowed" {
+			queryScope = allowScope
+		} else {
+			queryScope = rbacscope.String2Scope(reqScopeStr)
+		}
+	} else if hasAdmin {
+		if isAdmin && allowScope.HigherThan(rbacscope.ScopeProject) {
+			queryScope = allowScope
+		} else {
+			// a project-level caller asking for the admin view (or sending
+			// admin=false) falls back to the default view of the resource
+			queryScope = resScope
+		}
+	} else if action == policy.PolicyActionGet {
+		queryScope = allowScope
+	} else {
+		queryScope = resScope
+	}
+	if queryScope == "" || queryScope == rbacscope.ScopeNone ||
+		(queryScope == rbacscope.ScopeUser && resScope != rbacscope.ScopeUser) {
+		queryScope = resScope
+	}
+	return queryScope
 }
 
 func mapKeys(idMap map[string]string) []string {
@@ -565,8 +628,15 @@ func FetchStandaloneObjectsByIds(modelManager IModelManager, ids []string, targe
 	return FetchModelObjectsByIds(modelManager, "id", ids, targets)
 }
 
-func FetchDistinctField(modelManager IModelManager, field string) ([]string, error) {
-	q := modelManager.Query(field).Distinct()
+func FetchField(modelMan IModelManager, field string, qCallback func(q *sqlchemy.SQuery) *sqlchemy.SQuery) ([]string, error) {
+	q := modelMan.Query(field)
+	if qCallback != nil {
+		q = qCallback(q)
+	}
+	return FetchIds(q)
+}
+
+func FetchIds(q *sqlchemy.SQuery) ([]string, error) {
 	rows, err := q.Rows()
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
@@ -588,4 +658,66 @@ func FetchDistinctField(modelManager IModelManager, field string) ([]string, err
 		}
 	}
 	return values, nil
+}
+
+func FetchDistinctField(modelManager IModelManager, field string) ([]string, error) {
+	return FetchField(modelManager, field, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Distinct()
+	})
+}
+
+func Purge(modelManager IModelManager, field string, ids []string, forceDelete bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	var splitByLen = func(data []string, splitLen int) [][]string {
+		var result [][]string
+		for i := 0; i < len(data); i += splitLen {
+			end := i + splitLen
+			if end > len(data) {
+				end = len(data)
+			}
+			result = append(result, data[i:end])
+		}
+		return result
+	}
+
+	var purge = func(ids []string) error {
+		vars := []interface{}{}
+		placeholders := make([]string, len(ids))
+		for i := range placeholders {
+			placeholders[i] = "?"
+			vars = append(vars, ids[i])
+		}
+		placeholder := strings.Join(placeholders, ",")
+		sql := fmt.Sprintf(
+			"delete from %s where %s in (%s)",
+			modelManager.TableSpec().Name(), field, placeholder,
+		)
+
+		if !forceDelete {
+			sql = fmt.Sprintf(
+				"update %s set deleted=1, deleted_at= ? where %s in (%s)",
+				modelManager.TableSpec().Name(), field, placeholder,
+			)
+			vars = append([]interface{}{time.Now()}, vars...)
+		}
+		_, err := sqlchemy.GetDB().Exec(
+			sql, vars...,
+		)
+		if err != nil {
+			return errors.Wrapf(err, strings.ReplaceAll(sql, "?", "%s"), vars...)
+		}
+		return nil
+	}
+
+	idsArr := splitByLen(ids, 100)
+	for i := range idsArr {
+		err := purge(idsArr[i])
+		if err != nil {
+			return errors.Wrapf(err, "purge")
+		}
+	}
+	return nil
 }

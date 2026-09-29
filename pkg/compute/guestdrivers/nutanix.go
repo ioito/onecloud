@@ -17,10 +17,8 @@ package guestdrivers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
-	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 
@@ -131,8 +129,8 @@ func (self *SNutanixGuestDriver) GetAttachDiskStatus() ([]string, error) {
 	return []string{api.VM_READY}, nil
 }
 
-func (self *SNutanixGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SNutanixGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SNutanixGuestDriver) CanKeepDetachDisk() bool {
@@ -158,15 +156,11 @@ func (self *SNutanixGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *
 }
 
 func (self *SNutanixGuestDriver) ValidateCreateEip(ctx context.Context, userCred mcclient.TokenCredential, input api.ServerCreateEipInput) error {
-	return httperrors.NewInputParameterError("%s not support create eip", self.GetHypervisor())
+	return httperrors.NewInputParameterError("%s does not support creating eip", self.GetHypervisor())
 }
 
 func (self *SNutanixGuestDriver) AllowReconfigGuest() bool {
 	return true
-}
-
-func (self *SNutanixGuestDriver) RequestRenewInstance(ctx context.Context, guest *models.SGuest, bc billing.SBillingCycle) (time.Time, error) {
-	return time.Time{}, nil
 }
 
 func (self *SNutanixGuestDriver) IsSupportEip() bool {

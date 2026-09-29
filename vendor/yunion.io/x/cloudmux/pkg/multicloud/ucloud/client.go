@@ -31,29 +31,6 @@ import (
 
 const UCLOUD_API_HOST = "https://api.ucloud.cn"
 
-// API返回结果对应的字段名
-var UCLOUD_API_RESULT_KEYS = map[string]string{
-	"AllocateEIP":            "EIPSet",
-	"GetProjectList":         "ProjectSet",
-	"GetRegion":              "Regions",
-	"DescribeVPC":            "DataSet",
-	"DescribeImage":          "ImageSet",
-	"DescribeIsolationGroup": "IsolationGroupSet",
-	"DescribeUHostInstance":  "UHostSet",
-	"DescribeUHostTags":      "TagSet",
-	"DescribeUDSet":          "UDSet",
-	"DescribeUDisk":          "DataSet",
-	"DescribeUDiskSnapshot":  "DataSet",
-	"DescribeEIP":            "EIPSet",
-	"DescribeFirewall":       "DataSet",
-	"DescribeSubnet":         "DataSet",
-	"DescribeBucket":         "DataSet",
-	"CreateUDisk":            "UDiskId",
-	"CreateVPC":              "VPCId",
-	"CreateUDiskSnapshot":    "SnapshotId",
-	"DescribeVIP":            "VIPSet",
-}
-
 type SParams struct {
 	data jsonutils.JSONDict
 }
@@ -157,7 +134,7 @@ func parseUcloudResponse(params SParams, resp jsonutils.JSONObject) (jsonutils.J
 
 	if err.RetCode > 0 {
 		if err.RetCode == 171 {
-			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, err.Error())
+			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", err.Error())
 		}
 		return nil, err
 	}

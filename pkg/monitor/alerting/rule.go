@@ -16,14 +16,12 @@ package alerting
 
 import (
 	"context"
-	"fmt"
 	"regexp"
 	"strconv"
 	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -45,21 +43,25 @@ func init() {
 
 // Rule is the in-memory version of an alert rule.
 type Rule struct {
-	Id                  string
-	Frequency           int64
-	Title               string
-	Name                string
-	Message             string
-	LastStateChange     time.Time
-	For                 time.Duration
-	NoDataState         monitor.NoDataOption
-	ExecutionErrorState monitor.ExecutionErrorOption
-	State               monitor.AlertStateType
-	Conditions          []Condition
-	Notifications       []string
+	Id        string
+	Frequency int64
+	Title     string
+	Name      string
+	Message   string
+	// 使用 TriggeredMessages 存储触发的条件，替代 Message
+	TriggeredMessages     []string
+	LastStateChange       time.Time
+	For                   time.Duration
+	NoDataState           monitor.NoDataOption
+	ExecutionErrorState   monitor.ExecutionErrorOption
+	State                 monitor.AlertStateType
+	Conditions            []Condition
+	Notifications         []string
+	DisableNotifyRecovery bool
 	// AlertRuleTags       []*models.AlertRuleTag
 	Level           string
-	RuleDescription []*RuleDescription
+	Reason          string
+	RuleDescription []*monitor.AlertRecordRule
 
 	StateChanges int
 
@@ -115,15 +117,17 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 	model.Title = ruleDef.GetTitle()
 	model.Name = ruleDef.Name
 	model.Message = ruleDef.Message
+	model.TriggeredMessages = make([]string, 0)
 	model.State = monitor.AlertStateType(ruleDef.State)
 	model.LastStateChange = ruleDef.LastStateChange
 	model.For = time.Duration(ruleDef.For)
 	model.NoDataState = monitor.NoDataOption(ruleDef.NoDataState)
 	model.ExecutionErrorState = monitor.ExecutionErrorOption(ruleDef.ExecutionErrorState)
 	model.StateChanges = ruleDef.StateChanges
-	model.RuleDescription = make([]*RuleDescription, 0)
+	model.RuleDescription = make([]*monitor.AlertRecordRule, 0)
 
 	model.Frequency = ruleDef.Frequency
+	model.DisableNotifyRecovery = ruleDef.DisableNotifyRecovery
 	// frequency cannot be zero since that would not execute the alert rule.
 	// so we fallback to 60 seconds if `Frequency` is missing
 	if model.Frequency == 0 {
@@ -132,10 +136,11 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 	model.CustomizeConfig = ruleDef.CustomizeConfig
 	settings, err := ruleDef.GetSettings()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "get settings")
 	}
 
 	model.Level = ruleDef.Level
+	model.Reason = ruleDef.Reason
 	nIds := []string{}
 	notis, err := ruleDef.GetNotifications()
 	if err != nil {
@@ -143,7 +148,7 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 	}
 	for _, n := range notis {
 		noti, _ := n.GetNotification()
-		if noti.Frequency != 0 {
+		if noti != nil && noti.Frequency != 0 {
 			model.SilentPeriod = noti.Frequency
 		}
 		nIds = append(nIds, n.NotificationId)
@@ -155,7 +160,6 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 		return nil, errors.Wrap(err, "GetCommonAlert error")
 	}
 	for index, condition := range settings.Conditions {
-		alertDetails := alert.GetCommonAlertMetricDetailsFromAlertCondition(index, &settings.Conditions[index])
 		condType := condition.Type
 		factory, exist := conditionFactories[condType]
 		if !exist {
@@ -165,7 +169,8 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "construct query condition %s", jsonutils.Marshal(condition))
 		}
-		newRuleDescription(model, alertDetails)
+		ruleDesc := alert.GetAlertRule(settings, index, model.SilentPeriod)
+		model.RuleDescription = append(model.RuleDescription, ruleDesc)
 		model.Conditions = append(model.Conditions, queryCond)
 	}
 
@@ -173,61 +178,6 @@ func NewRuleFromDBAlert(ruleDef *models.SAlert) (*Rule, error) {
 		return nil, validators.ErrAlertConditionEmpty
 	}
 	return model, nil
-}
-
-func newRuleDescription(rule *Rule, alertDetails *monitor.CommonAlertMetricDetails) {
-	ruleDes := RuleDescription{
-		AlertRecordRule: monitor.AlertRecordRule{
-			ResType:         alertDetails.ResType,
-			Metric:          fmt.Sprintf("%s.%s", alertDetails.Measurement, alertDetails.Field),
-			Measurement:     alertDetails.Measurement,
-			Database:        alertDetails.DB,
-			MeasurementDesc: alertDetails.MeasurementDisplayName,
-			Field:           alertDetails.Field,
-			FieldDesc:       alertDetails.FieldDescription.DisplayName,
-			Comparator:      alertDetails.Comparator,
-			Threshold:       RationalizeValueFromUnit(alertDetails.Threshold, alertDetails.FieldDescription.Unit, ""),
-			ConditionType:   alertDetails.ConditionType,
-		},
-	}
-	if len(ruleDes.ResType) == 0 {
-		if alertDetails.DB == monitor.METRIC_DATABASE_TELE {
-			ruleDes.ResType = monitor.METRIC_RES_TYPE_HOST
-		}
-	}
-	rule.RuleDescription = append(rule.RuleDescription, &ruleDes)
-}
-
-var fileSize = []string{"bps", "Bps", "byte"}
-
-func RationalizeValueFromUnit(value float64, unit string, opt string) string {
-	if utils.IsInStringArray(unit, fileSize) {
-		if unit == "byte" {
-			return (FormatFileSize(value, unit, float64(1024)))
-		}
-		return FormatFileSize(value, unit, float64(1000))
-	}
-	if unit == "%" && monitor.CommonAlertFieldOpt_Division == opt {
-		return fmt.Sprintf("%0.4f%s", value*100, unit)
-	}
-	return fmt.Sprintf("%0.4f%s", value, unit)
-}
-
-// 单位转换 保留四位小数
-func FormatFileSize(fileSize float64, unit string, unitsize float64) (size string) {
-	if fileSize < unitsize {
-		return fmt.Sprintf("%.4f%s", fileSize, unit)
-	} else if fileSize < (unitsize * unitsize) {
-		return fmt.Sprintf("%.4fK%s", float64(fileSize)/float64(unitsize), unit)
-	} else if fileSize < (unitsize * unitsize * unitsize) {
-		return fmt.Sprintf("%.4fM%s", float64(fileSize)/float64(unitsize*unitsize), unit)
-	} else if fileSize < (unitsize * unitsize * unitsize * unitsize) {
-		return fmt.Sprintf("%.4fG%s", float64(fileSize)/float64(unitsize*unitsize*unitsize), unit)
-	} else if fileSize < (unitsize * unitsize * unitsize * unitsize * unitsize) {
-		return fmt.Sprintf("%.4fT%s", float64(fileSize)/float64(unitsize*unitsize*unitsize*unitsize), unit)
-	} else { //if fileSize < (1024 * 1024 * 1024 * 1024 * 1024 * 1024)
-		return fmt.Sprintf("%.4fE%s", float64(fileSize)/float64(unitsize*unitsize*unitsize*unitsize*unitsize), unit)
-	}
 }
 
 type AlertRuleTester struct{}

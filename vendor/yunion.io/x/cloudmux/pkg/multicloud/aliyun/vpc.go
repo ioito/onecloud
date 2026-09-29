@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -49,20 +48,20 @@ type SVpc struct {
 
 	iwires []cloudprovider.ICloudWire
 
-	secgroups   []cloudprovider.ICloudSecurityGroup
 	routeTables []cloudprovider.ICloudRouteTable
 
-	CidrBlock    string
-	CreationTime time.Time
-	Description  string
-	IsDefault    bool
-	RegionId     string
-	Status       string
-	UserCidrs    SUserCIDRs
-	VRouterId    string
-	VSwitchIds   SVSwitchIds
-	VpcId        string
-	VpcName      string
+	CidrBlock     string
+	Ipv6CidrBlock string
+	CreationTime  time.Time
+	Description   string
+	IsDefault     bool
+	RegionId      string
+	Status        string
+	UserCidrs     SUserCIDRs
+	VRouterId     string
+	VSwitchIds    SVSwitchIds
+	VpcId         string
+	VpcName       string
 }
 
 func (self *SVpc) GetId() string {
@@ -90,6 +89,10 @@ func (self *SVpc) GetIsDefault() bool {
 
 func (self *SVpc) GetCidrBlock() string {
 	return self.CidrBlock
+}
+
+func (self *SVpc) GetCidrBlock6() string {
+	return self.Ipv6CidrBlock
 }
 
 func (self *SVpc) GetStatus() string {
@@ -171,34 +174,17 @@ func (self *SVpc) GetIWireById(wireId string) (cloudprovider.ICloudWire, error) 
 	return nil, cloudprovider.ErrNotFound
 }
 
-func (self *SVpc) fetchSecurityGroups() error {
-	secgroups := make([]SSecurityGroup, 0)
-	for {
-		parts, total, err := self.region.GetSecurityGroups(self.VpcId, "", []string{}, len(secgroups), 50)
-		if err != nil {
-			return err
-		}
-		secgroups = append(secgroups, parts...)
-		if len(secgroups) >= total {
-			break
-		}
-	}
-	self.secgroups = make([]cloudprovider.ICloudSecurityGroup, len(secgroups))
-	for i := 0; i < len(secgroups); i++ {
-		secgroups[i].region = self.region
-		self.secgroups[i] = &secgroups[i]
-	}
-	return nil
-}
-
 func (self *SVpc) GetISecurityGroups() ([]cloudprovider.ICloudSecurityGroup, error) {
-	if self.secgroups == nil {
-		err := self.fetchSecurityGroups()
-		if err != nil {
-			return nil, err
-		}
+	groups, err := self.region.GetSecurityGroups(self.VpcId, "", nil)
+	if err != nil {
+		return nil, err
 	}
-	return self.secgroups, nil
+	ret := []cloudprovider.ICloudSecurityGroup{}
+	for i := range groups {
+		groups[i].region = self.region
+		ret = append(ret, &groups[i])
+	}
+	return ret, nil
 }
 
 func (self *SVpc) fetchRouteTables() error {
@@ -241,23 +227,10 @@ func (self *SVpc) GetIRouteTableById(routeTableId string) (cloudprovider.ICloudR
 			return tables[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, routeTableId)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", routeTableId)
 }
 
 func (self *SVpc) Delete() error {
-	err := self.fetchSecurityGroups()
-	if err != nil {
-		log.Errorf("fetchSecurityGroup for VPC delete fail %s", err)
-		return err
-	}
-	for i := 0; i < len(self.secgroups); i += 1 {
-		secgroup := self.secgroups[i].(*SSecurityGroup)
-		err := self.region.DeleteSecurityGroup(secgroup.SecurityGroupId)
-		if err != nil {
-			log.Errorf("deleteSecurityGroup for VPC delete fail %s", err)
-			return err
-		}
-	}
 	return self.region.DeleteVpc(self.VpcId)
 }
 

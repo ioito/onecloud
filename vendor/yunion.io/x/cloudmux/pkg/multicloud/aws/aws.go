@@ -16,19 +16,20 @@ package aws
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	sdk "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -133,15 +134,6 @@ func (cli *SAwsClient) getIamArn(arn string) string {
 	}
 }
 
-func (cli *SAwsClient) getIamCommonArn(arn string) string {
-	switch cli.GetAccessEnv() {
-	case api.CLOUD_ACCESS_ENV_AWS_GLOBAL:
-		return strings.TrimPrefix(arn, AWS_GLOBAL_ARN_PREFIX)
-	default:
-		return strings.TrimPrefix(arn, AWS_CHINA_ARN_PREFIX)
-	}
-}
-
 func GetDefaultRegionId(accessUrl string) string {
 	defaultRegion := AWS_INTERNATIONAL_DEFAULT_REGION
 	switch accessUrl {
@@ -174,10 +166,27 @@ func (self *SAwsClient) ec2Request(regionId string, apiName string, params map[s
 	return self.request(regionId, EC2_SERVICE_NAME, EC2_SERVICE_ID, "2016-11-15", apiName, params, retval, assumeRole)
 }
 
-func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*session.Session, error) {
+// Amazon Elastic Container Service
+func (self *SAwsClient) ecsRequest(regionId string, apiName string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, ECS_SERVICE_NAME, ECS_SERVICE_ID, "2014-11-13", apiName, "", params, retval, assumeRole)
+}
+
+func (self *SAwsClient) lambdaRequest(regionId string, apiName, path string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, LAMBDA_SERVICE_NAME, LAMBDA_SERVICE_ID, "2015-03-31", apiName, path, params, retval, assumeRole)
+}
+
+func (self *SAwsClient) kinesisRequest(regionId string, apiName, path string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, KINESIS_SERVICE_NAME, KINESIS_SERVICE_ID, "2013-12-02", apiName, path, params, retval, assumeRole)
+}
+
+func (self *SAwsClient) cfRequest(apiName string, params map[string]string, retval interface{}, assumeRole bool) error {
+	return self.request("", CDN_SERVICE_NAME, CDN_SERVICE_ID, "2020-05-31", apiName, params, retval, assumeRole)
+}
+
+func (client *SAwsClient) getHttpClient() (*http.Client, error) {
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
 	transport, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 		var action string
 		if req.ContentLength > 0 && !strings.Contains(req.URL.Host, ".s3.") {
 			body, err := ioutil.ReadAll(req.Body)
@@ -194,7 +203,7 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 
 		service := strings.Split(req.URL.Host, ".")[0]
 		method, path := req.Method, req.URL.Path
-		respCheck := func(resp *http.Response) {
+		respCheck := func(resp *http.Response) error {
 			if resp.StatusCode == 403 {
 				if client.cpcfg.UpdatePermission != nil {
 					if len(action) > 0 {
@@ -204,16 +213,17 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 					}
 				}
 			}
+			return nil
 		}
 
 		if client.cpcfg.ReadOnly {
 			if len(action) > 0 {
-				for _, prefix := range []string{"Get", "List", "Describe"} {
+				for _, prefix := range []string{"Get", "List", "Describe", "AssumeRole"} {
 					if strings.HasPrefix(action, prefix) {
 						return respCheck, nil
 					}
 				}
-				return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+				return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s", action)
 			}
 			// organization
 			if service == "organizations" {
@@ -227,6 +237,14 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 		}
 		return respCheck, nil
 	})
+	return httpClient, nil
+}
+
+func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*session.Session, error) {
+	httpClient, err := client.getHttpClient()
+	if err != nil {
+		return nil, errors.Wrap(err, "getHttpClient")
+	}
 	s, err := session.NewSession(&sdk.Config{
 		Region: sdk.String(regionId),
 		Credentials: credentials.NewStaticCredentials(
@@ -284,40 +302,33 @@ func (client *SAwsClient) fetchOwnerId() error {
 }
 
 func (client *SAwsClient) fetchBuckets() error {
-	s, err := client.getDefaultSession(true)
+	s3cli, err := client.GetS3Client()
 	if err != nil {
-		return errors.Wrap(err, "getDefaultSession")
+		return errors.Wrap(err, "GetS3Client")
 	}
-	s3cli := s3.New(s)
-	output, err := s3cli.ListBuckets(&s3.ListBucketsInput{})
+	output, err := s3cli.ListBuckets(context.Background(), &s3.ListBucketsInput{})
 	if err != nil {
-		if e, ok := err.(awserr.Error); ok && e.Code() == "AccessDenied" {
-			return errors.Wrapf(cloudprovider.ErrForbidden, e.Message())
+		if strings.Contains(err.Error(), "AccessDenied") {
+			return errors.Wrapf(cloudprovider.ErrForbidden, "%s", err.Error())
 		}
 		return errors.Wrap(err, "ListBuckets")
 	}
 
 	ret := make([]cloudprovider.ICloudBucket, 0)
 	for _, bInfo := range output.Buckets {
-		if err := FillZero(bInfo); err != nil {
-			log.Errorf("s3cli.Binfo.FillZero error %s", err)
+		if bInfo.Name == nil {
 			continue
 		}
 
-		input := &s3.GetBucketLocationInput{}
-		input.Bucket = bInfo.Name
-		output, err := s3cli.GetBucketLocation(input)
+		locOutput, err := s3cli.GetBucketLocation(context.Background(), &s3.GetBucketLocationInput{
+			Bucket: bInfo.Name,
+		})
 		if err != nil {
 			log.Errorf("s3cli.GetBucketLocation error %s", err)
 			continue
 		}
 
-		if err := FillZero(output); err != nil {
-			log.Errorf("s3cli.GetBucketLocation.FillZero error %s", err)
-			continue
-		}
-
-		location := *output.LocationConstraint
+		location := string(locOutput.LocationConstraint)
 		if len(location) == 0 {
 			// https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLocation.html
 			// Buckets in Region us-east-1 have a LocationConstraint of null.
@@ -328,11 +339,15 @@ func (client *SAwsClient) fetchBuckets() error {
 			log.Errorf("client.getIRegionByRegionId %s fail %s", location, err)
 			continue
 		}
+		creationDate := time.Time{}
+		if bInfo.CreationDate != nil {
+			creationDate = *bInfo.CreationDate
+		}
 		b := SBucket{
 			region:       region.(*SRegion),
 			Name:         *bInfo.Name,
 			Location:     location,
-			CreationDate: *bInfo.CreationDate,
+			CreationDate: creationDate,
 		}
 		ret = append(ret, &b)
 	}
@@ -360,13 +375,13 @@ func (self *SAwsClient) GetRegions() ([]SRegion, error) {
 	return ret.RegionInfo, nil
 }
 
-func (self *SAwsClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAwsClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	ret := []cloudprovider.ICloudRegion{}
 	for i := range self.regions {
 		self.regions[i].client = self
 		ret = append(ret, &self.regions[i])
 	}
-	return ret
+	return ret, nil
 }
 
 func (self *SAwsClient) GetRegion(regionId string) (*SRegion, error) {
@@ -446,6 +461,35 @@ func (self *SAwsClient) GetIStorageById(id string) (cloudprovider.ICloudStorage,
 	return nil, errors.Wrap(cloudprovider.ErrNotFound, "GetIStorageById")
 }
 
+func (self *SAwsClient) cdnList(marker string, pageSize int64) ([]SCdnDomain, string, error) {
+	input := map[string]string{
+		"Marker":   marker,
+		"MaxItems": fmt.Sprintf("%d", pageSize),
+	}
+	ret := &struct {
+		Items      []SCdnDomain `xml:"Items>DistributionSummary"`
+		NextMarker string       `xml:"NextMarker,omitempty"`
+	}{}
+	err := self.cfRequest("ListDistributions2020_05_31", input, ret, true)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "cdnList")
+	}
+	return ret.Items, ret.NextMarker, err
+}
+
+func (self *SAwsClient) cdnGet(id string) (*SCdnDomain, error) {
+	input := map[string]string{
+		"Id": id,
+	}
+	var ret SCdnDomain
+	err := self.cfRequest("GetDistribution2020_05_31", input, &ret, true)
+	if err != nil {
+		return nil, errors.Wrap(err, "cdnGet")
+	}
+
+	return &ret, err
+}
+
 type SAccountBalance struct {
 	AvailableAmount     float64
 	AvailableCashAmount float64
@@ -485,10 +529,19 @@ func (self *SAwsClient) stsRequest(apiName string, params map[string]string, ret
 	return self.request("", STS_SERVICE_NAME, STS_SERVICE_ID, "2011-06-15", apiName, params, retval, false)
 }
 
+func (self *SAwsClient) orgRequest(apiName string, params map[string]interface{}, retval interface{}) error {
+	return self.invoke("", ORG_SERVICE_NAME, ORG_SERVICE_ID, "2016-11-28", apiName, "", params, retval, true)
+}
+
+func (self *SAwsClient) ceRequest(apiName string, params map[string]interface{}, retval interface{}) error {
+	return self.invoke(self.getCostExplorerRegion(), CE_SERVICE_NAME, CE_SERVICE_ID, "2017-10-25", apiName, "", params, retval, true)
+}
+
 func (self *SAwsClient) GetCapabilities() []string {
 	caps := []string{
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -502,6 +555,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_WAF,
 		cloudprovider.CLOUD_CAPABILITY_VPC_PEER,
 		cloudprovider.CLOUD_CAPABILITY_CONTAINER,
+		cloudprovider.CLOUD_CAPABILITY_CDN + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

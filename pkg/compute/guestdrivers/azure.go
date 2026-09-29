@@ -102,8 +102,22 @@ func (self *SAzureGuestDriver) IsRebuildRootSupportChangeUEFI() bool {
 	return false
 }
 
-func (self *SAzureGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
+// azureInstanceTypeSupportsResizeWhileRunning 部分 Azure SKU 在开机状态下变更规格易失败，此处做保守判断
+func azureInstanceTypeSupportsResizeWhileRunning(instanceType string) bool {
+	if len(instanceType) == 0 {
+		return true
+	}
+	if strings.HasPrefix(instanceType, "Basic_") || strings.HasPrefix(instanceType, "Standard_A") {
+		return false
+	}
+	return true
+}
+
+func (self *SAzureGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	if guest == nil || azureInstanceTypeSupportsResizeWhileRunning(guest.InstanceType) {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (self *SAzureGuestDriver) GetDeployStatus() ([]string, error) {
@@ -117,7 +131,7 @@ func (self *SAzureGuestDriver) IsNeedRestartForResetLoginInfo() bool {
 func (self *SAzureGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
 	//https://docs.microsoft.com/en-us/rest/api/compute/disks/update
 	//Resizes are only allowed if the disk is not attached to a running VM, and can only increase the disk's size
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	return nil
@@ -153,7 +167,7 @@ func (self *SAzureGuestDriver) ValidateCreateData(ctx context.Context, userCred 
 		return nil, err
 	}
 	if len(input.Networks) > 2 {
-		return nil, httperrors.NewInputParameterError("cannot support more than 1 nic")
+		return nil, httperrors.NewInputParameterError("multiple NICs are not supported")
 	}
 	if len(input.Disks) > 0 && len(input.Disks[0].ImageId) > 0 {
 		_image, err := models.CachedimageManager.FetchById(input.Disks[0].ImageId)
@@ -198,7 +212,7 @@ func (self *SAzureGuestDriver) ValidateCreateData(ctx context.Context, userCred 
 					(strings.HasPrefix(input.InstanceType, "Standard_NC") && strings.HasSuffix(input.InstanceType, "s_v3")) || // NCv3-series
 					(strings.HasPrefix(input.InstanceType, "Standard_ND")) || // ND-series
 					(strings.HasPrefix(input.InstanceType, "Standard_NV") && strings.HasSuffix(input.InstanceType, "s_v3"))) { // NVv3-series
-					return nil, httperrors.NewUnsupportOperationError("Azure UEFI image %s not support this instance sku", image.Name)
+					return nil, httperrors.NewUnsupportOperationError("Azure UEFI image %s does not support this instance sku", image.Name)
 				}
 			}
 		}

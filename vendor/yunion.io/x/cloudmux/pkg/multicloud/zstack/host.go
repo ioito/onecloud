@@ -107,9 +107,8 @@ func (host *SHost) GetIStorages() ([]cloudprovider.ICloudStorage, error) {
 				return nil, err
 			}
 			istorages = append(istorages, localStorages...)
-		case StorageTypeCeph:
+		default:
 			istorages = append(istorages, &storages[i])
-		case StorageTypeVCenter:
 		}
 	}
 	return istorages, nil
@@ -236,7 +235,7 @@ func (host *SHost) GetMemSizeMB() int {
 	return host.TotalMemoryCapacity / 1024 / 1024
 }
 
-func (host *SHost) GetStorageSizeMB() int {
+func (host *SHost) GetStorageSizeMB() int64 {
 	storages, err := host.zone.region.GetStorages(host.zone.UUID, host.ClusterUUID, "")
 	if err != nil {
 		return 0
@@ -253,7 +252,7 @@ func (host *SHost) GetStorageSizeMB() int {
 			}
 		}
 	}
-	return totalStorage / 1024 / 1024
+	return int64(totalStorage) / 1024 / 1024
 }
 
 func (host *SHost) GetStorageType() string {
@@ -337,7 +336,11 @@ func (region *SRegion) createDataDisks(disks []cloudprovider.SDiskInfo, hostId s
 				return diskIds, err
 			}
 		default:
-			return diskIds, fmt.Errorf("not support storageType %s", disks[i].StorageType)
+			disk, err := region.CreateDisk(disks[i].Name, storage.UUID, "", "", disks[i].SizeGB, "")
+			if err != nil {
+				return diskIds, err
+			}
+			diskIds = append(diskIds, disk.UUID)
 		}
 	}
 	return diskIds, nil
@@ -367,9 +370,11 @@ func (host *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudpr
 			log.Errorf("failed to attach disk %s into instance %s error: %v", diskIds[i], instance.Name, err)
 		}
 	}
-	err = host.zone.region.AssignSecurityGroup(instance.UUID, desc.ExternalSecgroupId)
-	if err != nil {
-		return nil, err
+	for _, id := range desc.ExternalSecgroupIds {
+		err = host.zone.region.AssignSecurityGroup(instance.UUID, id)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return host.GetIVMById(instance.UUID)
 }

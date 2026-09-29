@@ -32,6 +32,7 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	policyman "yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/keystone/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -62,7 +63,7 @@ type SRolePolicy struct {
 	db.SResourceBase
 
 	// 角色ID, 主键
-	RoleId string `width:"128" charset:"ascii" primary:"true" list:"domain" create:"domain_optional"`
+	RoleId string `width:"128" charset:"ascii" primary:"true" list:"domain" create:"domain_required"`
 	// 项目ID，主键
 	ProjectId string `width:"128" charset:"ascii" primary:"true" list:"domain" create:"domain_optional"`
 	// 权限ID, 主键
@@ -103,6 +104,95 @@ func (manager *SRolePolicyManager) newRecord(ctx context.Context, roleId, projec
 		return errors.Wrap(err, "insert role policy")
 	}
 	return nil
+}
+
+func normalizeRolePolicyBinding(ctx context.Context, userCred mcclient.TokenCredential, roleId, projectId, policyId string) (string, string, string, error) {
+	roleId = strings.TrimSpace(roleId)
+	projectId = strings.TrimSpace(projectId)
+	policyId = strings.TrimSpace(policyId)
+	if roleId == "" {
+		return "", "", "", httperrors.NewMissingParameterError("role_id")
+	}
+	if policyId == "" {
+		return "", "", "", httperrors.NewMissingParameterError("policy_id")
+	}
+
+	roleObj, err := RoleManager.FetchByIdOrName(ctx, userCred, roleId)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return "", "", "", httperrors.NewResourceNotFoundError2(RoleManager.Keyword(), roleId)
+		}
+		return "", "", "", errors.Wrap(err, "RoleManager.FetchByIdOrName")
+	}
+	role := roleObj.(*SRole)
+
+	policyObj, err := PolicyManager.FetchByIdOrName(ctx, userCred, policyId)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return "", "", "", httperrors.NewResourceNotFoundError2(PolicyManager.Keyword(), policyId)
+		}
+		return "", "", "", errors.Wrap(err, "PolicyManager.FetchByIdOrName")
+	}
+	pol := policyObj.(*SPolicy)
+
+	if projectId != "" {
+		projObj, err := ProjectManager.FetchByIdOrName(ctx, userCred, projectId)
+		if err != nil {
+			if errors.Cause(err) == sql.ErrNoRows {
+				return "", "", "", httperrors.NewResourceNotFoundError2(ProjectManager.Keyword(), projectId)
+			}
+			return "", "", "", errors.Wrap(err, "ProjectManager.FetchByIdOrName")
+		}
+		projectId = projObj.GetId()
+	}
+
+	isBootStrap, err := RolePolicyManager.isBootstrapRolePolicy()
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "isBootstrapRolePolicy")
+	}
+	if !isBootStrap {
+		if err := db.IsObjectRbacAllowed(ctx, role, userCred, policyman.PolicyActionPerform, "add-policy"); err != nil {
+			return "", "", "", err
+		}
+		if err := db.IsObjectRbacAllowed(ctx, pol, userCred, policyman.PolicyActionPerform, "bind-role"); err != nil {
+			return "", "", "", err
+		}
+		rps, err := RolePolicyManager.fetchByRoleId(role.Id)
+		if err != nil {
+			return "", "", "", errors.Wrap(err, "fetchByRoleId")
+		}
+		policyIds := stringutils2.NewSortedStrings(nil)
+		for i := range rps {
+			policyIds = stringutils2.Append(policyIds, rps[i].PolicyId)
+		}
+		policyIds = stringutils2.Append(policyIds, pol.Id)
+		if err := validateRolePolicies(userCred, policyIds); err != nil {
+			return "", "", "", errors.Wrap(err, "validateRolePolicies")
+		}
+	}
+	return role.Id, projectId, pol.Id, nil
+}
+
+func (manager *SRolePolicyManager) ValidateCreateData(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	query jsonutils.JSONObject,
+	input api.RolePolicyCreateInput,
+) (api.RolePolicyCreateInput, error) {
+	var err error
+	input.ResourceBaseCreateInput, err = manager.SResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.ResourceBaseCreateInput)
+	if err != nil {
+		return input, errors.Wrap(err, "SResourceBaseManager.ValidateCreateData")
+	}
+	roleId, projectId, policyId, err := normalizeRolePolicyBinding(ctx, userCred, input.RoleId, input.ProjectId, input.PolicyId)
+	if err != nil {
+		return input, err
+	}
+	input.RoleId = roleId
+	input.ProjectId = projectId
+	input.PolicyId = policyId
+	return input, nil
 }
 
 func (manager *SRolePolicyManager) deleteRecord(ctx context.Context, roleId, projectId, policyId string) error {
@@ -176,9 +266,9 @@ func (manager *SRolePolicyManager) NamespaceScope() rbacscope.TRbacScope {
 	return PolicyManager.NamespaceScope()
 }
 
-func (manager *SRolePolicyManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SRolePolicyManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	policyQ := PolicyManager.Query()
-	policyQ = PolicyManager.FilterByOwner(policyQ, PolicyManager, userCred, owner, scope)
+	policyQ = PolicyManager.FilterByOwner(ctx, policyQ, PolicyManager, userCred, owner, scope)
 	subq := policyQ.SubQuery()
 	q = q.Join(subq, sqlchemy.Equals(q.Field("policy_id"), subq.Field("id")))
 	return q
@@ -197,7 +287,7 @@ func (manager *SRolePolicyManager) ListItemFilter(
 	}
 	if len(query.RoleIds) > 0 {
 		for i := range query.RoleIds {
-			role, err := RoleManager.FetchByIdOrName(userCred, query.RoleIds[i])
+			role, err := RoleManager.FetchByIdOrName(ctx, userCred, query.RoleIds[i])
 			if err != nil {
 				if errors.Cause(err) == sql.ErrNoRows {
 					return nil, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", RoleManager.Keyword(), query.RoleIds[i])
@@ -213,7 +303,7 @@ func (manager *SRolePolicyManager) ListItemFilter(
 		))
 	}
 	if len(query.ProjectId) > 0 {
-		project, err := ProjectManager.FetchByIdOrName(userCred, query.ProjectId)
+		project, err := ProjectManager.FetchByIdOrName(ctx, userCred, query.ProjectId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", ProjectManager.Keyword(), query.ProjectId)
@@ -227,7 +317,7 @@ func (manager *SRolePolicyManager) ListItemFilter(
 		))
 	}
 	if len(query.PolicyId) > 0 {
-		policy, err := PolicyManager.FetchByIdOrName(userCred, query.PolicyId)
+		policy, err := PolicyManager.FetchByIdOrName(ctx, userCred, query.PolicyId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", PolicyManager.Keyword(), query.PolicyId)
@@ -353,21 +443,19 @@ func (manager *SRolePolicyManager) FetchCustomizeColumns(
 
 func (manager *SRolePolicyManager) getMatchPolicyIds(userCred rbacutils.IRbacIdentity, tm time.Time) ([]string, error) {
 	isGuest := true
-	if userCred != nil && !auth.IsGuestToken(userCred) {
+	if userCred != nil && len(userCred.GetProjectId()) > 0 && len(userCred.GetRoleIds()) > 0 && !auth.IsGuestToken(userCred) {
 		isGuest = false
 	}
 	return manager.getMatchPolicyIds2(isGuest, userCred.GetRoleIds(), userCred.GetProjectId(), userCred.GetLoginIp(), tm)
 }
 
 func (manager *SRolePolicyManager) getMatchPolicyIds2(isGuest bool, roleIds []string, pid string, loginIp string, tm time.Time) ([]string, error) {
+	if !isGuest && len(roleIds) == 0 {
+		return []string{}, nil
+	}
 	q := manager.Query()
 	if !isGuest {
-		if len(roleIds) > 0 {
-			q = q.Filter(sqlchemy.OR(
-				sqlchemy.IsNullOrEmpty(q.Field("role_id")),
-				sqlchemy.In(q.Field("role_id"), roleIds),
-			))
-		}
+		q = q.In("role_id", roleIds)
 		if len(pid) > 0 {
 			q = q.Filter(sqlchemy.OR(
 				sqlchemy.IsNullOrEmpty(q.Field("project_id")),
@@ -396,11 +484,11 @@ func (manager *SRolePolicyManager) getMatchPolicyIds2(isGuest bool, roleIds []st
 	return policyIds, nil
 }
 
-func appendPolicy(names map[rbacscope.TRbacScope][]string, policies rbacutils.TPolicyGroup, scope rbacscope.TRbacScope, policyName string, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
+func appendPolicy(ctx context.Context, names map[rbacscope.TRbacScope][]string, policies rbacutils.TPolicyGroup, scope rbacscope.TRbacScope, policyName string, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
 	if utils.IsInStringArray(policyName, names[scope]) {
 		return names, policies, nil
 	}
-	policyObj, err := PolicyManager.FetchByName(nil, policyName)
+	policyObj, err := PolicyManager.FetchByName(ctx, nil, policyName)
 	if err != nil && errors.Cause(err) != sql.ErrNoRows {
 		return nil, nil, errors.Wrapf(err, "FetchPolicy %s", policyName)
 	}
@@ -437,6 +525,9 @@ func (p sUserProjectPair) GetProjectId() string {
 }
 
 func (p sUserProjectPair) GetRoleIds() []string {
+	if len(p.userId) == 0 || len(p.projectId) == 0 {
+		return nil
+	}
 	roles, _ := AssignmentManager.FetchUserProjectRoles(p.userId, p.projectId)
 	ret := make([]string, len(roles))
 	for i := range roles {
@@ -446,7 +537,7 @@ func (p sUserProjectPair) GetRoleIds() []string {
 }
 
 func (p sUserProjectPair) GetUserId() string {
-	return ""
+	return p.userId
 }
 
 func (p sUserProjectPair) GetLoginIp() string {
@@ -454,11 +545,15 @@ func (p sUserProjectPair) GetLoginIp() string {
 }
 
 func (p sUserProjectPair) GetTokenString() string {
+	if len(p.userId) == 0 {
+		return auth.GUEST_TOKEN
+	}
 	return p.userId
 }
 
-func (manager *SRolePolicyManager) GetMatchPolicyGroupByInput(userId, projectId string, tm time.Time, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
+func (manager *SRolePolicyManager) GetMatchPolicyGroupByInput(ctx context.Context, userId, projectId string, tm time.Time, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
 	return manager.GetMatchPolicyGroupByCred(
+		ctx,
 		sUserProjectPair{
 			userId:    userId,
 			projectId: projectId,
@@ -467,14 +562,18 @@ func (manager *SRolePolicyManager) GetMatchPolicyGroupByInput(userId, projectId 
 	)
 }
 
-func (manager *SRolePolicyManager) GetMatchPolicyGroupByCred(userCred api.IRbacIdentityWithUserId, tm time.Time, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
+func (manager *SRolePolicyManager) GetMatchPolicyGroupByCred(ctx context.Context, userCred api.IRbacIdentityWithUserId, tm time.Time, nameOnly bool) (map[rbacscope.TRbacScope][]string, rbacutils.TPolicyGroup, error) {
 	names, policies, err := manager.GetMatchPolicyGroup(userCred, tm, nameOnly)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "GetMatchPolicyGroup")
 	}
+	if !options.Options.EnableDefaultDashboardPolicy {
+		return names, policies, nil
+	}
 	userId := userCred.GetUserId()
 	if len(userId) == 0 {
 		// anonymous access
+		log.Debugf("anomymouse accessed policies: %s", jsonutils.Marshal(names))
 		return names, policies, nil
 	}
 	usr, err := UserManager.fetchUserById(userId)
@@ -497,7 +596,7 @@ func (manager *SRolePolicyManager) GetMatchPolicyGroupByCred(userCred api.IRbacI
 			if len(consolePolicyName) == 0 {
 				continue
 			}
-			names, policies, err = appendPolicy(names, policies, scope, consolePolicyName, nameOnly)
+			names, policies, err = appendPolicy(ctx, names, policies, scope, consolePolicyName, nameOnly)
 			if err != nil {
 				return nil, nil, errors.Wrapf(err, "appendConsolePolicy %s %s", scope, consolePolicyName)
 			}
@@ -529,6 +628,10 @@ func (manager *SRolePolicyManager) GetPolicyGroupByIds(policyIds []string, nameO
 			return nil, nil, errors.Wrapf(err, "FetchPolicy %s", id)
 		}
 		policy := policyObj.(*SPolicy)
+		if policy.Enabled.IsFalse() {
+			// skip disabled policy
+			continue
+		}
 		if scopeName, ok := names[policy.Scope]; !ok {
 			names[policy.Scope] = []string{policy.Name}
 		} else {

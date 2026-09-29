@@ -17,6 +17,8 @@ package models
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
@@ -32,6 +34,8 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
@@ -79,13 +83,13 @@ type SInstanceSnapshot struct {
 	// 套餐名称
 	InstanceType string `width:"64" charset:"utf8" nullable:"true" list:"user" create:"optional"`
 	// 主机快照磁盘容量和
-	SizeMb int `nullable:"false"`
+	// SizeMb int `nullable:"false" list:"user"`
 	// 镜像ID
 	ImageId string `width:"36" charset:"ascii" nullable:"true" list:"user"`
 	// 是否保存内存
 	WithMemory bool `default:"false" get:"user" list:"user"`
 	// 内存文件大小
-	MemorySizeMB int `nullable:"true" get:"user" list:"user"`
+	MemorySizeKB int `nullable:"true" get:"user" list:"user" old_name:"memory_size_mb"`
 	// 内存文件所在宿主机
 	MemoryFileHostId string `width:"36" charset:"ascii" nullable:"true" get:"user" list:"user"`
 	// 内存文件路径
@@ -134,7 +138,7 @@ func (manager *SInstanceSnapshotManager) ListItemFilter(
 
 	guestStr := query.ServerId
 	if len(guestStr) > 0 {
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, guestStr)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, guestStr)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("guests", guestStr)
@@ -235,6 +239,15 @@ func (manager *SInstanceSnapshotManager) QueryDistinctExtraField(q *sqlchemy.SQu
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SInstanceSnapshotManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (self *SInstanceSnapshot) GetGuest() (*SGuest, error) {
 	if len(self.GuestId) == 0 {
 		return nil, errors.ErrNotFound
@@ -268,19 +281,22 @@ func (self *SInstanceSnapshot) getMoreDetails(userCred mcclient.TokenCredential,
 				DiskType:      snapshots[i].DiskType,
 				CloudregionId: snapshots[i].CloudregionId,
 				Size:          snapshots[i].Size,
+				VirtualSize:   snapshots[i].VirtualSize,
 				Status:        snapshots[i].Status,
 				StorageType:   snapshots[i].GetStorageType(),
 				EncryptKeyId:  snapshots[i].EncryptKeyId,
 				CreatedAt:     snapshots[i].CreatedAt,
 			})
-			out.Size += snapshots[i].Size
-
+			out.SizeMb += snapshots[i].Size
+			out.VirtualSizeMb += snapshots[i].VirtualSize
 			if len(snapshots[i].StorageId) > 0 && out.StorageType == "" {
 				out.StorageType = snapshots[i].GetStorageType()
 			}
 		}
+		if out.VirtualSizeMb <= 0 && guest != nil {
+			out.VirtualSizeMb = guest.getDiskSize()
+		}
 	} else if guest != nil {
-		out.Size = self.SizeMb
 		disk, err := guest.GetSystemDisk()
 		if err != nil {
 			log.Errorf("unable to GetSystemDisk of guest %q", guest.GetId())
@@ -290,10 +306,14 @@ func (self *SInstanceSnapshot) getMoreDetails(userCred mcclient.TokenCredential,
 				out.StorageType = s.StorageType
 			}
 		}
+		out.VirtualSizeMb = guest.getDiskSize()
+		out.SizeMb = out.VirtualSizeMb
 	}
 	if len(osType) > 0 {
 		out.Properties = map[string]string{"os_type": osType}
 	}
+	out.SizeMb += out.MemorySizeKB / 1024
+	out.Size = out.SizeMb * 1024 * 1024
 	return out
 }
 
@@ -426,7 +446,7 @@ func (manager *SInstanceSnapshotManager) CreateInstanceSnapshot(ctx context.Cont
 	}
 	manager.fillInstanceSnapshot(ctx, userCred, guest, instanceSnapshot)
 	// compute size of instanceSnapshot
-	instanceSnapshot.SizeMb = guest.getDiskSize()
+	// instanceSnapshot.SizeMb = guest.getDiskSize()
 	instanceSnapshot.WithMemory = withMemory
 	instanceSnapshot.MemoryFileHostId = guest.HostId
 	err := manager.TableSpec().Insert(ctx, instanceSnapshot)
@@ -499,6 +519,7 @@ func (self *SInstanceSnapshot) ToInstanceCreateInput(
 		sourceInput.Secgroups = inputSecgs
 	}
 	sourceInput.OsType = self.OsType
+	sourceInput.OsArch = self.OsArch
 	sourceInput.InstanceType = self.InstanceType
 	if len(sourceInput.Networks) == 0 {
 		sourceInput.Networks = serverConfig.Networks
@@ -552,7 +573,7 @@ func (self *SInstanceSnapshot) GetUsages() []db.IUsage {
 	}
 }
 
-func TotalInstanceSnapshotCount(scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) (int, error) {
+func TotalInstanceSnapshotCount(ctx context.Context, scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) (int, error) {
 	q := InstanceSnapshotManager.Query()
 
 	switch scope {
@@ -563,7 +584,7 @@ func TotalInstanceSnapshotCount(scope rbacscope.TRbacScope, ownerId mcclient.IId
 		q = q.Equals("tenant_id", ownerId.GetProjectId())
 	}
 
-	q = db.ObjectIdQueryWithPolicyResult(q, InstanceSnapshotManager, policyResult)
+	q = db.ObjectIdQueryWithPolicyResult(ctx, q, InstanceSnapshotManager, policyResult)
 
 	q = RangeObjectsFilter(q, rangeObjs, q.Field("cloudregion_id"), nil, q.Field("manager_id"), nil, nil)
 	q = CloudProviderFilter(q, q.Field("manager_id"), providers, brands, cloudEnv)
@@ -579,7 +600,7 @@ func (self *SInstanceSnapshot) GetInstanceSnapshotJointAt(diskIndex int) (*SInst
 
 func (self *SInstanceSnapshot) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
 	if self.Status == api.INSTANCE_SNAPSHOT_START_DELETE || self.Status == api.INSTANCE_SNAPSHOT_RESET {
-		return httperrors.NewForbiddenError("can't delete instance snapshot with wrong status")
+		return httperrors.NewForbiddenError("cannot delete instance snapshot in current status")
 	}
 	return nil
 }
@@ -600,9 +621,38 @@ func (self *SInstanceSnapshot) StartInstanceSnapshotDeleteTask(
 		log.Errorf("%s", err)
 		return err
 	}
-	self.SetStatus(userCred, api.INSTANCE_SNAPSHOT_START_DELETE, "InstanceSnapshotDeleteTask")
+	self.SetStatus(ctx, userCred, api.INSTANCE_SNAPSHOT_START_DELETE, "InstanceSnapshotDeleteTask")
 	task.ScheduleRun(nil)
 	return nil
+}
+
+func (self *SInstanceSnapshot) PerformPurge(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	snapshots, err := self.GetSnapshots()
+	if err != nil {
+		return nil, err
+	}
+	for i := range snapshots {
+		snapshotId := snapshots[i].Id
+		isjp := new(SInstanceSnapshotJoint)
+		err = InstanceSnapshotJointManager.Query().
+			Equals("instance_snapshot_id", self.Id).Equals("snapshot_id", snapshotId).First(isjp)
+		if err == nil || isjp != nil {
+			isjp.SetModelManager(InstanceSnapshotJointManager, isjp)
+			err = isjp.Delete(ctx, userCred)
+			if err != nil {
+				return nil, errors.Wrapf(err, "delete instance snapshot joint: %s", snapshotId)
+			}
+		} else {
+			log.Errorf("failed get instance_snapshot %s join %s: %s", self.Id, snapshotId, err)
+		}
+
+		_, err = snapshots[i].PerformPurge(ctx, userCred, query, data)
+		if err != nil {
+			return nil, errors.Wrapf(err, "delete snapshot: %s", snapshotId)
+		}
+	}
+	err = self.RealDelete(ctx, userCred)
+	return nil, err
 }
 
 func (self *SInstanceSnapshot) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {
@@ -642,7 +692,7 @@ func (is *SInstanceSnapshot) syncRemoveCloudInstanceSnapshot(ctx context.Context
 
 	err := is.ValidateDeleteCondition(ctx, nil)
 	if err != nil {
-		err = is.SetStatus(userCred, api.INSTANCE_SNAPSHOT_UNKNOWN, "sync to delete")
+		err = is.SetStatus(ctx, userCred, api.INSTANCE_SNAPSHOT_UNKNOWN, "sync to delete")
 	} else {
 		err = is.RealDelete(ctx, userCred)
 	}
@@ -778,4 +828,203 @@ func (self *SInstanceSnapshot) CustomizeCreate(
 	}
 	ownerId = guestObj.(*SGuest).GetOwnerId()
 	return self.SVirtualResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
+}
+
+func (manager *SInstanceSnapshotManager) GetNeedAutoSnapshotServers() ([]SSnapshotPolicyResource, error) {
+	tz, _ := time.LoadLocation(options.Options.TimeZone)
+	t := time.Now().In(tz)
+	week := t.Weekday()
+	if week == 0 { // sunday is zero
+		week += 7
+	}
+	timePoint := t.Hour()
+
+	policy := SnapshotPolicyManager.Query().Equals("type", api.SNAPSHOT_POLICY_TYPE_SERVER).Equals("cloudregion_id", api.DEFAULT_REGION_ID)
+	policy = policy.Filter(sqlchemy.Contains(policy.Field("repeat_weekdays"), fmt.Sprintf("%d", week)))
+	sq := policy.Filter(
+		sqlchemy.OR(
+			sqlchemy.Contains(policy.Field("time_points"), fmt.Sprintf(",%d,", timePoint)),
+			sqlchemy.Startswith(policy.Field("time_points"), fmt.Sprintf("[%d,", timePoint)),
+			sqlchemy.Endswith(policy.Field("time_points"), fmt.Sprintf(",%d]", timePoint)),
+			sqlchemy.Equals(policy.Field("time_points"), fmt.Sprintf("[%d]", timePoint)),
+		),
+	).SubQuery()
+	servers := GuestManager.Query().SubQuery()
+	q := SnapshotPolicyResourceManager.Query().Equals("resource_type", api.SNAPSHOT_POLICY_TYPE_SERVER)
+	q = q.Join(sq, sqlchemy.Equals(q.Field("snapshotpolicy_id"), sq.Field("id")))
+	q = q.Join(servers, sqlchemy.Equals(q.Field("resource_id"), servers.Field("id")))
+	ret := []SSnapshotPolicyResource{}
+	err := db.FetchModelObjects(SnapshotPolicyResourceManager, q, &ret)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+func (manager *SInstanceSnapshotManager) AutoServerSnapshot(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
+	servers, err := manager.GetNeedAutoSnapshotServers()
+	if err != nil {
+		log.Errorf("Get auto snapshot servers id failed: %s", err)
+		return
+	}
+	log.Infof("auto snapshot %d servers", len(servers))
+
+	serverMap := map[string]*SGuest{}
+	for i := range servers {
+		server, err := servers[i].GetServer()
+		if err != nil {
+			log.Errorf("get server error: %v", err)
+			continue
+		}
+		cnt, err := server.GetInstanceSnapshotCount()
+		if err != nil {
+			log.Errorf("get instance snapshot error: %v", err)
+			continue
+		}
+		if cnt > options.Options.RetentionDaysLimit {
+			msg := fmt.Sprintf("server %s auto snapshot count %d more than retention count limit %d", server.GetId(), cnt, options.Options.RetentionCountLimit)
+			log.Errorf("auto snapshot %s error: %v", server.Name, msg)
+			db.OpsLog.LogEvent(server, db.ACT_DISK_AUTO_SNAPSHOT_FAIL, msg, userCred)
+			notifyclient.NotifySystemErrorWithCtx(ctx, server.Id, server.Name, db.ACT_DISK_AUTO_SNAPSHOT_FAIL, msg)
+			continue
+		}
+		serverMap[server.Id] = server
+
+	}
+	for i := range serverMap {
+		input := api.ServerInstanceSnapshot{}
+		input.GenerateName = fmt.Sprintf("auto-%s-%d", serverMap[i].Name, time.Now().Unix())
+		serverMap[i].PerformInstanceSnapshot(ctx, userCred, jsonutils.NewDict(), input)
+	}
+}
+
+var instanceSnapshotCleanupTaskRunning int32 = 0
+
+func (manager *SInstanceSnapshotManager) CleanupInstanceSnapshots(ctx context.Context, userCred mcclient.TokenCredential, isStart bool) {
+	if instanceSnapshotCleanupTaskRunning > 0 {
+		log.Errorf("Previous CleanupInstanceSnapshots tasks still running !!!")
+		return
+	}
+	instanceSnapshotCleanupTaskRunning = 1
+	defer func() {
+		instanceSnapshotCleanupTaskRunning = 0
+	}()
+	sq := manager.Query().Startswith("name", "auto-").SubQuery()
+
+	iss := []struct {
+		GuestCnt int
+		GuestId  string
+	}{}
+	q := sq.Query(
+		sqlchemy.COUNT("guest_cnt", sq.Field("guest_id")),
+		sq.Field("guest_id"),
+	).GroupBy(sq.Field("guest_id"))
+	err := q.All(&iss)
+	if err != nil {
+		log.Errorf("Cleanup instance snapshots job fetch instance snapshot failed %s", err)
+		return
+	}
+
+	guestCount := map[string]int{}
+	for i := range iss {
+		guestCount[iss[i].GuestId] = iss[i].GuestCnt
+	}
+
+	// cleanup retention count instance snapshots
+	{
+		sq = SnapshotPolicyManager.Query().Equals("type", api.SNAPSHOT_POLICY_TYPE_SERVER).GT("retention_count", 0).SubQuery()
+		spr := SnapshotPolicyResourceManager.Query().Equals("resource_type", api.SNAPSHOT_POLICY_TYPE_SERVER).SubQuery()
+		q = sq.Query(
+			sq.Field("retention_count"),
+			spr.Field("resource_id").Label("guest_id"),
+		)
+		q = q.Join(spr, sqlchemy.Equals(q.Field("id"), spr.Field("snapshotpolicy_id")))
+
+		guestRetentions := []struct {
+			GuestId        string
+			RetentionCount int
+		}{}
+		err = q.All(&guestRetentions)
+		if err != nil {
+			log.Errorf("Cleanup instance snapshots job fetch guest retentions failed %s", err)
+			return
+		}
+		guestRetentionMap := map[string]int{}
+		for i := range guestRetentions {
+			if _, ok := guestRetentionMap[guestRetentions[i].GuestId]; !ok {
+				guestRetentionMap[guestRetentions[i].GuestId] = guestRetentions[i].RetentionCount
+			}
+			// 取最小保留个数
+			if guestRetentionMap[guestRetentions[i].GuestId] > guestRetentions[i].RetentionCount {
+				guestRetentionMap[guestRetentions[i].GuestId] = guestRetentions[i].RetentionCount
+			}
+		}
+
+		for guestId, retentionCnt := range guestRetentionMap {
+			if cnt, ok := guestCount[guestId]; ok && cnt > retentionCnt {
+				manager.startCleanupRetentionCount(ctx, userCred, guestId, cnt-retentionCnt)
+				return
+			}
+		}
+	}
+
+	// cleanup retention days instance snapshots
+	{
+		sq = SnapshotPolicyManager.Query().Equals("type", api.SNAPSHOT_POLICY_TYPE_SERVER).GT("retention_days", 0).SubQuery()
+		spr := SnapshotPolicyResourceManager.Query().Equals("resource_type", api.SNAPSHOT_POLICY_TYPE_SERVER).SubQuery()
+		q = sq.Query(
+			sq.Field("retention_days"),
+			spr.Field("resource_id").Label("guest_id"),
+		)
+		q = q.Join(spr, sqlchemy.Equals(q.Field("id"), spr.Field("snapshotpolicy_id")))
+
+		guestRetentions := []struct {
+			GuestId       string
+			RetentionDays int
+		}{}
+		err = q.All(&guestRetentions)
+		if err != nil {
+			log.Errorf("Cleanup instance snapshots job fetch guest retentions failed %s", err)
+			return
+		}
+		guestRetentionMap := map[string]int{}
+		for i := range guestRetentions {
+			if _, ok := guestRetentionMap[guestRetentions[i].GuestId]; !ok {
+				guestRetentionMap[guestRetentions[i].GuestId] = guestRetentions[i].RetentionDays
+			}
+			// 取最小保留天数
+			if guestRetentionMap[guestRetentions[i].GuestId] > guestRetentions[i].RetentionDays {
+				guestRetentionMap[guestRetentions[i].GuestId] = guestRetentions[i].RetentionDays
+			}
+		}
+		for guestId, retentionDays := range guestRetentionMap {
+			manager.startCleanupRetentionDays(ctx, userCred, guestId, retentionDays)
+			return
+		}
+	}
+}
+
+func (manager *SInstanceSnapshotManager) startCleanupRetentionCount(ctx context.Context, userCred mcclient.TokenCredential, guestId string, cnt int) error {
+	is := new(SInstanceSnapshot)
+	err := manager.Query().Equals("guest_id", guestId).Equals("status", api.INSTANCE_SNAPSHOT_READY).Startswith("name", "auto-").Asc("created_at").First(is)
+	if err != nil {
+		return err
+	}
+	is.SetModelManager(manager, is)
+	is.StartInstanceSnapshotDeleteTask(ctx, userCred, "")
+	return nil
+}
+
+func (manager *SInstanceSnapshotManager) startCleanupRetentionDays(ctx context.Context, userCred mcclient.TokenCredential, guestId string, day int) error {
+	expiredTime := time.Now().AddDate(0, 0, -day)
+	q := manager.Query().Equals("guest_id", guestId).Equals("status", api.INSTANCE_SNAPSHOT_READY).Startswith("name", "auto-").LE("created_at", expiredTime)
+	vms := []SInstanceSnapshot{}
+	err := db.FetchModelObjects(manager, q, &vms)
+	if err != nil {
+		return errors.Wrapf(err, "FetchModelObjects")
+	}
+	for i := range vms {
+		vms[i].StartInstanceSnapshotDeleteTask(ctx, userCred, "")
+	}
+	return nil
 }

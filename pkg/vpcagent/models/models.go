@@ -21,6 +21,7 @@ import (
 	"yunion.io/x/log"
 
 	compute_models "yunion.io/x/onecloud/pkg/compute/models"
+	"yunion.io/x/onecloud/pkg/util/netutils2"
 )
 
 type Vpc struct {
@@ -41,7 +42,7 @@ func (el *Vpc) Copy() *Vpc {
 type RouteTable struct {
 	compute_models.SRouteTable
 
-	Vpc *Vpc
+	Vpc *Vpc `json:"-"`
 }
 
 func (el *RouteTable) Copy() *RouteTable {
@@ -53,7 +54,7 @@ func (el *RouteTable) Copy() *RouteTable {
 type Wire struct {
 	compute_models.SWire
 
-	Vpc *Vpc
+	Vpc *Vpc `json:"-"`
 }
 
 func (el *Wire) Copy() *Wire {
@@ -64,6 +65,8 @@ func (el *Wire) Copy() *Wire {
 
 type Network struct {
 	compute_models.SNetwork
+
+	Routes [][]string `json:"routes"`
 
 	Vpc                  *Vpc                 `json:"-"`
 	Wire                 *Wire                `json:"-"`
@@ -76,6 +79,7 @@ type Network struct {
 func (el *Network) Copy() *Network {
 	return &Network{
 		SNetwork: el.SNetwork,
+		Routes:   el.Routes,
 	}
 }
 
@@ -87,6 +91,9 @@ type Guestnetwork struct {
 	Network   *Network         `json:"-"`
 	Elasticip *Elasticip       `json:"-"`
 	SubIPs    NetworkAddresses `json:"-"`
+
+	// guest nic level secgroup
+	Guestnetworksecgroups Guestnetworksecgroups `json:"-"`
 }
 
 func (el *Guestnetwork) Copy() *Guestnetwork {
@@ -105,6 +112,22 @@ type NetworkAddress struct {
 func (el *NetworkAddress) Copy() *NetworkAddress {
 	return &NetworkAddress{
 		SNetworkAddress: el.SNetworkAddress,
+	}
+}
+
+type Guestnetworksecgroup struct {
+	compute_models.SGuestnetworksecgroup
+
+	SecurityGroup *SecurityGroup `json:"-"`
+}
+
+func (el *Guestnetworksecgroup) ModelSetKey() string {
+	return fmt.Sprintf("%s/%d", el.GuestId, el.NetworkIndex)
+}
+
+func (el *Guestnetworksecgroup) Copy() *Guestnetworksecgroup {
+	return &Guestnetworksecgroup{
+		SGuestnetworksecgroup: el.SGuestnetworksecgroup,
 	}
 }
 
@@ -133,6 +156,42 @@ func (el *Guest) GetVips() []string {
 		}
 	}
 	return ret
+}
+
+type GuestnetworkList []*Guestnetwork
+
+func (a GuestnetworkList) Len() int           { return len(a) }
+func (a GuestnetworkList) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a GuestnetworkList) Less(i, j int) bool { return a[i].Index < a[j].Index }
+
+func (el *Guest) FixIsDefaults() {
+	gns := make([]*Guestnetwork, 0, len(el.Guestnetworks))
+	for _, v := range el.Guestnetworks {
+		gns = append(gns, v)
+	}
+	sort.Sort(GuestnetworkList(gns))
+	defaultCnt := 0
+	nics := netutils2.SNicInfoList{}
+	for _, gn := range gns {
+		if gn.Network == nil {
+			log.Debugf("guest %s %s", gn.GuestId, gn.NetworkId)
+			continue
+		}
+		if gn.IsDefault {
+			defaultCnt++
+		}
+		nics = nics.Add(gn.MacAddr, gn.IpAddr, gn.Network.GuestGateway, gn.Ip6Addr, gn.Network.GuestGateway6, gn.IsDefault)
+	}
+	if defaultCnt != 1 {
+		gwMac, _ := nics.FindDefaultNicMac()
+		for _, gn := range gns {
+			if gn.MacAddr == gwMac {
+				gn.IsDefault = true
+			} else {
+				gn.IsDefault = false
+			}
+		}
+	}
 }
 
 type Host struct {
@@ -204,7 +263,7 @@ func (el *Elasticip) Copy() *Elasticip {
 type DnsRecord struct {
 	compute_models.SDnsRecord
 
-	DnsZone *DnsZone
+	DnsZone *DnsZone `json:"-"`
 }
 
 func (el *DnsRecord) Copy() *DnsRecord {
@@ -216,7 +275,7 @@ func (el *DnsRecord) Copy() *DnsRecord {
 type DnsZone struct {
 	compute_models.SDnsZone
 
-	Records DnsRecords
+	Records DnsRecords `json:"-"`
 }
 
 func (el *DnsZone) Copy() *DnsZone {

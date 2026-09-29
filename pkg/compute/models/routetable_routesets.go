@@ -116,7 +116,7 @@ func (manager *SRouteTableRouteSetManager) ValidateCreateData(
 	if len(input.RouteTableId) == 0 {
 		return input, httperrors.NewMissingParameterError("route_table_id")
 	}
-	_routeTable, err := RouteTableManager.FetchByIdOrName(userCred, input.RouteTableId)
+	_routeTable, err := RouteTableManager.FetchByIdOrName(ctx, userCred, input.RouteTableId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return input, httperrors.NewResourceNotFoundError2("route_table", input.RouteTableId)
@@ -129,10 +129,10 @@ func (manager *SRouteTableRouteSetManager) ValidateCreateData(
 	}
 
 	if input.NextHopType != api.NEXT_HOP_TYPE_VPCPEERING {
-		return input, httperrors.NewNotSupportedError("not supported next hop type %s", input.NextHopType)
+		return input, httperrors.NewNotSupportedError("next hop type %s is not supported", input.NextHopType)
 	}
 	if input.NextHopType == api.NEXT_HOP_TYPE_VPCPEERING {
-		_vpcPeer, err := VpcPeeringConnectionManager.FetchByIdOrName(userCred, input.NextHopId)
+		_vpcPeer, err := VpcPeeringConnectionManager.FetchByIdOrName(ctx, userCred, input.NextHopId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, httperrors.NewResourceNotFoundError2("netx_hop_id", input.NextHopId)
@@ -150,7 +150,7 @@ func (manager *SRouteTableRouteSetManager) ValidateCreateData(
 		return input, errors.Wrapf(err, "GetProviderFactory")
 	}
 	if !factory.IsSupportModifyRouteTable() {
-		return input, httperrors.NewUnsupportOperationError("Not support modify routetable for provider %s", account.Provider)
+		return input, httperrors.NewUnsupportOperationError("Modifying route table is not supported for provider %s", account.Provider)
 	}
 	return input, nil
 }
@@ -219,10 +219,10 @@ func (self *SRouteTableRouteSet) ValidateUpdateData(
 	}
 
 	if input.NextHopType != api.NEXT_HOP_TYPE_VPCPEERING {
-		return input, httperrors.NewNotSupportedError("not supported next hop type %s", input.NextHopType)
+		return input, httperrors.NewNotSupportedError("next hop type %s is not supported", input.NextHopType)
 	}
 	if input.NextHopType == api.NEXT_HOP_TYPE_VPCPEERING {
-		_vpcPeer, err := VpcPeeringConnectionManager.FetchByIdOrName(userCred, input.NextHopId)
+		_vpcPeer, err := VpcPeeringConnectionManager.FetchByIdOrName(ctx, userCred, input.NextHopId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, httperrors.NewResourceNotFoundError2("netx_hop_id", input.NextHopId)
@@ -252,7 +252,7 @@ func (self *SRouteTableRouteSet) ValidateUpdateData(
 		return input, errors.Wrapf(err, "GetProviderFactory")
 	}
 	if !factory.IsSupportModifyRouteTable() {
-		return input, httperrors.NewUnsupportOperationError("Not support modify routetable for provider %s", account.Provider)
+		return input, httperrors.NewUnsupportOperationError("Modifying route table is not supported for provider %s", account.Provider)
 	}
 
 	return input, nil
@@ -266,7 +266,7 @@ func (self *SRouteTable) StartRouteTableUpdateTask(ctx context.Context, userCred
 	if err != nil {
 		return errors.Wrap(err, "Start RouteTableUpdateTask fail")
 	}
-	self.SetStatus(userCred, api.ROUTE_TABLE_UPDATING, "update route")
+	self.SetStatus(ctx, userCred, api.ROUTE_TABLE_UPDATING, "update route")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -294,7 +294,7 @@ func (self *SRouteTableRouteSet) ValidateDeleteCondition(ctx context.Context, in
 		return errors.Wrapf(err, "GetProviderFactory")
 	}
 	if !factory.IsSupportModifyRouteTable() {
-		return httperrors.NewUnsupportOperationError("Not support modify routetable for provider %s", account.Provider)
+		return httperrors.NewUnsupportOperationError("Modifying route table is not supported for provider %s", account.Provider)
 	}
 	return nil
 }

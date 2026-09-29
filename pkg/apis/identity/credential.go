@@ -31,6 +31,13 @@ type CredentialUpdateInput struct {
 
 	// enabled
 	Enabled *bool `json:"enabled"`
+
+	// 更新 blob 内容（明文，服务端加密后写入 encrypted_blob）
+	Blob string `json:"blob"`
+
+	// 由 ValidateUpdateData 在提供 blob 时填充，不允许客户端直接传入
+	EncryptedBlob string `json:"encrypted_blob"`
+	KeyHash       string `json:"key_hash"`
 }
 
 type CredentialCreateInput struct {
@@ -49,4 +56,16 @@ type CredentialCreateInput struct {
 
 	// Ignore
 	KeyHash string `json:"key_hash"`
+}
+
+type CredentialContainerImageBlob struct {
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	Auth          string `json:"auth"`
+	ServerAddress string `json:"server_address,omitempty"`
+	// IdentityToken is used to authenticate the user and get
+	// an access token for the registry.
+	IdentityToken string `json:"identity_token,omitempty"`
+	// RegistryToken is a bearer token to be sent to a registry
+	RegistryToken string `json:"registry_token,omitempty"`
 }

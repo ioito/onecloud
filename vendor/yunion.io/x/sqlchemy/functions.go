@@ -17,9 +17,15 @@ package sqlchemy
 import (
 	"fmt"
 	"strings"
-
-	"yunion.io/x/log"
 )
+
+// IFunctionQueryField is a special type of field that is an aggregate function
+type IFunctionQueryField interface {
+	IQueryField
+
+	// is this an aggregate function?
+	IsAggregate() bool
+}
 
 // IFunction is the interface for a SQL embedded function, such as MIN, MAX, NOW, etc.
 type IFunction interface {
@@ -31,10 +37,11 @@ type IFunction interface {
 
 // NewFunction creates a field with SQL function
 // for example: SUM(count) as total
-func NewFunction(ifunc IFunction, name string) IQueryField {
+func NewFunction(ifunc IFunction, name string, isAggre bool) IQueryField {
 	return &SFunctionFieldBase{
 		IFunction: ifunc,
 		alias:     name,
+		aggregate: isAggre,
 	}
 }
 
@@ -42,6 +49,18 @@ func NewFunction(ifunc IFunction, name string) IQueryField {
 type SFunctionFieldBase struct {
 	IFunction
 	alias string
+
+	aggregate bool
+
+	convertFunc func(interface{}) interface{}
+}
+
+func (ff *SFunctionFieldBase) getQuoteChar() string {
+	qChar := ""
+	if ff.database() != nil {
+		qChar = ff.database().backend.QuoteChar()
+	}
+	return qChar
 }
 
 // Reference implementation of SFunctionFieldBase for IQueryField
@@ -50,16 +69,12 @@ func (ff *SFunctionFieldBase) Reference() string {
 		// log.Warningf("reference a function field without alias! %s", ff.expression())
 		return ff.expression()
 	}
-	return fmt.Sprintf("`%s`", ff.alias)
+	qChar := ff.getQuoteChar()
+	return fmt.Sprintf("%s%s%s", qChar, ff.alias, qChar)
 }
 
 // Expression implementation of SFunctionFieldBase for IQueryField
 func (ff *SFunctionFieldBase) Expression() string {
-	if len(ff.alias) > 0 {
-		// add alias
-		return fmt.Sprintf("%s AS `%s`", ff.expression(), ff.alias)
-	}
-	// no alias
 	return ff.expression()
 }
 
@@ -84,6 +99,18 @@ func (ff *SFunctionFieldBase) Variables() []interface{} {
 	return ff.variables()
 }
 
+// ConvertFromValue implementation of SFunctionFieldBase for IQueryField
+func (ff *SFunctionFieldBase) ConvertFromValue(val interface{}) interface{} {
+	if ff.convertFunc != nil {
+		return ff.convertFunc(val)
+	}
+	return val
+}
+
+func (ff *SFunctionFieldBase) IsAggregate() bool {
+	return ff.aggregate
+}
+
 type sExprFunction struct {
 	fields   []IQueryField
 	function string
@@ -92,7 +119,7 @@ type sExprFunction struct {
 func (ff *sExprFunction) expression() string {
 	fieldRefs := make([]interface{}, 0)
 	for _, f := range ff.fields {
-		fieldRefs = append(fieldRefs, f.Reference())
+		fieldRefs = append(fieldRefs, f.Expression())
 	}
 	return fmt.Sprintf(ff.function, fieldRefs...)
 }
@@ -113,7 +140,9 @@ func (ff *sExprFunction) database() *SDatabase {
 			return db
 		}
 	}
-	log.Debugf("no fields function? %s", ff.expression())
+	// if ff.function != "COUNT(*)" {
+	// 	log.Debugf("no fields function? %s", ff.expression())
+	// }
 	return nil
 }
 
@@ -121,15 +150,21 @@ func (ff *sExprFunction) queryFields() []IQueryField {
 	return ff.fields
 }
 
+func NewFunctionField(name string, isAggr bool, funcexp string, fields ...IQueryField) IQueryField {
+	return NewFunctionFieldWithConvert(name, isAggr, funcexp, nil, fields...)
+}
+
 // NewFunctionField returns an instance of query field by calling a SQL embedded function
-func NewFunctionField(name string, funcexp string, fields ...IQueryField) IQueryField {
+func NewFunctionFieldWithConvert(name string, isAggr bool, funcexp string, convertFunc func(interface{}) interface{}, fields ...IQueryField) IQueryField {
 	funcBase := &sExprFunction{
 		fields:   fields,
 		function: funcexp,
 	}
 	return &SFunctionFieldBase{
-		IFunction: funcBase,
-		alias:     name,
+		IFunction:   funcBase,
+		alias:       name,
+		aggregate:   isAggr,
+		convertFunc: convertFunc,
 	}
 }
 
@@ -151,6 +186,11 @@ func MIN(name string, field IQueryField) IQueryField {
 // SUM represents the SQL function SUM
 func SUM(name string, field IQueryField) IQueryField {
 	return getFieldBackend(field).SUM(name, field)
+}
+
+// AVG represents the SQL function SUM
+func AVG(name string, field IQueryField) IQueryField {
+	return getFieldBackend(field).AVG(name, field)
 }
 
 // LOWER represents the SQL function SUM
@@ -188,16 +228,13 @@ func REPLACE(name string, field IQueryField, old string, new string) IQueryField
 type SConstField struct {
 	constVar interface{}
 	alias    string
+
+	db *SDatabase
 }
 
 // Expression implementation of SConstField for IQueryField
 func (s *SConstField) Expression() string {
-	name := s.Name()
-	if len(name) == 0 {
-		return s.Reference()
-	} else {
-		return fmt.Sprintf("%s AS `%s`", s.Reference(), name)
-	}
+	return s.Reference()
 }
 
 // Name implementation of SConstField for IQueryField
@@ -218,9 +255,14 @@ func (s *SConstField) Label(label string) IQueryField {
 	return s
 }
 
+// ConvertFromValue implementation of SConstField for IQueryField
+func (s *SConstField) ConvertFromValue(val interface{}) interface{} {
+	return val
+}
+
 // database implementation of SConstField for IQueryField
 func (s *SConstField) database() *SDatabase {
-	return nil
+	return s.db
 }
 
 // Variables implementation of SConstField for IQueryField
@@ -228,25 +270,39 @@ func (s *SConstField) Variables() []interface{} {
 	return nil
 }
 
+// IsAggregate implementation of SConstField for IFunctionQueryField
+func (s *SConstField) IsAggregate() bool {
+	return true
+}
+
 // NewConstField returns an instance of SConstField
 func NewConstField(variable interface{}) *SConstField {
 	return &SConstField{constVar: variable}
+}
+
+// database implementation of SStringField for IQueryField
+func (s *SConstField) WithField(f IQueryField) *SConstField {
+	s.db = f.database()
+	return s
+}
+
+func (q *SQuery) ConstField(variable interface{}) *SConstField {
+	f := NewConstField(variable)
+	f.db = q.db
+	return f
 }
 
 // SStringField is a query field of a string constant
 type SStringField struct {
 	strConst string
 	alias    string
+
+	db *SDatabase
 }
 
 // Expression implementation of SStringField for IQueryField
 func (s *SStringField) Expression() string {
-	name := s.Name()
-	if len(name) == 0 {
-		return s.Reference()
-	} else {
-		return fmt.Sprintf("%s AS `%s`", s.Reference(), name)
-	}
+	return s.Reference()
 }
 
 // Name implementation of SStringField for IQueryField
@@ -267,9 +323,14 @@ func (s *SStringField) Label(label string) IQueryField {
 	return s
 }
 
+// ConvertFromValue implementation of SStringField for IQueryField
+func (s *SStringField) ConvertFromValue(val interface{}) interface{} {
+	return val
+}
+
 // database implementation of SStringField for IQueryField
 func (s *SStringField) database() *SDatabase {
-	return nil
+	return s.db
 }
 
 // Variables implementation of SStringField for IQueryField
@@ -277,9 +338,26 @@ func (s *SStringField) Variables() []interface{} {
 	return nil
 }
 
+// IsAggregate implementation of SStringField for IFunctionQueryField
+func (s *SStringField) IsAggregate() bool {
+	return true
+}
+
+// database implementation of SStringField for IQueryField
+func (s *SStringField) WithField(f IQueryField) *SStringField {
+	s.db = f.database()
+	return s
+}
+
 // NewStringField returns an instance of SStringField
 func NewStringField(strConst string) *SStringField {
 	return &SStringField{strConst: strConst}
+}
+
+func (q *SQuery) StringField(strConst string) *SStringField {
+	f := NewStringField(strConst)
+	f.db = q.db
+	return f
 }
 
 // CONCAT represents a SQL function CONCAT
@@ -313,6 +391,11 @@ func INET_ATON(field IQueryField) IQueryField {
 	return getFieldBackend(field).INET_ATON(field)
 }
 
+// INET6_ATON represents a SQL function INET_ATON
+func INET6_ATON(field IQueryField) IQueryField {
+	return getFieldBackend(field).INET6_ATON(field)
+}
+
 // TimestampAdd represents a SQL function TimestampAdd
 func TimestampAdd(name string, field IQueryField, offsetSeconds int) IQueryField {
 	return TIMESTAMPADD(name, field, offsetSeconds)
@@ -333,6 +416,21 @@ func CAST(field IQueryField, typeStr string, fieldname string) IQueryField {
 	return getFieldBackend(field).CAST(field, typeStr, fieldname)
 }
 
+// CASTString represents a SQL function cast any type to String
+func CASTString(field IQueryField, fieldname string) IQueryField {
+	return getFieldBackend(field).CASTString(field, fieldname)
+}
+
+// CASTInt represents a SQL function cast any type to Integer
+func CASTInt(field IQueryField, fieldname string) IQueryField {
+	return getFieldBackend(field).CASTInt(field, fieldname)
+}
+
+// CASTFloat represents a SQL function cast any type to Float
+func CASTFloat(field IQueryField, fieldname string) IQueryField {
+	return getFieldBackend(field).CASTFloat(field, fieldname)
+}
+
 // LENGTH represents a SQL function of LENGTH
 func LENGTH(name string, field IQueryField) IQueryField {
 	return getFieldBackend(field).LENGTH(name, field)
@@ -343,7 +441,7 @@ func bc(name, op string, fields ...IQueryField) IQueryField {
 	for i := 0; i < len(fields); i++ {
 		exps = append(exps, "%s")
 	}
-	return NewFunctionField(name, strings.Join(exps, fmt.Sprintf(" %s ", op)), fields...)
+	return NewFunctionField(name, false, strings.Join(exps, fmt.Sprintf(" %s ", op)), fields...)
 }
 
 func ADD(name string, fields ...IQueryField) IQueryField {
@@ -364,4 +462,8 @@ func DIV(name string, fields ...IQueryField) IQueryField {
 
 func DATEDIFF(unit string, field1, field2 IQueryField) IQueryField {
 	return getFieldBackend(field1).DATEDIFF(unit, field1, field2)
+}
+
+func ABS(name string, field IQueryField) IQueryField {
+	return NewFunctionField(name, false, "ABS(%s)", field)
 }

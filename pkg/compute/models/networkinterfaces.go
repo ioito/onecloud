@@ -33,6 +33,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=networkinterface
+// +onecloud:swagger-gen-model-plural=networkinterfaces
 type SNetworkInterfaceManager struct {
 	db.SStatusInfrasResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -156,6 +158,15 @@ func (manager *SNetworkInterfaceManager) QueryDistinctExtraField(q *sqlchemy.SQu
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SNetworkInterfaceManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (self *SNetworkInterface) getMoreDetails(out api.NetworkInterfaceDetails) (api.NetworkInterfaceDetails, error) {
 	networks, err := self.GetNetworks()
 	if err != nil {
@@ -272,7 +283,7 @@ func (manager *SNetworkInterfaceManager) SyncNetworkInterfaces(
 			syncResult.AddError(err)
 			continue
 		}
-		syncMetadata(ctx, userCred, new, added[i])
+		syncMetadata(ctx, userCred, new, added[i], false)
 		localResources = append(localResources, *new)
 		remoteResources = append(remoteResources, added[i])
 		syncResult.Add()
@@ -302,7 +313,9 @@ func (self *SNetworkInterface) SyncWithCloudNetworkInterface(ctx context.Context
 	}
 
 	SyncCloudDomain(userCred, self, provider.GetOwnerId())
-	syncMetadata(ctx, userCred, self, ext)
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
 }

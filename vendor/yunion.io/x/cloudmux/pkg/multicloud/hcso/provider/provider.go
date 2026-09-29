@@ -50,18 +50,6 @@ func (self *SHCSOProviderFactory) GetMaxCloudEventKeepDays() int {
 	return 7
 }
 
-func (self *SHCSOProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SHCSOProviderFactory) IsSupportClouduserPolicy() bool {
-	return false
-}
-
-func (self *SHCSOProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
 func (factory *SHCSOProviderFactory) IsSupportCrossCloudEnvVpcPeering() bool {
 	return false
 }
@@ -95,8 +83,8 @@ func (self *SHCSOProviderFactory) ValidateCreateCloudaccountData(ctx context.Con
 		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "cloud_stack_endpoints")
 	}
 
-	if len(input.DefaultRegion) == 0 {
-		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "default_region")
+	if len(input.RegionId) == 0 {
+		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "region_id")
 	}
 
 	if len(input.SHCSOEndpoints.EndpointDomain) == 0 {
@@ -118,8 +106,8 @@ func (self *SHCSOProviderFactory) ValidateUpdateCloudaccountCredential(ctx conte
 	}
 
 	if input.SHCSOEndpoints != nil {
-		if len(input.DefaultRegion) == 0 {
-			return output, errors.Wrap(cloudprovider.ErrMissingParameter, "default_region")
+		if len(input.RegionId) == 0 {
+			return output, errors.Wrap(cloudprovider.ErrMissingParameter, "region_id")
 		}
 
 		if len(input.SHCSOEndpoints.EndpointDomain) == 0 {
@@ -202,14 +190,14 @@ func (self *SHCSOProvider) GetVersion() string {
 }
 
 func (self *SHCSOProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(huawei.HUAWEI_API_VERSION), "api_version")
 	return info, nil
 }
 
-func (self *SHCSOProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SHCSOProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -297,12 +285,8 @@ func (self *SHCSOProvider) CreateICloudgroup(name, desc string) (cloudprovider.I
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SHCSOProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SHCSOProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SHCSOProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SHCSOProvider) CreateICloudpolicy(opts *cloudprovider.SCloudpolicyCreateOptions) (cloudprovider.ICloudpolicy, error) {

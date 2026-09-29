@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/osprofile"
 	"yunion.io/x/pkg/util/rbacscope"
@@ -75,6 +76,8 @@ func (self *SQcloudGuestDriver) GetStorageTypes() []string {
 		api.STORAGE_LOCAL_BASIC,
 		api.STORAGE_LOCAL_SSD,
 		api.STORAGE_CLOUD_HSSD,
+		api.STORAGE_CLOUD_BSSD,
+		api.STORAGE_CLOUD_TSSD,
 	}
 }
 
@@ -94,8 +97,8 @@ func (self *SQcloudGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SQcloudGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
+func (self *SQcloudGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SQcloudGuestDriver) GetDeployStatus() ([]string, error) {
@@ -104,7 +107,7 @@ func (self *SQcloudGuestDriver) GetDeployStatus() ([]string, error) {
 
 func (self *SQcloudGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
 	//https://cloud.tencent.com/document/product/362/5747
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_RUNNING}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_RUNNING, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	if disk.DiskType == api.DISK_TYPE_SYS {
@@ -125,7 +128,7 @@ func (self *SQcloudGuestDriver) ValidateCreateData(ctx context.Context, userCred
 		return nil, err
 	}
 	if len(input.Networks) > 2 {
-		return nil, httperrors.NewInputParameterError("cannot support more than 1 nic")
+		return nil, httperrors.NewInputParameterError("multiple NICs are not supported")
 	}
 
 	sysDisk := input.Disks[0]
@@ -138,7 +141,7 @@ func (self *SQcloudGuestDriver) ValidateCreateData(ctx context.Context, userCred
 		if sysDisk.SizeMb > 1024*1024 {
 			return nil, fmt.Errorf("The %s system disk size must be less than 1024GB", sysDisk.Backend)
 		}
-	case api.STORAGE_LOCAL_PRO, api.STORAGE_CLOUD_HSSD: //https://cloud.tencent.com/document/product/362/2353
+	case api.STORAGE_LOCAL_PRO: //https://cloud.tencent.com/document/product/362/2353
 		return nil, fmt.Errorf("storage %s can not be system disk", sysDisk.Backend)
 	}
 
@@ -153,12 +156,12 @@ func (self *SQcloudGuestDriver) ValidateCreateData(ctx context.Context, userCred
 			if disk.SizeMb < 10*1024 || disk.SizeMb > 32000*1024 {
 				return nil, httperrors.NewInputParameterError("The %s disk size must be in the range of 10GB ~ 32000GB", disk.Backend)
 			}
-		case api.STORAGE_CLOUD_SSD, api.STORAGE_CLOUD_HSSD:
+		case api.STORAGE_CLOUD_SSD, api.STORAGE_CLOUD_HSSD, api.STORAGE_CLOUD_BSSD, api.STORAGE_CLOUD_TSSD:
 			if disk.SizeMb < 20*1024 || disk.SizeMb > 32000*1024 {
 				return nil, httperrors.NewInputParameterError("The %s disk size must be in the range of 20GB ~ 32000GB", disk.Backend)
 			}
 		case api.STORAGE_LOCAL_PRO:
-			return nil, httperrors.NewInputParameterError("storage %s can not be data disk", disk.Backend)
+			return nil, httperrors.NewInputParameterError("storage %s cannot be data disk", disk.Backend)
 		}
 		if disk.SizeMb/1024%10 > 0 {
 			return nil, httperrors.NewInputParameterError("Data disk size must be an integer multiple of 10G")
@@ -167,46 +170,51 @@ func (self *SQcloudGuestDriver) ValidateCreateData(ctx context.Context, userCred
 	return input, nil
 }
 
-func (self *SQcloudGuestDriver) ValidateChangeConfig(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, cpuChanged bool, memChanged bool, newDisks []*api.DiskConfig) error {
-	if cpuChanged || memChanged {
+func (qcloud *SQcloudGuestDriver) ValidateGuestChangeConfigInput(ctx context.Context, guest *models.SGuest, input api.ServerChangeConfigInput) (*api.ServerChangeConfigSettings, error) {
+	confs, err := qcloud.SBaseGuestDriver.ValidateGuestChangeConfigInput(ctx, guest, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SBaseGuestDriver.ValidateGuestChangeConfigInput")
+	}
+
+	if confs.CpuChanged() || confs.MemChanged() {
 		disk, err := guest.GetSystemDisk()
 		if err != nil {
-			return httperrors.NewResourceNotFoundError("failed to found system disk error: %v", err)
+			return nil, httperrors.NewResourceNotFoundError("failed to found system disk error: %v", err)
 		}
 		storage, _ := disk.GetStorage()
 		if storage == nil {
-			return httperrors.NewResourceNotFoundError("failed to found storage for disk %s(%s)", disk.Name, disk.Id)
+			return nil, httperrors.NewResourceNotFoundError("failed to found storage for disk %s(%s)", disk.Name, disk.Id)
 		}
 		// 腾讯云系统盘为本地存储，不支持调整配置
 		if utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_LOCAL_BASIC, api.STORAGE_LOCAL_SSD, api.STORAGE_LOCAL_PRO}) {
-			return httperrors.NewUnsupportOperationError("The system disk is locally stored and does not support changing configuration")
+			return nil, httperrors.NewUnsupportOperationError("locally stored system disks do not support changing configuration")
 		}
 	}
 
-	for _, newDisk := range newDisks {
+	for _, newDisk := range confs.Create {
 		switch newDisk.Backend {
 		case api.STORAGE_CLOUD_BASIC:
 			if newDisk.SizeMb < 10*1024 || newDisk.SizeMb > 16000*1024 {
-				return httperrors.NewInputParameterError("The %s disk size must be in the range of 10GB ~ 16000GB", newDisk.Backend)
+				return nil, httperrors.NewInputParameterError("The %s disk size must be in the range of 10GB ~ 16000GB", newDisk.Backend)
 			}
 		case api.STORAGE_CLOUD_PREMIUM:
 			if newDisk.SizeMb < 10*1024 || newDisk.SizeMb > 32000*1024 {
-				return httperrors.NewInputParameterError("The %s disk size must be in the range of 10GB ~ 32000GB", newDisk.Backend)
+				return nil, httperrors.NewInputParameterError("The %s disk size must be in the range of 10GB ~ 32000GB", newDisk.Backend)
 			}
-		case api.STORAGE_CLOUD_SSD, api.STORAGE_CLOUD_HSSD:
+		case api.STORAGE_CLOUD_SSD, api.STORAGE_CLOUD_HSSD, api.STORAGE_CLOUD_BSSD, api.STORAGE_CLOUD_TSSD:
 			if newDisk.SizeMb < 20*1024 || newDisk.SizeMb > 32000*1024 {
-				return httperrors.NewInputParameterError("The %s disk size must be in the range of 20GB ~ 32000GB", newDisk.Backend)
+				return nil, httperrors.NewInputParameterError("The %s disk size must be in the range of 20GB ~ 32000GB", newDisk.Backend)
 			}
 		case api.STORAGE_LOCAL_BASIC, api.STORAGE_LOCAL_SSD, api.STORAGE_LOCAL_PRO:
-			return httperrors.NewUnsupportOperationError("Not support create local storage disks")
+			return nil, httperrors.NewUnsupportOperationError("Creating local storage disks is not supported")
 		case "": //这里Backend为空有可能会导致创建出来还是local storage,依然会出错,需要用户显式指定
-			return httperrors.NewInputParameterError("Please input new disk backend type")
+			return nil, httperrors.NewInputParameterError("Please input new disk backend type")
 		}
 		if newDisk.SizeMb/1024%10 > 0 {
-			return httperrors.NewInputParameterError("Data disk size must be an integer multiple of 10G")
+			return nil, httperrors.NewInputParameterError("Data disk size must be an integer multiple of 10G")
 		}
 	}
-	return nil
+	return confs, nil
 }
 
 func (self *SQcloudGuestDriver) ValidateDetachDisk(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, disk *models.SDisk) error {
@@ -216,7 +224,7 @@ func (self *SQcloudGuestDriver) ValidateDetachDisk(ctx context.Context, userCred
 	}
 	// 腾讯云本地盘不支持卸载
 	if utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_LOCAL_BASIC, api.STORAGE_LOCAL_SSD}) {
-		return httperrors.NewUnsupportOperationError("The disk is locally stored and does not support detach")
+		return httperrors.NewUnsupportOperationError("locally stored disks do not support detaching")
 	}
 	return nil
 }
@@ -267,12 +275,16 @@ func (self *SQcloudGuestDriver) GetInstanceCapability() cloudprovider.SInstanceC
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_BASIC, MaxSizeGb: 16000, MinSizeGb: 10, StepSizeGb: 10, Resizable: true},
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_PREMIUM, MaxSizeGb: 16000, MinSizeGb: 50, StepSizeGb: 10, Resizable: true},
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_SSD, MaxSizeGb: 16000, MinSizeGb: 100, StepSizeGb: 10, Resizable: true},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_HSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 10, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_HSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_BSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_TSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 1, Resizable: true},
 			},
 			SysDisk: []cloudprovider.StorageInfo{
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_BASIC, MaxSizeGb: 500, MinSizeGb: 50, StepSizeGb: 10, Resizable: false},
 				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_PREMIUM, MaxSizeGb: 1024, MinSizeGb: 50, StepSizeGb: 10, Resizable: false},
-				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_SSD, MaxSizeGb: 500, MinSizeGb: 50, StepSizeGb: 10, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_SSD, MaxSizeGb: 500, MinSizeGb: 50, StepSizeGb: 1, Resizable: false},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_BSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 1, Resizable: true},
+				cloudprovider.StorageInfo{StorageType: api.STORAGE_CLOUD_TSSD, MaxSizeGb: 32000, MinSizeGb: 20, StepSizeGb: 1, Resizable: true},
 			},
 		},
 	}

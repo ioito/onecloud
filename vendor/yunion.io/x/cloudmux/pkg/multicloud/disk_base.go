@@ -14,19 +14,39 @@
 
 package multicloud
 
+import (
+	"context"
+
+	api "yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/errors"
+)
+
 type SDisk struct {
 	SVirtualResourceBase
 	SBillingBase
 }
 
-func (self *SDisk) GetExtSnapshotPolicyIds() ([]string, error) {
-	return []string{""}, nil
-}
-
-func (self *SDisk) GetIStorageId() string {
+func (disk *SDisk) GetIStorageId() string {
 	return ""
 }
 
-func (self *SDisk) GetIops() int {
+func (disk *SDisk) GetIops() int {
+	return 0
+}
+
+func (disk *SDisk) GetPreallocation() string {
+	return api.DISK_PREALLOCATION_OFF
+}
+
+func (disk *SDisk) ChangeStorage(ctx context.Context, opts *cloudprovider.ChangeStorageOptions) error {
+	return errors.Wrapf(cloudprovider.ErrNotImplemented, "ChangeStorage")
+}
+
+func (disk *SDisk) GetDeviceName() string {
+	return ""
+}
+
+func (disk *SDisk) GetThroughput() int {
 	return 0
 }

@@ -22,6 +22,7 @@ const (
 	HOST_TYPE_ALIYUN         = "aliyun"
 	HOST_TYPE_APSARA         = "apsara"
 	HOST_TYPE_AWS            = "aws"
+	HOST_TYPE_DEDICATED      = "dedicated"
 	HOST_TYPE_QCLOUD         = "qcloud"
 	HOST_TYPE_AZURE          = "azure"
 	HOST_TYPE_HUAWEI         = "huawei"
@@ -47,6 +48,13 @@ const (
 	HOST_TYPE_CUCLOUD        = "cucloud"
 	HOST_TYPE_QINGCLOUD      = "qingcloud"
 	HOST_TYPE_VOLCENGINE     = "volcengine"
+	HOST_TYPE_ORACLE         = "oracle"
+	HOST_TYPE_SANGFOR        = "sangfor"
+	HOST_TYPE_ZETTAKIT       = "zettakit"
+	HOST_TYPE_UIS            = "uis"
+	HOST_TYPE_CAS            = "cas"
+	HOST_TYPE_CNWARE         = "cnware"
+	HOST_TYPE_ROCKBASE       = "rockbase"
 
 	// # possible status
 	HOST_ONLINE  = "online"

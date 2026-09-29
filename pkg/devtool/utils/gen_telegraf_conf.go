@@ -101,6 +101,8 @@ const TELEGRAF_INPUT_LINUX = `
 [[inputs.internal]]
     name_prefix = "agent_"
     collect_memstats = false
+[[inputs.nvidia_smi]]
+    name_prefix = "agent_"
 `
 
 const TELEGRAF_INPUT_WINDOWS = `
@@ -133,6 +135,8 @@ const TELEGRAF_INPUT_WINDOWS = `
 [[inputs.internal]]
     name_prefix = "agent_"
     collect_memstats = false
+[[inputs.nvidia_smi]]
+    name_prefix = "agent_"
 `
 
 const TELEGRAF_INPUT_BAREMETAL = `
@@ -148,11 +152,6 @@ const TELEGRAF_INPUT_BAREMETAL = `
 [[inputs.diskio]]
     name_prefix = "agent_"
     skip_serial_number = false
-[[inputs.sensors]]
-    name_prefix = "agent_"
-[[inputs.smart]]
-    name_prefix = "agent_"
-    use_sudo = true
 [[inputs.mem]]
     name_prefix = "agent_"
 [[inputs.processes]]
@@ -170,6 +169,18 @@ const TELEGRAF_INPUT_BAREMETAL = `
 [[inputs.internal]]
     name_prefix = "agent_"
     collect_memstats = false
+[[inputs.nvidia_smi]]
+    name_prefix = "agent_"
+[[inputs.npu_smi]]
+    name_prefix = "agent_"
+[[inputs.ixsmi]]
+    name_prefix = "agent_"
+[[inputs.ppusmi]]
+    name_prefix = "agent_"
+[[inputs.hysmi]]
+    name_prefix = "agent_"
+[[inputs.xpusmi]]
+    name_prefix = "agent_"
 `
 
 var temp *template.Template
@@ -206,7 +217,7 @@ func GenerateTelegrafConf(
 		telegrafArgs["telegraf_agent_logfile"] = "/var/log/telegraf.log"
 	}
 	strBuild := strings.Builder{}
-	log.Errorf("telegraf args %v", telegrafArgs)
+	log.Infof("telegraf args %v", telegrafArgs)
 	err := temp.Execute(&strBuild, telegrafArgs)
 	if err != nil {
 		return "", errors.Wrap(err, "build telegraf config")

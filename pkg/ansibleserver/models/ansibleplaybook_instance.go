@@ -26,13 +26,13 @@ import (
 	"yunion.io/x/sqlchemy"
 
 	"yunion.io/x/onecloud/pkg/ansibleserver/options"
-	api "yunion.io/x/onecloud/pkg/apis/ansible"
+	api "yunion.io/x/onecloud/pkg/apis/ansibleserver"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/workmanager"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
-	"yunion.io/x/onecloud/pkg/mcclient/modules"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/devtool"
 	"yunion.io/x/onecloud/pkg/util/ansible"
 	"yunion.io/x/onecloud/pkg/util/ansiblev2"
 )
@@ -125,11 +125,11 @@ func (ai *SAnsiblePlaybookInstance) runPlaybook(ctx context.Context, userCred mc
 		ar = obj.(*SAnsiblePlaybookReference)
 	}
 	var (
-		privateKey string
-		err        error
+		privateKeys []string
+		err         error
 	)
-	if privateKey, err = compute.Sshkeypairs.FetchPrivateKey(ctx, userCred); err != nil {
-		return err
+	if privateKeys, err = compute.Sshkeypairs.FetchProjectPrivateKeys(ctx, userCred); err != nil {
+		return errors.Wrap(err, "unable to fetch private keys")
 	}
 	_, err = db.Update(ai, func() error {
 		ai.StartTime = time.Now()
@@ -143,15 +143,21 @@ func (ai *SAnsiblePlaybookInstance) runPlaybook(ctx context.Context, userCred mc
 	}
 
 	// merge configs
-	dp, params := ar.DefaultParams.(*jsonutils.JSONDict), ai.Params.(*jsonutils.JSONDict)
-	for _, k := range dp.SortedKeys() {
-		v, _ := dp.Get(k)
-		params.Set(k, v)
+	// the default params of the reference act as defaults, they are overridden
+	// by the params of this instance
+	params, _ := ai.Params.(*jsonutils.JSONDict)
+	if params == nil {
+		params = jsonutils.NewDict()
 	}
-	ar.DefaultParams.(*jsonutils.JSONDict).SortedKeys()
+	if dp, _ := ar.DefaultParams.(*jsonutils.JSONDict); dp != nil {
+		for _, k := range dp.SortedKeys() {
+			v, _ := dp.Get(k)
+			params.Set(k, v)
+		}
+	}
 	sess := ansiblev2.NewOfflineSession().
 		Inventory(ai.Inventory).
-		PrivateKey(privateKey).
+		PrivateKeys(privateKeys).
 		ConfigYaml(params.YAMLString()).
 		PlaybookPath(ar.PlaybookPath).
 		OutputWriter(&ansiblePlaybookOutputWriter{ai}).
@@ -216,7 +222,7 @@ var PlaybookWorker *workmanager.SWorkManager
 func taskFailed(ctx context.Context, reason string) {
 	if taskId := ctx.Value(appctx.APP_CONTEXT_KEY_TASK_ID); taskId != nil {
 		session := auth.GetAdminSessionWithInternal(ctx, "")
-		modules.TaskFailed(&compute.DevtoolTasks, session, taskId.(string), reason)
+		devtool.DevtoolTasks.TaskFailed2(session, taskId.(string), reason)
 	} else {
 		log.Warningf("Reqeuest task failed missing task id, with reason: %s", reason)
 	}
@@ -225,12 +231,12 @@ func taskFailed(ctx context.Context, reason string) {
 func taskCompleted(ctx context.Context, data jsonutils.JSONObject) {
 	if taskId := ctx.Value(appctx.APP_CONTEXT_KEY_TASK_ID); taskId != nil {
 		session := auth.GetAdminSessionWithInternal(ctx, "")
-		modules.TaskComplete(&compute.DevtoolTasks, session, taskId.(string), data)
+		devtool.DevtoolTasks.TaskComplete(session, taskId.(string), data)
 	} else {
 		log.Warningf("Reqeuest task failed missing task id, with data: %v", data)
 	}
 }
 
 func InitPlaybookWorker() {
-	PlaybookWorker = workmanager.NewWorkManger(taskFailed, taskCompleted, options.Options.PlaybookWorkerCount)
+	PlaybookWorker = workmanager.NewWorkManger("PlaybookWorker", taskFailed, taskCompleted, options.Options.PlaybookWorkerCount)
 }

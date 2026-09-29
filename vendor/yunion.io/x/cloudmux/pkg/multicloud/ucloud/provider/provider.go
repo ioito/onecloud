@@ -21,7 +21,6 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
-	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud/ucloud"
 )
@@ -131,7 +130,7 @@ func (self *SUcloudProvider) GetIProjects() ([]cloudprovider.ICloudProject, erro
 }
 
 func (self *SUcloudProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(ucloud.UCLOUD_API_VERSION), "api_version")
@@ -150,7 +149,7 @@ func (self *SUcloudProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SUcloudProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SUcloudProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -159,11 +158,7 @@ func (self *SUcloudProvider) GetIRegionById(extId string) (cloudprovider.ICloudR
 }
 
 func (self *SUcloudProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) {
-	return &cloudprovider.SBalanceInfo{
-		Amount:   0.0,
-		Currency: "CNY",
-		Status:   api.CLOUD_PROVIDER_HEALTH_NORMAL,
-	}, cloudprovider.ErrNotSupported
+	return self.client.GetBalance()
 }
 
 func (self *SUcloudProvider) GetOnPremiseIRegion() (cloudprovider.ICloudRegion, error) {
@@ -192,4 +187,8 @@ func (self *SUcloudProvider) GetObjectCannedAcls(regionId string) []string {
 
 func (self *SUcloudProvider) GetCapabilities() []string {
 	return self.client.GetCapabilities()
+}
+
+func (self *SUcloudProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
+	return self.client.GetMetrics(opts)
 }

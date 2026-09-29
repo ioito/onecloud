@@ -22,6 +22,7 @@ import (
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/imagetools"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -74,6 +75,7 @@ func (t *SVMTemplate) GetGlobalId() string {
 func (t *SVMTemplate) GetStatus() string {
 	ihosts, err := t.cache.datastore.GetAttachedHosts()
 	if err != nil {
+		log.Errorf("GetAttachedHosts for image %s error: %v", t.GetName(), err)
 		return api.CACHED_IMAGE_STATUS_CACHE_FAILED
 	}
 	for _, ihost := range ihosts {
@@ -87,6 +89,7 @@ func (t *SVMTemplate) GetStatus() string {
 			return api.CACHED_IMAGE_STATUS_CACHE_FAILED
 		}
 	}
+	log.Errorf("empty host attached for image %s", t.GetName())
 	return api.CACHED_IMAGE_STATUS_CACHE_FAILED
 }
 
@@ -148,27 +151,27 @@ func (t *SVMTemplate) GetBios() cloudprovider.TBiosType {
 }
 
 func (t *SVMTemplate) GetOsType() cloudprovider.TOsType {
-	return t.vm.GetOsType()
+	return cloudprovider.TOsType(imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsType)
 }
 
 func (t *SVMTemplate) GetOsDist() string {
-	return t.vm.GetOsDist()
+	return imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsDistro
 }
 
 func (t *SVMTemplate) GetOsVersion() string {
-	return t.vm.GetOsVersion()
+	return imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsVersion
 }
 
 func (t *SVMTemplate) GetOsLang() string {
-	return t.vm.GetOsLang()
+	return imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsLang
 }
 
 func (t *SVMTemplate) GetOsArch() string {
-	return t.vm.GetOsArch()
+	return imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsArch
 }
 
 func (t *SVMTemplate) GetFullOsName() string {
-	return t.vm.GetFullOsName()
+	return imagetools.NormalizeImageInfo(t.GetName(), "", "", "", "").OsFullVersion
 }
 
 func (t *SVMTemplate) GetMinOsDiskSizeGb() int {

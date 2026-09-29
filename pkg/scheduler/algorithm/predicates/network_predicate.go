@@ -30,6 +30,7 @@ import (
 	"yunion.io/x/onecloud/pkg/scheduler/algorithm/plugin"
 	"yunion.io/x/onecloud/pkg/scheduler/api"
 	"yunion.io/x/onecloud/pkg/scheduler/core"
+	schedmodels "yunion.io/x/onecloud/pkg/scheduler/models"
 )
 
 // NetworkPredicate will filter the current network information with
@@ -75,6 +76,11 @@ type INetworkNicCountGetter interface {
 
 func (p *NetworkPredicate) PreExecute(ctx context.Context, u *core.Unit, cs []core.Candidater) (bool, error) {
 	data := u.SchedData()
+
+	if data.ResetCpuNumaPin {
+		return false, nil
+	}
+
 	if len(data.Networks) == 0 {
 		return false, nil
 	}
@@ -100,7 +106,7 @@ func (p *NetworkPredicate) PreExecute(ctx context.Context, u *core.Unit, cs []co
 	return true, nil
 }
 
-func IsNetworksAvailable(ctx context.Context, c core.Candidater, data *api.SchedInfo, req *computeapi.NetworkConfig, networks []*api.CandidateNetwork, netTypes []string, getFreePort func(string) int) (int, []core.PredicateFailureReason) {
+func IsNetworksAvailable(ctx context.Context, c core.Candidater, data *api.SchedInfo, req *computeapi.NetworkConfig, networks []*api.CandidateNetwork, netTypes []computeapi.TNetworkType, getFreePort func(string) int) (int, []core.PredicateFailureReason) {
 	var fullErrMsgs []core.PredicateFailureReason
 	var freeCnt int
 
@@ -110,11 +116,16 @@ func IsNetworksAvailable(ctx context.Context, c core.Candidater, data *api.Sched
 
 	ovnCapable := c.Getter().OvnCapable()
 	ovnNetworks := []*api.CandidateNetwork{}
+	hostLocalNetworks := []*api.CandidateNetwork{}
 	for i := len(networks) - 1; i >= 0; i -= 1 {
 		net := networks[i]
 		if net.Provider == computeapi.CLOUD_PROVIDER_ONECLOUD || net.Provider == computeapi.CLOUD_PROVIDER_CLOUDPODS {
 			networks = append(networks[:i], networks[i+1:]...)
-			ovnNetworks = append(ovnNetworks, net)
+			if net.WireId == computeapi.DEFAULT_HOST_LOCAL_WIRE_ID {
+				hostLocalNetworks = append(hostLocalNetworks, net)
+			} else {
+				ovnNetworks = append(ovnNetworks, net)
+			}
 		}
 	}
 
@@ -132,6 +143,10 @@ func IsNetworksAvailable(ctx context.Context, c core.Candidater, data *api.Sched
 
 	if ovnCapable {
 		checkNets(ovnNetworks)
+	}
+
+	if len(hostLocalNetworks) > 0 {
+		checkNets(hostLocalNetworks)
 	}
 
 	// reuse network
@@ -162,7 +177,7 @@ func checkSriovNic(
 		}
 	}
 	getter := c.Getter()
-	devs := getter.UnusedIsolatedDevicesByModelAndWire(dev.Model, netWireId)
+	devs := getter.AvailableIsolatedDevicesByModelAndWire(dev.Model, netWireId)
 	if len(devs) == 0 {
 		return fmt.Errorf("Network wire no sriov nic available")
 	}
@@ -173,22 +188,28 @@ func IsNetworkAvailable(
 	ctx context.Context,
 	c core.Candidater, data *api.SchedInfo,
 	req *computeapi.NetworkConfig, n *api.CandidateNetwork,
-	netTypes []string, getFreePort func(string) int,
+	netTypes []computeapi.TNetworkType, getFreePort func(string) int,
 ) core.PredicateFailureReason {
 	address := req.Address
 	private := req.Private
 	exit := req.Exit
 	wire := req.Wire
 
+	if req.RequireIPv6 && !n.IsSupportIPv6() {
+		return FailReason{
+			Reason: fmt.Sprintf("%v(%v): %s", n.Name, n.Id, ErrNotSupportIpv6),
+		}
+	}
+
 	isMatchServerType := func(network *models.SNetwork) bool {
-		return utils.IsInStringArray(network.ServerType, netTypes)
+		return computeapi.IsInNetworkTypes(network.ServerType, netTypes)
 	}
 
 	isMigrate := func() bool {
 		return len(data.HostId) > 0
 	}
 
-	if n.IsExitNetwork() != exit {
+	if isExit := n.IsExitNetwork(); isExit && isExit != exit {
 		return FailReason{
 			Reason: fmt.Sprintf("%v(%v): %s", n.Name, n.Id, ErrExitIsNotMatch),
 		}
@@ -261,7 +282,7 @@ func IsNetworkAvailable(
 	} else {
 		if !isMatchServerType(n.SNetwork) {
 			return FailReason{
-				Reason: fmt.Sprintf("Network %s type %s match", n.Name, n.ServerType),
+				Reason: fmt.Sprintf("Network %s type %s not match %s", n.Name, n.ServerType, netTypes),
 				Type:   NetworkTypeMatch,
 			}
 		}
@@ -293,10 +314,14 @@ func IsNetworkAvailable(
 	return nil
 }
 
-func (p *NetworkPredicate) GetNetworkTypes(u *core.Unit, specifyType string) []string {
-	netTypes := p.GetHypervisorDriver(u).GetRandomNetworkTypes()
+func (p *NetworkPredicate) GetNetworkTypes(u *core.Unit, specifyType computeapi.TNetworkType) []computeapi.TNetworkType {
+	netTypes := []computeapi.TNetworkType{}
+	driver := p.GetHypervisorDriver(u)
+	if driver != nil {
+		netTypes = driver.GetRandomNetworkTypes()
+	}
 	if len(specifyType) > 0 {
-		netTypes = []string{specifyType}
+		netTypes = []computeapi.TNetworkType{specifyType}
 	}
 	return netTypes
 }
@@ -310,7 +335,7 @@ func (p *NetworkPredicate) Execute(ctx context.Context, u *core.Unit, c core.Can
 
 	getFreePort := func(id string) int {
 		if _, ok := p.networkFreePortCount[id]; ok {
-			return p.networkFreePortCount[id] - c.Getter().GetPendingUsage().NetUsage.Get(id)
+			return p.networkFreePortCount[id] - schedmodels.HostPendingUsageManager.GetNetPendingUsage(id)
 		}
 		return c.Getter().GetFreePort(id)
 	}

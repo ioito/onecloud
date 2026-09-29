@@ -31,6 +31,7 @@ func defaultPredicates() sets.String {
 	return sets.NewString(
 		factory.RegisterFitPredicate("a-GuestHostStatusFilter", &predicateguest.StatusPredicate{}),
 		factory.RegisterFitPredicate("b-GuestHypervisorFilter", &predicateguest.HypervisorPredicate{}),
+		factory.RegisterFitPredicate("c-GuestHostPathFilter", predicates.NewHostPathPredicate()),
 		factory.RegisterFitPredicate("c-GuestHostschedtagFilter", predicates.NewHostSchedtagPredicate()),
 		factory.RegisterFitPredicate("d-GuestMigrateFilter", &predicateguest.MigratePredicate{}),
 		factory.RegisterFitPredicate("e-GuestDomainFilter", &predicates.DomainPredicate{}),
@@ -59,5 +60,7 @@ func defaultPriorities() sets.String {
 		factory.RegisterPriority("guest-lowload", &priorityguest.LowLoadPriority{}, 1),
 		factory.RegisterPriority("guest-creating", &priorityguest.CreatingPriority{}, 1),
 		factory.RegisterPriority("guest-capacity", &priorityguest.CapacityPriority{}, 1),
+		factory.RegisterPriority("guest-gpu-vram-binpack", &priorityguest.GPUVramBinpackPriority{}, 1),
+		factory.RegisterPriority("guest-cpunumapin", &priorityguest.CpuNumaPinPriority{}, 1),
 	)
 }

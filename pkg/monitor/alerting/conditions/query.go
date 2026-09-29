@@ -23,7 +23,10 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/sets"
+	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -31,6 +34,7 @@ import (
 	mc_mds "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/monitor/alerting"
+	"yunion.io/x/onecloud/pkg/monitor/datasource"
 	"yunion.io/x/onecloud/pkg/monitor/models"
 	"yunion.io/x/onecloud/pkg/monitor/options"
 	"yunion.io/x/onecloud/pkg/monitor/tsdb"
@@ -50,6 +54,7 @@ type QueryCondition struct {
 	Index         int
 	Query         AlertQuery
 	Reducer       Reducer
+	ReducerOrder  monitor.ResultReducerOrder
 	Evaluator     AlertEvaluator
 	Operator      string
 	HandleRequest tsdb.HandleRequestFunc
@@ -59,14 +64,13 @@ type QueryCondition struct {
 // AlertQuery contains information about what datasource a query
 // should be send to and the query object.
 type AlertQuery struct {
-	Model        monitor.MetricQuery
-	DataSourceId string
-	From         string
-	To           string
+	Model monitor.MetricQuery
+	From  string
+	To    string
 }
 
 type FormatCond struct {
-	QueryMeta    *tsdb.QueryResultMeta
+	QueryMeta    *monitor.QueryResultMeta
 	QueryKeyInfo string
 	Reducer      string
 	Evaluator    AlertEvaluator
@@ -93,14 +97,22 @@ func GetFetchImpByDb(db string) iEvalMatchFetch {
 	return iFetchImp[db]
 }
 
-func (c *QueryCondition) GenerateFormatCond(meta *tsdb.QueryResultMeta, metric string) *FormatCond {
+func (c *QueryCondition) GenerateFormatCond(meta *monitor.QueryResultMeta, metric string) *FormatCond {
 	return &FormatCond{
 		QueryMeta:    meta,
 		QueryKeyInfo: metric,
-		Reducer:      c.Reducer.GetType(),
+		Reducer:      string(c.Reducer.GetType()),
 		Evaluator:    c.Evaluator,
 	}
 }
+
+func (c *QueryCondition) IsCloudResource() bool {
+	if c.ResType == "" {
+		return false
+	}
+	return monitor.MetricCloudResTypes.Has(c.ResType)
+}
+
 func (c FormatCond) String() string {
 	if c.QueryMeta != nil {
 		return fmt.Sprintf("%s(%q) %s", c.Reducer, c.QueryMeta.RawQuery, c.Evaluator.String())
@@ -108,9 +120,15 @@ func (c FormatCond) String() string {
 	return "no_data"
 }
 
-func (c *QueryCondition) filterTags(tags map[string]string, details monitor.CommonAlertMetricDetails) map[string]string {
+func (c *QueryCondition) filterTags(tags map[string]string, cloudTags map[string]string, details monitor.CommonAlertMetricDetails) map[string]string {
 	ret := make(map[string]string)
-	for key, val := range tags {
+	allTags := make(map[string]string)
+	for _, ts := range []map[string]string{tags, cloudTags} {
+		for k, v := range ts {
+			allTags[k] = v
+		}
+	}
+	for key, val := range allTags {
 		//if strings.HasSuffix(key, "_id") {
 		//	continue
 		//}
@@ -158,12 +176,18 @@ func (c *QueryCondition) Eval(context *alerting.EvalContext) (*alerting.Conditio
 	var matches []*monitor.EvalMatch
 	var alertOkmatches []*monitor.EvalMatch
 
-	//allResources, err := c.GetQueryResources()
-	//if err != nil {
-	//	return nil, errors.Wrap(err, "GetQueryResources err")
-	//}
+	alert, err := models.CommonAlertManager.GetAlert(context.Rule.Id)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetAlert to NewEvalMatch error")
+	}
+
 	for _, series := range seriesList {
-		if len(c.ResType) != 0 {
+		if c.ResType == monitor.METRIC_RES_TYPE_CLOUDACCOUNT {
+			if enabled, ok := series.Tags["enabled"]; ok && enabled == "false" {
+				continue
+			}
+		}
+		if c.IsCloudResource() {
 			isLatestOfSerie, resource := c.serieIsLatestResource(nil, series)
 			if !isLatestOfSerie {
 				continue
@@ -186,22 +210,26 @@ func (c *QueryCondition) Eval(context *alerting.EvalContext) (*alerting.Conditio
 		if evalMatch {
 			evalMatchCount++
 		}
-		var meta *tsdb.QueryResultMeta
+		var meta *monitor.QueryResultMeta
 		if len(metas) > 0 {
 			//the relation metas with series is 1 to more
 			meta = &metas[0]
 		}
 		if evalMatch {
-			match, err := c.NewEvalMatch(context, *series, meta, reducedValue, valStrArr)
+			match, err := c.NewEvalMatch(alert, context, *series, meta, reducedValue, valStrArr, evalMatch)
 			if err != nil {
 				return nil, errors.Wrap(err, "NewEvalMatch error")
 			}
 			matches = append(matches, match)
 		}
 		if reducedValue != nil && !evalMatch {
-			match, err := c.NewEvalMatch(context, *series, meta, reducedValue, valStrArr)
+			match, err := c.NewEvalMatch(alert, context, *series, meta, reducedValue, valStrArr, evalMatch)
 			if err != nil {
 				return nil, errors.Wrap(err, "NewEvalMatch error")
+			}
+			resId := monitor.GetResourceIdFromTagWithDefault(match.Tags, c.ResType)
+			if err := OkEvalMatchSetIsRecovery(alert, resId, match); err != nil {
+				log.Warningf("[Query] set eval match %s to recovered: %v", jsonutils.Marshal(match), err)
 			}
 			alertOkmatches = append(alertOkmatches, match)
 		}
@@ -239,13 +267,8 @@ func (c *QueryCondition) Eval(context *alerting.EvalContext) (*alerting.Conditio
 	}, nil
 }
 
-func (c *QueryCondition) serieIsLatestResource(resources map[string]jsonutils.JSONObject, series *tsdb.TimeSeries) (bool, jsonutils.JSONObject) {
-	tagId := monitor.MEASUREMENT_TAG_ID[c.ResType]
-	if len(tagId) == 0 {
-		tagId = "host_id"
-	}
-	resId := series.Tags[tagId]
-	log.Debugf("serieIsLatestResource use tagId %q, found resId %q", tagId, resId)
+func (c *QueryCondition) serieIsLatestResource(resources map[string]jsonutils.JSONObject, series *monitor.TimeSeries) (bool, jsonutils.JSONObject) {
+	resId := monitor.GetResourceIdFromTagWithDefault(series.Tags, c.ResType)
 	if len(resources) != 0 {
 		resource, ok := resources[resId]
 		if !ok {
@@ -263,7 +286,7 @@ func (c *QueryCondition) serieIsLatestResource(resources map[string]jsonutils.JS
 }
 
 func (c *QueryCondition) FillSerieByResourceField(resource jsonutils.JSONObject,
-	series *tsdb.TimeSeries) {
+	series *monitor.TimeSeries) {
 	//startTime := time.Now()
 	//defer func() {
 	//	log.Debugf("--FillSerieByResourceField: %s", time.Since(startTime))
@@ -274,14 +297,21 @@ func (c *QueryCondition) FillSerieByResourceField(resource jsonutils.JSONObject,
 		if err != nil {
 			continue
 		}
-		series.Tags[tagKey], _ = val.GetString()
+		if series.CloudTags == nil {
+			series.CloudTags = map[string]string{}
+		}
+		series.CloudTags[tagKey], _ = val.GetString()
 	}
 }
 
-func (c *QueryCondition) NewEvalMatch(context *alerting.EvalContext, series tsdb.TimeSeries,
-	meta *tsdb.QueryResultMeta, value *float64, valStrArr []string) (*monitor.EvalMatch, error) {
+func (c *QueryCondition) NewEvalMatch(
+	alert *models.SCommonAlert,
+	context *alerting.EvalContext,
+	series monitor.TimeSeries,
+	meta *monitor.QueryResultMeta,
+	value *float64, valStrArr []string, isMatch bool) (*monitor.EvalMatch, error) {
 	evalMatch := new(monitor.EvalMatch)
-	alertDetails, err := c.GetCommonAlertDetails(context)
+	alertDetails, err := c.GetCommonAlertDetails(alert)
 	if err != nil {
 		return nil, errors.Wrap(err, "GetAlert to NewEvalMatch error")
 	}
@@ -294,9 +324,9 @@ func (c *QueryCondition) NewEvalMatch(context *alerting.EvalContext, series tsdb
 		queryKeyInfo = evalMatch.Metric
 	}
 	evalMatch.Unit = alertDetails.FieldDescription.Unit
-	evalMatch.Tags = c.filterTags(series.Tags, *alertDetails)
+	evalMatch.Tags = c.filterTags(series.Tags, series.CloudTags, *alertDetails)
 	evalMatch.Value = value
-	evalMatch.ValueStr = alerting.RationalizeValueFromUnit(*value, alertDetails.FieldDescription.Unit,
+	evalMatch.ValueStr = models.RationalizeValueFromUnit(*value, alertDetails.FieldDescription.Unit,
 		alertDetails.FieldOpt)
 	if alertDetails.GetPointStr {
 		evalMatch.ValueStr = c.jointPointStr(series, evalMatch.ValueStr, valStrArr)
@@ -304,11 +334,39 @@ func (c *QueryCondition) NewEvalMatch(context *alerting.EvalContext, series tsdb
 	c.FetchCustomizeEvalMatch(context, evalMatch, alertDetails)
 	//c.newRuleDescription(context, alertDetails)
 	//evalMatch.Condition = c.GenerateFormatCond(meta, queryKeyInfo).String()
+	var thresholdStr string
+	// 处理 ranged types (within_range, outside_range)
+	if utils.IsInStringArray(alertDetails.Comparator, validators.EvaluatorRangedTypes) {
+		if len(alertDetails.ThresholdRange) >= 2 {
+			lowerStr := models.RationalizeValueFromUnit(alertDetails.ThresholdRange[0], evalMatch.Unit, "")
+			upperStr := models.RationalizeValueFromUnit(alertDetails.ThresholdRange[1], evalMatch.Unit, "")
+			thresholdStr = fmt.Sprintf("[%s, %s]", lowerStr, upperStr)
+		} else {
+			thresholdStr = models.RationalizeValueFromUnit(alertDetails.Threshold, evalMatch.Unit, "")
+		}
+	} else {
+		// 处理默认 types (gt, lt, eq)
+		thresholdStr = models.RationalizeValueFromUnit(alertDetails.Threshold, evalMatch.Unit, "")
+	}
 	msg := fmt.Sprintf("%s.%s %s %s", alertDetails.Measurement, alertDetails.Field,
-		alertDetails.Comparator, alerting.RationalizeValueFromUnit(alertDetails.Threshold, evalMatch.Unit, ""))
+		alertDetails.Comparator, thresholdStr)
+	// 为每个 EvalMatch 记录自身的触发条件，便于在通知模板中按 metric 精确展示
+	evalMatch.Condition = msg
 	if len(context.Rule.Message) == 0 {
 		context.Rule.Message = msg
 	}
+	// 避免重复指标
+	if isMatch {
+		op := alertDetails.Operator
+		if op != "" && c.Index > 0 {
+			msg = fmt.Sprintf("%s %s", strings.ToUpper(op), msg)
+		}
+		msgSet := sets.NewString(context.Rule.TriggeredMessages...)
+		if !msgSet.Has(msg) {
+			context.Rule.TriggeredMessages = append(context.Rule.TriggeredMessages, msg)
+		}
+	}
+	evalMatch.AlertDetails = jsonutils.Marshal(alertDetails)
 	return evalMatch, nil
 }
 
@@ -341,17 +399,13 @@ func (m *meterFetchImp) FetchCustomizeEvalMatch(context *alerting.EvalContext, e
 	return nil
 }
 
-func (c *QueryCondition) GetCommonAlertDetails(context *alerting.EvalContext) (*monitor.CommonAlertMetricDetails, error) {
-	alert, err := models.CommonAlertManager.GetAlert(context.Rule.Id)
-	if err != nil {
-		return nil, errors.Wrap(err, "GetAlert to NewEvalMatch error")
-	}
+func (c *QueryCondition) GetCommonAlertDetails(alert *models.SCommonAlert) (*monitor.CommonAlertMetricDetails, error) {
 	settings, _ := alert.GetSettings()
 	alertDetails := alert.GetCommonAlertMetricDetailsFromAlertCondition(c.Index, &settings.Conditions[c.Index])
 	return alertDetails, nil
 }
 
-func (c *QueryCondition) jointPointStr(series tsdb.TimeSeries, value string, valStrArr []string) string {
+func (c *QueryCondition) jointPointStr(series monitor.TimeSeries, value string, valStrArr []string) string {
 	str := ""
 	for i := 0; i < len(valStrArr); i++ {
 		if i == 0 {
@@ -364,19 +418,15 @@ func (c *QueryCondition) jointPointStr(series tsdb.TimeSeries, value string, val
 }
 
 type queryResult struct {
-	series tsdb.TimeSeriesSlice
-	metas  []tsdb.QueryResultMeta
+	series        monitor.TimeSeriesSlice
+	metas         []monitor.QueryResultMeta
+	reducedResult *monitor.ReducedResult
 }
 
 func (c *QueryCondition) executeQuery(evalCtx *alerting.EvalContext, timeRange *tsdb.TimeRange) (*queryResult, error) {
-	ds, err := models.DataSourceManager.GetSource(c.Query.DataSourceId)
-	if err != nil {
-		return nil, errors.Wrapf(err, "Cound not find datasource %v", c.Query.DataSourceId)
-	}
-
-	req := c.getRequestForAlertRule(ds, timeRange, evalCtx.IsDebug)
-	result := make(tsdb.TimeSeriesSlice, 0)
-	metas := make([]tsdb.QueryResultMeta, 0)
+	req := c.getRequestForAlertRule(timeRange, evalCtx.IsDebug)
+	result := make(monitor.TimeSeriesSlice, 0)
+	metas := make([]monitor.QueryResultMeta, 0)
 
 	if evalCtx.IsDebug {
 		data := jsonutils.NewDict()
@@ -412,7 +462,12 @@ func (c *QueryCondition) executeQuery(evalCtx *alerting.EvalContext, timeRange *
 		})
 	}
 
-	resp, err := c.HandleRequest(evalCtx.Ctx, ds.ToTSDBDataSource(c.Query.Model.Database), req)
+	ds, err := datasource.GetDefaultSource(c.Query.Model.Database)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetDefaultDataSource")
+	}
+
+	resp, err := c.HandleRequest(evalCtx.Ctx, ds, req)
 	if err != nil {
 		if err == context.DeadlineExceeded {
 			return nil, errors.Error("Alert execution exceeded the timeout")
@@ -452,14 +507,15 @@ func (c *QueryCondition) executeQuery(evalCtx *alerting.EvalContext, timeRange *
 	}, nil
 }
 
-func (c *QueryCondition) getRequestForAlertRule(ds *models.SDataSource, timeRange *tsdb.TimeRange, debug bool) *tsdb.TsdbQuery {
+func (c *QueryCondition) getRequestForAlertRule(timeRange *tsdb.TimeRange, debug bool) *tsdb.TsdbQuery {
+	ds, _ := datasource.GetDefaultSource(c.Query.Model.Database)
 	req := &tsdb.TsdbQuery{
 		TimeRange: timeRange,
 		Queries: []*tsdb.Query{
 			{
 				RefId:       "A",
 				MetricQuery: c.Query.Model,
-				DataSource:  *ds.ToTSDBDataSource(c.Query.Model.Database),
+				DataSource:  *ds,
 			},
 		},
 		Debug: debug,
@@ -485,7 +541,6 @@ func newQueryCondition(model *monitor.AlertCondition, index int) (*QueryConditio
 		return nil, errors.Wrapf(err, "to value %q", cond.Query.To)
 	}
 
-	cond.Query.DataSourceId = q.DataSourceId
 	//reducer := model.Reducer
 	//cond.Reducer = newSimpleReducer(reducer.Type)
 	reducer, err := NewAlertReducer(&model.Reducer)
@@ -493,6 +548,7 @@ func newQueryCondition(model *monitor.AlertCondition, index int) (*QueryConditio
 		return nil, fmt.Errorf("error in condition %v: %v", index, err)
 	}
 	cond.Reducer = reducer
+	cond.ReducerOrder = model.ReducerOrder
 	evaluator, err := NewAlertEvaluator(&model.Evaluator)
 	if err != nil {
 		return nil, fmt.Errorf("error in condition %v: %v", index, err)
@@ -506,6 +562,7 @@ func newQueryCondition(model *monitor.AlertCondition, index int) (*QueryConditio
 
 	cond.checkGroupByField()
 	cond.setResType()
+	models.AppendCloudAccountDefaultQueryTags(&cond.Query.Model, true)
 
 	return cond, nil
 }
@@ -517,20 +574,23 @@ func (c *QueryCondition) checkGroupByField() {
 	}
 	for i, group := range c.Query.Model.GroupBy {
 		if group.Params[0] == "*" {
-			c.Query.Model.GroupBy[i].Params = []string{monitor.MEASUREMENT_TAG_ID[metricMeasurement.ResType]}
+			tagId := monitor.GetMeasurementTagIdKeyByResType(metricMeasurement.ResType)
+			if tagId == "" {
+				tagId = "*"
+			}
+			c.Query.Model.GroupBy[i].Params = []string{tagId}
 		}
 	}
 }
 
 func (c *QueryCondition) setResType() {
+	metricMeasurement, _ := models.MetricMeasurementManager.GetCache().Get(c.Query.Model.Measurement)
+	if metricMeasurement != nil {
+		c.ResType = metricMeasurement.ResType
+	}
 	var resType = monitor.METRIC_RES_TYPE_HOST
 	if len(c.Query.Model.GroupBy) == 0 {
 		return
-	}
-	metricMeasurement, _ := models.MetricMeasurementManager.GetCache().Get(c.Query.Model.Measurement)
-	if metricMeasurement != nil {
-		resType = metricMeasurement.ResType
-		c.ResType = resType
 	}
 	// NOTE: shouldn't set ResType when tenant_id and domain_id within GroupBy
 	/* if len(resType) != 0 && c.Query.Model.GroupBy[0].Params[0] != monitor.
@@ -548,12 +608,14 @@ func (c *QueryCondition) setResType() {
 		}
 	} */
 	if c.Query.Model.Database == monitor.METRIC_DATABASE_TELE {
-		c.ResType = resType
+		if c.ResType == "" {
+			c.ResType = resType
+		}
 	}
 }
 
-func (c *QueryCondition) GetQueryResources(s *mcclient.ClientSession, showDetails bool) ([]jsonutils.JSONObject, error) {
-	allRes, err := c.getOnecloudResources(s, showDetails)
+func (c *QueryCondition) GetQueryResources(s *mcclient.ClientSession, scope string, showDetails bool) ([]jsonutils.JSONObject, error) {
+	allRes, err := c.getOnecloudResources(s, scope, showDetails)
 	if err != nil {
 		return nil, errors.Wrap(err, "getOnecloudResources error")
 	}
@@ -561,12 +623,9 @@ func (c *QueryCondition) GetQueryResources(s *mcclient.ClientSession, showDetail
 	return allRes, nil
 }
 
-func (c *QueryCondition) getOnecloudResources(s *mcclient.ClientSession, showDetails bool) ([]jsonutils.JSONObject, error) {
-	var err error
-	allResources := make([]jsonutils.JSONObject, 0)
-
+func (c *QueryCondition) getOnecloudResources(s *mcclient.ClientSession, scope string, showDetails bool) ([]jsonutils.JSONObject, error) {
 	query := jsonutils.NewDict()
-	query.Add(jsonutils.NewStringArray([]string{"running", "ready"}), "status")
+	queryStatus := []string{"running", "ready"}
 	// query.Add(jsonutils.NewString("true"), "admin")
 	//if len(c.Query.Model.Tags) != 0 {
 	//	query, err = c.convertTagsQuery(evalContext, query)
@@ -574,52 +633,63 @@ func (c *QueryCondition) getOnecloudResources(s *mcclient.ClientSession, showDet
 	//		return nil, errors.Wrap(err, "NoDataQueryCondition convertTagsQuery error")
 	//	}
 	//}
+	var (
+		err          error
+		manager      modulebase.Manager
+		allResources = make([]jsonutils.JSONObject, 0)
+	)
 	switch c.ResType {
 	case monitor.METRIC_RES_TYPE_HOST:
-		query := jsonutils.NewDict()
-		query.Set("host_type", jsonutils.NewString(hostconsts.TELEGRAF_TAG_KEY_HYPERVISOR))
+		// models.SetQueryHostType(query)
+		queryStatus = append(queryStatus, "unknown")
+		query.Set("filter.0", jsonutils.NewString(fmt.Sprintf("host_type.notequals('%s')", compute.HOST_TYPE_BAREMETAL)))
 		query.Set("enabled", jsonutils.NewInt(1))
-		allResources, err = ListAllResources(s, &mc_mds.Hosts, query, showDetails)
+		manager = &mc_mds.Hosts
 	case monitor.METRIC_RES_TYPE_GUEST:
-		allResources, err = ListAllResources(s, &mc_mds.Servers, query, showDetails)
+		manager = &mc_mds.Servers
 	case monitor.METRIC_RES_TYPE_AGENT:
-		allResources, err = ListAllResources(s, &mc_mds.Servers, query, showDetails)
+		manager = &mc_mds.Servers
 	case monitor.METRIC_RES_TYPE_RDS:
-		allResources, err = ListAllResources(s, &mc_mds.DBInstance, query, showDetails)
+		manager = &mc_mds.DBInstance
 	case monitor.METRIC_RES_TYPE_REDIS:
-		allResources, err = ListAllResources(s, &mc_mds.ElasticCache, query, showDetails)
+		manager = &mc_mds.ElasticCache
 	case monitor.METRIC_RES_TYPE_OSS:
-		allResources, err = ListAllResources(s, &mc_mds.Buckets, query, showDetails)
+		manager = &mc_mds.Buckets
 	case monitor.METRIC_RES_TYPE_CLOUDACCOUNT:
 		query.Remove("status")
 		query.Add(jsonutils.NewBool(true), "enabled")
-		allResources, err = ListAllResources(s, &mc_mds.Cloudaccounts, query, showDetails)
+		manager = &mc_mds.Cloudaccounts
 	case monitor.METRIC_RES_TYPE_TENANT:
-		allResources, err = ListAllResources(s, &identity.Projects, query, showDetails)
+		manager = &identity.Projects
 	case monitor.METRIC_RES_TYPE_DOMAIN:
-		allResources, err = ListAllResources(s, &identity.Domains, query, showDetails)
+		manager = &identity.Domains
 	case monitor.METRIC_RES_TYPE_STORAGE:
 		query.Remove("status")
-		allResources, err = ListAllResources(s, &mc_mds.Storages, query, showDetails)
+		manager = &mc_mds.Storages
 	default:
 		query := jsonutils.NewDict()
 		query.Set("brand", jsonutils.NewString(hostconsts.TELEGRAF_TAG_ONECLOUD_BRAND))
-		query.Set("host-type", jsonutils.NewString(hostconsts.TELEGRAF_TAG_KEY_HYPERVISOR))
-		allResources, err = ListAllResources(s, &mc_mds.Hosts, query, showDetails)
+		models.SetQueryHostType(query)
+		manager = &mc_mds.Hosts
 	}
 
+	query.Add(jsonutils.NewStringArray(queryStatus), "status")
+	allResources, err = ListAllResources(s, manager, query, scope, showDetails)
 	if err != nil {
-		return nil, errors.Wrap(err, "NoDataQueryCondition Host list error")
+		return nil, errors.Wrapf(err, "ListAllResources for %s with query %s, scope: %s, showDetails: %v", manager.GetKeyword(), query, scope, showDetails)
 	}
 	return allResources, nil
 }
 
-func ListAllResources(s *mcclient.ClientSession, manager modulebase.Manager, params *jsonutils.JSONDict, showDetails bool) ([]jsonutils.JSONObject, error) {
+func ListAllResources(s *mcclient.ClientSession, manager modulebase.Manager, params *jsonutils.JSONDict, scope string, showDetails bool) ([]jsonutils.JSONObject, error) {
 	if params == nil {
 		params = jsonutils.NewDict()
 	}
 	if s.GetToken().HasSystemAdminPrivilege() {
 		params.Add(jsonutils.NewString("system"), "scope")
+	}
+	if scope != "" {
+		params.Add(jsonutils.NewString(scope), "scope")
 	}
 	params.Add(jsonutils.NewInt(int64(options.Options.APIListBatchSize)), "limit")
 	params.Add(jsonutils.NewBool(showDetails), "details")

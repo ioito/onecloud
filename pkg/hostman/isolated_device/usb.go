@@ -26,19 +26,29 @@ import (
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
+	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/util/regutils2"
 )
 
 type sUSBDevice struct {
-	*sBaseDevice
+	*SBaseDevice
 	lsusbLine *sLsusbLine
+
+	PortPath string
 }
 
 // TODO: rename PCIDevice
 func newUSBDevice(dev *PCIDevice, lsusbLine *sLsusbLine) *sUSBDevice {
 	return &sUSBDevice{
-		sBaseDevice: newBaseDevice(dev, api.USB_TYPE),
+		SBaseDevice: NewBaseDevice(dev, api.USB_TYPE, api.DEVICE_SHARING_MODE_EXCLUSIVE),
 		lsusbLine:   lsusbLine,
+	}
+}
+
+func (dev *sUSBDevice) SetPortPath(portPath string) {
+	dev.PortPath = portPath
+	if len(dev.PortPath) > 0 {
+		dev.dev.Addr = fmt.Sprintf("%s:%s", dev.dev.Addr, portPath)
 	}
 }
 
@@ -59,7 +69,22 @@ func GetUSBDevId(vendorId, devId, bus, addr string) string {
 	return fmt.Sprintf("dev_%s_%s-%s_%s", vendorId, devId, bus, addr)
 }
 
-func getUSBDevQemuOptions(vendorId, deviceId string, bus, addr string) (map[string]string, error) {
+func getUSBDevQemuOptions(vendorId, deviceId string, bus, addr, port string) (map[string]interface{}, error) {
+	vendorIDI, err := strconv.ParseUint(vendorId, 16, 32)
+	if err != nil {
+		return nil, errors.Wrapf(err, "parse vendor ID %q", vendorId)
+	}
+	productIDI, err := strconv.ParseUint(deviceId, 16, 32)
+	if err != nil {
+		return nil, errors.Wrapf(err, "parse product ID %q", deviceId)
+	}
+	if !options.HostOptions.DisablePassthroughWithVendorDeviceId {
+		return map[string]interface{}{
+			"vendorid":  uint32(vendorIDI),
+			"productid": uint32(productIDI),
+		}, nil
+	}
+
 	// id := GetUSBDevId(vendorId, deviceId, bus, addr)
 	busI, err := strconv.Atoi(bus)
 	if err != nil {
@@ -69,17 +94,24 @@ func getUSBDevQemuOptions(vendorId, deviceId string, bus, addr string) (map[stri
 	if err != nil {
 		return nil, errors.Wrapf(err, "parse addr to int %q", bus)
 	}
-	return map[string]string{
+	if len(port) > 0 {
+		return map[string]interface{}{
+			"hostbus":  uint64(busI),
+			"hostport": port,
+		}, nil
+	}
+
+	return map[string]interface{}{
 		// "id": id,
 		// "bus":       "usb.0",
-		"vendorid":  fmt.Sprintf("0x%s", vendorId),
-		"productid": fmt.Sprintf("0x%s", deviceId),
-		"hostbus":   fmt.Sprintf("%d", busI),
-		"hostaddr":  fmt.Sprintf("%d", addrI),
+		"vendorid":  uint32(vendorIDI),
+		"productid": uint32(productIDI),
+		"hostbus":   uint64(busI),
+		"hostaddr":  uint64(addrI),
 	}, nil
 }
 
-func GetUSBDevQemuOptions(vendorDevId string, addr string) (map[string]string, error) {
+func GetUSBDevQemuOptions(vendorDevId string, addr string) (map[string]interface{}, error) {
 	parts := strings.Split(vendorDevId, ":")
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid vendor_device_id %q", vendorDevId)
@@ -88,13 +120,17 @@ func GetUSBDevQemuOptions(vendorDevId string, addr string) (map[string]string, e
 	productId := parts[1]
 
 	addrParts := strings.Split(addr, ":")
-	if len(addrParts) != 2 {
+	if len(addrParts) != 2 && len(addrParts) != 3 {
 		return nil, fmt.Errorf("invalid addr %q", addr)
 	}
 	hostBus := addrParts[0]
 	hostAddr := addrParts[1]
+	hostPort := ""
+	if len(addrParts) == 3 {
+		hostPort = addrParts[2]
+	}
 
-	return getUSBDevQemuOptions(vendorId, productId, hostBus, hostAddr)
+	return getUSBDevQemuOptions(vendorId, productId, hostBus, hostAddr, hostPort)
 }
 
 func (dev *sUSBDevice) GetKernelDriver() (string, error) {
@@ -108,7 +144,15 @@ func (dev *sUSBDevice) GetQemuId() string {
 
 func (dev *sUSBDevice) GetPassthroughOptions() map[string]string {
 	opts, _ := GetUSBDevQemuOptions(dev.dev.GetVendorDeviceId(), dev.dev.Addr)
-	return opts
+	ret := make(map[string]string, len(opts))
+	for k, v := range opts {
+		if k == "vendorid" || k == "productid" {
+			ret[k] = fmt.Sprintf("0x%x", v)
+			continue
+		}
+		ret[k] = fmt.Sprint(v)
+	}
+	return ret
 }
 
 func (dev *sUSBDevice) GetPassthroughCmd(index int) string {
@@ -121,11 +165,13 @@ func (dev *sUSBDevice) GetPassthroughCmd(index int) string {
 	return opt
 }
 
-func (dev *sUSBDevice) GetHotPlugOptions(*desc.SGuestIsolatedDevice) ([]*HotPlugOption, error) {
+func (dev *sUSBDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice, guestDesc *desc.SGuestDesc) ([]*HotPlugOption, error) {
 	opts, err := GetUSBDevQemuOptions(dev.dev.GetVendorDeviceId(), dev.dev.Addr)
 	if err != nil {
 		return nil, errors.Wrap(err, "GetUSBDevQemuOptions")
 	}
+	opts["id"] = isolatedDev.Usb.Id
+	opts["bus"] = fmt.Sprintf("%s.0", guestDesc.Usb.Id)
 	return []*HotPlugOption{
 		{
 			Device:  "usb-host",
@@ -175,7 +221,7 @@ func getPassthroughUSBs() ([]*sUSBDevice, error) {
 		}
 
 		// check by trees
-		isHubClass, err := isUSBHubClass(dev, trees)
+		isHubClass, err := checkIsUSBHubClassAndSetPortPath(dev, trees)
 		if err != nil {
 			return nil, errors.Wrap(err, "check isUSBHubClass")
 		}
@@ -195,7 +241,7 @@ func isUSBLinuxRootHub(vendorId string, deviceId string) bool {
 	return false
 }
 
-func isUSBHubClass(dev *sUSBDevice, trees *sLsusbTrees) (bool, error) {
+func checkIsUSBHubClassAndSetPortPath(dev *sUSBDevice, trees *sLsusbTrees) (bool, error) {
 	busNum, err := dev.lsusbLine.GetBusNumber()
 	if err != nil {
 		return false, errors.Wrapf(err, "GetBusNumber of dev %#v", dev.lsusbLine)
@@ -212,8 +258,12 @@ func isUSBHubClass(dev *sUSBDevice, trees *sLsusbTrees) (bool, error) {
 	if treeDev == nil {
 		return false, errors.Errorf("not found dev %#v by bus %d, dev %d", dev.lsusbLine, busNum, devNum)
 	}
+	if utils.IsInStringArray(treeDev.Class, []string{"root_hub", "Hub"}) {
+		return true, nil
+	}
 
-	return utils.IsInStringArray(treeDev.Class, []string{"root_hub", "Hub"}), nil
+	dev.SetPortPath(tree.GetPortPath(devNum))
+	return false, nil
 }
 
 func parseLsusb(lines []string) ([]*sUSBDevice, error) {
@@ -379,9 +429,9 @@ const (
 )
 
 var (
-	lsusbTreeRootBusRegex     = `(?P<prefix>(.*))Bus (?P<bus_id>([0-9]{2}))\.`
-	lsusbTreeBusSuffixRegex   = `Port (?P<port_id>([0-9]{1,2})): Dev (?P<device>([0-9]{1,2})), Class=(?P<class>(.*)), Driver=(?P<driver>(.*)),\s{0,1}(?P<speed>(.*))`
-	lsusbTreeSuffixRegex      = `Port (?P<port_id>([0-9]{1,2})): Dev (?P<device>([0-9]{1,2})), If (?P<interface>([0-9]{1,2})), Class=(?P<class>(.*)), Driver=(?P<driver>(.*)),\s{0,1}(?P<speed>(.*))`
+	lsusbTreeRootBusRegex     = `(?P<prefix>(.*))Bus (?P<bus_id>([0-9]{1,3}))\.`
+	lsusbTreeBusSuffixRegex   = `Port (?P<port_id>([0-9]{1,3})): Dev (?P<device>([0-9]{1,3})), Class=(?P<class>(.*)), Driver=(?P<driver>(.*)),\s{0,1}(?P<speed>(.*))`
+	lsusbTreeSuffixRegex      = `Port (?P<port_id>([0-9]{1,3})): Dev (?P<device>([0-9]{1,3})), If (?P<interface>([0-9]{1,2})), Class=(?P<class>(.*)), Driver=(?P<driver>(.*)),\s{0,1}(?P<speed>(.*))`
 	lsusbTreeRootBusLineRegex = lsusbTreeRootBusRegex + lsusbTreeBusSuffixRegex
 	lsusbTreeLineRegex        = `(?P<prefix>(.*))` + lsusbTreeSuffixRegex
 )
@@ -398,7 +448,7 @@ type sLsusbTree struct {
 	If      int           `json:"if"`
 	Class   string        `json:"class"`
 	Driver  string        `json:"driver"`
-	Content string        `json:"content`
+	Content string        `json:"content"`
 	Nodes   []*sLsusbTree `json:"nodes"`
 }
 
@@ -512,6 +562,36 @@ func (t *sLsusbTree) GetContents() []string {
 		ret = append(ret, n.GetContents()...)
 	}
 	return ret
+}
+
+func (t *sLsusbTree) GetPortPath(devNum int) string {
+	portPath, found := t.GetDevicePortPath("", devNum)
+	if !found {
+		return ""
+	}
+	return portPath
+}
+
+func (t *sLsusbTree) GetDevicePortPath(portPath string, devNum int) (string, bool) {
+	if !t.IsRootBus {
+		if len(portPath) > 0 {
+			portPath = fmt.Sprintf("%s.%d", portPath, t.Port)
+		} else {
+			portPath = strconv.Itoa(t.Port)
+		}
+	}
+
+	if t.Dev == devNum {
+		return portPath, true
+	}
+
+	for _, node := range t.Nodes {
+		devPortPath, found := node.GetDevicePortPath(portPath, devNum)
+		if found {
+			return devPortPath, true
+		}
+	}
+	return "", false
 }
 
 func (t *sLsusbTree) GetDevice(devNum int) *sLsusbTree {

@@ -29,6 +29,7 @@ type LoadbalancerListenerRuleDetails struct {
 	LoadbalancerListenerResourceInfo
 
 	SLoadbalancerListenerRule
+	LoadbalancerCertificateResourceInfo
 
 	BackendGroup string `json:"backend_group"`
 
@@ -39,6 +40,7 @@ type LoadbalancerListenerRuleListInput struct {
 	apis.StatusStandaloneResourceListInput
 	apis.ExternalizedResourceBaseListInput
 	LoadbalancerListenerFilterListInput
+	LoadbalancerCertificateFilterListInput
 
 	// filter by backend_group
 	BackendGroup string `json:"backend_group"`
@@ -53,23 +55,32 @@ type LoadbalancerListenerRuleListInput struct {
 type LoadbalancerListenerRuleCreateInput struct {
 	apis.StatusStandaloneResourceCreateInput
 
-	// swagger: ignore
+	// swagger:ignore
 	Listener   string `json:"listener" yunion-deprecated-by:"listener_id"`
 	ListenerId string `json:"listener_id"`
 
-	BackendGroup   string `json:"backend_group" yunion-deprecated-by:"backend_group_id"`
+	CertificateId string `json:"certificate_id"`
+
+	// swagger:ignore
+	BackendGroup string `json:"backend_group" yunion-deprecated-by:"backend_group_id"`
+	// 默认后端服务器组ID
 	BackendGroupId string `json:"backend_group_id"`
+
+	// 后端服务器组列表
+	BackendGroups ListenerRuleBackendGroups `json:"backend_groups"`
+
+	RedirectPool ListenerRuleRedirectPool `json:"redirect_pool"`
 
 	Domain               string `json:"domain"`
 	Path                 string `json:"path"`
 	HttpRequstRate       int    `json:"http_request_rate"`
 	HttpRequstRatePerSec int    `json:"http_request_rate_per_sec"`
 
-	Redirect       string
-	RedirectCode   int64
-	RedirectScheme string
-	RedirectHost   string
-	RedirectPath   string
+	Redirect       string `json:"redirect"`
+	RedirectCode   int64  `json:"redirect_code"`
+	RedirectScheme string `json:"redirect_scheme"`
+	RedirectHost   string `json:"redirect_host"`
+	RedirectPath   string `json:"redirect_path"`
 
 	Condition string `json:"conditon"`
 }
@@ -122,7 +133,7 @@ func (self *LoadbalancerListenerRuleCreateInput) Validate() error {
 type LoadbalancerListenerRuleUpdateInput struct {
 	apis.StatusStandaloneResourceBaseUpdateInput
 
-	// swagger: ignore
+	// swagger:ignore
 	Listener   string `json:"listener" yunion-deprecated-by:"listener_id"`
 	ListenerId string `json:"listener_id"`
 
@@ -134,11 +145,11 @@ type LoadbalancerListenerRuleUpdateInput struct {
 	HttpRequstRate       int    `json:"http_request_rate"`
 	HttpRequstRatePerSec int    `json:"http_request_rate_per_sec"`
 
-	Redirect       string
-	RedirectCode   int64
-	RedirectScheme string
-	RedirectHost   string
-	RedirectPath   string
+	Redirect       string `json:"redirect"`
+	RedirectCode   int64  `json:"redirect_code"`
+	RedirectScheme string `json:"redirect_scheme"`
+	RedirectHost   string `json:"redirect_host"`
+	RedirectPath   string `json:"redirect_path"`
 
 	Condition string `json:"conditon"`
 }

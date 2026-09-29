@@ -30,6 +30,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/compare"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
@@ -92,6 +93,8 @@ type SBucket struct {
 	ObjectCntLimit int   `nullable:"false" default:"0" list:"user"`
 
 	AccessUrls jsonutils.JSONObject `nullable:"true" list:"user"`
+
+	EnablePerfMon bool `default:"false" list:"user" update:"user" create:"optional"`
 }
 
 func (manager *SBucketManager) SetHandlerProcessTimeout(info *appsrv.SHandlerInfo, r *http.Request) time.Duration {
@@ -151,7 +154,7 @@ func (manager *SBucketManager) syncBuckets(ctx context.Context, userCred mcclien
 	}
 	if !xor {
 		for i := 0; i < len(commondb); i += 1 {
-			err = commondb[i].syncWithCloudBucket(ctx, userCred, commonext[i], provider, false)
+			err = commondb[i].SyncWithCloudBucket(ctx, userCred, commonext[i], false)
 			if err != nil {
 				syncResult.UpdateError(err)
 			} else {
@@ -238,14 +241,14 @@ func (manager *SBucketManager) newFromCloudBucket(
 		return nil, err
 	}
 
-	SyncCloudProject(ctx, userCred, &bucket, provider.GetOwnerId(), extBucket, provider.Id)
+	SyncCloudProject(ctx, userCred, &bucket, provider.GetOwnerId(), extBucket, provider)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
 		Obj:    &bucket,
 		Action: notifyclient.ActionSyncCreate,
 	})
 	bucket.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
 
-	syncVirtualResourceMetadata(ctx, userCred, &bucket, extBucket)
+	syncVirtualResourceMetadata(ctx, userCred, &bucket, extBucket, false)
 	db.OpsLog.LogEvent(&bucket, db.ACT_CREATE, bucket.GetShortDesc(ctx), userCred)
 
 	return &bucket, nil
@@ -274,11 +277,10 @@ func (bucket *SBucket) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
 	return desc
 }
 
-func (bucket *SBucket) syncWithCloudBucket(
+func (bucket *SBucket) SyncWithCloudBucket(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	extBucket cloudprovider.ICloudBucket,
-	provider *SCloudprovider,
 	statsOnly bool,
 ) error {
 	oStats := bucket.getStats()
@@ -291,6 +293,11 @@ func (bucket *SBucket) syncWithCloudBucket(
 		bucket.ObjectCnt = stats.ObjectCount
 		if bucket.ObjectCnt < 0 {
 			bucket.ObjectCnt = 0
+		}
+
+		created := extBucket.GetCreatedAt()
+		if !created.IsZero() {
+			bucket.CreatedAt = created
 		}
 
 		if !statsOnly {
@@ -318,7 +325,9 @@ func (bucket *SBucket) syncWithCloudBucket(
 		return errors.Wrap(err, "db.UpdateWithLock")
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, bucket, extBucket)
+	if account := bucket.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, bucket, extBucket, account.ReadOnly)
+	}
 
 	db.OpsLog.LogSyncUpdate(bucket, diff, userCred)
 	if len(diff) > 0 {
@@ -332,8 +341,9 @@ func (bucket *SBucket) syncWithCloudBucket(
 		db.OpsLog.LogEvent(bucket, api.BUCKET_OPS_STATS_CHANGE, bucket.GetShortDesc(ctx), userCred)
 	}
 
+	provider := bucket.GetCloudprovider()
 	if provider != nil {
-		SyncCloudProject(ctx, userCred, bucket, provider.GetOwnerId(), extBucket, provider.Id)
+		SyncCloudProject(ctx, userCred, bucket, provider.GetOwnerId(), extBucket, provider)
 		bucket.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
 	}
 
@@ -397,7 +407,7 @@ func (bucket *SBucket) StartBucketDeleteTask(ctx context.Context, userCred mccli
 		log.Errorf("%s", err)
 		return err
 	}
-	bucket.SetStatus(userCred, api.CLOUD_PROVIDER_START_DELETE, "StartBucketDeleteTask")
+	bucket.SetStatus(ctx, userCred, api.CLOUD_PROVIDER_START_DELETE, "StartBucketDeleteTask")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -439,12 +449,12 @@ func (manager *SBucketManager) ValidateCreateData(
 ) (api.BucketCreateInput, error) {
 	var err error
 	var cloudRegionV *SCloudregion
-	cloudRegionV, input.CloudregionResourceInput, err = ValidateCloudregionResourceInput(userCred, input.CloudregionResourceInput)
+	cloudRegionV, input.CloudregionResourceInput, err = ValidateCloudregionResourceInput(ctx, userCred, input.CloudregionResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateCloudregionResourceInput")
 	}
 	var managerV *SCloudprovider
-	managerV, input.CloudproviderResourceInput, err = ValidateCloudproviderResourceInput(userCred, input.CloudproviderResourceInput)
+	managerV, input.CloudproviderResourceInput, err = ValidateCloudproviderResourceInput(ctx, userCred, input.CloudproviderResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateCloudproviderResourceInput")
 	}
@@ -514,10 +524,10 @@ func (bucket *SBucket) PostCreate(
 		}
 	}
 
-	bucket.SetStatus(userCred, api.BUCKET_STATUS_START_CREATE, "PostCreate")
+	bucket.SetStatus(ctx, userCred, api.BUCKET_STATUS_START_CREATE, "PostCreate")
 	task, err := taskman.TaskManager.NewTask(ctx, "BucketCreateTask", bucket, userCred, nil, "", "", nil)
 	if err != nil {
-		bucket.SetStatus(userCred, api.BUCKET_STATUS_CREATE_FAIL, errors.Wrapf(err, "NewTask").Error())
+		bucket.SetStatus(ctx, userCred, api.BUCKET_STATUS_CREATE_FAIL, errors.Wrapf(err, "NewTask").Error())
 		return
 	}
 	task.ScheduleRun(nil)
@@ -567,9 +577,9 @@ func (bucket *SBucket) RemoteCreate(ctx context.Context, userCred mcclient.Token
 			logclient.AddSimpleActionLog(bucket, logclient.ACT_UPDATE_TAGS, err, userCred, false)
 		}
 	}
-	err = bucket.syncWithCloudBucket(ctx, userCred, extBucket, nil, false)
+	err = bucket.SyncWithCloudBucket(ctx, userCred, extBucket, false)
 	if err != nil {
-		return errors.Wrap(err, "bucket.syncWithCloudBucket")
+		return errors.Wrap(err, "SyncWithCloudBucket")
 	}
 	return nil
 }
@@ -602,7 +612,7 @@ func joinPath(ep, path string) string {
 }
 
 func (bucket *SBucket) getMoreDetails(out api.BucketDetails) api.BucketDetails {
-	s3gwUrl, _ := auth.GetServiceURL("s3gateway", options.Options.Region, "", identity_apis.EndpointInterfacePublic)
+	s3gwUrl, _ := auth.GetServiceURL("s3gateway", options.Options.Region, "", identity_apis.EndpointInterfacePublic, httputils.POST)
 
 	if len(s3gwUrl) > 0 {
 		accessUrls := make([]cloudprovider.SBucketAccessUrl, 0)
@@ -690,6 +700,15 @@ func (manager *SBucketManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field
 		return q, nil
 	}
 	q, err = manager.SCloudregionResourceBaseManager.QueryDistinctExtraField(q, field)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
+func (manager *SBucketManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
 	if err == nil {
 		return q, nil
 	}
@@ -842,7 +861,7 @@ func (bucket *SBucket) PerformMakedir(
 		// replace
 		return nil, nil
 	} else if err != cloudprovider.ErrNotFound {
-		return nil, httperrors.NewInternalServerError("GetIObject fail %s", err)
+		return nil, httperrors.NewInternalServerError("GetIObject failed %s", err)
 	}
 
 	if bucket.ObjectCntLimit > 0 && bucket.ObjectCntLimit < bucket.ObjectCnt+1 {
@@ -866,7 +885,7 @@ func (bucket *SBucket) PerformMakedir(
 	db.OpsLog.LogEvent(bucket, db.ACT_MKDIR, key, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_MKDIR, key, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, true)
 
@@ -912,7 +931,7 @@ func (bucket *SBucket) PerformDelete(
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_OBJECT, keyStrs, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_OBJECT, keyStrs, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	return modulebase.SubmitResults2JSON(results), nil
 }
@@ -935,7 +954,7 @@ func (bucket *SBucket) PerformUpload(
 	key := appParams.Request.Header.Get(api.BUCKET_UPLOAD_OBJECT_KEY_HEADER)
 
 	if strings.HasSuffix(key, "/") {
-		return nil, httperrors.NewInputParameterError("object key should not ends with /")
+		return nil, httperrors.NewInputParameterError("object key must not end with /")
 	}
 
 	err := s3utils.CheckValidObjectName(key)
@@ -988,7 +1007,7 @@ func (bucket *SBucket) PerformUpload(
 		inc.SizeBytes = sizeBytes
 		inc.ObjectCount = 1
 	} else {
-		return nil, httperrors.NewInternalServerError("GetIObject error %s", err)
+		return nil, httperrors.NewInternalServerError("GetIObject failed: %s", err)
 	}
 
 	if bucket.SizeBytesLimit > 0 && inc.SizeBytes > 0 && bucket.SizeBytesLimit < bucket.SizeBytes+inc.SizeBytes {
@@ -1001,7 +1020,7 @@ func (bucket *SBucket) PerformUpload(
 	pendingUsage := SRegionQuota{ObjectGB: int(inc.SizeBytes / 1000 / 1000 / 1000), ObjectCnt: inc.ObjectCount}
 	keys, err := bucket.GetQuotaKeys()
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("bucket.GetQuotaKeys fail %s", err)
+		return nil, httperrors.NewInternalServerError("bucket.GetQuotaKeys failed %s", err)
 	}
 	pendingUsage.SetKeys(keys)
 	if !pendingUsage.IsEmpty() {
@@ -1016,13 +1035,13 @@ func (bucket *SBucket) PerformUpload(
 		if !pendingUsage.IsEmpty() {
 			quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, false)
 		}
-		return nil, httperrors.NewInternalServerError("put object error %s", err)
+		return nil, httperrors.NewInternalServerError("put object failed: %s", err)
 	}
 
 	db.OpsLog.LogEvent(bucket, db.ACT_UPLOAD_OBJECT, key, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_UPLOAD_OBJECT, key, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	if !pendingUsage.IsEmpty() {
 		quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, true)
@@ -1061,12 +1080,12 @@ func (bucket *SBucket) PerformAcl(
 		}
 		err = iBucket.SetAcl(input.Acl)
 		if err != nil {
-			return nil, httperrors.NewInternalServerError("setAcl error %s", err)
+			return nil, httperrors.NewInternalServerError("setAcl failed: %s", err)
 		}
 
-		err = bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, false)
+		err = bucket.SyncWithCloudBucket(ctx, userCred, iBucket, false)
 		if err != nil {
-			return nil, httperrors.NewInternalServerError("syncWithCloudBucket error %s", err)
+			return nil, httperrors.NewInternalServerError("syncWithCloudBucket failed: %s", err)
 		}
 		return nil, nil
 	}
@@ -1105,7 +1124,7 @@ func (bucket *SBucket) PerformSyncstatus(
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("Bucket has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("Bucket has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, bucket, "BucketSyncstatusTask", "")
@@ -1128,16 +1147,12 @@ func (bucket *SBucket) PerformSync(
 		return nil, errors.Wrap(err, "GetIBucket")
 	}
 
-	err = bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, statsOnly)
+	err = bucket.SyncWithCloudBucket(ctx, userCred, iBucket, statsOnly)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("syncWithCloudBucket error %s", err)
+		return nil, httperrors.NewInternalServerError("syncWithCloudBucket failed: %s", err)
 	}
 
 	return nil, nil
-}
-
-func (bucket *SBucket) ValidatePurgeCondition(ctx context.Context) error {
-	return bucket.SSharableVirtualResourceBase.ValidateDeleteCondition(ctx, nil)
 }
 
 func (bucket *SBucket) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
@@ -1145,9 +1160,9 @@ func (bucket *SBucket) ValidateDeleteCondition(ctx context.Context, info jsonuti
 		return bucket.SSharableVirtualResourceBase.ValidateDeleteCondition(ctx, nil)
 	}
 	if bucket.ObjectCnt > 0 {
-		return httperrors.NewNotEmptyError("Buckets that are not empty do not support this operation")
+		return httperrors.NewNotEmptyError("non-empty buckets do not support this operation")
 	}
-	return bucket.ValidatePurgeCondition(ctx)
+	return bucket.SSharableVirtualResourceBase.ValidateDeleteCondition(ctx, info)
 }
 
 // 获取对象或bucket的ACL
@@ -1176,7 +1191,7 @@ func (bucket *SBucket) GetDetailsAcl(
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
 				return output, httperrors.NewNotFoundError("object %s not found", objKey)
 			} else {
-				return output, httperrors.NewInternalServerError("iBucket.GetIObjects error %s", err)
+				return output, httperrors.NewInternalServerError("iBucket.GetIObjects failed: %s", err)
 			}
 		}
 		acl = object.GetAcl()
@@ -1216,7 +1231,7 @@ func (bucket *SBucket) PerformSetWebsite(
 	}
 	err = iBucket.SetWebsite(bucketWebsiteConf)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.SetWebsite error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.SetWebsite failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_SET_WEBSITE, bucketWebsiteConf, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_SET_WEBSITE, bucketWebsiteConf, userCred, true)
@@ -1235,7 +1250,7 @@ func (bucket *SBucket) PerformDeleteWebsite(
 	}
 	err = iBucket.DeleteWebSiteConf()
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.DeleteWebSiteConf error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.DeleteWebSiteConf failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_WEBSITE, "", userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_WEBSITE, "", userCred, true)
@@ -1254,7 +1269,7 @@ func (bucket *SBucket) GetDetailsWebsite(
 	}
 	conf, err := iBucket.GetWebsiteConf()
 	if err != nil {
-		return websiteConf, httperrors.NewInternalServerError("iBucket.GetWebsiteConf error %s", err)
+		return websiteConf, httperrors.NewInternalServerError("iBucket.GetWebsiteConf failed: %s", err)
 	}
 
 	websiteConf.Index = conf.Index
@@ -1302,7 +1317,7 @@ func (bucket *SBucket) PerformSetCors(
 	}
 	err = cloudprovider.SetBucketCORS(iBucket, rules)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("cloudprovider.SetBucketCORS error %s", err)
+		return nil, httperrors.NewInternalServerError("cloudprovider.SetBucketCORS failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_SET_CORS, rules, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_SET_CORS, rules, userCred, true)
@@ -1321,7 +1336,7 @@ func (bucket *SBucket) PerformDeleteCors(
 	}
 	result, err := cloudprovider.DeleteBucketCORS(iBucket, input.Id)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.DeleteCORS error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.DeleteCORS failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_CORS, result, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_CORS, result, userCred, true)
@@ -1340,7 +1355,7 @@ func (bucket *SBucket) GetDetailsCors(
 	}
 	corsRules, err := iBucket.GetCORSRules()
 	if err != nil {
-		return rules, httperrors.NewInternalServerError("iBucket.GetCORSRules error %s", err)
+		return rules, httperrors.NewInternalServerError("iBucket.GetCORSRules failed: %s", err)
 	}
 
 	for i := range corsRules {
@@ -1369,7 +1384,7 @@ func (bucket *SBucket) GetDetailsCdnDomain(
 	}
 	cdnDomains, err := iBucket.GetCdnDomains()
 	if err != nil {
-		return domains, httperrors.NewInternalServerError("iBucket.GetCdnDomains error %s", err)
+		return domains, httperrors.NewInternalServerError("iBucket.GetCdnDomains failed: %s", err)
 	}
 	for i := range cdnDomains {
 		domains.Data = append(domains.Data, api.CdnDomain{
@@ -1408,7 +1423,7 @@ func (bucket *SBucket) PerformSetReferer(
 
 	err = iBucket.SetReferer(conf)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.SetRefer error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.SetRefer failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_SET_REFERER, conf, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_SET_REFERER, conf, userCred, true)
@@ -1427,7 +1442,7 @@ func (bucket *SBucket) GetDetailsReferer(
 	}
 	referConf, err := iBucket.GetReferer()
 	if err != nil {
-		return conf, httperrors.NewInternalServerError("iBucket.GetRefer error %s", err)
+		return conf, httperrors.NewInternalServerError("iBucket.GetRefer failed: %s", err)
 	}
 	conf.Enabled = referConf.Enabled
 	if conf.Enabled {
@@ -1451,7 +1466,7 @@ func (bucket *SBucket) GetDetailsPolicy(
 	}
 	policyStatements, err := iBucket.GetPolicy()
 	if err != nil {
-		return policy, httperrors.NewInternalServerError("iBucket.GetPolicy error %s", err)
+		return policy, httperrors.NewInternalServerError("iBucket.GetPolicy failed: %s", err)
 	}
 	for i := range policyStatements {
 		policy.Data = append(policy.Data, api.BucketPolicyStatement{
@@ -1495,7 +1510,7 @@ func (bucket *SBucket) PerformSetPolicy(
 
 	err = iBucket.SetPolicy(opts)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.SetPolicy error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.SetPolicy failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_SET_POLICY, opts, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_SET_POLICY, opts, userCred, true)
@@ -1514,7 +1529,7 @@ func (bucket *SBucket) PerformDeletePolicy(
 	}
 	result, err := iBucket.DeletePolicy(input.Id)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("iBucket.DeletePolicy error %s", err)
+		return nil, httperrors.NewInternalServerError("iBucket.DeletePolicy failed: %s", err)
 	}
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_POLICY, result, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_POLICY, result, userCred, true)
@@ -1543,10 +1558,10 @@ type SBucketUsages struct {
 	DiskUsedRate float64
 }
 
-func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) SBucketUsages {
+func (manager *SBucketManager) TotalCount(ctx context.Context, scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) SBucketUsages {
 	usage := SBucketUsages{}
 	bq := manager.Query()
-	bq = db.ObjectIdQueryWithPolicyResult(bq, manager, policyResult)
+	bq = db.ObjectIdQueryWithPolicyResult(ctx, bq, manager, policyResult)
 	bq = scopeOwnerIdFilter(bq, scope, ownerId)
 	buckets := bq.SubQuery()
 	bucketsQ := buckets.Query(
@@ -1556,6 +1571,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 				buckets.Field("object_cnt"),
 			).Else(sqlchemy.NewConstField(0)),
 			"object_cnt1",
+			false,
 		),
 		sqlchemy.NewFunction(
 			sqlchemy.NewCase().When(
@@ -1563,6 +1579,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 				buckets.Field("size_bytes"),
 			).Else(sqlchemy.NewConstField(0)),
 			"size_bytes1",
+			false,
 		),
 		sqlchemy.NewFunction(
 			sqlchemy.NewCase().When(
@@ -1571,6 +1588,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 			).Else(
 				buckets.Field("size_bytes")),
 			"size_bytes_limit",
+			false,
 		),
 	)
 	bucketsQ = manager.usageQ(bucketsQ, rangeObjs, providers, brands, cloudEnv)
@@ -1604,7 +1622,7 @@ func (bucket *SBucket) PerformLimit(
 	limit := cloudprovider.SBucketStats{}
 	err := data.Unmarshal(&limit, "limit")
 	if err != nil {
-		return nil, httperrors.NewInputParameterError("unmarshal limit error %s", err)
+		return nil, httperrors.NewInputParameterError("unmarshal limit failed: %s", err)
 	}
 
 	iBucket, err := bucket.GetIBucket(ctx)
@@ -1614,7 +1632,7 @@ func (bucket *SBucket) PerformLimit(
 
 	err = iBucket.SetLimit(limit)
 	if err != nil && err != cloudprovider.ErrNotSupported {
-		return nil, httperrors.NewInternalServerError("SetLimit error %s", err)
+		return nil, httperrors.NewInternalServerError("SetLimit failed: %s", err)
 	}
 
 	diff, err := db.Update(bucket, func() error {
@@ -1624,7 +1642,7 @@ func (bucket *SBucket) PerformLimit(
 	})
 
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("Update error %s", err)
+		return nil, httperrors.NewInternalServerError("Update failed: %s", err)
 	}
 
 	if len(diff) > 0 {
@@ -1716,7 +1734,7 @@ func (bucket *SBucket) processObjectsActionInput(ctx context.Context, input api.
 		if strings.HasSuffix(key, "/") {
 			objs, err := cloudprovider.GetAllObjects(iBucket, key, true)
 			if err != nil {
-				return nil, nil, httperrors.NewInternalServerError("iBucket.GetIObjects error %s", err)
+				return nil, nil, httperrors.NewInternalServerError("iBucket.GetIObjects failed: %s", err)
 			}
 			objects = append(objects, objs...)
 		} else {
@@ -1725,7 +1743,7 @@ func (bucket *SBucket) processObjectsActionInput(ctx context.Context, input api.
 				if errors.Cause(err) == cloudprovider.ErrNotFound {
 					return nil, nil, httperrors.NewResourceNotFoundError("object %s not found", key)
 				} else {
-					return nil, nil, httperrors.NewInternalServerError("iBucket.GetIObject error %s", err)
+					return nil, nil, httperrors.NewInternalServerError("iBucket.GetIObject failed: %s", err)
 				}
 			}
 			objects = append(objects, object)
@@ -1735,7 +1753,10 @@ func (bucket *SBucket) processObjectsActionInput(ctx context.Context, input api.
 }
 
 func (bucket *SBucket) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(bucket.ExternalId) == 0 {
+	if len(bucket.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := bucket.GetCloudaccount(); account != nil && account.ReadOnly {
 		return
 	}
 	iBucket, err := bucket.GetIBucket(ctx)
@@ -1754,7 +1775,11 @@ func (bucket *SBucket) OnMetadataUpdated(ctx context.Context, userCred mcclient.
 	if diff.IsChanged() {
 		logclient.AddSimpleActionLog(bucket, logclient.ACT_UPDATE_TAGS, diff, userCred, true)
 	}
-	syncVirtualResourceMetadata(ctx, userCred, bucket, iBucket)
+	readOnly := false
+	if account := bucket.GetCloudaccount(); account != nil {
+		readOnly = account.ReadOnly
+	}
+	syncVirtualResourceMetadata(ctx, userCred, bucket, iBucket, readOnly)
 }
 
 func (manager *SBucketManager) ListItemExportKeys(ctx context.Context,

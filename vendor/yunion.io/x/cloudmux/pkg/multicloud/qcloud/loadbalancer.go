@@ -51,7 +51,6 @@ type SLoadbalancer struct {
 	region *SRegion
 
 	Status            int64     `json:"Status"` // 0：创建中，1：正常运行
-	Domain            string    `json:"Domain"`
 	VpcId             string    `json:"VpcId"`
 	Log               string    `json:"Log"`
 	ProjectId         int64     `json:"ProjectId"`
@@ -72,6 +71,9 @@ type SLoadbalancer struct {
 		InternetChargeType      string
 		InternetMaxBandwidthOut int
 	}
+	LoadBalancerDomain string `json:"LoadBalancerDomain"`
+
+	SecureGroups []string
 }
 
 type ZoneSet struct {
@@ -93,6 +95,10 @@ func (self *SLoadbalancer) GetChargeType() string {
 
 func (self *SLoadbalancer) GetEgressMbps() int {
 	return self.NetworkAttributes.InternetMaxBandwidthOut
+}
+
+func (lb *SLoadbalancer) GetSecurityGroupIds() ([]string, error) {
+	return lb.SecureGroups, nil
 }
 
 // https://cloud.tencent.com/document/product/214/30689
@@ -213,7 +219,10 @@ func (self *SLoadbalancer) Refresh() error {
 
 // 腾讯云当前不支持一个LB绑定多个ip，每个LB只支持绑定一个ip
 func (self *SLoadbalancer) GetAddress() string {
-	return self.LoadBalancerVips[0]
+	for _, addr := range self.LoadBalancerVips {
+		return addr
+	}
+	return self.LoadBalancerDomain
 }
 
 func (self *SLoadbalancer) GetAddressType() string {
@@ -286,10 +295,22 @@ func (self *SLoadbalancer) GetILoadBalancerBackendGroups() ([]cloudprovider.IClo
 	}
 	lbbgs := []SLBBackendGroup{}
 	for i := range listeners {
-		lbbgs = append(lbbgs, SLBBackendGroup{
-			lb:       self,
-			listener: &listeners[i],
-		})
+		if listeners[i].GetListenerType() == "http" || listeners[i].GetListenerType() == "https" {
+			for j := range listeners[i].Rules {
+				lbbgs = append(lbbgs, SLBBackendGroup{
+					lb:       self,
+					listener: &listeners[i],
+					domain:   listeners[i].Rules[j].Domain,
+					path:     listeners[i].Rules[j].URL,
+				})
+			}
+
+		} else {
+			lbbgs = append(lbbgs, SLBBackendGroup{
+				lb:       self,
+				listener: &listeners[i],
+			})
+		}
 	}
 
 	ret := []cloudprovider.ICloudLoadbalancerBackendGroup{}
@@ -300,18 +321,17 @@ func (self *SLoadbalancer) GetILoadBalancerBackendGroups() ([]cloudprovider.IClo
 	return ret, nil
 }
 
-func (self *SLoadbalancer) GetIEIP() (cloudprovider.ICloudEIP, error) {
-	if self.LoadBalancerType == "OPEN" && len(self.LoadBalancerVips) > 0 {
-		return &SEipAddress{
-			region:      self.region,
-			AddressId:   self.LoadBalancerId,
-			AddressIp:   self.LoadBalancerVips[0],
-			AddressType: EIP_STATUS_BIND,
-			InstanceId:  self.LoadBalancerId,
-			CreatedTime: self.CreateTime,
-		}, nil
+func (self *SLoadbalancer) GetIEIPs() ([]cloudprovider.ICloudEIP, error) {
+	eips, _, err := self.region.GetEips("", self.LoadBalancerId, 0, 50)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetEips")
 	}
-	return nil, nil
+	ret := []cloudprovider.ICloudEIP{}
+	for i := range eips {
+		eips[i].region = self.region
+		ret = append(ret, &eips[i])
+	}
+	return ret, nil
 }
 
 func (self *SRegion) GetLoadbalancers(ids []string, limit, offset int) ([]SLoadbalancer, int, error) {
@@ -348,7 +368,7 @@ func (self *SRegion) GetLoadbalancer(id string) (*SLoadbalancer, error) {
 			return &lbs[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 /*
@@ -508,7 +528,7 @@ func (self *SRegion) CreateILoadBalancer(opts *cloudprovider.SLoadbalancerCreate
 		return nil, errors.Wrapf(err, "resp.Unmarshal")
 	}
 	if len(ret.RequestId) == 0 || len(ret.LoadBalancerIds) != 1 {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, resp.String())
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", resp.String())
 	}
 	err = self.WaitLBTaskSuccess(ret.RequestId, 5*time.Second, time.Minute*1)
 	if err != nil {

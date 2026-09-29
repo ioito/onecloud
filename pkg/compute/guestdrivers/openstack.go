@@ -26,7 +26,6 @@ import (
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
-	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -113,7 +112,7 @@ func (self *SOpenStackGuestDriver) GetMinimalSysDiskSizeGb() int {
 }
 
 func (self *SOpenStackGuestDriver) GetStorageTypes() []string {
-	storages, _ := models.StorageManager.GetStorageTypesByHostType(api.HYPERVISOR_HOSTTYPE[self.GetHypervisor()])
+	storages, _ := models.StorageManager.GetStorageTypesByProvider(self.GetProvider())
 	return storages
 }
 
@@ -133,8 +132,8 @@ func (self *SOpenStackGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING, api.VM_REBUILD_ROOT_FAIL}, nil
 }
 
-func (self *SOpenStackGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY, api.VM_RUNNING}, nil
+func (self *SOpenStackGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return true, nil
 }
 
 func (self *SOpenStackGuestDriver) IsNeedInjectPasswordByCloudInit() bool {
@@ -158,7 +157,7 @@ func (self *SOpenStackGuestDriver) GetDeployStatus() ([]string, error) {
 }
 
 func (self *SOpenStackGuestDriver) ValidateCreateEip(ctx context.Context, userCred mcclient.TokenCredential, input api.ServerCreateEipInput) error {
-	return httperrors.NewInputParameterError("%s not support create eip, it only support bind eip", self.GetHypervisor())
+	return httperrors.NewInputParameterError("%s does not support creating EIP; only binding EIP is supported", self.GetHypervisor())
 }
 
 func (self *SOpenStackGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
@@ -175,15 +174,15 @@ func (self *SOpenStackGuestDriver) ValidateCreateData(ctx context.Context, userC
 		return nil, err
 	}
 	if len(input.Networks) >= 2 {
-		return nil, httperrors.NewInputParameterError("cannot support more than 1 nic")
+		return nil, httperrors.NewInputParameterError("multiple NICs are not supported")
 	}
 	if len(input.Eip) > 0 || input.EipBw > 0 {
-		return nil, httperrors.NewUnsupportOperationError("%s not support create virtual machine with eip", self.GetHypervisor())
+		return nil, httperrors.NewUnsupportOperationError("%s does not support creating virtual machine with eip", self.GetHypervisor())
 	}
 	for i := 1; i < len(input.Disks); i++ {
 		disk := input.Disks[i]
 		if disk.Backend == api.STORAGE_OPENSTACK_NOVA {
-			return nil, httperrors.NewUnsupportOperationError("data disk not support storage type %s", disk.Backend)
+			return nil, httperrors.NewUnsupportOperationError("data disk does not support storage type %s", disk.Backend)
 		}
 	}
 
@@ -216,6 +215,11 @@ func (self *SOpenStackGuestDriver) RemoteDeployGuestForRebuildRoot(ctx context.C
 	iVM, err := ihost.GetIVMById(guest.GetExternalId())
 	if err != nil || iVM == nil {
 		return nil, fmt.Errorf("cannot find vm %s(%s)", guest.Id, guest.Name)
+	}
+
+	driver, err := guest.GetDriver()
+	if err != nil {
+		return nil, err
 	}
 
 	instanceId := iVM.GetGlobalId()
@@ -290,7 +294,7 @@ func (self *SOpenStackGuestDriver) RemoteDeployGuestForRebuildRoot(ctx context.C
 
 		instanceId = iVM.GetGlobalId()
 		db.SetExternalId(guest, task.GetUserCred(), instanceId)
-		initialState := guest.GetDriver().GetGuestInitialStateAfterCreate()
+		initialState := driver.GetGuestInitialStateAfterCreate()
 		log.Debugf("VMrebuildRoot %s new instance, wait status %s ...", iVM.GetGlobalId(), initialState)
 		cloudprovider.WaitStatus(iVM, initialState, time.Second*5, time.Second*1800)
 
@@ -324,7 +328,7 @@ func (self *SOpenStackGuestDriver) RemoteDeployGuestForRebuildRoot(ctx context.C
 		return nil, err
 	}
 
-	initialState := guest.GetDriver().GetGuestInitialStateAfterRebuild()
+	initialState := driver.GetGuestInitialStateAfterRebuild()
 	log.Debugf("VMrebuildRoot %s new diskID %s, wait status %s ...", iVM.GetGlobalId(), diskId, initialState)
 	err = cloudprovider.WaitStatus(iVM, initialState, time.Second*5, time.Second*1800)
 	if err != nil {
@@ -386,100 +390,4 @@ func (self *SOpenStackGuestDriver) IsSupportMigrate() bool {
 
 func (self *SOpenStackGuestDriver) IsSupportLiveMigrate() bool {
 	return true
-}
-
-func (self *SOpenStackGuestDriver) CheckMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestMigrateInput) error {
-	return nil
-}
-
-func (self *SOpenStackGuestDriver) CheckLiveMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestLiveMigrateInput) error {
-	return nil
-}
-
-func (self *SOpenStackGuestDriver) RequestMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestMigrateInput, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iVM, err := guest.GetIVM(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "guest.GetIVM")
-		}
-		hostExternalId := ""
-		if input.PreferHostId != "" {
-			iHost, err := models.HostManager.FetchById(input.PreferHostId)
-			if err != nil {
-				return nil, errors.Wrapf(err, "models.HostManager.FetchById(%s)", input.PreferHostId)
-			}
-			host := iHost.(*models.SHost)
-			hostExternalId = host.ExternalId
-		}
-		if err = iVM.MigrateVM(hostExternalId); err != nil {
-			return nil, errors.Wrapf(err, "iVM.MigrateVM(%s)", hostExternalId)
-		}
-		hostExternalId = iVM.GetIHostId()
-		if hostExternalId == "" {
-			return nil, errors.Wrap(fmt.Errorf("empty hostExternalId"), "iVM.GetIHostId()")
-		}
-		iHost, err := db.FetchByExternalIdAndManagerId(models.HostManager, hostExternalId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
-			if host, _ := guest.GetHost(); host != nil {
-				return q.Equals("manager_id", host.ManagerId)
-			}
-			return q
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "db.FetchByExternalId(models.HostManager,%s)", hostExternalId)
-		}
-		host := iHost.(*models.SHost)
-		_, err = db.Update(guest, func() error {
-			guest.HostId = host.GetId()
-			return nil
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "db.Update guest.hostId")
-		}
-		return nil, nil
-	})
-	return nil
-}
-
-func (self *SOpenStackGuestDriver) RequestLiveMigrate(ctx context.Context, guest *models.SGuest, userCred mcclient.TokenCredential, input api.GuestLiveMigrateInput, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		iVM, err := guest.GetIVM(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "guest.GetIVM")
-		}
-		hostExternalId := ""
-		if input.PreferHostId != "" {
-			iHost, err := models.HostManager.FetchById(input.PreferHostId)
-			if err != nil {
-				return nil, errors.Wrapf(err, "models.HostManager.FetchById(%s)", input.PreferHostId)
-			}
-			host := iHost.(*models.SHost)
-			hostExternalId = host.ExternalId
-		}
-		if err = iVM.LiveMigrateVM(hostExternalId); err != nil {
-			return nil, errors.Wrapf(err, "iVM.LiveMigrateVM(%s)", hostExternalId)
-		}
-		hostExternalId = iVM.GetIHostId()
-		if hostExternalId == "" {
-			return nil, errors.Wrap(fmt.Errorf("empty hostExternalId"), "iVM.GetIHostId()")
-		}
-		iHost, err := db.FetchByExternalIdAndManagerId(models.HostManager, hostExternalId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
-			if host, _ := guest.GetHost(); host != nil {
-				return q.Equals("manager_id", host.ManagerId)
-			}
-			return q
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "db.FetchByExternalId(models.HostManager,%s)", hostExternalId)
-		}
-		host := iHost.(*models.SHost)
-		_, err = db.Update(guest, func() error {
-			guest.HostId = host.GetId()
-			return nil
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "db.Update guest.hostId")
-		}
-		return nil, nil
-	})
-	return nil
 }

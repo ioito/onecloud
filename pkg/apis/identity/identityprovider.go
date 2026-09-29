@@ -44,6 +44,10 @@ type IdentityProviderDetails struct {
 	// 该认证源关联的所有域的组数量
 	GroupCount int `json:"group_count,allowempty"`
 
+	// 该认证源的URL, 可以区分ladp是否使用TLS
+	// example: ldaps://192.168.100.10, ldap://192.168.100.10
+	URL string `json:"url,allowempty"`
+
 	SIdentityProvider
 }
 
@@ -59,6 +63,9 @@ type IdpResourceInfo struct {
 
 	// 认证源类型, 例如sql, cas, ldap等
 	IdpDriver string `json:"idp_driver"`
+
+	// 是否是SSO登录方式
+	IsSso bool `json:"is_sso"`
 
 	// 认证源模板
 	Template string `json:"template"`
@@ -95,6 +102,14 @@ type IdentityProviderCreateInput struct {
 
 	// 图标URL
 	IconUri string `json:"icon_uri"`
+}
+
+type IdentityProviderPropertyAttributeNamesInput struct {
+	// 后端驱动名称
+	Driver string `json:"driver"`
+
+	// 模板名称
+	Template string `json:"template"`
 }
 
 type GetIdpSamlMetadataInput struct {

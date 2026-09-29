@@ -197,10 +197,6 @@ func (self *SDisk) GetISnapshots() ([]cloudprovider.ICloudSnapshot, error) {
 	return []cloudprovider.ICloudSnapshot{}, nil
 }
 
-func (self *SDisk) GetExtSnapshotPolicyIds() ([]string, error) {
-	return []string{}, nil
-}
-
 func (self *SDisk) Resize(ctx context.Context, newSizeMB int64) error {
 	return self.storage.zone.region.ResizeDisk(self.GetId(), newSizeMB/1024)
 }
@@ -217,7 +213,7 @@ func (self *SRegion) GetDisks() ([]SDisk, error) {
 	pageNo := 1
 	params := map[string]interface{}{
 		"pageNo":   pageNo,
-		"pageSize": 100,
+		"pageSize": 50,
 	}
 	ret := []SDisk{}
 	for {

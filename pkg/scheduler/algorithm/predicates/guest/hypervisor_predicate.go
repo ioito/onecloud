@@ -18,9 +18,10 @@ import (
 	"context"
 
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/utils"
 
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/scheduler/algorithm/predicates"
-	"yunion.io/x/onecloud/pkg/scheduler/api"
 	"yunion.io/x/onecloud/pkg/scheduler/core"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager/schedtag"
 )
@@ -56,7 +57,7 @@ func hostHasContainerTag(c core.Candidater) bool {
 func hostAllowRunContainer(c core.Candidater) bool {
 	getter := c.Getter()
 	hostType := getter.HostType()
-	if hostType == api.HostTypeKubelet {
+	if hostType == computeapi.HOST_TYPE_CONTAINER {
 		return true
 	}
 	if hostHasContainerTag(c) {
@@ -71,9 +72,19 @@ func (f *HypervisorPredicate) Execute(ctx context.Context, u *core.Unit, c core.
 
 	hostType := c.Getter().HostType()
 	guestNeedType := u.SchedData().Hypervisor
-
+	if hostType == computeapi.HOST_TYPE_HYPERVISOR {
+		if u.SchedData().QemuVersion != "" {
+			host := c.Getter().Host()
+			qemuVersions := make([]string, 0)
+			host.SysInfo.Unmarshal(&qemuVersions, "qemu_versions")
+			if !utils.IsInStringArray(u.SchedData().QemuVersion, qemuVersions) {
+				h.Exclude(predicates.ErrHostQemuVersionNotMatch)
+				return h.GetResult()
+			}
+		}
+	}
 	if guestNeedType != hostType {
-		if guestNeedType == api.SchedTypeContainer && hostAllowRunContainer(c) {
+		if guestNeedType == computeapi.HYPERVISOR_POD && hostAllowRunContainer(c) {
 			return h.GetResult()
 		}
 		h.Exclude2(f.Name(), hostType, guestNeedType)

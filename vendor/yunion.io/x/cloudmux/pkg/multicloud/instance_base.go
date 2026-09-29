@@ -31,6 +31,10 @@ func (instance *SInstanceBase) GetIHostId() string {
 	return ""
 }
 
+func (instance *SInstanceBase) GetCpuSockets() int {
+	return 1
+}
+
 func (instance *SInstanceBase) GetSerialOutput(port int) (string, error) {
 	return "", cloudprovider.ErrNotImplemented
 }
@@ -85,4 +89,24 @@ func (self *SInstanceBase) GetInternetMaxBandwidthOut() int {
 
 func (ins *SInstanceBase) GetPowerStates() string {
 	return ""
+}
+
+func (ins *SInstanceBase) GetHealthStatus() string {
+	return ""
+}
+
+func (instance *SInstanceBase) GetError() error {
+	return nil
+}
+
+func (instance *SInstanceBase) GetIsolateDeviceIds() ([]string, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "GetIsolateDeviceIds")
+}
+
+func (instance *SInstanceBase) GetContainers() ([]cloudprovider.ICloudContainer, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "GetContainers")
+}
+
+func (instance *SInstanceBase) GetModificationTypes() ([]cloudprovider.SInstanceModificationType, error) {
+	return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "GetModificationTypes")
 }

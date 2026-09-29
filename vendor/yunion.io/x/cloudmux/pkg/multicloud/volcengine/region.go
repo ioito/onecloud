@@ -32,21 +32,26 @@ import (
 )
 
 var RegionLocations = map[string]string{
-	"cn-beijing":   "中国(北京)",
-	"cn-shanghai":  "中国(上海)",
-	"cn-guangzhou": "中国(广州)",
-}
-
-var RegionLocationsEN = map[string]string{
-	"cn-beijing":   "China (Beijing)",
-	"cn-shanghai":  "China (Shanghai)",
-	"cn-guangzhou": "China (Guangzhou)",
+	"cn-beijing":     "华北2（北京）",
+	"cn-shanghai":    "华东2（上海）",
+	"cn-guangzhou":   "华南1（广州）",
+	"ap-southeast-1": "亚太东南（柔佛）",
+	"ap-southeast-3": "亚太东南（雅加达）",
+	"cn-hongkong":    "中国香港",
 }
 
 var RegionEndpoint = map[string]string{
-	"cn-beijing":   "cn-beijing.volces.com",
-	"cn-shanghai":  "cn-shanghai.volces.com",
-	"cn-guangzhou": "cn-beijing.volces.com",
+	"cn-beijing":     "cn-beijing.volces.com",
+	"cn-shanghai":    "cn-shanghai.volces.com",
+	"cn-guangzhou":   "cn-beijing.volces.com",
+	"ap-southeast-1": "ap-southeast-1.volces.com",
+	"cn-hongkong":    "cn-hongkong.volces.com",
+	"ap-southeast-3": "ap-southeast-3.volces.com",
+}
+
+type sStorageType struct {
+	Id    string
+	Zones []string
 }
 
 type SRegion struct {
@@ -59,6 +64,7 @@ type SRegion struct {
 
 	ivpcs []cloudprovider.ICloudVpc
 
+	storageTypes []sStorageType
 	storageCache *SStoragecache
 }
 
@@ -83,10 +89,11 @@ func (region *SRegion) GetId() string {
 }
 
 func (region *SRegion) GetName() string {
+	name := region.RegionId
 	if localName, ok := RegionLocations[region.RegionId]; ok {
-		return fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_CN, localName)
+		name = localName
 	}
-	return fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_CN, region.RegionId)
+	return fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_CN, name)
 }
 
 func (region *SRegion) GetGlobalId() string {
@@ -94,12 +101,11 @@ func (region *SRegion) GetGlobalId() string {
 }
 
 func (region *SRegion) GetI18n() cloudprovider.SModelI18nTable {
-	var en string
-	if localName, ok := RegionLocationsEN[region.RegionId]; ok {
-		en = fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_EN, localName)
-	} else {
-		en = fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_EN, region.RegionId)
+	name := region.RegionId
+	if localName, ok := RegionLocations[region.RegionId]; ok {
+		name = localName
 	}
+	en := fmt.Sprintf("%s %s", CLOUD_PROVIDER_VOLCENGINE_EN, name)
 	table := cloudprovider.SModelI18nTable{}
 	table["name"] = cloudprovider.NewSModelI18nEntry(region.GetName()).CN(region.GetName()).EN(en)
 	return table
@@ -135,7 +141,7 @@ func (region *SRegion) GetZones(id string) ([]SZone, error) {
 		return nil, err
 	}
 	ret := []SZone{}
-	err = body.Unmarshal(&ret, "Result", "AvailableZones")
+	err = body.Unmarshal(&ret, "AvailableZones")
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +201,7 @@ func (region *SRegion) CreateVpc(opts *cloudprovider.VpcCreateOptions) (*SVpc, e
 	if err != nil {
 		return nil, err
 	}
-	vpcId, err := body.GetString("Result", "VpcId")
+	vpcId, err := body.GetString("VpcId")
 	if err != nil {
 		return nil, err
 	}
@@ -250,11 +256,11 @@ func (region *SRegion) GetVpcs(vpcIds []string, pageNumber int, pageSize int) ([
 		return nil, 0, errors.Wrapf(err, "GetVpcs fail")
 	}
 	vpcs := make([]SVpc, 0)
-	err = body.Unmarshal(&vpcs, "Result", "Vpcs")
+	err = body.Unmarshal(&vpcs, "Vpcs")
 	if err != nil {
 		return nil, 0, errors.Wrapf(err, "Unmarshal vpcs fail")
 	}
-	total, _ := body.Int("Result", "TotalCount")
+	total, _ := body.Int("TotalCount")
 	return vpcs, int(total), nil
 }
 
@@ -332,23 +338,6 @@ func (region *SRegion) GetIEips() ([]cloudprovider.ICloudEIP, error) {
 		ret[i] = &eips[i]
 	}
 	return ret, nil
-}
-
-func (region *SRegion) FetchSubnets(ids []string, zoneId string, vpcId string) ([]SNetwork, error) {
-	pageNumber := 1
-	nets := make([]SNetwork, 0)
-	for {
-		parts, total, err := region.GetSubnets(ids, zoneId, vpcId, pageNumber, 50)
-		if err != nil {
-			return nil, err
-		}
-		nets = append(nets, parts...)
-		if len(nets) >= total {
-			break
-		}
-		pageNumber += 1
-	}
-	return nets, nil
 }
 
 // IBucket
@@ -444,25 +433,10 @@ func (region *SRegion) GetCapabilities() []string {
 }
 
 // Security Group
-func (region *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
-	externalId, err := region.CreateSecurityGroup(conf.VpcId, conf.Name, conf.Desc, conf.ProjectId)
+func (region *SRegion) CreateISecurityGroup(opts *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
+	externalId, err := region.CreateSecurityGroup(opts)
 	if err != nil {
 		return nil, err
-	}
-	if conf.OnCreated != nil {
-		conf.OnCreated(externalId)
-	}
-	outRules := conf.OutRules
-	if len(outRules) > 0 && outRules[0].String() == "out:allow any" {
-		outRules = outRules[1:]
-	}
-	rules := append(conf.InRules, outRules...)
-	for _, rule := range rules {
-		rule.Priority = 101 - rule.Priority
-		err = region.addSecurityGroupRule(externalId, rule)
-		if err != nil {
-			return nil, err
-		}
 	}
 	err = cloudprovider.Wait(5*time.Second, time.Minute, func() (bool, error) {
 		_, err := region.GetISecurityGroupById(externalId)
@@ -479,25 +453,7 @@ func (region *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCre
 }
 
 func (region *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICloudSecurityGroup, error) {
-	return region.GetSecurityGroupDetails(secgroupId)
-}
-
-func (region *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, _, err := region.GetSecurityGroups(opts.VpcId, opts.Name, nil, 1, 100)
-	if err != nil {
-		return nil, err
-	}
-	for _, secgroup := range secgroups {
-		if secgroup.SecurityGroupName == opts.Name {
-			secgroup.region = region
-			return &secgroup, nil
-		}
-	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s not found", opts.Name)
-}
-
-func (region *SRegion) DeleteISecurityGroupById(secgroupId string) error {
-	return region.DeleteSecurityGroupById(secgroupId)
+	return region.GetSecurityGroup(secgroupId)
 }
 
 func (region *SRegion) getSdkCredential(service string, token string) sdk.Credentials {
@@ -563,7 +519,11 @@ func (region *SRegion) instanceOperation(instanceId string, apiName string, extr
 }
 
 func (region *SRegion) getBaseEndpoint() string {
-	return RegionEndpoint[region.RegionId]
+	endpoint, ok := RegionEndpoint[region.RegionId]
+	if ok {
+		return endpoint
+	}
+	return fmt.Sprintf("%s.volces.com", region.RegionId)
 }
 
 func (region *SRegion) getS3Endpoint() string {
@@ -601,7 +561,7 @@ func (region *SRegion) GetRouteTables(ids []string, pageNumber int, pageSize int
 	if err != nil {
 		return nil, 0, errors.Wrapf(err, "Unmarshal routetables fail")
 	}
-	total, _ := body.Int("Result", "TotalCount")
+	total, _ := body.Int("TotalCount")
 	return routetables, int(total), nil
 }
 
@@ -639,7 +599,7 @@ func (regioin *SRegion) GetIHosts() ([]cloudprovider.ICloudHost, error) {
 }
 
 func (region *SRegion) GetIDiskById(id string) (cloudprovider.ICloudDisk, error) {
-	return region.getDisk(id)
+	return region.GetDisk(id)
 }
 
 func (region *SRegion) GetIStorageById(id string) (cloudprovider.ICloudStorage, error) {
@@ -675,6 +635,57 @@ func (region *SRegion) GetIStorages() ([]cloudprovider.ICloudStorage, error) {
 	return iStores, nil
 }
 
+func (region *SRegion) getOrCreateZone(zoneId string, cache map[string]*SZone) (*SZone, error) {
+	if len(zoneId) == 0 {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "empty zone")
+	}
+	if cache != nil {
+		if zone, ok := cache[zoneId]; ok {
+			return zone, nil
+		}
+	}
+	zone := &SZone{
+		region: region,
+		ZoneId: zoneId,
+	}
+	if cache != nil {
+		cache[zoneId] = zone
+	}
+	return zone, nil
+}
+
+func (region *SRegion) initInstanceHost(vm *SInstance, zoneCache map[string]*SZone) error {
+	zone, err := region.getOrCreateZone(vm.ZoneId, zoneCache)
+	if err != nil {
+		return err
+	}
+	vm.host = zone.getHost()
+	return nil
+}
+
 func (region *SRegion) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
-	return region.GetInstance(id)
+	vm, err := region.GetInstance(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := region.initInstanceHost(vm, nil); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	vms, err := region.GetInstances("", nil)
+	if err != nil {
+		return nil, err
+	}
+	zoneCache := make(map[string]*SZone)
+	ret := []cloudprovider.ICloudVM{}
+	for i := range vms {
+		if err := region.initInstanceHost(&vms[i], zoneCache); err != nil {
+			return nil, err
+		}
+		ret = append(ret, &vms[i])
+	}
+	return ret, nil
 }

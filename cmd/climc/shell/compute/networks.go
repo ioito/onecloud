@@ -26,17 +26,20 @@ import (
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
 	compute_options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
+	"yunion.io/x/onecloud/pkg/util/netutils2"
 )
 
 func init() {
 
 	cmd := shell.NewResourceCmd(&modules.Networks).WithContextManager(&modules.Wires)
 	cmd.List(&compute_options.NetworkListOptions{})
+	cmd.Create(&compute_options.NetworkCreateOptions{})
 	cmd.Update(&compute_options.NetworkUpdateOptions{})
 	cmd.Show(&compute_options.NetworkIdOptions{})
 	cmd.Delete(&compute_options.NetworkIdOptions{})
 	cmd.GetMetadata(&compute_options.NetworkIdOptions{})
 	cmd.Perform("private", &compute_options.NetworkIdOptions{})
+	cmd.Perform("public", &options.SharableResourcePublicOptions{})
 	cmd.Perform("syncstatus", &compute_options.NetworkIdOptions{})
 	cmd.Perform("sync", &compute_options.NetworkIdOptions{})
 	cmd.Perform("purge", &compute_options.NetworkIdOptions{})
@@ -44,82 +47,17 @@ func init() {
 	cmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
 	cmd.Perform("switch-wire", &compute_options.NetworkSwitchWireOptions{})
 	cmd.Perform("sync-additional-wires", &compute_options.NetworkSyncAdditionalWiresOptions{})
-
-	type NetworkShareOptions struct {
-		ID             string   `help:"ID or Name of the zone to show"`
-		Scope          string   `help:"sharing scope" choices:"system|domain|project"`
-		SharedProjects []string `help:"Share to prjects"`
-		SharedDomains  []string `help:"share to domains"`
-	}
-	R(&NetworkShareOptions{}, "network-public", "Make a network public", func(s *mcclient.ClientSession, args *NetworkShareOptions) error {
-		params := jsonutils.Marshal(args)
-		result, err := modules.Networks.PerformAction(s, args.ID, "public", params)
-		if err != nil {
-			return err
-		}
-		printObject(result)
-		return nil
-	})
-
-	type NetworkCreateOptions struct {
-		WIRE        string `help:"ID or Name of wire in which the network is created"`
-		NETWORK     string `help:"Name of new network"`
-		STARTIP     string `help:"Start of IPv4 address range"`
-		ENDIP       string `help:"End of IPv4 address rnage"`
-		NETMASK     int64  `help:"Length of network mask"`
-		Gateway     string `help:"Default gateway"`
-		VlanId      int64  `help:"Vlan ID" default:"1"`
-		IfnameHint  string `help:"Hint for ifname generation"`
-		AllocPolicy string `help:"Address allocation policy" choices:"none|stepdown|stepup|random"`
-		ServerType  string `help:"Server type" choices:"baremetal|container|eip|guest|ipmi|pxe"`
-		IsAutoAlloc *bool  `help:"Auto allocation IP pool"`
-		BgpType     string `help:"Internet service provider name" positional:"false"`
-		Desc        string `help:"Description" metavar:"DESCRIPTION"`
-	}
-	R(&NetworkCreateOptions{}, "network-create", "Create a virtual network", func(s *mcclient.ClientSession, args *NetworkCreateOptions) error {
-		params := jsonutils.NewDict()
-		params.Add(jsonutils.NewString(args.NETWORK), "name")
-		params.Add(jsonutils.NewString(args.STARTIP), "guest_ip_start")
-		params.Add(jsonutils.NewString(args.ENDIP), "guest_ip_end")
-		params.Add(jsonutils.NewInt(args.NETMASK), "guest_ip_mask")
-		if len(args.Gateway) > 0 {
-			params.Add(jsonutils.NewString(args.Gateway), "guest_gateway")
-		}
-		if args.VlanId > 0 {
-			params.Add(jsonutils.NewInt(args.VlanId), "vlan_id")
-		}
-		if len(args.ServerType) > 0 {
-			params.Add(jsonutils.NewString(args.ServerType), "server_type")
-		}
-		if len(args.IfnameHint) > 0 {
-			params.Add(jsonutils.NewString(args.IfnameHint), "ifname_hint")
-		}
-		if len(args.AllocPolicy) > 0 {
-			params.Add(jsonutils.NewString(args.AllocPolicy), "alloc_policy")
-		}
-		if len(args.Desc) > 0 {
-			params.Add(jsonutils.NewString(args.Desc), "description")
-		}
-		if len(args.BgpType) > 0 {
-			params.Add(jsonutils.NewString(args.BgpType), "bgp_type")
-		}
-		if args.IsAutoAlloc != nil {
-			params.Add(jsonutils.NewBool(*args.IsAutoAlloc), "is_auto_alloc")
-		}
-		net, e := modules.Networks.CreateInContext(s, params, &modules.Wires, args.WIRE)
-		if e != nil {
-			return e
-		}
-		printObject(net)
-		return nil
-	})
+	cmd.Get("available-addresses", &compute_options.NetworkIdOptions{})
 
 	type NetworkCreateOptions2 struct {
-		Wire           string `help:"ID or Name of wire in which the network is created"`
-		Vpc            string `help:"ID or Name of vpc in which the network is created"`
-		Zone           string `help:"ID or Name of zone in which the network is created"`
-		NAME           string `help:"Name of new network"`
-		PREFIX         string `help:"Start of IPv4 address range"`
+		Wire   string `help:"ID or Name of wire in which the network is created"`
+		Vpc    string `help:"ID or Name of vpc in which the network is created"`
+		Zone   string `help:"ID or Name of zone in which the network is created"`
+		NAME   string `help:"Name of new network"`
+		PREFIX string `help:"IPv4 prefix"`
+
+		Prefix6 string `help:"IPv6 prefix"`
+
 		BgpType        string `help:"Internet service provider name" positional:"false"`
 		AssignPublicIp bool
 		Desc           string `help:"Description" metavar:"DESCRIPTION"`
@@ -128,6 +66,11 @@ func init() {
 		params := jsonutils.NewDict()
 		params.Add(jsonutils.NewString(args.NAME), "name")
 		params.Add(jsonutils.NewString(args.PREFIX), "guest_ip_prefix")
+
+		if len(args.Prefix6) > 0 {
+			params.Add(jsonutils.NewString(args.Prefix6), "guest_ip6_prefix")
+		}
+
 		params.Set("assign_public_ip", jsonutils.NewBool(args.AssignPublicIp))
 		if len(args.BgpType) > 0 {
 			params.Add(jsonutils.NewString(args.BgpType), "bgp_type")
@@ -150,6 +93,22 @@ func init() {
 		net, e := modules.Networks.Create(s, params)
 		if e != nil {
 			return e
+		}
+		printObject(net)
+		return nil
+	})
+
+	type NetworkCreate3Options struct {
+		compute_options.NetworkCreateOptions `start_ip->positional:"false" end_ip->positional:"false" net_mask->positional:"false"`
+	}
+	R(&NetworkCreate3Options{}, "network-create3", "Create a dual-stack virtual network", func(s *mcclient.ClientSession, args *NetworkCreate3Options) error {
+		params, err := args.Params()
+		if err != nil {
+			return err
+		}
+		net, err := modules.Networks.Create(s, params)
+		if err != nil {
+			return err
 		}
 		printObject(net)
 		return nil
@@ -253,7 +212,7 @@ func init() {
 
 	type NetworkChangeOwnerOptions struct {
 		ID      string `help:"Network to change owner" json:"-"`
-		PROJECT string `help:"Project ID or change" json:"tenant"`
+		PROJECT string `help:"Project ID or name" json:"tenant"`
 	}
 	R(&NetworkChangeOwnerOptions{}, "network-change-owner", "Change owner project of a network", func(s *mcclient.ClientSession, args *NetworkChangeOwnerOptions) error {
 		params, err := options.StructToParams(args)
@@ -281,6 +240,23 @@ func init() {
 			return err
 		}
 		printObject(net)
+		return nil
+	})
+	type NetworkInterfaceInfoOptions struct {
+		DEV string `help:"name of device, e.g. eth0"`
+	}
+	R(&NetworkInterfaceInfoOptions{}, "network-interface-info", "Show addr and routes of interface", func(s *mcclient.ClientSession, args *NetworkInterfaceInfoOptions) error {
+		netIf := netutils2.NewNetInterface(args.DEV)
+
+		fmt.Println("[Slave Addresses]")
+		for _, addr := range netIf.GetSlaveAddresses() {
+			fmt.Printf("%s/%d\n", addr.Addr, addr.MaskLen)
+		}
+		fmt.Println("[Routes]")
+		for _, r := range netIf.GetRouteSpecs() {
+			fmt.Printf("%s via %s dev %d\n", r.Dst.String(), r.Gw.String(), r.LinkIndex)
+		}
+
 		return nil
 	})
 }

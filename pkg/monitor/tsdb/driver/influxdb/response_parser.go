@@ -23,7 +23,9 @@ import (
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/sets"
 
+	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/monitor/tsdb"
 )
 
@@ -47,22 +49,22 @@ func (rp *ResponseParser) Parse(response *Response, query *Query) *tsdb.QueryRes
 	return queryRes
 }
 
-func (rp *ResponseParser) transformRows(rows []Row, queryResult *tsdb.QueryResult, query *Query) tsdb.TimeSeriesSlice {
-	var result tsdb.TimeSeriesSlice
+func (rp *ResponseParser) transformRows(rows []Row, queryResult *tsdb.QueryResult, query *Query) monitor.TimeSeriesSlice {
+	var result monitor.TimeSeriesSlice
 	for _, row := range rows {
 		for columnIndex, column := range row.Columns {
 			if column == "time" {
 				continue
 			}
 
-			var points tsdb.TimeSeriesPoints
+			var points monitor.TimeSeriesPoints
 			for _, valuePair := range row.Values {
 				point, err := rp.parseTimepoint(valuePair, columnIndex)
 				if err == nil {
 					points = append(points, point)
 				}
 			}
-			result = append(result, &tsdb.TimeSeries{
+			result = append(result, &monitor.TimeSeries{
 				Name:   rp.formatSerieName(row, column, query),
 				Points: points,
 				Tags:   row.Tags,
@@ -73,9 +75,26 @@ func (rp *ResponseParser) transformRows(rows []Row, queryResult *tsdb.QueryResul
 	return result
 }
 
-func (rp *ResponseParser) transformRowsV2(rows []Row, queryResult *tsdb.QueryResult, query *Query) tsdb.TimeSeriesSlice {
-	var result tsdb.TimeSeriesSlice
-	for _, row := range rows {
+func (rp *ResponseParser) transformRowsV2(rows []Row, queryResult *tsdb.QueryResult, query *Query) monitor.TimeSeriesSlice {
+	var result monitor.TimeSeriesSlice
+
+	// 添加值不同的 tag key
+	diffTagKeys := sets.NewString()
+	if len(rows) > 1 {
+		row0 := rows[0]
+		restRows := rows[1:]
+		for tagKey, tagVal := range row0.Tags {
+			for _, rr := range restRows {
+				resultTagVal := rr.Tags[tagKey]
+				if tagVal != resultTagVal {
+					diffTagKeys.Insert(tagKey)
+					break
+				}
+			}
+		}
+	}
+
+	for idx, row := range rows {
 		col := ""
 		columns := make([]string, 0)
 		for _, column := range row.Columns {
@@ -90,7 +109,7 @@ func (rp *ResponseParser) transformRowsV2(rows []Row, queryResult *tsdb.QueryRes
 			col = fmt.Sprintf("%s-%s", col, column)
 		}
 		columns = append(columns, "time")
-		var points tsdb.TimeSeriesPoints
+		var points monitor.TimeSeriesPoints
 		for _, valuePair := range row.Values {
 			point, err := rp.parseTimepointV2(valuePair)
 			if err == nil {
@@ -104,15 +123,22 @@ func (rp *ResponseParser) transformRowsV2(rows []Row, queryResult *tsdb.QueryRes
 			val_ := strings.ReplaceAll(val, "+", " ")
 			tags[key] = val_
 		}
-		result = append(result, &tsdb.TimeSeries{
-			Name:    rp.formatSerieName(row, col, query),
-			Columns: columns,
-			Points:  points,
-			Tags:    tags,
-		})
+		name := rp.formatSerieName(row, col, query)
+		ts := tsdb.NewTimeSeries(name, formatRawName(idx, name, query, tags, diffTagKeys), columns, points, tags)
+		result = append(result, ts)
 	}
 
 	return result
+}
+
+func formatRawName(idx int, name string, query *Query, tags map[string]string, diffTagKeys sets.String) string {
+	groupByTags := []string{}
+	for _, group := range query.GroupBy {
+		if group.Type == "tag" {
+			groupByTags = append(groupByTags, group.Params[0])
+		}
+	}
+	return tsdb.FormatRawName(idx, name, groupByTags, tags, diffTagKeys)
 }
 
 func (rp *ResponseParser) transformRowToTable(row Row, table *tsdb.Table) *tsdb.Table {
@@ -185,27 +211,27 @@ func (rp *ResponseParser) buildSerieNameFromQuery(row Row, column string) string
 	return fmt.Sprintf("%s.%s", row.Name, column)
 }
 
-func (rp *ResponseParser) parseTimepoint(valuePair []interface{}, valuePosition int) (tsdb.TimePoint, error) {
+func (rp *ResponseParser) parseTimepoint(valuePair []interface{}, valuePosition int) (monitor.TimePoint, error) {
 	var value *float64 = rp.parseValue(valuePair[valuePosition])
 
 	timestampNumber, _ := valuePair[0].(json.Number)
 	timestamp, err := timestampNumber.Float64()
 	if err != nil {
-		return tsdb.TimePoint{}, err
+		return monitor.TimePoint{}, err
 	}
 
-	return tsdb.NewTimePoint(value, timestamp), nil
+	return monitor.NewTimePoint(value, timestamp), nil
 }
 
-func (rp *ResponseParser) parseTimepointV2(valuePair []interface{}) (tsdb.TimePoint, error) {
-	timepoint := make(tsdb.TimePoint, 0)
+func (rp *ResponseParser) parseTimepointV2(valuePair []interface{}) (monitor.TimePoint, error) {
+	timepoint := make(monitor.TimePoint, 0)
 	for i := 1; i < len(valuePair); i++ {
 		timepoint = append(timepoint, rp.parseValueV2(valuePair[i]))
 	}
 	timestampNumber, _ := valuePair[0].(json.Number)
 	timestamp, err := timestampNumber.Float64()
 	if err != nil {
-		return tsdb.TimePoint{}, errors.Wrapf(err, "timestampNumber.Float64 of %#v", timestampNumber)
+		return monitor.TimePoint{}, errors.Wrapf(err, "timestampNumber.Float64 of %#v", timestampNumber)
 	}
 	timepoint = append(timepoint, timestamp)
 	return timepoint, nil

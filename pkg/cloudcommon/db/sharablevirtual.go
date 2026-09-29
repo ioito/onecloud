@@ -48,8 +48,8 @@ func (manager *SSharableVirtualResourceBaseManager) GetISharableVirtualModelMana
 	return manager.GetVirtualObject().(ISharableVirtualModelManager)
 }
 
-func (manager *SSharableVirtualResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
-	return SharableManagerFilterByOwner(manager.GetISharableVirtualModelManager(), q, userCred, owner, scope)
+func (manager *SSharableVirtualResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return SharableManagerFilterByOwner(ctx, manager.GetISharableVirtualModelManager(), q, userCred, owner, scope)
 }
 
 func (model *SSharableVirtualResourceBase) IsSharable(reqUsrId mcclient.IIdentityProvider) bool {
@@ -171,6 +171,7 @@ func (model *SSharableVirtualResourceBase) GetSharedDomains() []string {
 	return SharableGetSharedProjects(model, SharedTargetDomain)
 }
 
+// 更改项目
 func (model *SSharableVirtualResourceBase) PerformChangeOwner(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,

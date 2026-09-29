@@ -40,8 +40,8 @@ type SStorageResourceBaseManager struct {
 	SManagedResourceBaseManager
 }
 
-func ValidateStorageResourceInput(userCred mcclient.TokenCredential, query api.StorageResourceInput) (*SStorage, api.StorageResourceInput, error) {
-	storageObj, err := StorageManager.FetchByIdOrName(userCred, query.StorageId)
+func ValidateStorageResourceInput(ctx context.Context, userCred mcclient.TokenCredential, query api.StorageResourceInput) (*SStorage, api.StorageResourceInput, error) {
+	storageObj, err := StorageManager.FetchByIdOrName(ctx, userCred, query.StorageId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, query, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", StorageManager.Keyword(), query.StorageId)
@@ -122,11 +122,22 @@ func (manager *SStorageResourceBaseManager) ListItemFilter(
 	query api.StorageFilterListInput,
 ) (*sqlchemy.SQuery, error) {
 	if len(query.StorageId) > 0 {
-		storageObj, _, err := ValidateStorageResourceInput(userCred, query.StorageResourceInput)
+		storageObj, _, err := ValidateStorageResourceInput(ctx, userCred, query.StorageResourceInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "ValidateStorageResourceInput")
 		}
 		q = q.Equals("storage_id", storageObj.GetId())
+	}
+	if len(query.StorageHostId) > 0 {
+		hostInput := api.HostResourceInput{}
+		hostInput.HostId = query.StorageHostId
+		var err error
+		_, hostInput, err = ValidateHostResourceInput(ctx, userCred, hostInput)
+		if err != nil {
+			return nil, errors.Wrap(err, "ValidateHostResourceInput")
+		}
+		hostStoragesQ := HoststorageManager.Query().Equals("host_id", hostInput.HostId).SubQuery()
+		q = q.Join(hostStoragesQ, sqlchemy.Equals(q.Field("storage_id"), hostStoragesQ.Field("storage_id")))
 	}
 	subq := StorageManager.Query("id").Snapshot()
 	subq, err := manager.SZoneResourceBaseManager.ListItemFilter(ctx, subq, userCred, query.ZonalFilterListInput)

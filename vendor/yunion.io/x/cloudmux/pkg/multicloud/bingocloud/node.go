@@ -41,8 +41,8 @@ type SNode struct {
 	CpuNode      int
 	CpuSockets   int
 	CpuUsed      int
-	DiskMax      int
-	DiskNode     int
+	DiskMax      int64
+	DiskNode     int64
 	DiskUsed     int
 	MemNode      int
 	MemoryMax    int
@@ -139,7 +139,7 @@ func (self *SNode) GetReservedMemoryMb() int {
 	return 0
 }
 
-func (self *SNode) GetStorageSizeMB() int {
+func (self *SNode) GetStorageSizeMB() int64 {
 	if self.DiskMax > 0 {
 		return self.DiskMax * 1024
 	}
@@ -230,10 +230,6 @@ func (self *SNode) getIWires() ([]cloudprovider.ICloudWire, error) {
 	return ret, nil
 }
 
-func (self *SNode) GetSchedtags() ([]string, error) {
-	return []string{}, nil
-}
-
 func (self *SNode) GetIsMaintenance() bool {
 	return self.Status == "maintain"
 }
@@ -268,7 +264,7 @@ func (self *SCluster) GetIHostById(id string) (cloudprovider.ICloudHost, error) 
 			return &nodes[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SCluster) GetIHosts() ([]cloudprovider.ICloudHost, error) {

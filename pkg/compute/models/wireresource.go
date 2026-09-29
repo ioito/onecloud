@@ -22,7 +22,6 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/reflectutils"
-	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -42,8 +41,8 @@ type SWireResourceBaseManager struct {
 	SZoneResourceBaseManager
 }
 
-func ValidateWireResourceInput(userCred mcclient.TokenCredential, input api.WireResourceInput) (*SWire, api.WireResourceInput, error) {
-	wireObj, err := WireManager.FetchByIdOrName(userCred, input.WireId)
+func ValidateWireResourceInput(ctx context.Context, userCred mcclient.TokenCredential, input api.WireResourceInput) (*SWire, api.WireResourceInput, error) {
+	wireObj, err := WireManager.FetchByIdOrName(ctx, userCred, input.WireId)
 	if err != nil {
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", WireManager.Keyword(), input.WireId)
@@ -166,7 +165,7 @@ func (manager *SWireResourceBaseManager) ListItemFilter(
 	query api.WireFilterListInput,
 ) (*sqlchemy.SQuery, error) {
 	if len(query.WireId) > 0 {
-		wireObj, _, err := ValidateWireResourceInput(userCred, query.WireResourceInput)
+		wireObj, _, err := ValidateWireResourceInput(ctx, userCred, query.WireResourceInput)
 		if err != nil {
 			return nil, errors.Wrap(err, "ValidateWireResourceInput")
 		}
@@ -192,7 +191,7 @@ func (manager *SWireResourceBaseManager) ListItemFilter(
 	}
 
 	if len(query.ZoneList()) > 0 {
-		region := &SCloudregion{}
+		/* region := &SCloudregion{}
 		firstZone := query.FirstZone()
 		sq := ZoneManager.Query().SubQuery()
 		regionQ := CloudregionManager.Query()
@@ -210,8 +209,23 @@ func (manager *SWireResourceBaseManager) ListItemFilter(
 		err = regionQ.First(region)
 		if err != nil {
 			return nil, errors.Wrap(err, "regionQ.First")
+		} */
+		var err error
+		zoneQuery := api.ZonalFilterListInput{
+			ZonalFilterListBase: query.ZonalFilterListBase,
 		}
-		if utils.IsInStringArray(region.Provider, api.REGIONAL_NETWORK_PROVIDERS) {
+		wireZoneQ := WireManager.Query("zone_id").Snapshot()
+		wireZoneQ, err = manager.SZoneResourceBaseManager.ListItemFilter(ctx, wireZoneQ, userCred, zoneQuery)
+		if err != nil {
+			return nil, errors.Wrap(err, "SZoneResourceBaseManager.ListItemFilter")
+		}
+		if wireZoneQ.IsAltered() {
+			wireQ = wireQ.Filter(sqlchemy.OR(
+				sqlchemy.IsNullOrEmpty(wireQ.Field("zone_id")),
+				sqlchemy.In(wireQ.Field("zone_id"), wireZoneQ.SubQuery()),
+			))
+		}
+		/*if utils.IsInStringArray(region.Provider, api.REGIONAL_NETWORK_PROVIDERS) {
 			vpcQ := VpcManager.Query().SubQuery()
 			wireQ = wireQ.Join(vpcQ, sqlchemy.Equals(vpcQ.Field("id"), wireQ.Field("vpc_id"))).
 				Filter(sqlchemy.Equals(vpcQ.Field("cloudregion_id"), region.Id))
@@ -223,7 +237,7 @@ func (manager *SWireResourceBaseManager) ListItemFilter(
 			if err != nil {
 				return nil, errors.Wrap(err, "SZoneResourceBaseManager.ListItemFilter")
 			}
-		}
+		}*/
 	}
 
 	if wireQ.IsAltered() {
@@ -253,6 +267,15 @@ func (manager *SWireResourceBaseManager) QueryDistinctExtraField(q *sqlchemy.SQu
 			}
 		}
 	}
+}
+
+func (manager *SWireResourceBaseManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SVpcResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
 }
 
 func (manager *SWireResourceBaseManager) OrderByExtraFields(

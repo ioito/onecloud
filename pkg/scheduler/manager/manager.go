@@ -28,6 +28,7 @@ import (
 	candidatecache "yunion.io/x/onecloud/pkg/scheduler/cache/candidate"
 	"yunion.io/x/onecloud/pkg/scheduler/core"
 	"yunion.io/x/onecloud/pkg/scheduler/data_manager"
+	"yunion.io/x/onecloud/pkg/scheduler/data_manager/common"
 	schedmodels "yunion.io/x/onecloud/pkg/scheduler/models"
 	o "yunion.io/x/onecloud/pkg/scheduler/options"
 	"yunion.io/x/onecloud/pkg/util/k8s"
@@ -46,9 +47,11 @@ type SchedulerManager struct {
 	DataManager        *data_manager.DataManager
 	CandidateManager   *data_manager.CandidateManager
 	KubeClusterManager *k8s.SKubeClusterManager
+
+	stopCh <-chan struct{}
 }
 
-func NewSchedulerManager(stopCh <-chan struct{}) *SchedulerManager {
+func newSchedulerManager(stopCh <-chan struct{}) *SchedulerManager {
 	sm := &SchedulerManager{}
 	sm.DataManager = data_manager.NewDataManager(stopCh)
 	sm.CandidateManager = data_manager.NewCandidateManager(sm.DataManager, stopCh)
@@ -57,6 +60,9 @@ func NewSchedulerManager(stopCh <-chan struct{}) *SchedulerManager {
 	sm.HistoryManager = NewHistoryManager(stopCh)
 	sm.TaskManager = NewTaskManager(stopCh)
 	sm.KubeClusterManager = k8s.NewKubeClusterManager(o.Options.Region, 30*time.Second)
+	sm.stopCh = stopCh
+
+	common.RegisterCacheManager(sm.CandidateManager)
 
 	return sm
 }
@@ -74,14 +80,32 @@ func InitAndStart(stopCh <-chan struct{}) {
 		log.Warningf("Global scheduler already init.")
 		return
 	}
-	schedManager = NewSchedulerManager(stopCh)
+	schedManager = newSchedulerManager(stopCh)
 	go schedManager.start()
 	log.Infof("InitAndStart ok")
 }
 
 func (sm *SchedulerManager) start() {
+	// Safety net: periodically GC session pending usages older than 30 minutes.
+	go func() {
+		t := time.NewTicker(1 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				n := schedmodels.HostPendingUsageManager.GCExpiredSessionUsages(30 * time.Minute)
+				if n > 0 {
+					log.Warningf("[PendingUsage] GC expired session usages: cleared=%d", n)
+				}
+			case <-sm.stopCh:
+				return
+			}
+		}
+	}()
+
 	startFuncs := []func(){
 		sm.ExpireManager.Run,
+		sm.ExpireManager.reloadCancelQueue.Run,
 		sm.CompletedManager.Run,
 		sm.HistoryManager.Run,
 		sm.TaskManager.Run,
@@ -96,7 +120,7 @@ func (sm *SchedulerManager) start() {
 
 func (sm *SchedulerManager) schedule(info *api.SchedInfo) (*core.ScheduleResult, error) {
 	// force sync clean expire cache before do schedule
-	sm.ExpireManager.Trigger()
+	// sm.ExpireManager.Trigger()
 
 	log.V(10).Infof("SchedulerManager do schedule, input: %#v", info)
 	task, err := sm.TaskManager.AddTask(sm, info)

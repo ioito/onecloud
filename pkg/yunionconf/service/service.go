@@ -32,7 +32,7 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/yunionconf/models"
 	"yunion.io/x/onecloud/pkg/yunionconf/options"
-	_ "yunion.io/x/onecloud/pkg/yunionconf/policy"
+	"yunion.io/x/onecloud/pkg/yunionconf/policy"
 )
 
 func StartService() {
@@ -42,9 +42,11 @@ func StartService() {
 	commonOpts := &options.Options.CommonOptions
 	dbOpts := &options.Options.DBOptions
 	common_options.ParseOptions(opts, os.Args, "yunionconf.conf", api.SERVICE_TYPE)
+	policy.Init()
 	app_common.InitAuth(commonOpts, func() {
 		log.Infof("Auth complete!!")
 	})
+	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
 
 	cloudcommon.InitDB(dbOpts)
 
@@ -54,7 +56,7 @@ func StartService() {
 			session := auth.GetAdminSession(ctx, baseOpts.Region)
 			notifyclient.EventNotifyServiceAbnormal(ctx, session.GetToken(), consts.GetServiceType(), method, path, body, err)
 		})
-	InitHandlers(app)
+	InitHandlers(app, opts.IsSlaveNode)
 	db.AppDBInit(app)
 
 	if db.CheckSync(opts.AutoSyncTable, opts.EnableDBChecksumTables, opts.DBChecksumSkipInit) {

@@ -1,0 +1,169 @@
+package models
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	commonapi "yunion.io/x/onecloud/pkg/apis"
+	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
+)
+
+type drivers struct {
+	drivers *sync.Map
+}
+
+func newDrivers() *drivers {
+	return &drivers{
+		drivers: &sync.Map{},
+	}
+}
+
+func (d *drivers) GetWithError(typ string) (interface{}, error) {
+	drv, ok := d.drivers.Load(typ)
+	if !ok {
+		return drv, httperrors.NewNotFoundError("app container driver %s not found", typ)
+	}
+	return drv, nil
+}
+
+func (d *drivers) Get(typ string) interface{} {
+	drv, err := d.GetWithError(typ)
+	if err != nil {
+		panic(err.Error())
+	}
+	return drv
+}
+
+func (d *drivers) Register(typ string, drv interface{}) {
+	d.drivers.Store(typ, drv)
+}
+
+func registerDriver[K ~string, D any](drvs *drivers, typ K, drv D) {
+	drvs.Register(string(typ), drv)
+}
+
+func getDriver[K ~string, D any](drvs *drivers, typ K) D {
+	return drvs.Get(string(typ)).(D)
+}
+
+func getDriverWithError[K ~string, D any](drvs *drivers, typ K) (D, error) {
+	drv, err := drvs.GetWithError(string(typ))
+	if err != nil {
+		var zero D
+		return zero, err
+	}
+	return drv.(D), nil
+}
+
+type ILLMContainerInstantModel interface {
+	GetMountedModels(sku *SLLMSku) []string
+
+	GetProbedInstantModelsExt(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, mdlIds ...string) (map[string]llm.LLMInternalInstantMdlInfo, error)
+	DetectModelPaths(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, pkgInfo llm.LLMInternalInstantMdlInfo) ([]string, error)
+
+	GetImageInternalPathMounts(sApp *SInstantModel) map[string]string
+	GetSaveDirectories(sApp *SInstantModel) (string, []string, error)
+
+	ValidateMounts(mounts []string, mdlName string, mdlTag string) ([]string, error)
+	CheckDuplicateMounts(errStr string, dupIndex int) string
+	GetInstantModelIdByPostOverlay(postOverlay *commonapi.ContainerVolumeMountDiskPostOverlay, mdlNameToId map[string]string) string
+	GetDirPostOverlay(dir llm.LLMMountDirInfo) *commonapi.ContainerVolumeMountDiskPostOverlay
+
+	PreInstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, instMdl *SLLMInstantModel) error
+	InstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, dirs []string, mdlIds []string) error
+	UninstallModel(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, instMdl *SLLMInstantModel) error
+	DownloadModel(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, tmpDir string, input llm.InstantModelImportInput, progress func(progress float32)) (string, []string, error)
+}
+
+type ILLMContainerDriver interface {
+	GetType() llm.LLMContainerType
+	// GetContainerSpecs returns one or more container specs. If nil or empty, caller falls back to GetContainerSpec for a single container.
+	GetContainerSpecs(ctx context.Context, llm *SLLM, image *SLLMImage, sku *SLLMSku, props []string, devices []computeapi.SIsolatedDevice, diskId string) []*computeapi.PodContainerCreateInput
+	GetPrimaryContainer(ctx context.Context, llm *SLLM, containers []*computeapi.PodContainerDesc) (*computeapi.PodContainerDesc, error)
+
+	// StartLLM is called after the pod is running. Drivers that need a post-start hook implement it; drivers that start from the container entrypoint return nil.
+	StartLLM(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM) error
+
+	// GetSpec returns the type-specific spec from the SKU (e.g. *LLMSpecOllama, *LLMSpecDify). Returns nil if not applicable or missing.
+	GetSpec(sku *SLLMSku) interface{}
+	// GetEffectiveSpec returns the merged type-specific spec for container build: llm.LLMSpec and sku.LLMSpec merged with llm priority; each driver implements its own merge. Returns same type as GetSpec.
+	GetEffectiveSpec(llm *SLLM, sku *SLLMSku) interface{}
+	// GetPrimaryImageId returns the primary image id for this SKU type (e.g. LLMImageId for ollama/vllm, DifyApiImageId for dify).
+	GetPrimaryImageId(sku *SLLMSku) string
+	// ValidateLLMSkuCreateData validates create input and returns the LLMSpec to store. Called by SKU manager after base validation.
+	ValidateLLMSkuCreateData(ctx context.Context, userCred mcclient.TokenCredential, input *llm.LLMSkuCreateInput) (*llm.LLMSkuCreateInput, error)
+	// ValidateLLMSkuUpdateData validates update input, merges with current spec, and returns the LLMSpec to store. Called by SKU when LLMSpec is not nil.
+	ValidateLLMSkuUpdateData(ctx context.Context, userCred mcclient.TokenCredential, sku *SLLMSku, input *llm.LLMSkuUpdateInput) (*llm.LLMSkuUpdateInput, error)
+
+	MatchContainerToUpdate(ctr *computeapi.SContainer, podCtrs []*computeapi.PodContainerCreateInput) (*computeapi.PodContainerCreateInput, error)
+
+	ValidateLLMCreateSpec(ctx context.Context, userCred mcclient.TokenCredential, sku *SLLMSku, input *llm.LLMSpec) (*llm.LLMSpec, error)
+	ValidateLLMUpdateSpec(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, input *llm.LLMSpec) (*llm.LLMSpec, error)
+
+	// ValidateLLMCreateData validates SLLM create input against this driver's requirements (e.g. ollama/vllm require devices + mounted_models from either input or sku). Returns the (possibly modified) input.
+	ValidateLLMCreateData(ctx context.Context, userCred mcclient.TokenCredential, sku *SLLMSku, input *llm.LLMCreateInput) (*llm.LLMCreateInput, error)
+	// ValidateLLMUpdateData validates SLLM update input against this driver's requirements; the current SLLM is passed so existing override values can be considered.
+	ValidateLLMUpdateData(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, sku *SLLMSku, input *llm.LLMUpdateInput) (*llm.LLMUpdateInput, error)
+
+	ILLMContainerMCPAgent
+}
+
+// ILLMContainerInstantModelDriver is for drivers that support instant models (e.g. Ollama, vLLM). GetMountedModels is only required here so that drivers without models (e.g. Dify) need not implement it.
+type ILLMContainerInstantModelDriver interface {
+	ILLMContainerDriver
+	ILLMContainerInstantModel
+}
+
+type ILLMContainerMCPAgent interface {
+	GetLLMAccessUrlInfo(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM, input *LLMAccessInfoInput) (*llm.LLMAccessUrlInfo, error)
+}
+
+// ILLMContainerLoginInfo is an optional interface for drivers that provide web login credentials (e.g. Dify, OpenClaw). If not implemented, GetDetailsLoginInfo returns only login_url.
+type ILLMContainerLoginInfo interface {
+	GetLoginInfo(ctx context.Context, userCred mcclient.TokenCredential, llm *SLLM) (*llm.LLMAccessInfo, error)
+}
+
+var (
+	llmContainerDrivers = newDrivers()
+)
+
+func RegisterLLMContainerDriver(drv ILLMContainerDriver) {
+	registerDriver(llmContainerDrivers, drv.GetType(), drv)
+}
+
+func GetLLMContainerDriver(typ llm.LLMContainerType) ILLMContainerDriver {
+	return getDriver[llm.LLMContainerType, ILLMContainerDriver](llmContainerDrivers, typ)
+}
+
+func GetLLMContainerDriverWithError(typ llm.LLMContainerType) (ILLMContainerDriver, error) {
+	return getDriverWithError[llm.LLMContainerType, ILLMContainerDriver](llmContainerDrivers, typ)
+}
+
+func GetLLMContainerInstantModelDriver(typ llm.LLMContainerType) (ILLMContainerInstantModelDriver, error) {
+	drv, err := GetLLMContainerDriverWithError(typ)
+	if err != nil {
+		return nil, err
+	}
+	if instantDrv, ok := drv.(ILLMContainerInstantModelDriver); ok {
+		return instantDrv, nil
+	}
+	return nil, fmt.Errorf("driver %s does not support instant model operations", typ)
+}
+
+// GetDriverPodContainers returns the container(s) for the given driver. If the driver implements ILLMContainerDriverMultiContainer, GetContainerSpecs is used; otherwise a single-element slice from GetContainerSpec is returned.
+func GetDriverPodContainers(ctx context.Context, drv ILLMContainerDriver, llm *SLLM, image *SLLMImage, sku *SLLMSku, props []string, devices []computeapi.SIsolatedDevice, diskId string) []*computeapi.PodContainerCreateInput {
+	containers := drv.GetContainerSpecs(ctx, llm, image, sku, props, devices, diskId)
+	if sku != nil {
+		var llmBase *SLLMBase
+		if llm != nil {
+			llmBase = &llm.SLLMBase
+		}
+		AppendLLMSkuVolumeMounts(containers, llmBase, &sku.SLLMSkuBase, nil)
+		AppendLLMSkuEnvs(containers, &sku.SLLMSkuBase)
+	}
+	return containers
+}

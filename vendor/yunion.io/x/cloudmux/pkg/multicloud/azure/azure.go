@@ -37,11 +37,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/go-autorest/autorest"
-	azureenv "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/pkg/errors"
-	"golang.org/x/oauth2/clientcredentials"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -61,26 +57,12 @@ const (
 	AZURE_API_VERSION = "2016-02-01"
 )
 
-type TAzureResource string
-
-var (
-	GraphResource        = TAzureResource("graph")
-	DefaultResource      = TAzureResource("default")
-	LoganalyticsResource = TAzureResource("loganalytics")
-)
-
-type azureAuthClient struct {
-	client *autorest.Client
-	domain string
-}
-
 type SAzureClient struct {
 	*AzureClientConfig
 
-	clientCache map[TAzureResource]*azureAuthClient
-	lock        sync.Mutex
-
-	ressourceGroups []SResourceGroup
+	tokenLock  sync.Mutex
+	tokenMap    map[string]*Token
+	httpClient  *http.Client
 
 	regions  []SRegion
 	iBuckets []cloudprovider.ICloudBucket
@@ -88,6 +70,8 @@ type SAzureClient struct {
 	subscriptions []SSubscription
 
 	debug bool
+
+	ctx context.Context
 
 	workspaces []SLoganalyticsWorkspace
 }
@@ -134,7 +118,8 @@ func NewAzureClient(cfg *AzureClientConfig) (*SAzureClient, error) {
 	client := SAzureClient{
 		AzureClientConfig: cfg,
 		debug:             cfg.debug,
-		clientCache:       map[TAzureResource]*azureAuthClient{},
+		tokenMap:          map[string]*Token{},
+		ctx:               context.Background(),
 	}
 	var err error
 	client.subscriptions, err = client.ListSubscriptions()
@@ -148,94 +133,12 @@ func NewAzureClient(cfg *AzureClientConfig) (*SAzureClient, error) {
 	for i := range client.regions {
 		client.regions[i].client = &client
 	}
-	client.ressourceGroups, err = client.ListResourceGroups()
-	if err != nil {
-		return nil, errors.Wrapf(err, "ListResourceGroups")
-	}
 	return &client, nil
 }
 
-func (self *SAzureClient) getClient(resource TAzureResource) (*azureAuthClient, error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-	_client, ok := self.clientCache[resource]
-	if ok {
-		return _client, nil
-	}
-	ret := &azureAuthClient{}
-	client := autorest.NewClientWithUserAgent("Yunion API")
-	conf := auth.NewClientCredentialsConfig(self.clientId, self.clientSecret, self.tenantId)
-	env, err := azureenv.EnvironmentFromName(self.envName)
-	if err != nil {
-		return nil, errors.Wrapf(err, "azureenv.EnvironmentFromName(%s)", self.envName)
-	}
-
-	httpClient := self.cpcfg.AdaptiveTimeoutHttpClient()
-	transport, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
-		if self.cpcfg.ReadOnly {
-			if req.Method == "GET" || (req.Method == "POST" && strings.HasSuffix(req.URL.Path, "oauth2/token")) {
-				return nil, nil
-			}
-			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
-		}
-		return nil, nil
-	})
-	client.Sender = httpClient
-
-	switch resource {
-	case GraphResource:
-		ret.domain = env.GraphEndpoint
-		conf.Resource = env.GraphEndpoint
-		if self.envName == "AzureChinaCloud" {
-			ret.domain = "https://graph.chinacloudapi.cn/"
-			conf.Resource = "https://graph.chinacloudapi.cn/"
-		}
-	case LoganalyticsResource:
-		ret.domain = env.ResourceIdentifiers.OperationalInsights
-		conf.Resource = env.ResourceIdentifiers.OperationalInsights
-		if conf.Resource == "N/A" && self.envName == "AzureChinaCloud" {
-			ret.domain = "https://api.loganalytics.azure.cn"
-			conf.Resource = ret.domain
-		}
-	default:
-		ret.domain = env.ResourceManagerEndpoint
-		conf.Resource = env.ResourceManagerEndpoint
-	}
-	conf.AADEndpoint = env.ActiveDirectoryEndpoint
-	{
-		spt, err := conf.ServicePrincipalToken()
-		if err != nil {
-			return nil, errors.Wrapf(err, "ServicePrincipalToken")
-		}
-		spt.SetSender(httpClient)
-		client.Authorizer = autorest.NewBearerAuthorizer(spt)
-	}
-	if self.debug {
-		client.RequestInspector = LogRequest()
-	}
-	ret.client = &client
-	self.clientCache[resource] = ret
-	return ret, nil
-}
-
-func (self *SAzureClient) getDefaultClient() (*azureAuthClient, error) {
-	return self.getClient(DefaultResource)
-}
-
-func (self *SAzureClient) getGraphClient() (*azureAuthClient, error) {
-	return self.getClient(GraphResource)
-}
-
-func (self *SAzureClient) getLoganalyticsClient() (*azureAuthClient, error) {
-	return self.getClient(LoganalyticsResource)
-}
-
 func (self *SAzureClient) jsonRequest(method, path string, body jsonutils.JSONObject, params url.Values, showErrorMsg bool) (jsonutils.JSONObject, error) {
-	cli, err := self.getDefaultClient()
-	if err != nil {
-		return nil, errors.Wrapf(err, "getDefaultClient")
-	}
+	domain := azServices[SERVICE_MANAGEMENT][self.envName]
+	var err error
 	defer func() {
 		if err != nil && showErrorMsg {
 			bj := ""
@@ -247,7 +150,7 @@ func (self *SAzureClient) jsonRequest(method, path string, body jsonutils.JSONOb
 	}()
 	var resp jsonutils.JSONObject
 	for i := 0; i < 2; i++ {
-		resp, err = jsonRequest(cli.client, method, cli.domain, path, body, params, self.debug)
+		resp, err = self.doJsonRequest(method, domain, path, body, params)
 		if err != nil {
 			if ae, ok := err.(*AzureResponseError); ok {
 				switch ae.AzureError.Code {
@@ -279,27 +182,15 @@ func (self *SAzureClient) jsonRequest(method, path string, body jsonutils.JSONOb
 }
 
 func (self *SAzureClient) ljsonRequest(method, path string, body jsonutils.JSONObject, params url.Values) (jsonutils.JSONObject, error) {
-	cli, err := self.getLoganalyticsClient()
-	if err != nil {
-		return nil, errors.Wrapf(err, "getLoganalyticsClient")
+	domain := azServices[SERVICE_LOGANALYTICS][self.envName]
+	if len(domain) == 0 {
+		return nil, errors.Errorf("log analytics is not available in %s", self.envName)
 	}
 	if params == nil {
 		params = url.Values{}
 	}
 	params.Set("api-version", "2021-12-01-preview")
-	return jsonRequest(cli.client, method, cli.domain, path, body, params, self.debug)
-}
-
-func (self *SAzureClient) gjsonRequest(method, path string, body jsonutils.JSONObject, params url.Values) (jsonutils.JSONObject, error) {
-	cli, err := self.getGraphClient()
-	if err != nil {
-		return nil, errors.Wrapf(err, "gjsonRequest")
-	}
-	if params == nil {
-		params = url.Values{}
-	}
-	params.Set("api-version", "1.6")
-	return jsonRequest(cli.client, method, cli.domain, path, body, params, self.debug)
+	return self.doJsonRequest(method, domain, path, body, params)
 }
 
 func (self *SAzureClient) put(path string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -346,55 +237,6 @@ func (self *SAzureClient) get(resourceId string, params url.Values, retVal inter
 	return self._get(resourceId, params, retVal, true)
 }
 
-func (self *SAzureClient) gcreate(resource string, body jsonutils.JSONObject, retVal interface{}) error {
-	path := resource
-	result, err := self.msGraphRequest("POST", path, body)
-	if err != nil {
-		return errors.Wrapf(err, "msGraphRequest")
-	}
-	if gotypes.IsNil(result) {
-		return fmt.Errorf("empty response")
-	}
-	if retVal != nil {
-		return result.Unmarshal(retVal)
-	}
-	return nil
-}
-
-func (self *SAzureClient) gpatch(resource string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	return self.gjsonRequest("PATCH", resource, body, nil)
-}
-
-func (self *SAzureClient) glist(resource string, params url.Values, retVal interface{}) error {
-	if params == nil {
-		params = url.Values{}
-	}
-	err := self._glist(resource, params, retVal)
-	if err != nil {
-		return errors.Wrapf(err, "_glist(%s)", resource)
-	}
-	return nil
-}
-
-func (self *SAzureClient) _glist(resource string, params url.Values, retVal interface{}) error {
-	path := resource
-	if len(params) > 0 {
-		path = fmt.Sprintf("%s?%s", path, params.Encode())
-	}
-	body, err := self.msGraphRequest("GET", path, nil)
-	if err != nil {
-		return err
-	}
-	if gotypes.IsNil(body) {
-		return fmt.Errorf("empty response")
-	}
-	err = body.Unmarshal(retVal, "value")
-	if err != nil {
-		return errors.Wrapf(err, "body.Unmarshal")
-	}
-	return nil
-}
-
 func (self *SAzureClient) list(resource string, params url.Values, retVal interface{}) error {
 	if params == nil {
 		params = url.Values{}
@@ -405,6 +247,9 @@ func (self *SAzureClient) list(resource string, params url.Values, retVal interf
 		resp, err := self._list(resource, params)
 		if err != nil {
 			return errors.Wrapf(err, "_list(%s)", resource)
+		}
+		if gotypes.IsNil(resp) {
+			return fmt.Errorf("empty response for %s", resource)
 		}
 		keys := []string{}
 		if resp.Contains("value") {
@@ -516,6 +361,9 @@ func (self *SAzureClient) _apiVersion(resource string, params url.Values) string
 		if utils.IsInStringArray("applicationgatewayavailablewafrulesets", info) {
 			return "2018-06-01"
 		}
+		if utils.IsInStringArray("securityrules", info) {
+			return "2023-05-01"
+		}
 		return "2018-06-01"
 	} else if utils.IsInStringArray("microsoft.storage", info) {
 		if utils.IsInStringArray("storageaccounts", info) {
@@ -535,7 +383,7 @@ func (self *SAzureClient) _apiVersion(resource string, params url.Values) string
 	} else if utils.IsInStringArray("microsoft.insights", info) {
 		return "2017-03-01-preview"
 	} else if utils.IsInStringArray("microsoft.authorization", info) {
-		return "2018-01-01-preview"
+		return "2022-04-01"
 	} else if utils.IsInStringArray("microsoft.cache", info) {
 		if utils.IsInStringArray("redisenterprise", info) {
 			return "2021-03-01"
@@ -596,18 +444,6 @@ func (self *SAzureClient) del(resourceId string) error {
 	return err
 }
 
-func (self *SAzureClient) GDelete(resourceId string) error {
-	return self.gdel(resourceId)
-}
-
-func (self *SAzureClient) gdel(resourceId string) error {
-	_, err := self.msGraphRequest("DELETE", resourceId, nil)
-	if err != nil {
-		return errors.Wrapf(err, "gdel(%s)", resourceId)
-	}
-	return nil
-}
-
 func (self *SAzureClient) perform(resourceId string, action string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	path := fmt.Sprintf("%s/%s", resourceId, action)
 	return self.post(path, body)
@@ -658,17 +494,21 @@ func (self *SAzureClient) getUniqName(resourceGroup, resourceType, name string) 
 	newName := name
 	for i := 0; i < 20; i++ {
 		err := self._get(prefix+newName, nil, url.Values{}, false)
+		if err == nil {
+			info := strings.Split(newName, "-")
+			num, err := strconv.Atoi(info[len(info)-1])
+			if err != nil {
+				info = append(info, "1")
+			} else {
+				info[len(info)-1] = fmt.Sprintf("%d", num+1)
+			}
+			newName = strings.Join(info, "-")
+			continue
+		}
 		if errors.Cause(err) == cloudprovider.ErrNotFound {
 			return newName, nil
 		}
-		info := strings.Split(newName, "-")
-		num, err := strconv.Atoi(info[len(info)-1])
-		if err != nil {
-			info = append(info, "1")
-		} else {
-			info[len(info)-1] = fmt.Sprintf("%d", num+1)
-		}
-		newName = strings.Join(info, "-")
+		return "", err
 	}
 	return "", fmt.Errorf("not find uniq name for %s[%s]", resourceType, name)
 }
@@ -741,12 +581,98 @@ func (self *SAzureClient) update(body jsonutils.JSONObject, retVal interface{}) 
 	return nil
 }
 
-func jsonRequest(client *autorest.Client, method, domain, baseUrl string, body jsonutils.JSONObject, params url.Values, debug bool) (jsonutils.JSONObject, error) {
-	result, err := _jsonRequest(client, method, domain, baseUrl, body, params, debug)
+func (self *SAzureClient) doJsonRequest(method, domain, path string, body jsonutils.JSONObject, params url.Values) (jsonutils.JSONObject, error) {
+	uri := fmt.Sprintf("%s/%s?%s", strings.TrimSuffix(domain, "/"), strings.TrimPrefix(path, "/"), params.Encode())
+	parsedUrl, err := url.Parse(strings.TrimSuffix(domain, "/"))
+	if err != nil {
+		return nil, errors.Wrapf(err, "url.Parse(%s)", domain)
+	}
+	token, err := self.auth(fmt.Sprintf("https://%s", parsedUrl.Host))
+	if err != nil {
+		return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "auth: %v", err)
+	}
+	req := httputils.NewJsonRequest(httputils.THttpMethod(method), uri, body)
+	header := http.Header{}
+	header.Set("Authorization", token)
+	req.SetHeader(header)
+	ae := AzureResponseError{}
+	cli := httputils.NewJsonClient(self)
+	respHeader, respBody, err := cli.Send(self.ctx, req, &ae, self.debug)
 	if err != nil {
 		return nil, err
 	}
-	return result, nil
+	locationFunc := func(head http.Header) string {
+		for _, k := range []string{"Azure-Asyncoperation", "Location"} {
+			link := head.Get(k)
+			if len(link) > 0 {
+				return link
+			}
+		}
+		return ""
+	}
+	location := locationFunc(respHeader)
+	if len(location) > 0 && (respBody == nil || respBody.IsZero() || !respBody.Contains("id")) {
+		err = cloudprovider.Wait(time.Second*10, time.Minute*30, func() (bool, error) {
+			locationUrl, err := url.Parse(location)
+			if err != nil {
+				return false, errors.Wrapf(err, "url.Parse(%s)", location)
+			}
+			if len(locationUrl.Query().Get("api-version")) == 0 {
+				q, _ := url.ParseQuery(locationUrl.RawQuery)
+				q.Set("api-version", params.Get("api-version"))
+				locationUrl.RawQuery = q.Encode()
+			}
+			pollReq := httputils.NewJsonRequest(httputils.GET, locationUrl.String(), nil)
+			pollReq.SetHeader(header)
+			lae := AzureResponseError{}
+			_header, _body, _err := cli.Send(self.ctx, pollReq, &lae, self.debug)
+			if _err != nil {
+				if utils.IsInStringArray(lae.AzureError.Code, []string{"OSProvisioningTimedOut", "OSProvisioningClientError", "OSProvisioningInternalError"}) {
+					respBody = _body
+					return true, nil
+				}
+				return false, errors.Wrapf(_err, "cli.Send(%s)", location)
+			}
+			if retryAfter := _header.Get("Retry-After"); len(retryAfter) > 0 {
+				sleepTime, _ := strconv.Atoi(retryAfter)
+				time.Sleep(time.Second * time.Duration(sleepTime))
+				return false, nil
+			}
+			if _body != nil {
+				task := struct {
+					Status     string
+					Properties struct {
+						Output *jsonutils.JSONDict
+					}
+				}{}
+				_body.Unmarshal(&task)
+				if len(task.Status) == 0 {
+					respBody = _body
+					return true, nil
+				}
+				switch task.Status {
+				case "InProgress":
+					log.Debugf("process %s %s InProgress", method, path)
+					return false, nil
+				case "Succeeded":
+					log.Debugf("process %s %s Succeeded", method, path)
+					if task.Properties.Output != nil {
+						respBody = task.Properties.Output
+					}
+					return true, nil
+				case "Failed":
+					return false, fmt.Errorf("%s %s failed", method, path)
+				default:
+					return false, fmt.Errorf("Unknow status %s %s %s", task.Status, method, path)
+				}
+			}
+			return false, nil
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "time out for waiting %s %s", method, uri)
+		}
+	}
+	return respBody, nil
 }
 
 // {"odata.error":{"code":"Authorization_RequestDenied","message":{"lang":"en","value":"Insufficient privileges to complete the operation."},"requestId":"b776ba11-5cae-4fb9-b80d-29552e3caedd","date":"2020-10-29T09:05:23"}}
@@ -754,12 +680,14 @@ type sMessage struct {
 	Lang  string
 	Value string
 }
+
 type sOdataError struct {
 	Code      string
 	Message   sMessage
 	RequestId string
 	Date      time.Time
 }
+
 type AzureResponseError struct {
 	OdataError sOdataError `json:"odata.error"`
 	AzureError AzureError  `json:"error"`
@@ -783,10 +711,10 @@ func (ae *AzureResponseError) ParseErrorFromJsonResponse(statusCode int, status 
 		return errors.Wrap(cloudprovider.ErrNotFound, msg)
 	}
 	if ae.AzureError.Code == "AuthorizationFailed" {
-		return errors.Wrapf(cloudprovider.ErrForbidden, jsonutils.Marshal(ae).String())
+		return errors.Wrapf(cloudprovider.ErrForbidden, "%s", jsonutils.Marshal(ae).String())
 	}
 	if ae.AzureError.Code == "ResourceCollectionRequestsThrottled" {
-		return errors.Wrapf(cloudprovider.ErrTooManyRequests, jsonutils.Marshal(ae).String())
+		return errors.Wrapf(cloudprovider.ErrTooManyRequests, "%s", jsonutils.Marshal(ae).String())
 	}
 	if len(ae.OdataError.Code) > 0 || len(ae.AzureError.Code) > 0 || (len(ae.Code) > 0 && len(ae.Message) > 0) {
 		return ae
@@ -794,95 +722,17 @@ func (ae *AzureResponseError) ParseErrorFromJsonResponse(statusCode int, status 
 	return nil
 }
 
-func _jsonRequest(client *autorest.Client, method, domain, path string, body jsonutils.JSONObject, params url.Values, debug bool) (jsonutils.JSONObject, error) {
-	uri := fmt.Sprintf("%s/%s?%s", strings.TrimSuffix(domain, "/"), strings.TrimPrefix(path, "/"), params.Encode())
-	req := httputils.NewJsonRequest(httputils.THttpMethod(method), uri, body)
-	ae := AzureResponseError{}
-	cli := httputils.NewJsonClient(client)
-	header, body, err := cli.Send(context.TODO(), req, &ae, debug)
+func (self *SAzureClient) ListRegions() ([]SRegion, error) {
+	resp, err := self.list_v2("locations", "2014-02-26", nil)
 	if err != nil {
-		if strings.Contains(err.Error(), "azure.BearerAuthorizer#WithAuthorization") {
-			return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, err.Error())
-		}
 		return nil, err
 	}
-	locationFunc := func(head http.Header) string {
-		for _, k := range []string{"Azure-Asyncoperation", "Location"} {
-			link := head.Get(k)
-			if len(link) > 0 {
-				return link
-			}
-		}
-		return ""
-	}
-	location := locationFunc(header)
-	if len(location) > 0 && (body == nil || body.IsZero() || !body.Contains("id")) {
-		err = cloudprovider.Wait(time.Second*10, time.Minute*30, func() (bool, error) {
-			locationUrl, err := url.Parse(location)
-			if err != nil {
-				return false, errors.Wrapf(err, "url.Parse(%s)", location)
-			}
-			if len(locationUrl.Query().Get("api-version")) == 0 {
-				q, _ := url.ParseQuery(locationUrl.RawQuery)
-				q.Set("api-version", params.Get("api-version"))
-				locationUrl.RawQuery = q.Encode()
-			}
-			req := httputils.NewJsonRequest(httputils.GET, locationUrl.String(), nil)
-			lae := AzureResponseError{}
-			_header, _body, _err := cli.Send(context.TODO(), req, &lae, debug)
-			if _err != nil {
-				if utils.IsInStringArray(lae.AzureError.Code, []string{"OSProvisioningTimedOut", "OSProvisioningClientError", "OSProvisioningInternalError"}) {
-					body = _body
-					return true, nil
-				}
-				return false, errors.Wrapf(_err, "cli.Send(%s)", location)
-			}
-			if retryAfter := _header.Get("Retry-After"); len(retryAfter) > 0 {
-				sleepTime, _ := strconv.Atoi(retryAfter)
-				time.Sleep(time.Second * time.Duration(sleepTime))
-				return false, nil
-			}
-			if _body != nil {
-				task := struct {
-					Status     string
-					Properties struct {
-						Output *jsonutils.JSONDict
-					}
-				}{}
-				_body.Unmarshal(&task)
-				if len(task.Status) == 0 {
-					body = _body
-					return true, nil
-				}
-				switch task.Status {
-				case "InProgress":
-					log.Debugf("process %s %s InProgress", method, path)
-					return false, nil
-				case "Succeeded":
-					log.Debugf("process %s %s Succeeded", method, path)
-					if task.Properties.Output != nil {
-						body = task.Properties.Output
-					}
-					return true, nil
-				case "Failed":
-					return false, fmt.Errorf("%s %s failed", method, path)
-				default:
-					return false, fmt.Errorf("Unknow status %s %s %s", task.Status, method, path)
-				}
-			}
-			return false, nil
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "time out for waiting %s %s", method, uri)
-		}
-	}
-	return body, nil
-}
-
-func (self *SAzureClient) ListRegions() ([]SRegion, error) {
 	regions := []SRegion{}
-	err := self.list("locations", url.Values{}, &regions)
-	return regions, err
+	err = resp.Unmarshal(&regions, "value")
+	if err != nil {
+		return nil, err
+	}
+	return regions, nil
 }
 
 func (self *SAzureClient) GetRegions() []SRegion {
@@ -890,11 +740,19 @@ func (self *SAzureClient) GetRegions() []SRegion {
 }
 
 func (self *SAzureClient) GetSubAccounts() (subAccounts []cloudprovider.SSubAccount, err error) {
+	levelBySub, err := self.getSubscriptionManagementGroupLevels()
+	if err != nil {
+		levelBySub = map[string]map[string]string{}
+	}
 	subAccounts = make([]cloudprovider.SSubAccount, len(self.subscriptions))
 	for i, subscription := range self.subscriptions {
 		subAccounts[i].Account = fmt.Sprintf("%s/%s", self.tenantId, subscription.SubscriptionId)
+		subAccounts[i].Id = subscription.SubscriptionId
 		subAccounts[i].Name = subscription.DisplayName
 		subAccounts[i].HealthStatus = subscription.GetHealthStatus()
+		if tags, ok := levelBySub[subscription.SubscriptionId]; ok {
+			subAccounts[i].Tags = tags
+		}
 	}
 	return subAccounts, nil
 }
@@ -912,26 +770,17 @@ func (self *SAzureClient) GetIamLoginUrl() string {
 	}
 }
 
-func (self *SAzureClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAzureClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	ret := []cloudprovider.ICloudRegion{}
 	for i := range self.regions {
 		ret = append(ret, &self.regions[i])
 	}
-	return ret
+	return ret, nil
 }
 
 func (self *SAzureClient) getDefaultRegion() (cloudprovider.ICloudRegion, error) {
 	if len(self.regions) > 0 {
 		return &self.regions[0], nil
-	}
-	return nil, cloudprovider.ErrNotFound
-}
-
-func (self *SAzureClient) getIRegionByRegionId(id string) (cloudprovider.ICloudRegion, error) {
-	for i := 0; i < len(self.regions); i += 1 {
-		if self.regions[i].GetId() == id {
-			return &self.regions[i], nil
-		}
 	}
 	return nil, cloudprovider.ErrNotFound
 }
@@ -1006,21 +855,14 @@ func getResourceGroup(id string) string {
 }
 
 func (self *SAzureClient) GetIProjects() ([]cloudprovider.ICloudProject, error) {
-	subscriptionId := self.subscriptionId
-	groups := []SResourceGroup{}
-	for _, sub := range self.subscriptions {
-		self.subscriptionId = sub.SubscriptionId
-		resourceGroups, err := self.ListResourceGroups()
-		if err != nil {
-			return nil, errors.Wrapf(err, "ListResourceGroups")
-		}
-		groups = append(groups, resourceGroups...)
+	resourceGroups, err := self.ListResourceGroups()
+	if err != nil {
+		return nil, errors.Wrapf(err, "ListResourceGroups")
 	}
-	self.subscriptionId = subscriptionId
 	iprojects := []cloudprovider.ICloudProject{}
-	for i := range groups {
-		groups[i].client = self
-		iprojects = append(iprojects, &groups[i])
+	for i := range resourceGroups {
+		resourceGroups[i].client = self
+		iprojects = append(iprojects, &resourceGroups[i])
 	}
 	return iprojects, nil
 }
@@ -1048,15 +890,14 @@ func (self *SAzureClient) GetStorageClasses(regionExtId string) ([]string, error
 }
 
 func (self *SAzureClient) GetAccessEnv() string {
-	env, _ := azureenv.EnvironmentFromName(self.envName)
-	switch env.Name {
-	case azureenv.PublicCloud.Name:
+	switch self.envName {
+	case ENV_NAME_GLOBAL:
 		return api.CLOUD_ACCESS_ENV_AZURE_GLOBAL
-	case azureenv.ChinaCloud.Name:
+	case ENV_NAME_CHINA:
 		return api.CLOUD_ACCESS_ENV_AZURE_CHINA
-	case azureenv.GermanCloud.Name:
+	case ENV_NAME_GERMAN:
 		return api.CLOUD_ACCESS_ENV_AZURE_GERMAN
-	case azureenv.USGovernmentCloud.Name:
+	case ENV_NAME_US_GOVERNMENT:
 		return api.CLOUD_ACCESS_ENV_AZURE_US_GOVERNMENT
 	default:
 		return api.CLOUD_ACCESS_ENV_AZURE_CHINA
@@ -1068,6 +909,7 @@ func (self *SAzureClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -1075,7 +917,6 @@ func (self *SAzureClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_CACHE + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_EVENT,
 		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
-		cloudprovider.CLOUD_CAPABILITY_SAML_AUTH,
 		cloudprovider.CLOUD_CAPABILITY_WAF,
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_CACHE + cloudprovider.READ_ONLY_SUFFIX,
@@ -1083,6 +924,61 @@ func (self *SAzureClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_CONTAINER + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
+}
+
+type SManagementEntity struct {
+	Id         string `json:"id"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Properties struct {
+		DisplayName            string   `json:"displayName"`
+		ParentDisplayNameChain []string `json:"parentDisplayNameChain"`
+	} `json:"properties"`
+}
+
+type SManagementEntities struct {
+	Value []SManagementEntity `json:"value"`
+}
+
+func (self *SAzureClient) getSubscriptionManagementGroupLevels() (map[string]map[string]string, error) {
+	result := map[string]map[string]string{}
+	resp, err := self.post_v2("/providers/Microsoft.Management/getEntities", "2020-05-01", map[string]interface{}{
+		"$select": "Name,DisplayName,Type,ParentDisplayNameChain",
+	})
+	if err != nil {
+		return result, errors.Wrap(err, "post_v2 Microsoft.Management/getEntities")
+	}
+	entities := SManagementEntities{}
+	if err := resp.Unmarshal(&entities); err != nil {
+		return result, errors.Wrap(err, "resp.Unmarshal SManagementEntities")
+	}
+	for i := range entities.Value {
+		e := entities.Value[i]
+		if !strings.Contains(strings.ToLower(e.Type), "subscriptions") {
+			continue
+		}
+		chain := e.Properties.ParentDisplayNameChain
+		if len(chain) == 0 {
+			continue
+		}
+		tags := map[string]string{}
+		for idx, name := range chain {
+			key := ""
+			switch idx {
+			case 0:
+				key = "L1"
+			case 1:
+				key = "L2"
+			case 2:
+				key = "L3"
+			default:
+				key = fmt.Sprintf("L%d", idx+1)
+			}
+			tags[key] = name
+		}
+		result[e.Name] = tags
+	}
+	return result, nil
 }
 
 type TagParams struct {
@@ -1119,35 +1015,4 @@ func (self *SAzureClient) SetTags(resourceId string, tags map[string]string) (js
 		return nil, self.del(path)
 	}
 	return self.patch(path, jsonutils.Marshal(input))
-}
-
-func (self *SAzureClient) msGraphClient() *http.Client {
-	conf := clientcredentials.Config{
-		ClientID:     self.clientId,
-		ClientSecret: self.clientSecret,
-
-		TokenURL: fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", self.tenantId),
-		Scopes:   []string{"https://graph.microsoft.com/.default"},
-	}
-	if self.envName == "AzureChinaCloud" {
-		conf.TokenURL = fmt.Sprintf("https://login.partner.microsoftonline.cn/%s/oauth2/v2.0/token", self.tenantId)
-		conf.Scopes = []string{"https://microsoftgraph.chinacloudapi.cn/.default"}
-	}
-	return conf.Client(context.TODO())
-}
-
-func (self *SAzureClient) msGraphRequest(method string, resource string, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	client := self.msGraphClient()
-	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/%s", resource)
-	if self.envName == "AzureChinaCloud" {
-		url = fmt.Sprintf("https://microsoftgraph.chinacloudapi.cn/v1.0/%s", resource)
-	}
-	req := httputils.NewJsonRequest(httputils.THttpMethod(method), url, body)
-	ae := AzureResponseError{}
-	cli := httputils.NewJsonClient(client)
-	_, body, err := cli.Send(context.TODO(), req, &ae, self.debug)
-	if err != nil {
-		return nil, err
-	}
-	return body, nil
 }

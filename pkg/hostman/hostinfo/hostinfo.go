@@ -26,14 +26,18 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/errgroup"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/regutils"
 	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
 
@@ -44,7 +48,10 @@ import (
 	napi "yunion.io/x/onecloud/pkg/apis/notify"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudcommon/types"
+	_ "yunion.io/x/onecloud/pkg/hostman/container/storage/local_raw"
+	_ "yunion.io/x/onecloud/pkg/hostman/container/storage/rbd"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostbridge"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
@@ -55,6 +62,7 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/monitor"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
+	_ "yunion.io/x/onecloud/pkg/hostman/storageman/container_storage"
 	"yunion.io/x/onecloud/pkg/hostman/system_service"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -67,6 +75,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/ovnutils"
+	"yunion.io/x/onecloud/pkg/util/pod"
+	"yunion.io/x/onecloud/pkg/util/pod/stats"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemutils"
 	"yunion.io/x/onecloud/pkg/util/sysutils"
@@ -78,9 +88,7 @@ type SHostInfo struct {
 	// registerCallback func()
 	stopped bool
 	isLoged bool
-
-	saved  bool
-	pinger *SHostPingTask
+	saved   bool
 
 	Cpu                 *SCPUInfo
 	Mem                 *SMemory
@@ -90,13 +98,18 @@ type SHostInfo struct {
 
 	kubeletConfig kubelet.KubeletConfig
 
-	isInit           bool
-	onHostDown       string
-	reservedCpusInfo *api.HostReserveCpusInput
+	isInit             bool
+	onHostDown         string
+	reservedCpusInfo   *api.HostReserveCpusInput
+	guestPinnedCpus    []int
+	enableNumaAllocate bool
+	cpuCmtBound        float32
+	memCmtBound        float32
 
 	IsolatedDeviceMan isolated_device.IsolatedDeviceManager
 
 	MasterNic *netutils2.SNetInterface
+	FirstNic  *netutils2.SNetInterface
 	Nics      []*SNIC
 
 	HostId         string
@@ -112,6 +125,34 @@ type SHostInfo struct {
 	SysError map[string][]api.HostError
 
 	IoScheduler string
+
+	// container related members
+	cri                            pod.CRI
+	containerCPUMap                *pod.HostContainerCPUMap
+	containerStatsProvider         stats.ContainerStatsProvider
+	containerCpufreqSimulateConfig *jsonutils.JSONDict
+	containerNvidiaGpus            []isolated_device.IDevice
+	hasNvidiaGpus                  *bool
+	hasVastaitechGpus              *bool
+	hasCphAmdGpus                  *bool
+
+	guestManager hostutils.IGuestManager
+}
+
+func (h *SHostInfo) GetContainerDeviceConfigurationFilePath() string {
+	return options.HostOptions.ContainerDeviceConfigFile
+}
+
+func (h *SHostInfo) GetContainerCpufreqSimulateConfig() *jsonutils.JSONDict {
+	return h.containerCpufreqSimulateConfig
+}
+
+func (h *SHostInfo) SetIGuestManager(guestManager hostutils.IGuestManager) {
+	h.guestManager = guestManager
+}
+
+func (h *SHostInfo) GetIGuestManager() hostutils.IGuestManager {
+	return h.guestManager
 }
 
 func (h *SHostInfo) GetIsolatedDeviceManager() isolated_device.IsolatedDeviceManager {
@@ -119,8 +160,9 @@ func (h *SHostInfo) GetIsolatedDeviceManager() isolated_device.IsolatedDeviceMan
 }
 
 func (h *SHostInfo) GetBridgeDev(bridge string) hostbridge.IBridgeDriver {
+	bridgeDev := options.HostOptions.NicBridgeDevName(bridge)
 	for _, n := range h.Nics {
-		if bridge == n.Bridge {
+		if bridgeDev == n.Bridge {
 			return n.BridgeDev
 		}
 	}
@@ -144,7 +186,12 @@ func (h *SHostInfo) GetBridgeDev(bridge string) hostbridge.IBridgeDriver {
 
 func (h *SHostInfo) StartDHCPServer() {
 	for _, nic := range h.Nics {
-		nic.dhcpServer.Start(false)
+		if nic.dhcpServer != nil {
+			nic.dhcpServer.Start(false)
+		}
+		if nic.dhcpServer6 != nil {
+			nic.dhcpServer6.Start(false)
+		}
 	}
 }
 
@@ -186,7 +233,7 @@ func (h *SHostInfo) HugepageSizeKb() int {
  * 4. parse host config, config ip address
  * 5. check is ovn support, setup ovn chassis
  */
-func (h *SHostInfo) Init() error {
+func (h *SHostInfo) Init(ctx context.Context) error {
 	if err := h.prepareEnv(); err != nil {
 		return errors.Wrap(err, "Prepare environment")
 	}
@@ -197,9 +244,7 @@ func (h *SHostInfo) Init() error {
 	}
 
 	if err := hostbridge.Prepare(options.HostOptions.BridgeDriver); err != nil {
-		err := errors.Errorf("Prepare host bridge %q error: %v", options.HostOptions.BridgeDriver, err)
-		log.Errorln(err)
-		return err
+		return errors.Wrapf(err, "Prepare host bridge %q", options.HostOptions.BridgeDriver)
 	}
 
 	log.Infof("Start parseConfig")
@@ -212,6 +257,44 @@ func (h *SHostInfo) Init() error {
 		}
 	}
 
+	if h.IsContainerHost() {
+		if err := h.initCRI(); err != nil {
+			return errors.Wrap(err, "init container runtime interface")
+		}
+		if err := h.initContainerCPUMap(h.sysinfo.Topology); err != nil {
+			return errors.Wrap(err, "init container cpu map")
+		}
+		go func() {
+			if err := h.startContainerStatsProvider(h.cri); err != nil {
+				log.Warningf("start container stats provider error: %v", err)
+			} else {
+				log.Infof("container stats provider started")
+			}
+		}()
+		if fileutils2.Exists(options.HostOptions.ContainerSystemCpufreqSimulateConfigFile) {
+			if err := h.getContainerCpufreqSimulateConfig(); err != nil {
+				return errors.Wrap(err, "getContainerCpuSimulateConfig")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (h *SHostInfo) getContainerCpufreqSimulateConfig() error {
+	content, err := fileutils2.FileGetContents(options.HostOptions.ContainerSystemCpufreqSimulateConfigFile)
+	if err != nil {
+		return errors.Wrapf(err, "FileGetContents %s", options.HostOptions.ContainerSystemCpufreqSimulateConfigFile)
+	}
+	obj, err := jsonutils.ParseYAML(content)
+	if err != nil {
+		return errors.Wrapf(err, "parse YAML content: %s", content)
+	}
+	cfg := new(hostutils.SContainerCpufreqSimulateConfig)
+	if err := obj.Unmarshal(cfg); err != nil {
+		return errors.Wrapf(err, "unmarshal object to SContainerCpufreqSimulateConfig")
+	}
+	h.containerCpufreqSimulateConfig = jsonutils.Marshal(cfg).(*jsonutils.JSONDict)
 	return nil
 }
 
@@ -298,10 +381,10 @@ func (h *SHostInfo) parseConfig() error {
 	if mem < 64 { // MB
 		return fmt.Errorf("Not enough memory!")
 	}
-	if len(options.HostOptions.Networks) == 0 {
+	if len(options.HostOptions.Networks) == 0 && len(options.HostOptions.ListenInterface) == 0 {
 		netConf, err := h.generateLocalNetworkConfig()
 		if err != nil {
-			return err
+			return errors.Wrap(err, "generateLocalNetworkConfig")
 		}
 		log.Infof("Generate network config %s", netConf)
 		options.HostOptions.Networks = []string{netConf}
@@ -318,36 +401,90 @@ func (h *SHostInfo) parseConfig() error {
 	for _, n := range options.HostOptions.Networks {
 		nic, err := NewNIC(n)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "NewNIC %s", n)
 		}
 		h.Nics = append(h.Nics, nic)
 	}
-	for i := 0; i < len(h.Nics); i++ {
-		if err := h.Nics[i].SetupDhcpRelay(); err != nil {
-			return err
+	{
+		// host local bridge
+		nic, err := NewNIC(fmt.Sprintf("/%s/%s", options.HostOptions.HostLocalBridgeName, api.DEFAULT_HOST_LOCAL_WIRE_NAME))
+		if err != nil {
+			return errors.Wrapf(err, "NewNic for host local bridge %s", options.HostOptions.HostLocalBridgeName)
+		}
+		h.Nics = append(h.Nics, nic)
+	}
+
+	{
+		// init first nic
+		h.FirstNic = nil
+		for _, n := range h.Nics {
+			if len(n.Ip) > 0 || len(n.Ip6) > 0 {
+				h.FirstNic = netutils2.NewNetInterface(n.Bridge)
+				break
+			}
 		}
 	}
+
 	if len(options.HostOptions.ListenInterface) > 0 {
 		h.MasterNic = netutils2.NewNetInterface(options.HostOptions.ListenInterface)
-		if len(h.MasterNic.Addr) == 0 {
+		if len(h.MasterNic.Addr) == 0 && len(h.MasterNic.Addr6) == 0 {
 			return fmt.Errorf("Listen interface %s master have no IP", options.HostOptions.ListenInterface)
 		}
 	} else {
 		// set MasterNic to the first NIC with IP
-		h.MasterNic = nil
-		for _, n := range h.Nics {
-			if len(n.Ip) > 0 {
-				h.MasterNic = netutils2.NewNetInterface(n.Bridge)
-			}
-		}
+		h.MasterNic = h.FirstNic
 		if h.MasterNic == nil {
 			return fmt.Errorf("No interface suitable to be master NIC")
+		}
+	}
+
+	if h.MasterNic != nil {
+		if regutils.MatchIP4Addr(h.GetMasterIp()) {
+			options.HostOptions.Address = "0.0.0.0"
+		} else {
+			options.HostOptions.Address = "::"
 		}
 	}
 
 	h.IsolatedDeviceMan = isolated_device.NewManager(h)
 
 	return nil
+}
+
+func (h *SHostInfo) getIoSchedulerSupported(scheduler string, supportedSchedulers []string) (string, map[string]string) {
+	// IoScheduler default to none scheduler
+	ioParams := make(map[string]string, 0)
+	switch scheduler {
+	case "deadline":
+		if utils.IsInStringArray("mq-deadline", supportedSchedulers) {
+			scheduler = "mq-deadline"
+		} else if utils.IsInStringArray("deadline", supportedSchedulers) {
+			scheduler = "deadline"
+		} else {
+			scheduler = "none"
+		}
+	case "cfq":
+		if utils.IsInStringArray("bfq", supportedSchedulers) {
+			scheduler = "bfq"
+		} else if utils.IsInStringArray("cfq", supportedSchedulers) {
+			scheduler = "cfq"
+		} else {
+			scheduler = "none"
+		}
+	default:
+		if !utils.IsInStringArray(scheduler, supportedSchedulers) {
+			scheduler = "none"
+		}
+	}
+	ioParams["queue/scheduler"] = scheduler
+	switch scheduler {
+	case "cfq":
+		ioParams["queue/iosched/group_isolation"] = "1"
+		ioParams["queue/iosched/slice_idle"] = "0"
+		ioParams["queue/iosched/group_idle"] = "0"
+		ioParams["queue/iosched/quantum"] = "32"
+	}
+	return scheduler, ioParams
 }
 
 func (h *SHostInfo) prepareEnv() error {
@@ -381,57 +518,42 @@ func (h *SHostInfo) prepareEnv() error {
 	}
 
 	supportedSchedulers, _ := fileutils2.GetAllBlkdevsIoSchedulers()
-	// IoScheduler default to none scheduler
-	ioParams := make(map[string]string, 0)
-	switch options.HostOptions.BlockIoScheduler {
-	case "deadline":
-		if utils.IsInStringArray("mq-deadline", supportedSchedulers) {
-			h.IoScheduler = "mq-deadline"
-		} else if utils.IsInStringArray("deadline", supportedSchedulers) {
-			h.IoScheduler = "deadline"
-		} else {
-			h.IoScheduler = "none"
-		}
-	case "cfq":
-		if utils.IsInStringArray("bfq", supportedSchedulers) {
-			h.IoScheduler = "bfq"
-		} else if utils.IsInStringArray("cfq", supportedSchedulers) {
-			h.IoScheduler = "cfq"
-		} else {
-			h.IoScheduler = "none"
-		}
-	default:
-		if utils.IsInStringArray(options.HostOptions.BlockIoScheduler, supportedSchedulers) {
-			h.IoScheduler = options.HostOptions.BlockIoScheduler
-		} else {
-			h.IoScheduler = "none"
+	log.Infof("supported io schedulers %v", supportedSchedulers)
+	// set hdd block devices io scheduler
+	{
+		hddIoScheduler, ioParams := h.getIoSchedulerSupported(options.HostOptions.BlockIoScheduler, supportedSchedulers)
+		log.Infof("HDD I/O Scheduler switch to %s", hddIoScheduler)
+		fileutils2.ChangeHddBlkdevsParams(ioParams)
+		h.IoScheduler = hddIoScheduler
+	}
+	// set ssd block devices io scheduler
+	{
+		ssdIoScheduler, ioParams := h.getIoSchedulerSupported(options.HostOptions.SsdBlockIoScheduler, supportedSchedulers)
+		log.Infof("SSD I/O Scheduler switch to %s", ssdIoScheduler)
+		fileutils2.ChangeSsdBlkdevsParams(ioParams)
+	}
+
+	if !utils.IsInStringArray("tun", options.HostOptions.SkipCheckKernelMods) {
+		_, err = procutils.NewRemoteCommandAsFarAsPossible("modprobe", "tun").Output()
+		if err != nil {
+			return errors.Wrap(err, "Failed to activate tun/tap device")
 		}
 	}
 
-	log.Infof("I/O Scheduler switch to %s", h.IoScheduler)
-
-	ioParams["queue/scheduler"] = h.IoScheduler
-	switch h.IoScheduler {
-	case "cfq":
-		ioParams["queue/iosched/group_isolation"] = "1"
-		ioParams["queue/iosched/slice_idle"] = "0"
-		ioParams["queue/iosched/group_idle"] = "0"
-		ioParams["queue/iosched/quantum"] = "32"
-	}
-	fileutils2.ChangeAllBlkdevsParams(ioParams)
-	_, err = procutils.NewRemoteCommandAsFarAsPossible("modprobe", "tun").Output()
+	_, err = procutils.NewRemoteCommandAsFarAsPossible("modprobe", "ifb", "numifbs=0").Output()
 	if err != nil {
-		return errors.Wrap(err, "Failed to activate tun/tap device")
+		return errors.Wrap(err, "Failed to activate ifb device")
 	}
+
 	output, err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", "vhost_net").Output()
 	if err != nil {
 		log.Warningf("modprobe vhost_net error: %s", output)
 	}
-	if !options.HostOptions.DisableSetCgroup {
-		if !cgrouputils.Init(h.IoScheduler) {
-			return fmt.Errorf("Cannot initialize control group subsystem")
-		}
+
+	if err := cgrouputils.Init(h.IoScheduler); err != nil {
+		return fmt.Errorf("Cannot initialize control group subsystem: %s", err)
 	}
+	h.sysinfo.CgroupVersion = cgrouputils.GetCgroupVersion()
 
 	// err = h.resetIptables()
 	// if err != nil {
@@ -451,7 +573,7 @@ func (h *SHostInfo) prepareEnv() error {
 		h.EnableNativeHugepages()
 		hp, err := h.Mem.GetHugepages()
 		if err != nil {
-			return errors.Wrap(err, "Mem.GetHugepages")
+			return errors.Wrap(err, "MEM.GetHugepages")
 		}
 		for i := 0; i < len(hp); i++ {
 			if hp[i].SizeKb == options.HostOptions.HugepageSizeMb*1024 {
@@ -477,17 +599,30 @@ func (h *SHostInfo) prepareEnv() error {
 	return nil
 }
 
-func (h *SHostInfo) detectHostInfo() error {
-	output, err := procutils.NewCommand("dmidecode", "-t", "1").Output()
+func runDmidecode(hType string) (*types.SSystemInfo, error) {
+	output, err := procutils.NewCommand("dmidecode", "-t", hType).Output()
 	if err != nil {
-		log.Errorf("dmidecode -t 1 error %s(%s)", err, string(output))
-		h.sysinfo.SSystemInfo = &types.SSystemInfo{}
-	} else {
-		h.sysinfo.SSystemInfo, err = sysutils.ParseDMISysinfo(strings.Split(string(output), "\n"))
-		if err != nil {
-			return err
-		}
+		return &types.SSystemInfo{}, errors.Wrapf(err, "cmd: dmidecode -t %s, output: %s", hType, output)
 	}
+	info, err := sysutils.ParseDMISysinfo(strings.Split(string(output), "\n"))
+	if err != nil {
+		return &types.SSystemInfo{}, errors.Wrapf(err, "ParseDMISysinfo with line: %s", output)
+	}
+	return info, nil
+}
+
+func (h *SHostInfo) detectHostInfo() error {
+	sysInfo, err := runDmidecode("1")
+	if err != nil {
+		log.Warningf("get system info error: %v", err)
+	}
+	h.sysinfo.SSystemInfo = sysInfo
+
+	motherboardInfo, err := runDmidecode("2")
+	if err != nil {
+		log.Warningf("get motherboard info error: %v", err)
+	}
+	h.sysinfo.MotherboardInfo = motherboardInfo
 
 	h.detectKvmModuleSupport()
 	h.detectKVMMaxCpus()
@@ -498,6 +633,9 @@ func (h *SHostInfo) detectHostInfo() error {
 	}
 
 	h.detectStorageSystem()
+	if options.HostOptions.EnableHostAgentNumaAllocate {
+		h.sysinfo.HostAgentCpuNumaAllocate = true
+	}
 
 	topoInfo, err := hardware.GetTopology()
 	if err != nil {
@@ -510,7 +648,9 @@ func (h *SHostInfo) detectHostInfo() error {
 	h.sysinfo.Topology = topoInfo
 	h.sysinfo.CPUInfo = cpuInfo
 
-	system_service.Init()
+	if err = h.GetNodeHugepages(); err != nil {
+		return errors.Wrap(err, "GetNodeHugepages")
+	}
 	if options.HostOptions.CheckSystemServices {
 		if err := h.checkSystemServices(); err != nil {
 			return err
@@ -599,6 +739,33 @@ func (h *SHostInfo) EnableTransparentHugepages() {
 	}
 }
 
+func (h *SHostInfo) GetNodeHugepages() error {
+	if options.HostOptions.HugepagesOption != "native" {
+		return nil
+	}
+
+	hugepageSizeKB := h.sysinfo.HugepageSizeKb
+	nodeHugepages := make([]hostapi.HostNodeHugepageNr, len(h.sysinfo.Topology.Nodes))
+
+	for i := range h.sysinfo.Topology.Nodes {
+		nodeId := h.sysinfo.Topology.Nodes[i].ID
+		nodeHugepagePath := fmt.Sprintf("/sys/devices/system/node/node%d/hugepages/hugepages-%dkB", nodeId, hugepageSizeKB)
+		if !fileutils2.Exists(nodeHugepagePath) {
+			return errors.Errorf("node %s has no hugepages ?", nodeHugepagePath)
+		}
+		nrHugepage, err := fileutils2.FileGetIntContent(path.Join(nodeHugepagePath, "nr_hugepages"))
+		if err != nil {
+			return errors.Wrap(err, "get node nr hugepage")
+		}
+
+		nodeHugepages[i].NodeId = nodeId
+		nodeHugepages[i].HugepageNr = nrHugepage
+	}
+
+	h.sysinfo.NodeHugepages = nodeHugepages
+	return nil
+}
+
 func (h *SHostInfo) GetMemory() int {
 	return h.Mem.Total
 }
@@ -636,10 +803,12 @@ func (h *SHostInfo) EnableKsm(sleepSec int) {
 	sysutils.SetSysConfig("/sys/kernel/mm/ksm/run", "1")
 	sysutils.SetSysConfig("/sys/kernel/mm/ksm/sleep_millisecs",
 		fmt.Sprintf("%d", sleepSec*1000))
+	h.sysinfo.EnableKsm = true
 }
 
 func (h *SHostInfo) DisableKsm() {
 	sysutils.SetSysConfig("/sys/kernel/mm/ksm/run", "0")
+	h.sysinfo.EnableKsm = false
 }
 
 func (h *SHostInfo) PreventArpFlux() {
@@ -654,11 +823,10 @@ func (h *SHostInfo) tuneSystem() {
 	if minMemMb < 100 {
 		minMemMb = 100
 	}
-	minMemKB := fmt.Sprintf("%d", 2*minMemMb*1024)
+	minMemKB := 2 * minMemMb * 1024
 	kv := map[string]string{
 		"/proc/sys/vm/swappiness":                        "0",
 		"/proc/sys/vm/vfs_cache_pressure":                "350",
-		"/proc/sys/vm/min_free_kbytes":                   minMemKB,
 		"/proc/sys/net/ipv4/tcp_mtu_probing":             "2",
 		"/proc/sys/net/ipv4/neigh/default/gc_thresh1":    "1024",
 		"/proc/sys/net/ipv4/neigh/default/gc_thresh2":    "4096",
@@ -668,6 +836,13 @@ func (h *SHostInfo) tuneSystem() {
 
 		"/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal": "1",
 	}
+	ret, err := fileutils2.FileGetIntContent("/proc/sys/vm/min_free_kbytes")
+	if err != nil {
+		log.Errorf("failed get /proc/sys/vm/min_free_kbytes: %s", err)
+	} else if ret < minMemKB {
+		kv["/proc/sys/vm/min_free_kbytes"] = fmt.Sprintf("%d", minMemKB)
+	}
+
 	for k, v := range kv {
 		sysutils.SetSysConfig(k, v)
 	}
@@ -703,27 +878,24 @@ func (h *SHostInfo) initCgroup() error {
 	hostCpuset := hostCpusetBuilder.Result()
 	hostCpusetStr := hostCpuset.String()
 	// init host cpuset root group
-	if !cgrouputils.NewCGroupCPUSetTask("", hostconsts.HOST_CGROUP, 0, hostCpusetStr).Configure() {
+	if !cgrouputils.NewCGroupCPUSetTask("", hostconsts.HOST_CGROUP, hostCpusetStr, "").Configure() {
 		return fmt.Errorf("failed init host root cpuset")
 	}
 	// init host cpu root group
-	cgrouputils.CgroupSet("", hostconsts.HOST_CGROUP, hostCpuset.Size()*1024)
-	// init host blkio root group
-	cgrouputils.CgroupIoHardlimitSet("", hostconsts.HOST_CGROUP, 0, nil, "")
+	cgrouputils.NewCGroupCPUTask("", hostconsts.HOST_CGROUP, hostCpuset.Size()*1024).SetTask()
 
 	if h.reservedCpusInfo != nil {
-		reservedCpusTask := cgrouputils.NewCGroupCPUSetTask("", hostconsts.HOST_RESERVED_CPUSET, 0, h.reservedCpusInfo.Cpus)
+		reservedCpusTask := cgrouputils.NewCGroupCPUSetTask("", hostconsts.HOST_RESERVED_CPUSET, h.reservedCpusInfo.Cpus, h.reservedCpusInfo.Mems)
 		if !reservedCpusTask.Configure() {
 			return fmt.Errorf("failed init host reserved cpuset %s", h.reservedCpusInfo.Cpus)
-		}
-		if h.reservedCpusInfo.Mems != "" &&
-			!reservedCpusTask.CustomConfig(cgrouputils.CPUSET_MEMS, h.reservedCpusInfo.Mems) {
-			return fmt.Errorf("failed init host reserved cpuset mems %s", h.reservedCpusInfo.Mems)
 		}
 		if h.reservedCpusInfo.DisableSchedLoadBalance != nil &&
 			*h.reservedCpusInfo.DisableSchedLoadBalance &&
 			!reservedCpusTask.CustomConfig(cgrouputils.CPUSET_SCHED_LOAD_BALANCE, "0") {
 			return fmt.Errorf("failed init host reserved cpuset sched load balance")
+		}
+		if len(h.reservedCpusInfo.ProcessesPrefix) > 0 {
+			go h.startBindReservedCpus(h.reservedCpusInfo.ProcessesPrefix)
 		}
 	}
 	return nil
@@ -735,7 +907,7 @@ func (h *SHostInfo) detectKvmModuleSupport() string {
 }
 
 func (h *SHostInfo) detectNestSupport() {
-	if sysutils.IsNestEnabled() {
+	if sysutils.DetectNestSupport(options.HostOptions.EnableNestedVirtualization) == sysutils.HOST_NEST_ENABLE {
 		h.sysinfo.Nest = "enabled"
 	} else {
 		h.sysinfo.Nest = "disabled"
@@ -800,9 +972,15 @@ func (h *SHostInfo) detectKernelVersion() {
 func (h *SHostInfo) detectSyssoftwareInfo() error {
 	h.detectOsDist()
 	h.detectKernelVersion()
-	if err := h.detectQemuVersion(); err != nil {
-		log.Errorf("detect qemu version: %s", err.Error())
-		h.AppendHostError(fmt.Sprintf("detect qemu version: %s", err.Error()))
+	if !h.IsContainerHost() {
+		if err := h.detectQemuVersion(); err != nil {
+			log.Errorf("detect qemu version: %s", err.Error())
+			h.AppendHostError(fmt.Sprintf("detect qemu version: %s", err.Error()))
+		}
+		h.sysinfo.QemuVersions = qemutils.GetUsrLocalQemuVersions()
+		if !utils.IsInStringArray(h.sysinfo.QemuVersion, h.sysinfo.QemuVersions) {
+			h.sysinfo.QemuVersions = append(h.sysinfo.QemuVersions, h.sysinfo.QemuVersion)
+		}
 	}
 	h.detectOvsVersion()
 	if err := h.detectOvsKOVersion(); err != nil {
@@ -932,32 +1110,36 @@ func (h *SHostInfo) detectQemuCapabilities(version string) error {
 	}
 
 	qmpCmds := fmt.Sprintf(`echo "{'execute': 'qmp_capabilities'}
-       {'execute': 'query-machines'}
+       {'execute': 'query-machines','id':'query_machines'}
        {'execute': 'quit'}" | %s -qmp stdio  -vnc none -machine none -display none`, qemutils.GetQemu(version))
 	log.Debugf("qemu caps cmdline %v", qmpCmds)
 	out, err := procutils.NewRemoteCommandAsFarAsPossible("sh", "-c", qmpCmds).Output()
 	if err != nil {
 		log.Errorf("failed start qemu caps cmdline: %s", qmpCmds)
 	}
+
 	segs := bytes.Split(out, []byte{'\n'})
-	if len(segs) < 6 {
-		return errors.Errorf("unexpect qmp res %s", out)
+	for _, seg := range segs {
+		res, err := jsonutils.Parse(bytes.TrimSpace(seg))
+		if err != nil {
+			return errors.Errorf("Unmarshal %s error: %s", seg, err)
+		}
+		id, _ := res.GetString("id")
+		if id == "query_machines" {
+			var machineInfoList = make([]monitor.MachineInfo, 0)
+			err = res.Unmarshal(&machineInfoList, "return")
+			if err != nil {
+				return errors.Wrapf(err, "failed unmarshal machineinfo return %s", res.PrettyString())
+			}
+			h.qemuMachineInfoList = machineInfoList
+			qemuCaps := &QemuCaps{
+				QemuVersion:     version,
+				MachineInfoList: machineInfoList,
+			}
+			return fileutils2.FilePutContents(capsPath, jsonutils.Marshal(qemuCaps).String(), false)
+		}
 	}
-	res, err := jsonutils.Parse(bytes.TrimSpace(segs[2]))
-	if err != nil {
-		return errors.Errorf("Unmarshal %s error: %s", segs[2], err)
-	}
-	var machineInfoList = make([]monitor.MachineInfo, 0)
-	err = res.Unmarshal(&machineInfoList, "return")
-	if err != nil {
-		return errors.Errorf("failed unmarshal machineinfo return %s: %s", segs[3], err)
-	}
-	h.qemuMachineInfoList = machineInfoList
-	qemuCaps := &QemuCaps{
-		QemuVersion:     version,
-		MachineInfoList: machineInfoList,
-	}
-	return fileutils2.FilePutContents(capsPath, jsonutils.Marshal(qemuCaps).String(), false)
+	return errors.Errorf("failed parse qemu machine info: %s", out)
 }
 
 func (h *SHostInfo) GetQemuMachineInfoList() []monitor.MachineInfo {
@@ -993,21 +1175,35 @@ func (h *SHostInfo) detectOvsKOVersion() error {
 	lines := strings.Split(string(output), "\n")
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		if strings.HasPrefix(line, "version:") || strings.HasPrefix(line, "vermagic") {
+		if strings.HasPrefix(line, "version:") || strings.HasPrefix(line, "vermagic:") {
 			log.Infof("kernel module openvswitch %s", line)
+			parts := strings.Split(line, ":")
+			if len(parts) > 1 {
+				h.sysinfo.OvsKmodVersion = strings.TrimSpace(parts[1])
+			}
 			return nil
 		}
 	}
 	return errors.Errorf("kernel module openvswitch paramters version not found, is kernel version correct ??")
 }
 
-func (h *SHostInfo) GetMasterNicIpAndMask() (string, int) {
-	mask, _ := h.MasterNic.Mask.Size()
-	return h.MasterNic.Addr, mask
+func (h *SHostInfo) getNicIpAndMask(nic *netutils2.SNetInterface) (string, int) {
+	if nic.Addr != "" {
+		mask, _ := nic.Mask.Size()
+		return nic.Addr, mask
+	}
+	mask, _ := nic.Mask6.Size()
+	return nic.Addr6, mask
 }
 
 func (h *SHostInfo) GetMasterIp() string {
-	return h.MasterNic.Addr
+	if h.MasterNic == nil {
+		return ""
+	}
+	if h.MasterNic.Addr != "" {
+		return h.MasterNic.Addr
+	}
+	return h.MasterNic.Addr6
 }
 
 func (h *SHostInfo) GetMasterMac() string {
@@ -1057,24 +1253,49 @@ func (h *SHostInfo) register() {
 	hostInfo, err := h.initHostRecord()
 	if err != nil {
 		h.onFail(errors.Wrap(err, "initHostRecords"))
+		return
 	}
 	defer h.reportHostErrors()
 
-	err = h.initCgroup()
-	if err != nil {
-		h.onFail(errors.Wrap(err, "initCgroup"))
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		if e := h.initCgroup(); e != nil {
+			return errors.Wrap(e, "initCgroup")
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		if e := h.initHostNetworks(hostInfo); e != nil {
+			return errors.Wrap(e, "initHostNetworks")
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		if e := h.initIsolatedDevices(); e != nil {
+			return errors.Wrap(e, "initIsolatedDevices")
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		if e := h.initStorages(); e != nil {
+			return errors.Wrap(e, "initStorages")
+		}
+		return nil
+	})
+	if err = eg.Wait(); err != nil {
+		h.onFail(err)
+		return
 	}
-	err = h.initHostNetworks(hostInfo)
+
+	err = h.finalizeNetworkSetup(context.Background())
 	if err != nil {
-		h.onFail(errors.Wrap(err, "initHostNetworks"))
+		h.onFail(errors.Wrap(err, "finalizeNetworkSetup"))
+		return
 	}
-	err = h.initIsolatedDevices()
-	if err != nil {
-		h.onFail(errors.Wrap(err, "initIsolatedDevices"))
-	}
-	err = h.initStorages()
-	if err != nil {
-		h.onFail(errors.Wrap(err, "initStorages"))
+	if err := h.initHostFiles(); err != nil {
+		log.Errorf("initHostFiles failed: %s", err)
+	} else {
+		log.Infof("initHostFiles success")
 	}
 	h.deployAdminAuthorizedKeys()
 	h.onSucc()
@@ -1101,11 +1322,11 @@ func (h *SHostInfo) onFail(reason error) {
 }
 
 func (h *SHostInfo) initHostRecord() (*api.HostDetails, error) {
-	wireId, err := h.ensureMasterNetworks()
+	wireId, err := h.ensureAccessNicNetworks()
 	if err != nil {
 		return nil, errors.Wrap(err, "initHostRecord")
 	}
-	err = h.waitMasterNicIp()
+	err = h.waitFirstNicIp()
 	if err != nil {
 		return nil, errors.Wrap(err, "waitMasterNicIp")
 	}
@@ -1126,6 +1347,8 @@ func (h *SHostInfo) initHostRecord() (*api.HostDetails, error) {
 	}
 
 	h.HostId = hostInfo.Id
+	h.cpuCmtBound = hostInfo.CpuCommitBound
+	h.memCmtBound = hostInfo.MemCommitBound
 	hostInfo, err = h.updateHostMetadata(hostInfo.Name)
 	if err != nil {
 		return nil, errors.Wrap(err, "updateHostMetadata")
@@ -1145,27 +1368,40 @@ func (h *SHostInfo) initHostRecord() (*api.HostDetails, error) {
 		return nil, errors.Wrap(err, "parse reserved cpus info")
 	}
 
+	// enable numa allocate
+	if hostInfo.EnableNumaAllocate {
+		h.enableNumaAllocate = true
+		log.Infof("host enabled numa allocate")
+	}
+
 	// set host reserved memory
-	if h.IsHugepagesEnabled() && h.getReservedMemMb() != hostInfo.MemReserved {
-		if err = h.updateHostReservedMem(h.getReservedMemMb()); err != nil {
+	if h.IsHugepagesEnabled() && h.GetReservedMemMb() != hostInfo.MemReserved {
+		if err = h.updateHostReservedMem(h.GetReservedMemMb()); err != nil {
 			return nil, errors.Wrap(err, "updateHostReservedMem")
 		}
 	}
 	return hostInfo, nil
 }
 
+func (h *SHostInfo) getAccessNic() *netutils2.SNetInterface {
+	if h.FirstNic != nil {
+		return h.FirstNic
+	}
+	return h.MasterNic
+}
+
 // try to create network on region.
 func (h *SHostInfo) tryCreateNetworkOnWire() (string, error) {
-	masterIp, mask := h.GetMasterNicIpAndMask()
-	log.Infof("Get master ip %s and mask %d", masterIp, mask)
+	masterIp, mask := h.getNicIpAndMask(h.getAccessNic())
+	log.Infof("Get access nic ip %s and mask %d", masterIp, mask)
 	if len(masterIp) == 0 || mask == 0 {
-		return "", errors.Wrapf(httperrors.ErrInvalidStatus, "master ip %s mask %d", masterIp, mask)
+		return "", errors.Wrapf(httperrors.ErrInvalidStatus, "access nic ip %s mask %d", masterIp, mask)
 	}
 	params := jsonutils.NewDict()
 	params.Set("ip", jsonutils.NewString(masterIp))
 	params.Set("mask", jsonutils.NewInt(int64(mask)))
 	params.Set("is_classic", jsonutils.JSONTrue)
-	params.Set("server_type", jsonutils.NewString(api.NETWORK_TYPE_BAREMETAL))
+	params.Set("server_type", jsonutils.NewString(string(api.NETWORK_TYPE_BAREMETAL)))
 	params.Set("is_on_premise", jsonutils.JSONTrue)
 	ret, err := modules.Networks.PerformClassAction(h.GetSession(), "try-create-network", params)
 	if err != nil {
@@ -1181,12 +1417,13 @@ func (h *SHostInfo) tryCreateNetworkOnWire() (string, error) {
 	return wireId, nil
 }
 
-func (h *SHostInfo) ensureMasterNetworks() (string, error) {
-	masterIp := h.GetMasterIp()
-	if len(masterIp) == 0 {
-		return "", errors.Wrap(httperrors.ErrInvalidStatus, "master ip not found")
+func (h *SHostInfo) ensureAccessNicNetworks() (string, error) {
+	masterIp, mask := h.getNicIpAndMask(h.getAccessNic())
+	log.Infof("Get access nic ip %s and mask %d", masterIp, mask)
+	if len(masterIp) == 0 || mask == 0 {
+		return "", errors.Wrapf(httperrors.ErrInvalidStatus, "access nic ip %s mask %d", masterIp, mask)
 	}
-	log.Infof("Master ip %s to fetch wire", masterIp)
+	log.Infof("Access nic ip %s to fetch wire", masterIp)
 	params := jsonutils.NewDict()
 	params.Set("ip", jsonutils.NewString(masterIp))
 	params.Set("is_classic", jsonutils.JSONTrue)
@@ -1252,19 +1489,22 @@ func (h *SHostInfo) initZoneInfo(zoneId string) error {
 	return nil
 }
 
-func (h *SHostInfo) waitMasterNicIp() error {
+func (h *SHostInfo) waitFirstNicIp() error {
+	if h.FirstNic == nil {
+		return nil
+	}
 	const maxWaitSeconds = 900
 	waitSeconds := 0
-	for h.MasterNic.Addr == "" && waitSeconds < maxWaitSeconds {
+	for h.FirstNic.Addr == "" && h.FirstNic.Addr6 == "" && waitSeconds < maxWaitSeconds {
 		time.Sleep(time.Second)
 		waitSeconds++
-		h.MasterNic.FetchConfig()
+		h.FirstNic.FetchConfig()
 	}
-	if h.MasterNic.Addr == "" {
-		return errors.Wrap(httperrors.ErrInvalidStatus, "fail to fetch master nic IP address")
+	if h.FirstNic.Addr == "" && h.FirstNic.Addr6 == "" {
+		return errors.Wrap(httperrors.ErrInvalidStatus, "fail to fetch first nic IP address")
 	}
-	if h.MasterNic.GetMac() == "" {
-		return errors.Wrap(httperrors.ErrInvalidStatus, "fail to fetch master nic MAC address")
+	if h.FirstNic.GetMac() == "" {
+		return errors.Wrap(httperrors.ErrInvalidStatus, "fail to fetch first nic MAC address")
 	}
 
 	return nil
@@ -1308,7 +1548,7 @@ func (h *SHostInfo) ensureHostRecord(zoneId string) (*api.HostDetails, error) {
 
 		// 上次未能正常offline, 补充一次健康日志
 		if hosts[0].HostStatus == api.HOST_ONLINE {
-			reason := fmt.Sprintf("The host status is online when it staring. Maybe the control center was down earlier")
+			reason := "The host status is online when it staring. Maybe the control center was down earlier"
 			logclient.AddSimpleActionLog(h, logclient.ACT_HEALTH_CHECK, map[string]string{"reason": reason}, hostutils.GetComputeSession(context.Background()).GetToken(), false)
 			data := jsonutils.NewDict()
 			data.Add(jsonutils.NewString(h.GetName()), "name")
@@ -1317,7 +1557,11 @@ func (h *SHostInfo) ensureHostRecord(zoneId string) (*api.HostDetails, error) {
 		}
 	}
 
-	return h.updateOrCreateHost(h.HostId)
+	host, err := h.updateOrCreateHost(h.HostId)
+	if err != nil {
+		return nil, errors.Wrap(err, "updateOrCreateHost")
+	}
+	return host, nil
 }
 
 func (h *SHostInfo) UpdateSyncInfo(hostId string, body jsonutils.JSONObject) (interface{}, error) {
@@ -1346,12 +1590,13 @@ func (h *SHostInfo) ProbeSyncIsolatedDevices(hostId string, body jsonutils.JSONO
 	return h.probeSyncIsolatedDevices()
 }
 
-func (h *SHostInfo) setHostname(name string) {
-	h.FullName = name
-	err := sysutils.SetHostname(name)
+func (h *SHostInfo) fetchOsHostname() string {
+	hn, err := os.Hostname()
 	if err != nil {
-		log.Errorf("Fail to set system hostname: %s", err)
+		log.Fatalf("fail to get hostname %s", err)
+		return ""
 	}
+	return hn
 }
 
 func (h *SHostInfo) fetchHostname() string {
@@ -1372,7 +1617,11 @@ func (h *SHostInfo) fetchHostname() string {
 			hn = "host"
 		}
 		masterIp := h.GetMasterIp()
-		return hn + "-" + strings.Replace(masterIp, ".", "-", -1)
+		if len(masterIp) > 0 {
+			return hn + "-" + strings.Replace(masterIp, ".", "-", -1)
+		} else {
+			return hn
+		}
 	}
 }
 
@@ -1383,6 +1632,8 @@ func (h *SHostInfo) getSysInfo() *SSysInfo {
 func (h *SHostInfo) updateOrCreateHost(hostId string) (*api.HostDetails, error) {
 	if len(hostId) == 0 {
 		h.isInit = true
+	} else {
+		h.isInit = false
 	}
 	masterIp := h.GetMasterIp()
 	if len(masterIp) == 0 {
@@ -1393,13 +1644,18 @@ func (h *SHostInfo) updateOrCreateHost(hostId string) (*api.HostDetails, error) 
 	if len(hostId) == 0 {
 		input.GenerateName = h.fetchHostname()
 	}
+	input.Hostname = h.fetchOsHostname()
 	input.AccessIp = masterIp
 	input.AccessMac = h.GetMasterMac()
 	var schema = "http"
 	if options.HostOptions.EnableSsl {
 		schema = "https"
 	}
-	input.ManagerUri = fmt.Sprintf("%s://%s:%d", schema, masterIp, options.HostOptions.Port)
+	if regutils.MatchIP6Addr(masterIp) {
+		input.ManagerUri = fmt.Sprintf("%s://[%s]:%d", schema, masterIp, options.HostOptions.Port)
+	} else {
+		input.ManagerUri = fmt.Sprintf("%s://%s:%d", schema, masterIp, options.HostOptions.Port)
+	}
 	input.CpuCount = &h.Cpu.cpuInfoProc.Count
 	nodeCount := int8(h.Cpu.cpuInfoDmi.Nodes)
 	if sysutils.IsHypervisor() {
@@ -1409,6 +1665,8 @@ func (h *SHostInfo) updateOrCreateHost(hostId string) (*api.HostDetails, error) 
 	input.CpuDesc = h.Cpu.cpuInfoProc.Model
 	input.CpuMicrocode = h.Cpu.cpuInfoProc.Microcode
 	input.CpuArchitecture = h.Cpu.CpuArchitecture
+	maxVcpu := int(h.GetKVMMaxCpus())
+	input.KvmCapMaxVcpu = &maxVcpu
 
 	if h.Cpu.cpuInfoProc.Freq > 0 {
 		input.CpuMhz = &h.Cpu.cpuInfoProc.Freq
@@ -1417,7 +1675,7 @@ func (h *SHostInfo) updateOrCreateHost(hostId string) (*api.HostDetails, error) 
 	input.MemSize = fmt.Sprintf("%d", h.GetMemory())
 	if len(hostId) == 0 {
 		// first time create
-		input.MemReserved = fmt.Sprintf("%d", h.getReservedMemMb())
+		input.MemReserved = fmt.Sprintf("%d", h.GetReservedMemMb())
 	}
 	if h.IsHugepagesEnabled() {
 		pageSizeKb := options.HostOptions.HugepageSizeMb * 1024
@@ -1459,11 +1717,14 @@ func (h *SHostInfo) updateOrCreateHost(hostId string) (*api.HostDetails, error) 
 	)
 	if !h.isInit {
 		res, err = modules.Hosts.Update(h.GetSession(), hostId, jsonutils.Marshal(input))
+		if err != nil {
+			return nil, errors.Wrapf(err, "update host with input: %s", jsonutils.Marshal(input))
+		}
 	} else {
 		res, err = modules.Hosts.CreateInContext(h.GetSession(), jsonutils.Marshal(input), &modules.Zones, h.ZoneId)
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "host create or update with %s", jsonutils.Marshal(input))
+		if err != nil {
+			return nil, errors.Wrapf(err, "create host with zone: %q, input: %s", h.ZoneId, jsonutils.Marshal(input))
+		}
 	}
 
 	hostDetails := api.HostDetails{}
@@ -1529,6 +1790,7 @@ func (h *SHostInfo) parseReservedCpusInfo(hostInfo *api.HostDetails) error {
 		}
 		h.reservedCpusInfo = &reservedCpusInfo
 	}
+	h.guestPinnedCpus = hostInfo.GuestPinnedCpus
 	return nil
 }
 
@@ -1566,7 +1828,7 @@ func (h *SHostInfo) getOSReservedMemMb() int {
 	return reserved
 }
 
-func (h *SHostInfo) getReservedMemMb() int {
+func (h *SHostInfo) GetReservedMemMb() int {
 	if h.IsHugepagesEnabled() {
 		hp, _ := h.Mem.GetHugepages()
 		return h.GetMemory() - int(hp.BytesMb())
@@ -1617,14 +1879,24 @@ func (h *SHostInfo) ensureNicsHostwires(hostInfo *api.HostDetails) error {
 				return errors.Wrap(err, "SetWireId")
 			}
 		} else {
-			log.Warningf("NIC not present %s", jsonutils.Marshal(nic).String())
+			log.Warningf("NIC not present %s, %d", nicInfo.Mac, nicInfo.VlanId)
 		}
 	}
 	return nil
 }
 
 func (h *SHostInfo) isVirtualFunction(nic string) bool {
-	return fileutils2.Exists(path.Join("/sys/class/net", nic, "device", "physfn"))
+	physPortName, err := fileutils2.FileGetContents(path.Join("/sys/class/net", nic, "phys_port_name"))
+	if err != nil {
+		// log.Warningf("failed get nic %s phys_port_name: %s", nic, err)
+		return false
+	}
+	if strings.Contains(physPortName, "vf") {
+		log.Infof("nic %s is virtual function", nic)
+		return true
+	}
+	log.Infof("nic %s is not virtual function", nic)
+	return false
 }
 
 func (h *SHostInfo) uploadNetworkInfo() error {
@@ -1632,13 +1904,15 @@ func (h *SHostInfo) uploadNetworkInfo() error {
 	if err != nil {
 		return errors.Wrap(err, "parse physical nics info")
 	}
-	for _, pnic := range phyNics {
+	for i, pnic := range phyNics {
 		if h.isVirtualFunction(pnic.Dev) {
+			log.Warningf("phyNics %d %#v is a virtual function", i, pnic)
 			continue
 		}
 		nic := h.getMatchNic(pnic.Mac.String(), 1)
 		if nic != nil {
 			// no need to report managed NIC
+			log.Warningf("phyNics %d %#v is managed interface", i, pnic)
 			continue
 		}
 		// only report unmanaged physical NIC
@@ -1650,12 +1924,20 @@ func (h *SHostInfo) uploadNetworkInfo() error {
 
 	var hostDetails *api.HostDetails
 	for _, nic := range h.Nics {
+		log.Infof("host nic: %s", jsonutils.Marshal(nic).String())
+		if nic.IsHostLocal() {
+			continue
+		}
 		if len(nic.WireId) == 0 {
 			// nic info not uploaded yet
 			if len(nic.Wire) == 0 {
 				// no wire defined, find from region
 				kwargs := jsonutils.NewDict()
-				kwargs.Set("ip", jsonutils.NewString(nic.Ip))
+				if len(nic.Ip) > 0 {
+					kwargs.Set("ip", jsonutils.NewString(nic.Ip))
+				} else if len(nic.Ip6) > 0 {
+					kwargs.Set("ip", jsonutils.NewString(nic.Ip6))
+				}
 				kwargs.Set("is_classic", jsonutils.JSONTrue)
 				kwargs.Set("scope", jsonutils.NewString("system"))
 				kwargs.Set("limit", jsonutils.NewInt(0))
@@ -1697,7 +1979,7 @@ func (h *SHostInfo) uploadNetworkInfo() error {
 
 func (h *SHostInfo) doSendPhysicalNicInfo(nic *types.SNicDevInfo) error {
 	log.Infof("upload physical nic: %s(%s)", nic.Dev, nic.Mac)
-	_, err := h.doUploadNicInfoInternal(nic.Dev, nic.Mac.String(), 1, "", "", "", nic.Up != nil && *nic.Up)
+	_, err := h.doUploadNicInfoInternal(nic.Dev, nic.Mac.String(), 1, "", "", "", "", nic.Up != nil && *nic.Up)
 	if err != nil {
 		return errors.Wrap(err, "doUploadNicInfoInternal")
 	}
@@ -1705,15 +1987,15 @@ func (h *SHostInfo) doSendPhysicalNicInfo(nic *types.SNicDevInfo) error {
 }
 
 func (h *SHostInfo) doUploadNicInfo(nic *SNIC) (*api.HostDetails, error) {
-	hostDetails, err := h.doUploadNicInfoInternal(nic.Inter, nic.BridgeDev.GetMac(), nic.BridgeDev.GetVlanId(), nic.Wire, nic.Bridge, nic.Ip, true)
+	hostDetails, err := h.doUploadNicInfoInternal(nic.Inter, nic.BridgeDev.GetMac(), nic.BridgeDev.GetVlanId(), nic.Wire, nic.Bridge, nic.Ip, nic.Ip6, true)
 	if err != nil {
 		return nil, errors.Wrap(err, "doUploadNicInfoInternal")
 	}
 	return hostDetails, nil
 }
 
-func (h *SHostInfo) doUploadNicInfoInternal(ifname, mac string, vlanId int, wire, bridge, ipaddr string, isUp bool) (*api.HostDetails, error) {
-	log.Infof("Upload NIC br:%s if:%s", bridge, ifname)
+func (h *SHostInfo) doUploadNicInfoInternal(ifname, mac string, vlanId int, wire, bridge, ipaddr, ip6addr string, isUp bool) (*api.HostDetails, error) {
+	log.Infof("Upload NIC br:%s if:%s ip:%s ip6:%s", bridge, ifname, ipaddr, ip6addr)
 	content := jsonutils.NewDict()
 	content.Set("mac", jsonutils.NewString(mac))
 	content.Set("vlan_id", jsonutils.NewInt(int64(vlanId)))
@@ -1733,9 +2015,17 @@ func (h *SHostInfo) doUploadNicInfoInternal(ifname, mac string, vlanId int, wire
 		// always try to allocate from reserved pool
 		content.Set("reserve", jsonutils.JSONTrue)
 	}
+	if len(ip6addr) > 0 {
+		content.Set("ip6_addr", jsonutils.NewString(ip6addr))
+		if ip6addr == h.GetMasterIp() {
+			content.Set("nic_type", jsonutils.NewString(string(api.NIC_TYPE_ADMIN)))
+		}
+		// always try to allocate from reserved pool
+		content.Set("reserve", jsonutils.JSONTrue)
+	}
 	res, err := modules.Hosts.PerformAction(h.GetSession(), h.HostId, "add-netif", content)
 	if err != nil {
-		return nil, errors.Wrap(err, "modules.Hosts.PerformAction add-netif")
+		return nil, errors.Wrapf(err, "modules.Hosts.PerformAction add-netif: %s", content.String())
 	}
 
 	return json2HostDetails(res)
@@ -1892,7 +2182,7 @@ func (h *SHostInfo) initStoragesInternal(hoststorages []jsonutils.JSONObject) {
 				}
 				if storagetype == api.STORAGE_LVM {
 					// lvm set storage image cache info
-					storageManager.InitLVMStorageImageCache(storagecacheId, mountPoint)
+					storageManager.InitLVMStorageImageCache(storagecacheId, mountPoint, storage)
 				}
 			} else {
 				// XXX hack: storage type baremetal is a converted host，reserve storage
@@ -1986,73 +2276,115 @@ func (h *SHostInfo) initIsolatedDevices() error {
 	return nil
 }
 
-func (h *SHostInfo) getNicsInterfaces(nics []string) []isolated_device.HostNic {
-	if len(nics) == 0 {
-		return nil
-	}
-	res := []isolated_device.HostNic{}
-	for i := 0; i < len(h.Nics); i++ {
-		if utils.IsInStringArray(h.Nics[i].Inter, nics) {
-			res = append(res, isolated_device.HostNic{h.Nics[i].Bridge, h.Nics[i].Inter, h.Nics[i].WireId})
-		}
-	}
-	return res
-}
-
-func (h *SHostInfo) getNicsOvsOffloadInterfaces(nics []string) ([]isolated_device.HostNic, error) {
+func (h *SHostInfo) getNicsInterfaces(nics []string) ([]isolated_device.HostNic, error) {
 	if len(nics) == 0 {
 		return nil, nil
 	}
 
+	log.Infof("sriov input nics %v", nics)
 	res := []isolated_device.HostNic{}
-	for i := 0; i < len(h.Nics); i++ {
-		if utils.IsInStringArray(h.Nics[i].Inter, nics) {
-			if fileutils2.Exists(fmt.Sprintf("/sys/class/net/%s/bonding/slaves", h.Nics[i].Inter)) {
-				interStr, err := fileutils2.FileGetContents(fmt.Sprintf("/sys/class/net/%s/bonding/slaves", h.Nics[i].Inter))
-				if err != nil {
-					return nil, err
-				}
-				inters := strings.Split(strings.TrimSpace(interStr), " ")
-				for _, inter := range inters {
+	for i := 0; i < len(nics); i++ {
+		found := false
+		for j := 0; j < len(h.Nics); j++ {
+			if nics[i] == h.Nics[j].Inter {
+				if fileutils2.Exists(fmt.Sprintf("/sys/class/net/%s/bonding/slaves", h.Nics[j].Inter)) {
+					interStr, err := fileutils2.FileGetContents(fmt.Sprintf("/sys/class/net/%s/bonding/slaves", h.Nics[j].Inter))
+					if err != nil {
+						return nil, err
+					}
+					inters := strings.Split(strings.TrimSpace(interStr), " ")
+					for _, inter := range inters {
+						res = append(res, isolated_device.HostNic{
+							Bridge:    h.Nics[j].Bridge,
+							Interface: inter,
+							Wire:      h.Nics[j].WireId,
+						})
+					}
+				} else {
 					res = append(res, isolated_device.HostNic{
-						Bridge:    h.Nics[i].Bridge,
-						Interface: inter,
-						Wire:      h.Nics[i].WireId,
+						Bridge:    h.Nics[j].Bridge,
+						Interface: h.Nics[j].Inter,
+						Wire:      h.Nics[j].WireId,
 					})
 				}
-			} else {
-				res = append(res, isolated_device.HostNic{
-					Bridge:    h.Nics[i].Bridge,
-					Interface: h.Nics[i].Inter,
-					Wire:      h.Nics[i].WireId,
-				})
+
+				found = true
 			}
 		}
+		if !found {
+			res = append(res, isolated_device.HostNic{h.Nics[0].Bridge, nics[i], h.Nics[0].WireId})
+		}
 	}
+	log.Infof("sriov output nics %v", res)
 	return res, nil
 }
 
 func (h *SHostInfo) probeSyncIsolatedDevices() (*jsonutils.JSONArray, error) {
-	for _, driver := range []string{"vfio", "vfio_iommu_type1", "vfio-pci"} {
-		if out, err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", driver).Output(); err != nil {
-			log.Errorf("failed probe driver %s: %s %s", driver, out, err)
+	if !h.IsKvmSupport() && !h.IsContainerHost() {
+		// skip probe isolated device on kvm not supported
+		log.Errorf("KVM is not supported, skip probe isolated devices")
+		return nil, nil
+	}
+
+	if h.IsKvmSupport() {
+		for _, driver := range []string{"vfio", "vfio_iommu_type1", "vfio-pci"} {
+			if out, err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", driver).Output(); err != nil {
+				log.Errorf("failed probe driver %s: %s %s", driver, out, err)
+			}
 		}
 	}
 
-	offloadNics, err := h.getNicsOvsOffloadInterfaces(options.HostOptions.OvsOffloadNics)
+	_, err := modules.Hosts.GetSpecific(h.GetSession(), h.HostId, "guest-isolated-devices-initialized", nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "check GuestIsolatedDevicesInitialized")
+	}
+
+	offloadNics, err := h.getNicsInterfaces(options.HostOptions.OvsOffloadNics)
 	if err != nil {
 		return nil, err
 	}
-	sriovNics := h.getNicsInterfaces(options.HostOptions.SRIOVNics)
-	h.IsolatedDeviceMan.ProbePCIDevices(
-		options.HostOptions.DisableGPU, options.HostOptions.DisableUSB, options.HostOptions.DisableCustomDevice,
-		sriovNics, offloadNics, options.HostOptions.PTNVMEConfigs, options.HostOptions.AMDVgpuPFs, options.HostOptions.NVIDIAVgpuPFs,
+	sriovNics, err := h.getNicsInterfaces(options.HostOptions.SRIOVNics)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("==== probeSyncIsolatedDevices: hostType=%s isContainerHost=%v isKvmSupport=%v",
+		options.HostOptions.HostType, h.IsContainerHost(), h.IsKvmSupport())
+	log.Infof("==== probeSyncIsolatedDevices hygon config: enableDCU=%v enableHAMI=%v hySmiPath=%s hyhalPath=%s dtkPath=%s",
+		options.HostOptions.EnableContainerHygonDCU,
+		options.HostOptions.EnableContainerHygonDCUHami,
+		options.HostOptions.HygonHySmiPath,
+		options.HostOptions.HygonHyhalPath,
+		options.HostOptions.HygonDtkPath,
 	)
+	probeOpts := &isolated_device.SIsolatedDeviceProbeOptions{
+		SkipGPUs:                     options.HostOptions.DisableGPU,
+		SkipUSBs:                     options.HostOptions.DisableUSB,
+		SkipCustomDevs:               options.HostOptions.DisableCustomDevice,
+		EnableCudaHAMI:               options.HostOptions.EnableCudaHAMI,
+		EnableCudaMps:                options.HostOptions.EnableCudaMPS,
+		EnableContainerAscendNpu:     options.HostOptions.EnableContainerAscendNPU,
+		EnableContainerAscendNpuHAMI: options.HostOptions.EnableContainerAscendNPUHami,
+		EnableContainerHygonDCU:      options.HostOptions.EnableContainerHygonDCU,
+		EnableContainerHygonDCUHAMI:  options.HostOptions.EnableContainerHygonDCUHami,
+		EnableContainerIluvatarGPU:   options.HostOptions.EnableContainerIluvatarGPU,
+		EnableContainerTHeadPPU:      options.HostOptions.EnableContainerTHeadPPU,
+		EnableContainerKunlunxinXPU:  options.HostOptions.EnableContainerKunlunxinXPU,
+		EnableWhitelist:              options.HostOptions.EnableIsolatedDeviceWhitelist,
+		SriovNics:                    sriovNics,
+		OvsOffloadNics:               offloadNics,
+		NvmePciDisks:                 options.HostOptions.PTNVMEConfigs,
+		AmdVgpuPFs:                   options.HostOptions.AMDVgpuPFs,
+		NvidiaVgpuPFs:                options.HostOptions.NVIDIAVgpuPFs,
+	}
+	h.IsolatedDeviceMan.ProbePCIDevices(probeOpts)
 
 	objs, err := h.getRemoteIsolatedDevices()
 	if err != nil {
 		return nil, errors.Wrap(err, "getRemoteIsolatedDevices")
 	}
+
+	// devs need update
+	var devsNeedUpdate = map[string]bool{}
 	for _, obj := range objs {
 		info := isolated_device.CloudDeviceInfo{}
 		if err := obj.Unmarshal(&info); err != nil {
@@ -2061,22 +2393,53 @@ func (h *SHostInfo) probeSyncIsolatedDevices() (*jsonutils.JSONArray, error) {
 		dev := h.IsolatedDeviceMan.GetDeviceByIdent(info.VendorDeviceId, info.Addr, info.MdevId)
 		if dev != nil {
 			dev.SetDeviceInfo(info)
+			devsNeedUpdate[dev.GetCloudId()] = h.IsolatedDeviceMan.CheckDevIsNeedUpdate(dev, &info)
 		} else {
 			// detach device
 			h.IsolatedDeviceMan.AppendDetachedDevice(&info)
 		}
 	}
+
 	h.IsolatedDeviceMan.StartDetachTask()
 	h.IsolatedDeviceMan.BatchCustomProbe()
 
 	// sync each isolated device found
+	eg := errgroup.Group{}
+	// limits the number of active goroutines in this group to at most
+	eg.SetLimit(16)
+	mtx := sync.Mutex{}
 	updateDevs := jsonutils.NewArray()
-	for _, dev := range h.IsolatedDeviceMan.GetDevices() {
-		if obj, err := isolated_device.SyncDeviceInfo(h.GetSession(), h.HostId, dev); err != nil {
-			return nil, errors.Wrapf(err, "Sync device %s", dev)
-		} else {
-			updateDevs.Add(obj)
-		}
+	devs := h.IsolatedDeviceMan.GetDevices()
+	log.Infof("==== probeSyncIsolatedDevices: local isolated devices count=%d, syncing to region", len(devs))
+	for i := range devs {
+		dev := devs[i]
+		eg.Go(func() error {
+			needUpdate := false
+			if need, ok := devsNeedUpdate[dev.GetCloudId()]; !ok || need {
+				needUpdate = true
+			}
+
+			if obj, err := isolated_device.SyncDeviceInfo(h.GetSession(), h.HostId, dev, needUpdate); err != nil {
+				log.Errorf("Sync deviceInfo %s error: %v", dev.String(), err)
+				return errors.Wrapf(err, "Sync device %s", dev.String())
+			} else {
+				if obj != nil {
+					mtx.Lock()
+					updateDevs.Add(obj)
+					mtx.Unlock()
+					info := isolated_device.CloudDeviceInfo{}
+					if err := obj.Unmarshal(&info); err != nil {
+						return errors.Wrapf(err, "unmarshal isolated device %s to cloud device info", obj)
+					}
+					dev.SetDeviceInfo(info)
+				}
+				return nil
+			}
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 	return updateDevs, nil
 }
@@ -2094,7 +2457,7 @@ func (h *SHostInfo) onSucc() {
 		if err := h.save(); err != nil {
 			panic(err.Error())
 		}
-		h.StartPinger()
+		//h.StartPinger()
 		// if h.registerCallback != nil {
 		// 	h.registerCallback()
 		// }
@@ -2124,13 +2487,6 @@ func (h *SHostInfo) AppendError(content, errType, id, name string) {
 
 func (h *SHostInfo) RemoveErrorType(errType string) {
 	delete(h.SysError, errType)
-}
-
-func (h *SHostInfo) StartPinger() {
-	h.pinger = NewHostPingTask(options.HostOptions.PingRegionInterval)
-	if h.pinger != nil {
-		go h.pinger.Start()
-	}
 }
 
 func (h *SHostInfo) save() error {
@@ -2195,9 +2551,7 @@ func (h *SHostInfo) Keyword() string {
 func (h *SHostInfo) stop() {
 	log.Infof("Host Info stop ...")
 	h.unregister()
-	if h.pinger != nil {
-		h.pinger.Stop()
-	}
+
 	for _, nic := range h.Nics {
 		nic.ExitCleanup()
 	}
@@ -2240,7 +2594,7 @@ func (h *SHostInfo) OnCatalogChanged(catalog mcclient.KeystoneServiceCatalogV3) 
 
 	if options.HostOptions.ManageNtpConfiguration {
 		ntpd := system_service.GetService("ntpd")
-		urls, _ := s.GetServiceURLs("ntp", defaultEndpointType)
+		urls, _ := s.GetServiceURLs("ntp", defaultEndpointType, httputils.POST)
 		if len(urls) > 0 {
 			log.Infof("Get Ntp urls: %v", urls)
 		} else {
@@ -2258,6 +2612,7 @@ func (h *SHostInfo) OnCatalogChanged(catalog mcclient.KeystoneServiceCatalogV3) 
 	telegraf := system_service.GetService("telegraf")
 	conf := map[string]interface{}{}
 	conf["hostname"] = h.getHostname()
+	conf["server_path"] = options.HostOptions.ServersPath
 	conf["tags"] = map[string]string{
 		"id":                                  h.HostId,
 		"host_id":                             h.HostId,
@@ -2272,18 +2627,48 @@ func (h *SHostInfo) OnCatalogChanged(catalog mcclient.KeystoneServiceCatalogV3) 
 		hostconsts.TELEGRAF_TAG_KEY_BRAND:     hostconsts.TELEGRAF_TAG_ONECLOUD_BRAND,
 		hostconsts.TELEGRAF_TAG_KEY_RES_TYPE:  hostconsts.TELEGRAF_TAG_ONECLOUD_RES_TYPE,
 		hostconsts.TELEGRAF_TAG_KEY_HOST_TYPE: hostconsts.TELEGRAF_TAG_ONECLOUD_HOST_TYPE_HOST,
+
+		hostconsts.TELEGRAF_TAG_KEY_HYPERVISOR: options.HostOptions.HostType,
 	}
 	conf["nics"] = h.getNicsTelegrafConf()
-	urls, _ := s.GetServiceURLs("kafka", defaultEndpointType)
+	urls, _ := s.GetServiceURLs("kafka", defaultEndpointType, httputils.POST)
 	if len(urls) > 0 {
-		conf["kafka"] = map[string]interface{}{"brokers": urls, "topic": "telegraf"}
+		kafkaConf := map[string]interface{}{
+			"brokers": urls,
+			"topic":   options.HostOptions.TelegrafKafkaOutputTopic,
+		}
+		if len(options.HostOptions.TelegrafKafkaOutputSaslUsername) > 0 {
+			kafkaConf["sasl_username"] = options.HostOptions.TelegrafKafkaOutputSaslUsername
+		}
+		if len(options.HostOptions.TelegrafKafkaOutputSaslPassword) > 0 {
+			kafkaConf["sasl_password"] = options.HostOptions.TelegrafKafkaOutputSaslPassword
+		}
+		if len(options.HostOptions.TelegrafKafkaOutputSaslMechanism) > 0 {
+			kafkaConf["sasl_mechanism"] = options.HostOptions.TelegrafKafkaOutputSaslMechanism
+		}
+		conf["kafka"] = kafkaConf
 	}
-	urls, _ = s.GetServiceURLs("influxdb", defaultEndpointType)
+
+	urls, _ = s.GetServiceURLs("opentsdb", defaultEndpointType, httputils.POST)
 	if len(urls) > 0 {
-		conf["influxdb"] = map[string]interface{}{"url": urls, "database": "telegraf"}
+		conf["opentsdb"] = map[string]interface{}{
+			"url": urls[0],
+		}
+	}
+
+	if h.IsContainerHost() {
+		h.injectTelegrafDeviceConfig(conf)
+	}
+
+	tsdb, _ := tsdb.GetDefaultServiceSource(s, defaultEndpointType)
+	if tsdb != nil && len(tsdb.URLs) > 0 {
+		conf[apis.SERVICE_TYPE_INFLUXDB] = map[string]interface{}{
+			"url":       tsdb.URLs,
+			"database":  "telegraf",
+			"tsdb_type": tsdb.Type,
+		}
 	}
 	if !reflect.DeepEqual(telegraf.GetConf(), conf) || (!strings.Contains(svcs, "telegraf") && !telegraf.IsActive()) {
-		log.Debugf("telegraf config: %s", conf)
 		telegraf.SetConf(conf)
 		if !strings.Contains(svcs, "telegraf") {
 			telegraf.BgReload(conf)
@@ -2302,6 +2687,181 @@ func (h *SHostInfo) OnCatalogChanged(catalog mcclient.KeystoneServiceCatalogV3) 
 			fluentbit.BgReload(conf)
 		}
 	}*/
+}
+
+func resolveSmiBinPath(binPath string) string {
+	return resolveSmiBinPathWithReadlink(binPath, procutils.RemoteReadlink)
+}
+
+func resolveSmiBinPathWithReadlink(binPath string, readlink func(string) (string, error)) string {
+	if binPath == "" {
+		return binPath
+	}
+	resolved, err := readlink(binPath)
+	if err != nil || resolved == "" {
+		log.Warningf("failed to resolve smi binary path %q: %v", binPath, err)
+		return binPath
+	}
+	return resolved
+}
+
+func (h *SHostInfo) injectTelegrafDeviceConfig(conf map[string]interface{}) {
+	devs := h.GetIsolatedDeviceManager().GetDevices()
+	if len(devs) == 0 {
+		return
+	}
+	// group dev
+	hasNetint := false
+	hasVasmi := false
+	hasHygon := false
+	hasIluvatar := false
+	hasTHead := false
+	hasKunlunxin := false
+	hasNvidiasmi := false
+	hasNpusmi := false
+	for _, dev := range devs {
+		vendorId := strings.Split(dev.GetVendorDeviceId(), ":")[0]
+		if vendorId == api.HYGON_VENDOR_ID {
+			hasHygon = true
+		}
+		if vendorId == api.ILUVATAR_VENDOR_ID {
+			hasIluvatar = true
+		}
+		if vendorId == api.THEAD_VENDOR_ID {
+			hasTHead = true
+		}
+		if vendorId == api.KUNLUNXIN_VENDOR_ID {
+			hasKunlunxin = true
+		}
+		if !utils.IsInStringArray(dev.GetSharingMode(), api.VIRTUAL_SHARING_MODES) {
+			continue
+		}
+		if dev.GetDeviceType() == api.NETINT_TYPE {
+			hasNetint = true
+			continue
+		}
+
+		switch vendorId {
+		case api.AMD_VENDOR_ID:
+			confMap, ok := conf[system_service.TELEGRAF_INPUT_RADEONTOP].(map[string]interface{})
+			if !ok {
+				conf[system_service.TELEGRAF_INPUT_RADEONTOP] = map[string]interface{}{
+					system_service.TELEGRAF_INPUT_CONF_BIN_PATH:       "/usr/bin/radeontop",
+					system_service.TELEGRAF_INPUT_RADEONTOP_DEV_PATHS: []string{dev.GetDevicePath()},
+				}
+			} else {
+				devPaths := confMap[system_service.TELEGRAF_INPUT_RADEONTOP_DEV_PATHS].([]string)
+				if !utils.IsInStringArray(dev.GetDevicePath(), devPaths) {
+					devPaths = append(devPaths, dev.GetDevicePath())
+					confMap[system_service.TELEGRAF_INPUT_RADEONTOP_DEV_PATHS] = devPaths
+				}
+			}
+		case api.VASTAITECH_VENDOR_ID:
+			hasVasmi = true
+		case api.NVIDIA_VENDOR_ID:
+			hasNvidiasmi = true
+		case api.ASCEND_VENDOR_ID:
+			hasNpusmi = true
+		}
+	}
+	if hasNetint {
+		conf[system_service.TELEGRAF_INPUT_NETDEV] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: "/usr/bin/ni_rsrc_mon",
+		}
+	}
+	if hasVasmi {
+		conf[system_service.TELEGRAF_INPUT_VASMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: "/usr/bin/vasmi",
+		}
+	}
+	if hasHygon {
+		conf[system_service.TELEGRAF_INPUT_HYSMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: options.HostOptions.HygonHySmiPath,
+		}
+	}
+	if hasIluvatar {
+		defaultCorexHome := "/usr/local/corex-4.4.0"
+		ixsmiPath := options.HostOptions.IluvatarIxsmiPath
+		if ixsmiPath == "" {
+			ixsmiPath = "/usr/local/bin/ixsmi"
+		}
+		resolvedPath := resolveSmiBinPath(ixsmiPath)
+		corexHome := defaultCorexHome
+		if resolvedPath != ixsmiPath {
+			corexHome = path.Dir(path.Dir(resolvedPath))
+		}
+		conf[system_service.TELEGRAF_INPUT_IXSMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: resolvedPath,
+			system_service.TELEGRAF_INPUT_CONF_LIB_PATH: path.Join(corexHome, "lib64"),
+		}
+	}
+	if hasTHead {
+		sdkHome := options.HostOptions.THeadPpuSdkHome
+		if sdkHome == "" {
+			sdkHome = "/usr/local/PPU_SDK"
+		}
+		libPath := path.Join(sdkHome, "lib64")
+		if !fileutils2.Exists(libPath) && fileutils2.Exists(path.Join(sdkHome, "lib")) {
+			libPath = path.Join(sdkHome, "lib")
+		}
+		smiPath := options.HostOptions.THeadPpuSmiPath
+		if smiPath == "" {
+			smiPath = "/usr/local/bin/ppu-smi"
+		}
+		conf[system_service.TELEGRAF_INPUT_PPUSMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: smiPath,
+			system_service.TELEGRAF_INPUT_CONF_LIB_PATH: libPath,
+		}
+	}
+	if hasKunlunxin {
+		xreHome := options.HostOptions.KunlunxinXreHome
+		if xreHome == "" {
+			xreHome = defaultKunlunxinXreHome
+		}
+		smiPath := options.HostOptions.KunlunxinXpuSmiPath
+		if smiPath == "" {
+			smiPath = defaultKunlunxinXpuSmiPath
+		}
+		conf[system_service.TELEGRAF_INPUT_XPUSMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: smiPath,
+			system_service.TELEGRAF_INPUT_CONF_LIB_PATH: resolveKunlunxinXpuLibDir(xreHome, fileutils2.Exists),
+		}
+	}
+	if hasNvidiasmi {
+		conf[system_service.TELEGRAF_INPUT_NVIDIASMI] = struct{}{}
+	}
+	if hasNpusmi {
+		conf[system_service.TELEGRAF_INPUT_NPUSMI] = map[string]interface{}{
+			system_service.TELEGRAF_INPUT_CONF_BIN_PATH: "/usr/local/bin/npu-smi",
+		}
+	}
+}
+
+const (
+	defaultKunlunxinXreHome    = "/usr/local/xpu"
+	defaultKunlunxinXpuSmiPath = "/usr/local/bin/xpu-smi"
+)
+
+// resolveKunlunxinXpuLibDir returns the directory holding the Kunlunxin driver
+// libraries, mirroring container_device.kunlunxinXpuLibDir.
+func resolveKunlunxinXpuLibDir(xreHome string, exists func(string) bool) string {
+	if xreHome == "" {
+		xreHome = defaultKunlunxinXreHome
+	}
+	candidates := []string{
+		path.Join(xreHome, "so"),
+		path.Join(xreHome, "lib64"),
+		path.Join(xreHome, "lib"),
+	}
+	if exists == nil {
+		return candidates[0]
+	}
+	for _, candidate := range candidates {
+		if exists(candidate) {
+			return candidate
+		}
+	}
+	return candidates[0]
 }
 
 func (h *SHostInfo) getNicsTelegrafConf() []map[string]interface{} {
@@ -2332,11 +2892,19 @@ func (h *SHostInfo) getNicsTelegrafConf() []map[string]interface{} {
 	return ret
 }
 
-func (h *SHostInfo) getHostname() string {
-	if len(h.FullName) > 0 {
-		return h.FullName
+func (h *SHostInfo) ReportHostDmesg(entries []api.SKmsgEntry) error {
+	data := api.SHostReportDmesgInput{
+		Entries: entries,
 	}
-	return h.fetchHostname()
+	_, err := modules.Hosts.PerformAction(h.GetSession(), h.HostId, "report-dmesg", jsonutils.Marshal(data))
+	return err
+}
+
+func (h *SHostInfo) getHostname() string {
+	if h.FullName == "" {
+		h.FullName = h.fetchHostname()
+	}
+	return h.FullName
 }
 
 func (h *SHostInfo) GetCpuArchitecture() string {
@@ -2351,6 +2919,10 @@ func (h *SHostInfo) IsAarch64() bool {
 	return h.GetCpuArchitecture() == apis.OS_ARCH_AARCH64
 }
 
+func (h *SHostInfo) IsRiscv64() bool {
+	return h.GetCpuArchitecture() == apis.OS_ARCH_RISCV64
+}
+
 func (h *SHostInfo) IsX8664() bool {
 	return h.GetCpuArchitecture() == apis.OS_ARCH_X86_64
 }
@@ -2363,12 +2935,102 @@ func (h *SHostInfo) GetHostTopology() *hostapi.HostTopology {
 	return h.sysinfo.Topology
 }
 
-func (h *SHostInfo) GetReservedCpusInfo() *cpuset.CPUSet {
+func (h *SHostInfo) GetReservedCpusInfo() (*cpuset.CPUSet, *cpuset.CPUSet) {
 	if h.reservedCpusInfo == nil {
-		return nil
+		return nil, nil
 	}
 	cpus, _ := cpuset.Parse(h.reservedCpusInfo.Cpus)
-	return &cpus
+
+	var guestPinnedCpus *cpuset.CPUSet
+	if len(h.guestPinnedCpus) > 0 {
+		guestPinnedCpuSet := cpuset.NewCPUSet(h.guestPinnedCpus...)
+		guestPinnedCpus = &guestPinnedCpuSet
+	}
+	return &cpus, guestPinnedCpus
+}
+
+func (h *SHostInfo) IsSchedulerNumaAllocateEnabled() bool {
+	return h.enableNumaAllocate
+}
+
+func (h *SHostInfo) IsContainerdRuning() bool {
+	return false
+}
+
+func (h *SHostInfo) IsContainerHost() bool {
+	//return options.HostOptions.EnableContainerRuntime || options.HostOptions.HostType == api.HOST_TYPE_CONTAINER
+	return options.HostOptions.HostType == api.HOST_TYPE_CONTAINER
+}
+
+func (h *SHostInfo) GetContainerRuntimeEndpoint() string {
+	return options.HostOptions.ContainerRuntimeEndpoint
+}
+
+func (h *SHostInfo) CpuCmtBound() float32 {
+	return h.cpuCmtBound
+}
+
+func (h *SHostInfo) MemCmtBound() float32 {
+	return h.memCmtBound
+}
+
+func (h *SHostInfo) getProcessesPids(processesPrefix []string) (map[string]string, error) {
+	files, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	res := map[string]string{}
+	re := regexp.MustCompile(`^\d+$`)
+	for _, f := range files {
+		if re.MatchString(f.Name()) {
+			cmdline, err := fileutils2.FileGetContents(path.Join("/proc", f.Name(), "cmdline"))
+			if err != nil {
+				log.Errorf("failed read proc %s cmdline: %s", f.Name(), err)
+				continue
+			}
+			segs := strings.Split(cmdline, "\x00")
+			if utils.IsInStringArray(segs[0], processesPrefix) {
+				res[segs[0]] = f.Name()
+				// log.Debugf("getProcessesPids append %s %s", segs[0], f.Name())
+			}
+		}
+	}
+	return res, nil
+}
+
+func (h *SHostInfo) startBindReservedCpus(processesPrefix []string) {
+	for {
+		processPids, err := h.getProcessesPids(processesPrefix)
+		if err != nil {
+			log.Errorf("getProcessesPids %s", err)
+		} else {
+			for process, pid := range processPids {
+				cgroupName := path.Join(hostconsts.HOST_RESERVED_CPUSET, strings.ReplaceAll(process, "/", "_"))
+				task := cgrouputils.NewCGroupCPUSetTask(pid, cgroupName, "", "")
+				if !task.Configure() {
+					log.Errorf("process failed init reserved cpuset %s %s", process, pid)
+					continue
+				}
+				if !task.CustomConfig(cgrouputils.CPUSET_CLONE_CHILDREN, "1") {
+					log.Errorf("process failed set host reserved cpuset clone children %s %s", process, pid)
+					continue
+				}
+				if !task.SetTask() {
+					log.Errorf("process %s %s failed set cgroup cpuset", process, pid)
+					continue
+				}
+			}
+		}
+		time.Sleep(time.Second * 100)
+	}
+}
+
+func (h *SHostInfo) OnGuestLoadingComplete() {
+	for _, nic := range h.Nics {
+		if nic.dhcpServer6 != nil {
+			nic.dhcpServer6.InitRAQueue()
+		}
+	}
 }
 
 func NewHostInfo() (*SHostInfo, error) {
@@ -2383,6 +3045,8 @@ func NewHostInfo() (*SHostInfo, error) {
 
 	if res.IsAarch64() {
 		qemutils.UseAarch64()
+	} else if res.IsRiscv64() {
+		qemutils.UseRiscv64()
 	} else if !res.IsX8664() {
 		return nil, fmt.Errorf("unsupport cpu architecture %s", cpu.CpuArchitecture)
 	}

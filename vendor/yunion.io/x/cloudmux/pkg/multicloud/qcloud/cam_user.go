@@ -17,9 +17,9 @@ package qcloud
 import (
 	"fmt"
 
-	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
+	api "yunion.io/x/cloudmux/pkg/apis/cloudid"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
@@ -49,7 +49,7 @@ func (self *SUser) GetInviteUrl() string {
 	return ""
 }
 
-func (user *SUser) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (user *SUser) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	policies := []SPolicy{}
 	offset := 1
 	for {
@@ -65,51 +65,17 @@ func (user *SUser) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, erro
 	}
 	ret := []cloudprovider.ICloudpolicy{}
 	for i := range policies {
-		if policies[i].PolicyType == "QCS" || policies[i].PolicyType == "" {
-			policies[i].client = user.client
-			ret = append(ret, &policies[i])
-		}
+		policies[i].client = user.client
+		ret = append(ret, &policies[i])
 	}
 	return ret, nil
 }
 
-func (user *SUser) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	policies := []SPolicy{}
-	offset := 1
-	for {
-		part, total, err := user.client.ListAttachedUserPolicies(user.GetGlobalId(), offset, 50)
-		if err != nil {
-			return nil, errors.Wrap(err, "GetClouduserPolicy")
-		}
-		policies = append(policies, part...)
-		if len(policies) >= total {
-			break
-		}
-		offset += 1
-	}
-	ret := []cloudprovider.ICloudpolicy{}
-	for i := range policies {
-		if policies[i].PolicyType == "User" {
-			policies[i].client = user.client
-			ret = append(ret, &policies[i])
-		}
-	}
-	return ret, nil
-}
-
-func (user *SUser) AttachSystemPolicy(policyId string) error {
+func (user *SUser) AttachPolicy(policyId string, policyType api.TPolicyType) error {
 	return user.client.AttachUserPolicy(user.GetGlobalId(), policyId)
 }
 
-func (user *SUser) AttachCustomPolicy(policyId string) error {
-	return user.client.AttachUserPolicy(user.GetGlobalId(), policyId)
-}
-
-func (user *SUser) DetachSystemPolicy(policyId string) error {
-	return user.client.DetachUserPolicy(user.GetGlobalId(), policyId)
-}
-
-func (user *SUser) DetachCustomPolicy(policyId string) error {
+func (user *SUser) DetachPolicy(policyId string, policyType api.TPolicyType) error {
 	return user.client.DetachUserPolicy(user.GetGlobalId(), policyId)
 }
 
@@ -117,12 +83,29 @@ func (user *SUser) IsConsoleLogin() bool {
 	return user.ConsoleLogin == 1
 }
 
+func (user *SUser) SetDisable() error {
+	login := false
+	return user.client.UpdateUser(user.Name, "", &login, nil)
+}
+
+func (user *SUser) SetEnable(opts *cloudprovider.SClouduserEnableOptions) error {
+	login := true
+	err := user.client.UpdateUser(user.Name, opts.Password, &login, &opts.PasswordResetRequired)
+	if err != nil {
+		return errors.Wrapf(err, "UpdateUser")
+	}
+	if opts.EnableMfa {
+		return user.client.EnableUserMfa(fmt.Sprintf("%d", user.Uin))
+	}
+	return nil
+}
+
 func (user *SUser) Delete() error {
 	return user.client.DeleteUser(user.Name)
 }
 
 func (user *SUser) ResetPassword(password string) error {
-	return user.client.UpdateUser(user.Name, password)
+	return user.client.UpdateUser(user.Name, password, nil, nil)
 }
 
 func (user *SUser) GetICloudgroups() ([]cloudprovider.ICloudgroup, error) {
@@ -250,12 +233,6 @@ func (self *SQcloudClient) CreateIClouduser(conf *cloudprovider.SClouduserCreate
 	if err != nil {
 		return nil, errors.Wrap(err, "CreateClouduser")
 	}
-	for _, policyId := range conf.ExternalPolicyIds {
-		err = user.client.AttachUserPolicy(fmt.Sprintf("%d", user.Uin), policyId)
-		if err != nil {
-			log.Errorf("attach policy %s for user %s error: %v", policyId, conf.Name, err)
-		}
-	}
 	return user, nil
 }
 
@@ -283,11 +260,33 @@ func (self *SQcloudClient) AddUser(name, password, desc string, consoleLogin boo
 	return user, nil
 }
 
-func (self *SQcloudClient) UpdateUser(name, password string) error {
+func (self *SQcloudClient) EnableUserMfa(uin string) error {
 	params := map[string]string{
-		"Name":         name,
-		"ConsoleLogin": "1",
-		"Password":     password,
+		"OpUin":            uin,
+		"LoginFlag.Stoken": "1",
+	}
+	_, err := self.camRequest("SetMfaFlag", params)
+	return err
+}
+
+func (self *SQcloudClient) UpdateUser(name, password string, login, reset *bool) error {
+	params := map[string]string{
+		"Name": name,
+	}
+	if len(password) > 0 {
+		params["Password"] = password
+	}
+	if login != nil {
+		params["ConsoleLogin"] = "0"
+		if *login {
+			params["ConsoleLogin"] = "1"
+		}
+	}
+	if reset != nil {
+		params["NeedResetPassword"] = "0"
+		if *reset {
+			params["NeedResetPassword"] = "1"
+		}
 	}
 	_, err := self.camRequest("UpdateUser", params)
 	if err != nil {

@@ -36,6 +36,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/ctx"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -199,7 +200,7 @@ func (manager *SOpsLogManager) LogEvent(model IModel, action string, notes inter
 }
 
 func (opslog *SOpsLog) Run() {
-	err := OpsLog.TableSpec().Insert(context.Background(), opslog)
+	err := OpsLog.TableSpec().Insert(ctx.CtxWithTime(), opslog)
 	if err != nil {
 		log.Errorf("fail to insert opslog: %s", err)
 	}
@@ -332,6 +333,7 @@ func (manager *SOpsLogManager) ListItemFilter(
 			q = q.Filter(sqlchemy.In(q.Field("action"), input.Actions))
 		}
 	}
+
 	//if !IsAdminAllowList(userCred, manager) {
 	// 	q = q.Filter(sqlchemy.OR(
 	//		sqlchemy.Equals(q.Field("owner_tenant_id"), manager.GetOwnerId(userCred)),
@@ -362,8 +364,11 @@ func (manager *SOpsLogManager) LogSyncUpdate(m IModel, uds sqlchemy.UpdateDiffs,
 	}
 }
 
-func (self *SOpsLogManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (self *SOpsLogManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId != nil {
+		if scope == "" || scope == rbacscope.ScopeNone {
+			scope = rbacscope.ScopeProject
+		}
 		switch scope {
 		case rbacscope.ScopeUser:
 			if len(ownerId.GetUserId()) > 0 {

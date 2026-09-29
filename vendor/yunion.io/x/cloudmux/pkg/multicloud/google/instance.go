@@ -28,7 +28,7 @@ import (
 	"yunion.io/x/pkg/util/encode"
 	"yunion.io/x/pkg/util/fileutils"
 	"yunion.io/x/pkg/util/imagetools"
-	"yunion.io/x/pkg/util/pinyinutils"
+	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/pkg/utils"
 
 	billing_api "yunion.io/x/cloudmux/pkg/apis/billing"
@@ -133,7 +133,7 @@ func (region *SRegion) GetInstance(id string) (*SInstance, error) {
 }
 
 func (instance *SInstance) GetHostname() string {
-	return instance.GetName()
+	return ""
 }
 
 func (instance *SInstance) fetchMachineType() error {
@@ -164,7 +164,7 @@ func (self *SInstance) Refresh() error {
 	return nil
 }
 
-//PROVISIONING, STAGING, RUNNING, STOPPING, STOPPED, SUSPENDING, SUSPENDED, and TERMINATED.
+// PROVISIONING, STAGING, RUNNING, STOPPING, STOPPED, SUSPENDING, SUSPENDED, and TERMINATED.
 func (instance *SInstance) GetStatus() string {
 	switch instance.Status {
 	case "PROVISIONING":
@@ -363,108 +363,13 @@ func (instance *SInstance) GetInstanceType() string {
 	return instance.machineType
 }
 
-func (instance *SInstance) AssignSecurityGroup(id string) error {
-	for _, secgrpType := range []string{SECGROUP_TYPE_TAG, SECGROUP_TYPE_SERVICE_ACCOUNT} {
-		if strings.Contains(id, fmt.Sprintf("/%s/", secgrpType)) {
-			idx := strings.LastIndex(id, "/") + 1
-			if idx <= 0 {
-				return fmt.Errorf("invalid secgroup %s with id %s", secgrpType, id)
-			}
-			secgroup := id[idx:]
-			switch secgrpType {
-			case SECGROUP_TYPE_TAG:
-				tag := strings.ToLower(secgroup)
-				if !utils.IsInStringArray(tag, instance.Tags.Items) {
-					instance.Tags.Items = append(instance.Tags.Items, tag)
-					return instance.host.zone.region.SetResourceTags(instance.SelfLink, instance.Tags)
-				}
-			case SECGROUP_TYPE_SERVICE_ACCOUNT:
-				if len(instance.ServiceAccounts) > 0 {
-					return fmt.Errorf("instance %s has already set serviceAccount %s", instance.Name, instance.ServiceAccounts[0].Email)
-				}
-				return instance.host.zone.region.SetServiceAccount(instance.SelfLink, secgroup)
-			}
-		}
-	}
-	return fmt.Errorf("unknown secgroup type %s", id)
-}
-
 func (instance *SInstance) GetSecurityGroupIds() ([]string, error) {
-	secgroupIds := []string{}
-	isecgroups := []cloudprovider.ICloudSecurityGroup{}
-	for _, networkinterface := range instance.NetworkInterfaces {
-		vpc := SVpc{region: instance.host.zone.region}
-		err := instance.host.zone.region.GetBySelfId(networkinterface.Subnetwork, &vpc)
-		if err != nil {
-			return nil, errors.Wrap(err, "GetGlobalNetwork")
-		}
-		_isecgroups, err := vpc.GetISecurityGroups()
-		if err != nil {
-			return nil, errors.Wrap(err, "vpc.GetISecurityGroups")
-		}
-		isecgroups = append(isecgroups, _isecgroups...)
-		for _, isecgroup := range _isecgroups {
-			if len(instance.ServiceAccounts) > 0 && isecgroup.GetName() == instance.ServiceAccounts[0].Email {
-				secgroupIds = append(secgroupIds, isecgroup.GetGlobalId())
-			}
-			gvpcInfo := strings.Split(vpc.Network, "/")
-			gvpcName := gvpcInfo[len(gvpcInfo)-1]
-			if isecgroup.GetName() == gvpcName && !strings.Contains(isecgroup.GetGlobalId(), fmt.Sprintf("/%s/", SECGROUP_TYPE_TAG)) {
-				secgroupIds = append(secgroupIds, isecgroup.GetGlobalId())
-			}
-		}
-	}
-	if len(instance.NetworkInterfaces) == 1 {
-		for _, secgroup := range isecgroups {
-			if utils.IsInStringArray(secgroup.GetName(), instance.Tags.Items) && strings.Contains(secgroup.GetGlobalId(), fmt.Sprintf("/%s/", SECGROUP_TYPE_TAG)) {
-				secgroupIds = append(secgroupIds, secgroup.GetGlobalId())
-			}
-		}
-	}
-	return secgroupIds, nil
+	return instance.Tags.Items, nil
 }
 
 func (instance *SInstance) SetSecurityGroups(ids []string) error {
-	secgroups := map[string][]string{}
-	for _, id := range ids {
-		for _, secgrpType := range []string{SECGROUP_TYPE_TAG, SECGROUP_TYPE_SERVICE_ACCOUNT} {
-			if strings.Contains(id, fmt.Sprintf("/%s/", secgrpType)) {
-				idx := strings.LastIndex(id, "/") + 1
-				if idx <= 0 {
-					return fmt.Errorf("invalid secgroup %s with id %s", secgrpType, id)
-				}
-				secgroup := id[idx:]
-				if len(secgroup) == 0 {
-					return fmt.Errorf("invalid secgroup %s with id %s", secgrpType, id)
-				}
-				if _, ok := secgroups[secgrpType]; !ok {
-					secgroups[secgrpType] = []string{}
-				}
-				if !utils.IsInStringArray(secgroup, secgroups[secgrpType]) {
-					secgroups[secgrpType] = append(secgroups[secgrpType], secgroup)
-				}
-			}
-		}
-	}
-	if tags, ok := secgroups[SECGROUP_TYPE_TAG]; ok && len(tags) > 0 {
-		for _, tag := range tags {
-			tag = strings.ToLower(tag)
-			if !utils.IsInStringArray(tag, instance.Tags.Items) {
-				instance.Tags.Items = append(instance.Tags.Items, tag)
-			}
-		}
-		err := instance.host.zone.region.SetResourceTags(instance.SelfLink, instance.Tags)
-		if err != nil {
-			return errors.Wrap(err, "SetTags")
-		}
-	}
-	if serviceAccounts, ok := secgroups[SECGROUP_TYPE_SERVICE_ACCOUNT]; ok && len(serviceAccounts) > 0 {
-		if len(serviceAccounts) > 1 {
-			return fmt.Errorf("can not set multi service account for google instance")
-		}
-		return instance.host.zone.region.SetServiceAccount(instance.SelfLink, serviceAccounts[0])
-	}
-	return nil
+	instance.Tags.Items = ids
+	return instance.host.zone.region.SetResourceTags(instance.SelfLink, instance.Tags)
 }
 
 func (instance *SInstance) GetHypervisor() string {
@@ -480,6 +385,12 @@ func (instance *SInstance) StopVM(ctx context.Context, opts *cloudprovider.Serve
 }
 
 func (instance *SInstance) DeleteVM(ctx context.Context) error {
+	if instance.DeletionProtection {
+		err := instance.host.zone.region.DisableDeletionProtection(instance.SelfLink)
+		if err != nil {
+			return errors.Wrapf(err, "DisableDeletionProtection(%s)", instance.Name)
+		}
+	}
 	return instance.host.zone.region.Delete(instance.SelfLink)
 }
 
@@ -503,24 +414,38 @@ func (instance *SInstance) UpdateUserData(userData string) error {
 	return instance.host.zone.region.SetMetadata(instance.SelfLink, instance.Metadata)
 }
 
-func (instance *SInstance) RebuildRoot(ctx context.Context, desc *cloudprovider.SManagedVMRebuildRootConfig) (string, error) {
-	diskId, err := instance.host.zone.region.RebuildRoot(instance.Id, desc.ImageId, desc.SysSizeGB)
+func (instance *SInstance) RebuildRoot(ctx context.Context, opts *cloudprovider.SManagedVMRebuildRootConfig) (string, error) {
+	diskId, err := instance.host.zone.region.RebuildRoot(instance.Id, opts.ImageId, opts.SysSizeGB)
 	if err != nil {
 		return "", errors.Wrap(err, "region.RebuildRoot")
 	}
-	return diskId, instance.DeployVM(ctx, "", desc.Account, desc.Password, desc.PublicKey, false, "")
+	deployOpts := &cloudprovider.SInstanceDeployOptions{
+		Username:  opts.Account,
+		Password:  opts.Password,
+		UserData:  opts.UserData,
+		PublicKey: opts.PublicKey,
+	}
+	return diskId, instance.DeployVM(ctx, deployOpts)
 }
 
-func (instance *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
-	conf := cloudinit.SCloudConfig{}
-	user := cloudinit.NewUser(username)
-	if len(password) > 0 {
-		user.Password(password)
+func (instance *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
+	conf := cloudinit.SCloudConfig{
+		SshPwauth: cloudinit.SSH_PASSWORD_AUTH_ON,
 	}
-	if len(publicKey) > 0 {
-		user.SshKey(publicKey)
+	if len(opts.UserData) > 0 {
+		config, err := cloudinit.ParseUserData(opts.UserData)
+		if err == nil {
+			conf.Merge(config)
+		}
 	}
-	if len(password) > 0 || len(publicKey) > 0 {
+	user := cloudinit.NewUser(opts.Username)
+	if len(opts.Password) > 0 {
+		user.Password(opts.Password)
+	}
+	if len(opts.PublicKey) > 0 {
+		user.SshKey(opts.PublicKey)
+	}
+	if len(opts.Password) > 0 || len(opts.PublicKey) > 0 {
 		conf.MergeUser(user)
 		items := []SMetadataItem{}
 		instance.Refresh()
@@ -531,6 +456,18 @@ func (instance *SInstance) DeployVM(ctx context.Context, name string, username s
 		}
 		items = append(items, SMetadataItem{Key: METADATA_STARTUP_SCRIPT_POWER_SHELL, Value: conf.UserDataPowerShell()})
 		items = append(items, SMetadataItem{Key: METADATA_STARTUP_SCRIPT, Value: conf.UserDataScript()})
+		instance.Metadata.Items = items
+		return instance.host.zone.region.SetMetadata(instance.SelfLink, instance.Metadata)
+	}
+	if opts.DeleteKeypair {
+		items := []SMetadataItem{}
+		items = append(items, SMetadataItem{Key: METADATA_STARTUP_SCRIPT, Value: cloudinit.CLOUD_SHELL_HEADER + "\nrm -rf /root/.ssh/authorized_keys"})
+		instance.Refresh()
+		for _, item := range instance.Metadata.Items {
+			if item.Key != METADATA_STARTUP_SCRIPT {
+				items = append(items, item)
+			}
+		}
 		instance.Metadata.Items = items
 		return instance.host.zone.region.SetMetadata(instance.SelfLink, instance.Metadata)
 	}
@@ -577,7 +514,9 @@ func getDiskInfo(disk string) (cloudprovider.SDiskInfo, error) {
 	result := cloudprovider.SDiskInfo{}
 	diskInfo := strings.Split(disk, ":")
 	for _, d := range diskInfo {
-		if utils.IsInStringArray(d, []string{api.STORAGE_GOOGLE_PD_STANDARD, api.STORAGE_GOOGLE_PD_SSD, api.STORAGE_GOOGLE_LOCAL_SSD, api.STORAGE_GOOGLE_PD_BALANCED}) {
+		if utils.IsInStringArray(d, []string{
+			api.STORAGE_GOOGLE_PD_STANDARD, api.STORAGE_GOOGLE_PD_SSD, api.STORAGE_GOOGLE_LOCAL_SSD, api.STORAGE_GOOGLE_PD_BALANCED, api.STORAGE_GOOGLE_PD_EXTREME,
+			api.STORAGE_GOOGLE_HYPERDISK_THROUGHPUT, api.STORAGE_GOOGLE_HYPERDISK_ML, api.STORAGE_GOOGLE_HYPERDISK_BALANCED, api.STORAGE_GOOGLE_HYPERDISK_EXTREME}) {
 			result.StorageType = d
 		} else if memSize, err := fileutils.GetSizeMb(d, 'M', 1024); err == nil {
 			result.SizeGB = memSize >> 10
@@ -590,17 +529,17 @@ func getDiskInfo(disk string) (cloudprovider.SDiskInfo, error) {
 	}
 
 	if result.SizeGB == 0 {
-		return result, fmt.Errorf("Missing disk size")
+		return result, fmt.Errorf("missing disk size")
 	}
 	return result, nil
 }
 
 func (region *SRegion) CreateInstance(zone, name, desc, instanceType string, cpu, memoryMb int, networkId string, ipAddr, imageId string, disks []string) (*SInstance, error) {
 	if len(instanceType) == 0 && (cpu == 0 || memoryMb == 0) {
-		return nil, fmt.Errorf("Missing instanceType or cpu &memory info")
+		return nil, fmt.Errorf("missing instanceType or cpu &memory info")
 	}
 	if len(disks) == 0 {
-		return nil, fmt.Errorf("Missing disk info")
+		return nil, fmt.Errorf("missing disk info")
 	}
 	sysDisk, err := getDiskInfo(disks[0])
 	if err != nil {
@@ -628,44 +567,7 @@ func (region *SRegion) CreateInstance(zone, name, desc, instanceType string, cpu
 	return region._createVM(zone, conf)
 }
 
-func (region *SRegion) getSecgroupByIds(ids []string) (map[string][]string, error) {
-	secgroups := map[string][]string{}
-	for _, id := range ids {
-		for _, secgrpType := range []string{SECGROUP_TYPE_TAG, SECGROUP_TYPE_SERVICE_ACCOUNT} {
-			if strings.Contains(id, fmt.Sprintf("/%s/", secgrpType)) {
-				idx := strings.LastIndex(id, "/") + 1
-				if idx <= 0 {
-					return nil, fmt.Errorf("invalid secgroup %s for %s", id, secgrpType)
-				}
-				secgroup := id[idx:]
-				if len(secgroup) == 0 {
-					return nil, fmt.Errorf("invalid secgroup %s for %s", id, secgrpType)
-				}
-				if _, ok := secgroups[secgrpType]; !ok {
-					secgroups[secgrpType] = []string{}
-				}
-				if !utils.IsInStringArray(secgroup, secgroups[secgrpType]) {
-					secgroups[secgrpType] = append(secgroups[secgrpType], secgroup)
-				}
-			}
-		}
-	}
-	return secgroups, nil
-}
-
 func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCreateConfig) (*SInstance, error) {
-	vpc, err := region.GetVpc(desc.ExternalNetworkId)
-	if err != nil {
-		return nil, errors.Wrap(err, "region.GetNetwork")
-	}
-	secgroups, err := region.getSecgroupByIds(desc.ExternalSecgroupIds)
-	if err != nil {
-		return nil, errors.Wrap(err, "getSecgroupByIds")
-	}
-	serviceAccounts, ok := secgroups[SECGROUP_TYPE_SERVICE_ACCOUNT]
-	if ok && len(serviceAccounts) > 1 {
-		return nil, fmt.Errorf("Security groups are distributed across multiple service accounts")
-	}
 	if len(desc.InstanceType) == 0 {
 		desc.InstanceType = fmt.Sprintf("custom-%d-%d", desc.Cpu, desc.MemoryMB)
 	}
@@ -673,44 +575,59 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 	if len(desc.SysDisk.Name) == 0 {
 		desc.SysDisk.Name = fmt.Sprintf("vdisk-%s-%d", desc.Name, time.Now().UnixNano())
 	}
-	nameConv := func(name string) string {
-		name = strings.Replace(name, "_", "-", -1)
-		name = pinyinutils.Text2Pinyin(name)
-		return strings.ToLower(name)
+
+	labels := map[string]string{}
+	for k, v := range desc.Tags {
+		labels[encode.EncodeGoogleLabel(k)] = encode.EncodeGoogleLabel(v)
 	}
+
+	sysDiskParams := map[string]interface{}{
+		"diskName":    normalizeString(desc.SysDisk.Name),
+		"sourceImage": desc.ExternalImageId,
+		"diskSizeGb":  desc.SysDisk.SizeGB,
+		"diskType":    fmt.Sprintf("zones/%s/diskTypes/%s", zone, desc.SysDisk.StorageType),
+		"labels":      labels,
+	}
+	setDiskProvisionedPerformance(sysDiskParams, desc.SysDisk.StorageType, desc.SysDisk.SizeGB, desc.SysDisk.Iops, desc.SysDisk.Throughput)
 	disks = append(disks, map[string]interface{}{
-		"boot": true,
-		"initializeParams": map[string]interface{}{
-			"diskName":    nameConv(desc.SysDisk.Name),
-			"sourceImage": desc.ExternalImageId,
-			"diskSizeGb":  desc.SysDisk.SizeGB,
-			"diskType":    fmt.Sprintf("zones/%s/diskTypes/%s", zone, desc.SysDisk.StorageType),
-		},
-		"autoDelete": true,
+		"boot":             true,
+		"initializeParams": sysDiskParams,
+		"autoDelete":       true,
 	})
-	for _, disk := range desc.DataDisks {
-		if len(disk.Name) == 0 {
-			disk.Name = fmt.Sprintf("vdisk-%s-%d", desc.Name, time.Now().UnixNano())
+	for i, disk := range desc.DataDisks {
+		name := disk.Name
+		if len(name) == 0 {
+			name = fmt.Sprintf("vdisk-%s-%d-%d", desc.Name, i, time.Now().UnixNano())
 		}
+		dataDiskParams := map[string]interface{}{
+			"diskName":   normalizeString(name),
+			"diskSizeGb": disk.SizeGB,
+			"diskType":   fmt.Sprintf("zones/%s/diskTypes/%s", zone, disk.StorageType),
+			"labels":     labels,
+		}
+		setDiskProvisionedPerformance(dataDiskParams, disk.StorageType, disk.SizeGB, disk.Iops, disk.Throughput)
 		disks = append(disks, map[string]interface{}{
-			"boot": false,
-			"initializeParams": map[string]interface{}{
-				"diskName":   nameConv(disk.Name),
-				"diskSizeGb": disk.SizeGB,
-				"diskType":   fmt.Sprintf("zones/%s/diskTypes/%s", zone, disk.StorageType),
-			},
-			"autoDelete": true,
+			"boot":             false,
+			"initializeParams": dataDiskParams,
+			"autoDelete":       true,
 		})
 	}
+
 	networkInterface := map[string]string{
-		"network":    vpc.Network,
-		"subnetwork": vpc.SelfLink,
+		"subnetwork": desc.ExternalNetworkId,
+	}
+	if !strings.HasPrefix(desc.ExternalNetworkId, "projects/") {
+		vpc, err := region.GetVpc(desc.ExternalNetworkId)
+		if err != nil {
+			return nil, errors.Wrap(err, "region.GetNetwork")
+		}
+		networkInterface["subnetwork"] = getGlobalId(vpc.SelfLink)
 	}
 	if len(desc.IpAddr) > 0 {
 		networkInterface["networkIp"] = desc.IpAddr
 	}
 	params := map[string]interface{}{
-		"name":        desc.NameEn,
+		"name":        normalizeString(desc.NameEn),
 		"description": desc.Description,
 		"machineType": fmt.Sprintf("zones/%s/machineTypes/%s", zone, desc.InstanceType),
 		"networkInterfaces": []map[string]string{
@@ -719,23 +636,16 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 		"disks": disks,
 	}
 
-	labels := map[string]string{}
-	for k, v := range desc.Tags {
-		labels[encode.EncodeGoogleLabel(k)] = encode.EncodeGoogleLabel(v)
-	}
-
 	if len(labels) > 0 {
 		params["labels"] = labels
 	}
 
-	if tags, ok := secgroups[SECGROUP_TYPE_TAG]; ok && len(tags) > 0 {
-		for i := range tags {
-			tags[i] = strings.ToLower(tags[i])
-		}
+	if len(desc.ExternalSecgroupIds) > 0 {
 		params["tags"] = map[string][]string{
-			"items": tags,
+			"items": desc.ExternalSecgroupIds,
 		}
 	}
+
 	if len(desc.UserData) > 0 {
 		params["metadata"] = map[string]interface{}{
 			"items": []struct {
@@ -753,28 +663,10 @@ func (region *SRegion) _createVM(zone string, desc *cloudprovider.SManagedVMCrea
 			},
 		}
 	}
-	if len(serviceAccounts) > 0 {
-		params["serviceAccounts"] = []struct {
-			Email  string
-			Scopes []string
-		}{
-			{
-				Email: serviceAccounts[0],
-				Scopes: []string{
-					"https://www.googleapis.com/auth/devstorage.read_only",
-					"https://www.googleapis.com/auth/logging.write",
-					"https://www.googleapis.com/auth/monitoring.write",
-					"https://www.googleapis.com/auth/servicecontrol",
-					"https://www.googleapis.com/auth/service.management.readonly",
-					"https://www.googleapis.com/auth/trace.append",
-				},
-			},
-		}
-	}
 	log.Debugf("create google instance params: %s", jsonutils.Marshal(params).String())
 	instance := &SInstance{}
 	resource := fmt.Sprintf("zones/%s/instances", zone)
-	err = region.Insert(resource, jsonutils.Marshal(params), instance)
+	err := region.Insert(resource, jsonutils.Marshal(params), instance)
 	if err != nil {
 		return nil, err
 	}
@@ -794,6 +686,14 @@ func (region *SRegion) StopInstance(id string) error {
 func (region *SRegion) ResetInstance(id string) error {
 	params := map[string]string{}
 	return region.Do(id, "reset", nil, jsonutils.Marshal(params))
+}
+
+func (region *SRegion) DisableDeletionProtection(id string) error {
+	params := map[string]string{
+		"requestId":          stringutils.UUID4(),
+		"deletionProtection": "false",
+	}
+	return region.Do(id, "setDeletionProtection", params, nil)
 }
 
 func (region *SRegion) DetachDisk(instanceId, deviceName string) error {
@@ -910,6 +810,13 @@ func (region *SRegion) RebuildRoot(instanceId string, imageId string, sysDiskSiz
 			sysDiskSizeGb = disk.SizeGB
 		}
 	}
+	image, err := region.GetImage(imageId)
+	if err != nil {
+		return "", errors.Wrapf(err, "GetImage")
+	}
+	if image.DiskSizeGb > sysDiskSizeGb {
+		sysDiskSizeGb = image.DiskSizeGb
+	}
 
 	zone, err := region.GetZone(instance.Zone)
 	if err != nil {
@@ -917,7 +824,12 @@ func (region *SRegion) RebuildRoot(instanceId string, imageId string, sysDiskSiz
 	}
 
 	diskName := fmt.Sprintf("vdisk-%s-%d", instance.Name, time.Now().UnixNano())
-	disk, err := region.CreateDisk(diskName, sysDiskSizeGb, zone.Name, diskType, imageId, "create for replace instance system disk")
+	disk, err := region.CreateDisk(zone.Name, diskType, &cloudprovider.DiskCreateConfig{
+		Name:    diskName,
+		SizeGb:  sysDiskSizeGb,
+		ImageId: imageId,
+		Desc:    "create for replace instance system disk",
+	})
 	if err != nil {
 		return "", errors.Wrap(err, "region.CreateDisk.systemDisk")
 	}
@@ -947,7 +859,7 @@ func (region *SRegion) RebuildRoot(instanceId string, imageId string, sysDiskSiz
 
 func (self *SRegion) SaveImage(diskId string, opts *cloudprovider.SaveImageOptions) (*SImage, error) {
 	params := map[string]interface{}{
-		"name":        opts.Name,
+		"name":        normalizeString(opts.Name),
 		"description": opts.Notes,
 		"sourceDisk":  diskId,
 	}

@@ -66,18 +66,12 @@ type CloudenvResourceListInput struct {
 	// | Ceph      | 2.11       | Ceph对象存储                         |
 	// | Xsky      | 2.11       | XSKY启明星辰Ceph对象存储              |
 	//
-	// enum: OneCloud,VMware,Aliyun,Qcloud,Azure,Aws,Huawei,OpenStack,Ucloud,ZStack,Google,Ctyun,S3,Ceph,Xsky"
+	// enum: ["OneCloud","VMware","Aliyun","Qcloud","Azure","Aws","Huawei","OpenStack","Ucloud","ZStack","Google","Ctyun","S3","Ceph","Xsky"]
 	Providers []string `json:"providers"`
 	// swagger:ignore
 	// Deprecated
 	Provider []string `json:"provider" yunion-deprecated-by:"providers"`
 
-	// 列出指定云平台品牌的资源，一般来说brand和provider相同，除了以上支持的provider之外，还支持以下band
-	//
-	// |   Brand  | Provider | 说明        |
-	// |----------|----------|------------|
-	// | DStack   | ZStack   | 滴滴云私有云 |
-	//
 	Brands []string `json:"brands"`
 	// swagger:ignore
 	// Deprecated
@@ -91,31 +85,31 @@ type CloudenvResourceListInput struct {
 	// | private   | 私有云  |
 	// | onpremise | 本地IDC |
 	//
-	// enum: public,private,onpremise
+	// enum: ["public","private","onpremise"]
 	CloudEnv string `json:"cloud_env"`
 
 	// swagger:ignore
 	// Deprecated
 	// description: this param will be deprecate at 3.0
-	PublicCloud bool `json:"public_cloud"`
+	PublicCloud *bool `json:"public_cloud"`
 	// swagger:ignore
 	// Deprecated
 	// description: this param will be deprecate at 3.0
-	IsPublic bool `json:"is_public"`
+	IsPublic *bool `json:"is_public"`
 
 	// swagger:ignore
 	// Deprecated
 	// description: this param will be deprecate at 3.0
-	PrivateCloud bool `json:"private_cloud"`
+	PrivateCloud *bool `json:"private_cloud"`
 	// swagger:ignore
 	// Deprecated
 	// description: this param will be deprecate at 3.0
-	IsPrivate bool `json:"is_private"`
+	IsPrivate *bool `json:"is_private"`
 
 	// swagger:ignore
 	// Deprecated
 	// description: this param will be deprecate at 3.0
-	IsOnPremise bool `json:"is_on_premise"`
+	IsOnPremise *bool `json:"is_on_premise"`
 
 	// 以平台名称排序
 	// pattern:asc|desc
@@ -137,6 +131,7 @@ type CloudaccountResourceInfo struct {
 	AccountStatus string `json:"account_status,omitempty"`
 	// 云账号监控状态
 	AccountHealthStatus string `json:"account_health_status,omitempty"`
+	AccountReadOnly     bool   `json:"account_read_only,omitempty"`
 }
 
 type CloudaccountCreateInput struct {
@@ -145,13 +140,13 @@ type CloudaccountCreateInput struct {
 	// 指定云平台
 	// Qcloud: 腾讯云
 	// Ctyun: 天翼云
-	// enum: VMware, Aliyun, Qcloud, Azure, Aws, Huawei, OpenStack, Ucloud, ZStack, Google, Ctyun, JDcloud
+	// enum: ["VMware", "Aliyun", "Qcloud", "Azure", "Aws", "Huawei", "OpenStack", "Ucloud", "ZStack", "Google", "Ctyun", "JDcloud"]
 	Provider string `json:"provider"`
 	// swagger:ignore
-	AccountId string
+	AccountId string `json:"account_id"`
 
 	// 跳过重复账号注册检查
-	SkipDuplicateAccountCheck bool
+	SkipDuplicateAccountCheck bool `json:"skip_duplicate_account_check"`
 
 	// 指定云平台品牌, 此参数默认和provider相同
 	// requried: false
@@ -168,15 +163,15 @@ type CloudaccountCreateInput struct {
 	// | Huawei | Huawei |
 	// | OpenStack | OpenStack |
 	// | Ucloud | Ucloud |
-	// | ZStack | ZStack, DStack |
+	// | ZStack | ZStack |
 	// | Google | Google |
 	// | Ctyun | Ctyun |
 	Brand string `json:"brand"`
 
 	// swagger:ignore
-	IsPublicCloud bool
+	IsPublicCloud bool `json:"is_public_cloud"`
 	// swagger:ignore
-	IsOnPremise bool
+	IsOnPremise bool `json:"is_on_premise"`
 
 	// 指定云账号所属的项目
 	// Tenant string `json:"tenant"`
@@ -223,6 +218,8 @@ type CloudaccountCreateInput struct {
 	// 货币类型
 	// enmu: CNY, USD
 	Currency string `json:"currency"`
+
+	EnableAutoSyncResource *bool `json:"enable_auto_sync_resource"`
 }
 
 type SProjectMappingResourceInput struct {
@@ -234,7 +231,7 @@ type SProjectMappingResourceInput struct {
 type CloudaccountShareModeInput struct {
 	apis.Meta
 
-	ShareMode string
+	ShareMode string `json:"share_mode"`
 }
 
 func (i CloudaccountShareModeInput) Validate() error {
@@ -258,6 +255,8 @@ type CloudaccountListInput struct {
 
 	// 账号健康状态
 	HealthStatus []string `json:"health_status"`
+
+	ReadOnly *bool `json:"read_only"`
 
 	// 共享模式
 	ShareMode []string `json:"share_mode"`
@@ -339,7 +338,7 @@ type CloudaccountDetail struct {
 	SyncIntervalSeconds int `json:"sync_interval_seconds"`
 
 	// 同步状态
-	SyncStatus2 string `json:"sync_stauts2"`
+	SyncStatus2 string `json:"sync_status2"`
 
 	// 云账号环境类型
 	// public: 公有云
@@ -357,10 +356,14 @@ type CloudaccountDetail struct {
 	ProjectMappingResourceInfo
 
 	// 上次同步耗时
-	LastSyncCost string
+	LastSyncCost string `json:"last_sync_cost"`
 }
 
 func (self CloudaccountDetail) GetMetricTags() map[string]string {
+	enabled := "true"
+	if self.Enabled != nil && !*self.Enabled {
+		enabled = "false"
+	}
 	ret := map[string]string{
 		"id":                self.Id,
 		"cloudaccount_id":   self.Id,
@@ -369,8 +372,12 @@ func (self CloudaccountDetail) GetMetricTags() map[string]string {
 		"domain_id":         self.DomainId,
 		"project_domain":    self.ProjectDomain,
 		"currency":          self.Currency,
+		"tenant_id":         self.ProjectId,
+		"tenant":            self.Project,
+		"status":            self.Status,
+		"enabled":           enabled,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo, self.ProjectizedResourceInfo)
 }
 
 func (self CloudaccountDetail) GetMetricPairs() map[string]string {
@@ -402,6 +409,8 @@ type CloudaccountUpdateInput struct {
 	ReadOnly bool `json:"read_only"`
 
 	Currency string `json:"currency"`
+
+	EnableAutoSyncResource *bool `json:"enable_auto_sync_resource"`
 }
 
 type CloudaccountPerformPublicInput struct {
@@ -450,8 +459,8 @@ type VSwitch struct {
 }
 
 type SimpleHost struct {
-	Id   string
-	Name string
+	Id   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type CAWireNet struct {
@@ -526,22 +535,9 @@ type SubscriptonCreateInput struct {
 type EnrollmentAccountQuery struct {
 }
 
-type GetCloudaccountSamlOutput struct {
-	// cloudaccount SAML ServiceProvider entity ID
-	EntityId string `json:"entity_id,allowempty"`
-	// redirect login URL for this cloudaccount
-	RedirectLoginUrl string `json:"redirect_login_url,allowempty"`
-	// redirect logout URL for this cloudaccount
-	RedirectLogoutUrl string `json:"redirect_logout_url,allowempty"`
-	// metadata URL for this cloudaccount
-	MetadataUrl string `json:"metadata_url,allowempty"`
-	// initial SAML SSO login URL for this cloudaccount
-	InitLoginUrl string `json:"init_login_url,allowempty"`
-}
-
 type CloudaccountSyncSkusInput struct {
-	Resource string
-	Force    bool
+	Resource string `json:"resource"`
+	Force    bool   `json:"force"`
 
 	CloudregionResourceInput
 	CloudproviderResourceInput
@@ -572,12 +568,12 @@ type SyncRangeInput struct {
 	Zone   []string `json:"zone"`
 	Host   []string `json:"host"`
 
-	// swagger: ignore
+	// swagger:ignore
 	SkipSyncResources []string `json:"skip_sync_resources"`
 
 	// 按资源类型同步，可输入多个
 	// enmu: project, compute, network, eip, loadbalancer, objectstore, rds, cache, event, cloudid, dnszone, public_ip, intervpcnetwork, saml_auth, quota, nat, nas, waf, mongodb, es, kafka, app, cdn, container, ipv6_gateway, tablestore, modelarts, vpcpeer, misc
-	Resources []string `json:"resources" choices:"project|compute|network|eip|loadbalancer|objectstore|rds|cache|event|cloudid|dnszone|public_ip|intervpcnetwork|saml_auth|quota|nat|nas|waf|mongodb|es|kafka|app|cdn|container|ipv6_gateway|tablestore|modelarts|vpcpeer|misc"`
+	Resources []string `json:"resources" choices:"project|compute|network|eip|loadbalancer|objectstore|rds|cache|event|cloudid|dnszone|public_ip|intervpcnetwork|saml_auth|quota|nat|nas|waf|mongodb|es|kafka|app|cdn|container|ipv6_gateway|tablestore|modelarts|vpcpeer|misc|image"`
 }
 
 type iRes interface {
@@ -589,7 +585,7 @@ func (self *SyncRangeInput) IsNotSkipSyncResource(res iRes) bool {
 }
 
 type SAccountPermission struct {
-	Permissions []string
+	Permissions []string `json:"permissions"`
 }
 
 type SkipSyncResources []string

@@ -17,19 +17,26 @@ package service
 import (
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/devtool/models"
+	"yunion.io/x/onecloud/pkg/devtool/options"
 )
 
-func InitHandlers(app *appsrv.Application) {
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
-	taskman.AddTaskHandler("", app)
+
+	app_common.ExportOptionsHandler(app, &options.Options)
+
+	taskman.AddTaskHandler("", app, isSlave)
 
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
+
 		db.SharedResourceManager,
 		db.UserCacheManager,
 		db.TenantCacheManager,
@@ -51,6 +58,6 @@ func InitHandlers(app *appsrv.Application) {
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 }

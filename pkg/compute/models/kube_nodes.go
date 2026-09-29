@@ -35,6 +35,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=cloud_kube_node
+// +onecloud:swagger-gen-model-plural=cloud_kube_nodes
 type SKubeNodeManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -110,7 +112,7 @@ func (manager *SKubeNodeManager) FetchOwnerId(ctx context.Context, data jsonutil
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SKubeNodeManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SKubeNodeManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId != nil {
 		sq := KubeClusterManager.Query("id")
 		switch scope {
@@ -299,7 +301,12 @@ func (self *SKubeNode) SyncWithCloudKubeNode(ctx context.Context, userCred mccli
 		return errors.Wrapf(err, "UpdateWithLock")
 	}
 
-	syncMetadata(ctx, userCred, self, ext)
+	cluster, err := self.GetKubeCluster()
+	if err == nil {
+		if account := cluster.GetCloudaccount(); account != nil {
+			syncMetadata(ctx, userCred, self, ext, account.ReadOnly)
+		}
+	}
 
 	return nil
 }
@@ -315,9 +322,9 @@ func (self *SKubeCluster) GetNodePoolIdByExternalId(id string) (*SKubeNodePool, 
 		return &pools[0], nil
 	}
 	if len(pools) == 0 {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%v", id)
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, id)
+	return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%v", id)
 }
 
 func (self *SKubeCluster) newFromCloudKubeNode(ctx context.Context, userCred mcclient.TokenCredential, ext cloudprovider.ICloudKubeNode) (*SKubeNode, error) {
@@ -340,14 +347,14 @@ func (self *SKubeCluster) newFromCloudKubeNode(ctx context.Context, userCred mcc
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncMetadata(ctx, userCred, &node, ext)
+	syncMetadata(ctx, userCred, &node, ext, false)
 
 	return &node, nil
 }
 
 func (self *SKubeNode) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
 	log.Infof("kube node delete do nothing")
-	return self.SetStatus(userCred, apis.STATUS_DELETING, "")
+	return self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
 }
 
 func (self *SKubeNode) RealDelete(ctx context.Context, userCred mcclient.TokenCredential) error {

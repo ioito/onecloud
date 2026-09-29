@@ -15,6 +15,8 @@
 package monitor
 
 import (
+	"time"
+
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
@@ -27,8 +29,12 @@ import (
 type CommonAlertListOptions struct {
 	options.BaseListOptions
 	// 报警类型
-	AlertType string `help:"common alert type" choices:"normal|system"`
-	Level     string `help:"common alert notify level" choices:"normal|important|fatal"`
+	AlertType         string     `help:"common alert type" choices:"normal|system"`
+	Level             string     `help:"common alert notify level" choices:"normal|important|fatal"`
+	MonitorResourceId []string   `help:"monitor resource id"`
+	StartTime         *time.Time `help:"start time, format: 2025-01-01 00:00:00" json:"start_time"`
+	EndTime           *time.Time `help:"end time, format: 2025-01-01 00:00:00" json:"end_time"`
+	Top               *int       `help:"top" json:"top"`
 }
 
 func (o *CommonAlertListOptions) Params() (jsonutils.JSONObject, error) {
@@ -36,7 +42,7 @@ func (o *CommonAlertListOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type CommonAlertShowOptions struct {
-	ID string `help:"ID of alart " json:"-"`
+	ID string `help:"ID of alert" json:"-"`
 }
 
 func (o *CommonAlertShowOptions) Params() (jsonutils.JSONObject, error) {
@@ -48,10 +54,13 @@ func (o *CommonAlertShowOptions) GetId() string {
 }
 
 type CommonAlertUpdateOptions struct {
-	ID         string `help:"ID of alart " json:"-"`
+	ID         string `help:"ID of alert" json:"-"`
 	Period     string `help:"exec period of alert" json:"period"`
 	Comparator string `help:"Alarm policy threshold comparison method" json:"comparator" `
 	Threshold  string `help:"Alarm policy threshold" json:"threshold"`
+	Reason     string `help:"Alarm policy reason" json:"reason"`
+	// 为 true 时不发送恢复通知
+	DisableNotifyRecovery *bool `help:"when true, do not send recovery notifications" json:"disable_notify_recovery"`
 }
 
 func (o *CommonAlertUpdateOptions) Params() (jsonutils.JSONObject, error) {
@@ -63,7 +72,7 @@ func (o *CommonAlertUpdateOptions) GetId() string {
 }
 
 type CommonAlertDeleteOptions struct {
-	ID    []string `help:"ID of alart"`
+	ID    []string `help:"ID of alert"`
 	Force bool     `help:"force to delete alert"`
 }
 

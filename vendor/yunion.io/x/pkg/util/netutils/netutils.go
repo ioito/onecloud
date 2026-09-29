@@ -15,15 +15,18 @@
 package netutils
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"math/rand"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/regutils"
+	"yunion.io/x/pkg/util/sortutils"
 )
 
 const macChars = "0123456789abcdef"
@@ -53,46 +56,26 @@ func FormatMacAddr(macAddr string) string {
 func IP2Number(ipstr string) (uint32, error) {
 	parts := strings.Split(ipstr, ".")
 	if len(parts) == 4 {
-		var num uint32
+		bytes := make([]byte, 4)
 		for i := 0; i < 4; i += 1 {
-			n, e := strconv.Atoi(parts[i])
+			n, e := strconv.Atoi(strings.TrimSpace(parts[i]))
 			if e != nil {
 				return 0, ErrInvalidNumber // fmt.Errorf("invalid number %s", parts[i])
 			}
 			if n < 0 || n > 255 {
 				return 0, ErrOutOfRange
 			}
-			num = num | (uint32(n) << uint32(24-i*8))
+			bytes[i] = byte(n)
 		}
-		return num, nil
+		return binary.BigEndian.Uint32(bytes), nil
 	}
 	return 0, ErrInvalidIPAddr // fmt.Errorf("invalid ip address %s", ipstr)
 }
 
-/*func IP2Bytes(ipstr string) ([]byte, error) {
-	parts := strings.Split(ipstr, ".")
-	if len(parts) == 4 {
-		bytes := make([]byte, 4)
-		for i := 0; i < 4; i += 1 {
-			n, e := strconv.Atoi(parts[i])
-			if e != nil {
-				return nil, fmt.Errorf("invalid number %s", parts[i])
-			}
-			bytes[i] = byte(n)
-		}
-		return bytes, nil
-	}
-	return nil, fmt.Errorf("invalid ip address %s", ipstr)
-}*/
-
 func Number2Bytes(num uint32) []byte {
-	a := num >> 24
-	num -= a << 24
-	b := num >> 16
-	num -= b << 16
-	c := num >> 8
-	num -= c << 8
-	return []byte{byte(a), byte(b), byte(c), byte(num)}
+	ret := make([]byte, 4)
+	binary.BigEndian.PutUint32(ret, num)
+	return ret
 }
 
 func Number2IP(num uint32) string {
@@ -144,16 +127,20 @@ func (addr IPV4Addr) String() string {
 }
 
 func (addr IPV4Addr) ToBytes() []byte {
-	a := byte((addr & 0xff000000) >> 24)
-	b := byte((addr & 0x00ff0000) >> 16)
-	c := byte((addr & 0x0000ff00) >> 8)
-	d := byte(addr & 0x000000ff)
-	return []byte{a, b, c, d}
+	return Number2Bytes(uint32(addr))
+}
+
+func (addr IPV4Addr) ToIP() net.IP {
+	return net.IP(addr.ToBytes())
 }
 
 func (addr IPV4Addr) ToMac(prefix string) string {
 	bytes := addr.ToBytes()
 	return fmt.Sprintf("%s%02x:%02x:%02x:%02x", prefix, bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+func (addr IPV4Addr) IsZero() bool {
+	return addr == 0
 }
 
 type IPV4AddrRange struct {
@@ -162,10 +149,18 @@ type IPV4AddrRange struct {
 }
 
 func NewIPV4AddrRange(ip1 IPV4Addr, ip2 IPV4Addr) IPV4AddrRange {
+	ar := IPV4AddrRange{}
+	ar.Set(ip1, ip2)
+	return ar
+}
+
+func (ar *IPV4AddrRange) Set(ip1 IPV4Addr, ip2 IPV4Addr) {
 	if ip1 < ip2 {
-		return IPV4AddrRange{start: ip1, end: ip2}
+		ar.start = ip1
+		ar.end = ip2
 	} else {
-		return IPV4AddrRange{start: ip2, end: ip1}
+		ar.start = ip2
+		ar.end = ip1
 	}
 }
 
@@ -186,12 +181,21 @@ func (ar IPV4AddrRange) ContainsRange(ar2 IPV4AddrRange) bool {
 	return ar.start <= ar2.start && ar.end >= ar2.end
 }
 
+// Random returns an address from the range, excluding end. A range that
+// covers a single address returns that address.
 func (ar IPV4AddrRange) Random() IPV4Addr {
-	return IPV4Addr(uint32(ar.start) + uint32(rand.Intn(int(uint32(ar.end)-uint32(ar.start)))))
+	if ar.start >= ar.end {
+		return ar.start
+	}
+	// int64 so the span of a very large range cannot overflow the argument
+	// to the random source.
+	span := int64(uint32(ar.end) - uint32(ar.start))
+	return IPV4Addr(uint32(ar.start) + uint32(rand.Int63n(span)))
 }
 
 func (ar IPV4AddrRange) AddressCount() int {
-	return int(uint32(ar.end) - uint32(ar.start) + 1)
+	// 64 bit arithmetic so a full range does not wrap around to zero.
+	return int(uint64(uint32(ar.end)) - uint64(uint32(ar.start)) + 1)
 }
 
 func (ar IPV4AddrRange) String() string {
@@ -206,7 +210,7 @@ func (ar IPV4AddrRange) EndIp() IPV4Addr {
 	return ar.end
 }
 
-func (ar IPV4AddrRange) Merge(ar2 IPV4AddrRange) (*IPV4AddrRange, bool) {
+func (ar IPV4AddrRange) Merge(ar2 IPV4AddrRange) (IPV4AddrRange, bool) {
 	if ar.IsOverlap(ar2) || ar.end+1 == ar2.start || ar2.end+1 == ar.start {
 		if ar2.start < ar.start {
 			ar.start = ar2.start
@@ -214,9 +218,9 @@ func (ar IPV4AddrRange) Merge(ar2 IPV4AddrRange) (*IPV4AddrRange, bool) {
 		if ar2.end > ar.end {
 			ar.end = ar2.end
 		}
-		return &ar, true
+		return ar, true
 	}
-	return nil, false
+	return ar, false
 }
 
 func (ar IPV4AddrRange) IsOverlap(ar2 IPV4AddrRange) bool {
@@ -227,7 +231,23 @@ func (ar IPV4AddrRange) IsOverlap(ar2 IPV4AddrRange) bool {
 	}
 }
 
+func (pref IPV4Prefix) ToIPNet() *net.IPNet {
+	return &net.IPNet{
+		IP:   pref.Address.ToIP(),
+		Mask: net.CIDRMask(int(pref.MaskLen), 32),
+	}
+}
+
 func (ar IPV4AddrRange) ToIPNets() []*net.IPNet {
+	r := []*net.IPNet{}
+	mms := ar.ToPrefixes()
+	for _, mm := range mms {
+		r = append(r, mm.ToIPNet())
+	}
+	return r
+}
+
+/*func (ar IPV4AddrRange) ToIPNets() []*net.IPNet {
 	r := []*net.IPNet{}
 	mms := ar.ToMaskMatches()
 	for _, mm := range mms {
@@ -263,66 +283,103 @@ func (ar IPV4AddrRange) ToMaskMatches() [][2]uint32 {
 		sp = sp + b
 	}
 	return r
+}*/
+
+func (ar IPV4AddrRange) ToPrefixes() []IPV4Prefix {
+	prefixes := make([]IPV4Prefix, 0)
+	sp := ar.StartIp()
+	ep := ar.EndIp()
+	for sp <= ep {
+		masklen := int8(32)
+		for masklen > 0 && sp.NetAddr(masklen-1) == sp && sp.BroadcastAddr(masklen-1) <= ep {
+			masklen--
+		}
+		if masklen == 0 {
+			prefixes = append(prefixes, NewIPV4PrefixFromAddr(sp, 0))
+			break
+		}
+		prefixes = append(prefixes, NewIPV4PrefixFromAddr(sp, masklen))
+		sp = sp.BroadcastAddr(masklen).StepUp()
+	}
+	return prefixes
 }
 
-func (ar IPV4AddrRange) Substract(ar2 IPV4AddrRange) (lefts []IPV4AddrRange, sub *IPV4AddrRange) {
-	lefts = []IPV4AddrRange{}
+func (ar IPV4AddrRange) Substract(ar2 IPV4AddrRange) ([]IPV4AddrRange, *IPV4AddrRange) {
+	lefts, overlap, sub := ar.Substract2(ar2)
+	var subp *IPV4AddrRange
+	if overlap {
+		subp = &sub
+	}
+	return lefts, subp
+}
+
+func (ar IPV4AddrRange) Substract2(ar2 IPV4AddrRange) ([]IPV4AddrRange, bool, IPV4AddrRange) {
+	lefts := []IPV4AddrRange{}
 	// no intersection, no substract
 	if ar.end < ar2.start || ar.start > ar2.end {
 		lefts = append(lefts, ar)
-		return
+		return lefts, false, IPV4AddrRange{}
 	}
 
 	// ar contains ar2
 	if ar.ContainsRange(ar2) {
-		nns := [][2]int64{
-			[2]int64{int64(ar.start), int64(ar2.start) - 1},
-			[2]int64{int64(ar2.end) + 1, int64(ar.end)},
+		if ar.start == ar2.start && ar.end == ar2.end {
+			// lefts empty
+		} else if ar.start < ar2.start && ar.end == ar2.end {
+			lefts = append(lefts,
+				NewIPV4AddrRange(ar.start, ar2.start.StepDown()),
+			)
+		} else if ar.start == ar2.start && ar.end > ar2.end {
+			lefts = append(lefts,
+				NewIPV4AddrRange(ar2.end.StepUp(), ar.end),
+			)
+		} else {
+			lefts = append(lefts,
+				NewIPV4AddrRange(ar.start, ar2.start.StepDown()),
+				NewIPV4AddrRange(ar2.end.StepUp(), ar.end),
+			)
 		}
-		for _, nn := range nns {
-			if nn[0] <= nn[1] {
-				lefts = append(lefts, NewIPV4AddrRange(IPV4Addr(nn[0]), IPV4Addr(nn[1])))
-			}
-		}
-		ar2_ := ar2
-		sub = &ar2_
-		return
+		return lefts, true, ar2
 	}
 
 	// ar contained by ar2
 	if ar2.ContainsRange(ar) {
-		ar_ := ar
-		sub = &ar_
-		return
+		return lefts, true, ar
 	}
 
 	// intersect, ar on the left
 	if ar.start < ar2.start && ar.end >= ar2.start {
-		lefts = append(lefts, NewIPV4AddrRange(ar.start, ar2.start-1))
+		lefts = append(lefts, NewIPV4AddrRange(ar.start, ar2.start.StepDown()))
 		sub_ := NewIPV4AddrRange(ar2.start, ar.end)
-		sub = &sub_
-		return
+		return lefts, true, sub_
 	}
 
 	// intersect, ar on the right
 	if ar.start <= ar2.end && ar.end > ar2.end {
-		lefts = append(lefts, NewIPV4AddrRange(ar2.end+1, ar.end))
+		lefts = append(lefts, NewIPV4AddrRange(ar2.end.StepUp(), ar.end))
 		sub_ := NewIPV4AddrRange(ar.start, ar2.end)
-		sub = &sub_
-		return
+		return lefts, true, sub_
 	}
 
 	// no intersection
-	return
+	return lefts, false, IPV4AddrRange{}
 }
 
 func (ar IPV4AddrRange) equals(ar2 IPV4AddrRange) bool {
 	return ar.start == ar2.start && ar.end == ar2.end
 }
 
+// Masklen2Mask returns the network mask for a prefix length.
+//
+// A length above 32 cannot be represented and is treated as 32, i.e. a single
+// host, rather than shifting past the width of the mask and wrapping around to
+// a match-all mask.
 func Masklen2Mask(maskLen int8) IPV4Addr {
 	if maskLen < 0 {
 		panic("negative masklen")
+	}
+	if maskLen > 32 {
+		maskLen = 32
 	}
 	return IPV4Addr(^(uint32(1<<(32-uint8(maskLen))) - 1))
 }
@@ -352,6 +409,25 @@ func Mask2Len(mask IPV4Addr) int8 {
 	return int8(bits.LeadingZeros32(^uint32(mask)))
 }
 
+// ParsePrefix parses an IPv4 prefix written as "address/masklen", or as a
+// bare address, which is taken to be a /32. An empty string parses as
+// 0.0.0.0/32 rather than being rejected.
+//
+// The prefix length may also be written as a dotted-decimal mask, e.g.
+// "10.0.0.0/255.0.0.0". A dotted mask is converted by counting its leading
+// one bits, so the result always has a contiguous mask:
+// "1.2.3.4/255.0.255.0" yields 1.0.0.0/8 rather than being rejected.
+//
+// The numeric form is read with strconv.Atoi, so it also accepts a leading
+// sign and leading zeros: "+8" and "024" parse as 8 and 24.
+//
+// These accepted forms are more permissive than net.ParseCIDR. Note that
+// regutils.MatchCIDR and regutils.MatchIP4Addr reject the dotted-mask and
+// leading-zero spellings that this function accepts, so a value checked with
+// one of those and then normalised here can end up covering something other
+// than what was checked. Prefer net.ParseCIDR where the stricter grammar is
+// wanted; the lenient spellings are kept for compatibility with prefixes
+// already stored by callers.
 func ParsePrefix(prefix string) (IPV4Addr, int8, error) {
 	slash := strings.IndexByte(prefix, '/')
 	if slash > 0 {
@@ -398,6 +474,23 @@ func NewIPV4Prefix(prefix string) (IPV4Prefix, error) {
 	return pref, nil
 }
 
+// NewIPV4PrefixFromAddr builds a prefix from an address and a prefix length.
+//
+// A length above 32 is clamped to 32 so that the stored MaskLen always agrees
+// with the address and range it describes. A negative length keeps its
+// existing behaviour of panicking.
+func NewIPV4PrefixFromAddr(addr IPV4Addr, masklen int8) IPV4Prefix {
+	if masklen > 32 {
+		masklen = 32
+	}
+	pref := IPV4Prefix{
+		Address: addr.NetAddr(masklen),
+		MaskLen: masklen,
+	}
+	pref.ipRange = pref.ToIPRange()
+	return pref
+}
+
 func (prefix IPV4Prefix) ToIPRange() IPV4AddrRange {
 	start := prefix.Address.NetAddr(prefix.MaskLen)
 	end := prefix.Address.BroadcastAddr(prefix.MaskLen)
@@ -416,13 +509,28 @@ const (
 	multicastPrefix = "224.0.0.0/4"
 )
 
+// Ranges that cannot be a public address but are not part of the private
+// ranges used to classify guest addresses. They are consulted by
+// IsExitAddress only, so that IsPrivate keeps its current meaning for the
+// callers that use it for address allocation and DHCP.
+var reservedPrefixes = []string{
+	"0.0.0.0/8",       // "this network"
+	"192.0.2.0/24",    // TEST-NET-1
+	"198.51.100.0/24", // TEST-NET-2
+	"203.0.113.0/24",  // TEST-NET-3
+	"240.0.0.0/4",     // reserved, includes the limited broadcast address
+}
+
 var privateIPRanges []IPV4AddrRange
+var customizedPrivateIPRanges []IPV4AddrRange
+var reservedIPRanges []IPV4AddrRange
 var hostLocalIPRange IPV4AddrRange
 var linkLocalIPRange IPV4AddrRange
 var multicastIPRange IPV4AddrRange
 
 func init() {
-	updatePrivateIPRanges(nil)
+	initPrivateIPRanges()
+	initReservedIPRanges()
 
 	prefix, _ := NewIPV4Prefix(hostlocalPrefix)
 	hostLocalIPRange = prefix.ToIPRange()
@@ -432,13 +540,15 @@ func init() {
 	multicastIPRange = prefix.ToIPRange()
 }
 
-func updatePrivateIPRanges(prefs []string) {
-	if len(prefs) == 0 {
-		prefs = []string{
-			"10.0.0.0/8",
-			"172.16.0.0/12",
-			"192.168.0.0/16",
-		}
+func initPrivateIPRanges() {
+	// https://zh.wikipedia.org/wiki/%E4%BF%9D%E7%95%99IP%E5%9C%B0%E5%9D%80
+	prefs := []string{
+		"10.0.0.0/8",
+		"100.64.0.0/10",
+		"172.16.0.0/12",
+		"192.0.0.0/24",
+		"198.18.0.0/15",
+		"192.168.0.0/16",
 	}
 	privateIPRanges = make([]IPV4AddrRange, len(prefs))
 	for i, prefix := range prefs {
@@ -450,16 +560,39 @@ func updatePrivateIPRanges(prefs []string) {
 	}
 }
 
+func initReservedIPRanges() {
+	reservedIPRanges = make([]IPV4AddrRange, 0, len(reservedPrefixes))
+	for _, prefix := range reservedPrefixes {
+		p, err := NewIPV4Prefix(prefix)
+		if err != nil {
+			continue
+		}
+		reservedIPRanges = append(reservedIPRanges, p.ToIPRange())
+	}
+}
+
+// GetReservedIPRanges returns the ranges that IsReserved consults.
+func GetReservedIPRanges() []IPV4AddrRange {
+	return append([]IPV4AddrRange(nil), reservedIPRanges...)
+}
+
 func SetPrivatePrefixes(pref []string) {
-	updatePrivateIPRanges(pref)
+	customizedPrivateIPRanges = make([]IPV4AddrRange, 0)
+	for _, prefix := range pref {
+		prefix, err := NewIPV4Prefix(prefix)
+		if err != nil {
+			continue
+		}
+		customizedPrivateIPRanges = append(customizedPrivateIPRanges, prefix.ToIPRange())
+	}
 }
 
 func GetPrivateIPRanges() []IPV4AddrRange {
-	return privateIPRanges
+	return append(privateIPRanges, customizedPrivateIPRanges...)
 }
 
 func IsPrivate(addr IPV4Addr) bool {
-	for _, ipRange := range privateIPRanges {
+	for _, ipRange := range GetPrivateIPRanges() {
 		if ipRange.Contains(addr) {
 			return true
 		}
@@ -479,8 +612,23 @@ func IsMulticast(addr IPV4Addr) bool {
 	return multicastIPRange.Contains(addr)
 }
 
+// IsReserved reports whether addr is in a range that is reserved and can
+// never be a public address.
+func IsReserved(addr IPV4Addr) bool {
+	for _, ipRange := range reservedIPRanges {
+		if ipRange.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsExitAddress reports whether addr can be a public address, i.e. one that a
+// guest can reach directly. Reserved ranges are excluded along with the
+// private, host local, link local and multicast ones.
 func IsExitAddress(addr IPV4Addr) bool {
-	return !IsPrivate(addr) && !IsHostLocal(addr) && !IsLinkLocal(addr) && !IsMulticast(addr)
+	return !IsPrivate(addr) && !IsReserved(addr) &&
+		!IsHostLocal(addr) && !IsLinkLocal(addr) && !IsMulticast(addr)
 }
 
 func MacUnpackHex(mac string) string {
@@ -534,4 +682,81 @@ func Netlen2Mask(netmasklen int) string {
 		mask += "0"
 	}
 	return mask
+}
+
+type IPV4AddrRangeList []IPV4AddrRange
+
+func (rl IPV4AddrRangeList) Len() int {
+	return len(rl)
+}
+
+func (rl IPV4AddrRangeList) Swap(i, j int) {
+	rl[i], rl[j] = rl[j], rl[i]
+}
+
+func (rl IPV4AddrRangeList) Less(i, j int) bool {
+	return rl[i].Compare(rl[j]) == sortutils.Less
+}
+
+func (v4range IPV4AddrRange) Compare(r2 IPV4AddrRange) sortutils.CompareResult {
+	if v4range.start < r2.start {
+		return sortutils.Less
+	} else if v4range.start > r2.start {
+		return sortutils.More
+	} else {
+		// start equals, compare ends
+		if v4range.end > r2.end {
+			return sortutils.Less
+		} else if v4range.end < r2.end {
+			return sortutils.More
+		} else {
+			return sortutils.Equal
+		}
+	}
+}
+
+func (rl IPV4AddrRangeList) Merge() []IPV4AddrRange {
+	sort.Sort(rl)
+	ret := make([]IPV4AddrRange, 0, len(rl))
+	for i := range rl {
+		if i == 0 {
+			ret = append(ret, rl[i])
+		} else {
+			result, isMerged := ret[len(ret)-1].Merge(rl[i])
+			if isMerged {
+				ret[len(ret)-1] = result
+			} else {
+				ret = append(ret, rl[i])
+			}
+		}
+	}
+	return ret
+}
+
+func (rl IPV4AddrRangeList) String() string {
+	strs := make([]string, len(rl))
+	for i := range rl {
+		strs[i] = rl[i].String()
+	}
+	return strings.Join(strs, ",")
+}
+
+var IPV4Zero = IPV4Addr(0)
+var IPV4Ones = IPV4Addr(0xffffffff)
+var AllIPV4AddrRange = IPV4AddrRange{
+	start: IPV4Zero,
+	end:   IPV4Ones,
+}
+
+func (r IPV4AddrRange) IsAll() bool {
+	return r.start == IPV4Zero && r.end == IPV4Ones
+}
+
+func (rl IPV4AddrRangeList) Substract(addrRange IPV4AddrRange) []IPV4AddrRange {
+	ret := make([]IPV4AddrRange, 0)
+	for i := range rl {
+		lefts, _ := rl[i].Substract(addrRange)
+		ret = append(ret, lefts...)
+	}
+	return ret
 }

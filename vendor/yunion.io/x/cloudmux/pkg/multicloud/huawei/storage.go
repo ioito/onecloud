@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -30,22 +30,26 @@ type SStorage struct {
 	zone *SZone
 	multicloud.SStorageBase
 	HuaweiTags
-	storageType string // volume_type 目前支持“SSD”，“SAS”和“SATA”三种
+	storageType  string
+	volumeTypeId string
 }
 
 func (self *SStorage) GetId() string {
-	return fmt.Sprintf("%s-%s-%s", self.zone.region.client.cpcfg.Id, self.zone.GetId(), self.storageType)
+	return fmt.Sprintf("%s-%s-%s-%s", self.zone.region.client.cpcfg.Id, self.zone.region.Id, self.zone.GetId(), self.storageType)
 }
 
 func (self *SStorage) GetName() string {
-	return fmt.Sprintf("%s-%s-%s", self.zone.region.client.cpcfg.Name, self.zone.GetId(), self.storageType)
+	return fmt.Sprintf("%s-%s-%s-%s", self.zone.region.client.cpcfg.Name, self.zone.region.Id, self.zone.GetId(), self.storageType)
 }
 
 func (self *SStorage) GetGlobalId() string {
-	return fmt.Sprintf("%s-%s-%s", self.zone.region.client.cpcfg.Id, self.zone.GetGlobalId(), self.storageType)
+	return fmt.Sprintf("%s-%s-%s-%s", self.zone.region.client.cpcfg.Id, self.zone.region.Id, self.zone.GetGlobalId(), self.storageType)
 }
 
 func (self *SStorage) GetStatus() string {
+	if self.storageType == api.STORAGE_HUAWEI_SATA {
+		return api.STORAGE_OFFLINE
+	}
 	return api.STORAGE_ONLINE
 }
 
@@ -66,26 +70,16 @@ func (self *SStorage) GetIZone() cloudprovider.ICloudZone {
 }
 
 func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
-	disks, err := self.zone.region.GetDisks(self.zone.GetId())
+	disks, err := self.zone.region.GetDisks(self.zone.ZoneName, self.volumeTypeId)
 	if err != nil {
 		return nil, err
 	}
-
-	// 按storage type 过滤出disk
-	filtedDisks := make([]SDisk, 0)
-	for i := range disks {
-		disk := disks[i]
-		if disk.VolumeType == self.storageType {
-			filtedDisks = append(filtedDisks, disk)
-		}
+	ret := []cloudprovider.ICloudDisk{}
+	for i := 0; i < len(disks); i += 1 {
+		disks[i].storage = self
+		ret = append(ret, &disks[i])
 	}
-
-	idisks := make([]cloudprovider.ICloudDisk, len(filtedDisks))
-	for i := 0; i < len(filtedDisks); i += 1 {
-		filtedDisks[i].storage = self
-		idisks[i] = &filtedDisks[i]
-	}
-	return idisks, nil
+	return ret, nil
 }
 
 func (self *SStorage) GetStorageType() string {
@@ -117,16 +111,14 @@ func (self *SStorage) GetEnabled() bool {
 	return true
 }
 
-func (self *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
-	diskId, err := self.zone.region.CreateDisk(self.zone.GetId(), self.storageType, conf.Name, conf.SizeGb, "", conf.Desc, conf.ProjectId)
+func (self *SStorage) CreateIDisk(opts *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
+	diskId, err := self.zone.region.CreateDisk(self.zone.GetId(), self.storageType, opts)
 	if err != nil {
-		log.Errorf("createDisk fail %s", err)
-		return nil, err
+		return nil, errors.Wrapf(err, "CreateDisk")
 	}
 	disk, err := self.zone.region.GetDisk(diskId)
 	if err != nil {
-		log.Errorf("getDisk fail %s", err)
-		return nil, err
+		return nil, errors.Wrapf(err, "GetDisk")
 	}
 	disk.storage = self
 
@@ -139,17 +131,12 @@ func (self *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudpr
 }
 
 func (self *SStorage) GetIDiskById(idStr string) (cloudprovider.ICloudDisk, error) {
-	if len(idStr) == 0 {
-		log.Debugf("GetIDiskById disk id should not be empty")
-		return nil, cloudprovider.ErrNotFound
-	}
-
-	if disk, err := self.zone.region.GetDisk(idStr); err != nil {
+	disk, err := self.zone.region.GetDisk(idStr)
+	if err != nil {
 		return nil, err
-	} else {
-		disk.storage = self
-		return disk, nil
 	}
+	disk.storage = self
+	return disk, nil
 }
 
 func (self *SStorage) GetMountPoint() string {

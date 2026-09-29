@@ -107,13 +107,16 @@ func (fs *FeishuNotifier) Notify(ctx *alerting.EvalContext, _ jsonutils.JSONObje
 }
 
 func (fs *FeishuNotifier) getCommonInfoMod(config monitor.NotificationTemplateConfig) feishu.CardElement {
+	fields := []*feishu.CardElementField{
+		feishu.NewCardElementTextField(false, fmt.Sprintf("**时间:** %s", config.StartTime)),
+		feishu.NewCardElementTextField(false, fmt.Sprintf("**级别:** %s", config.Level)),
+	}
+	if config.Reason != "" {
+		fields = append(fields, feishu.NewCardElementTextField(false, fmt.Sprintf("**原因:** %s", config.Reason)))
+	}
 	elem := feishu.CardElement{
-		Tag: feishu.TagDiv,
-		// Text: feishu.NewCardElementText(config.Title),
-		Fields: []*feishu.CardElementField{
-			feishu.NewCardElementTextField(false, fmt.Sprintf("**时间:** %s", config.StartTime)),
-			feishu.NewCardElementTextField(false, fmt.Sprintf("**级别:** %s", config.Level)),
-		},
+		Tag:    feishu.TagDiv,
+		Fields: fields,
 	}
 	return elem
 }
@@ -156,15 +159,15 @@ func (fs *FeishuNotifier) getMetricsMod(config monitor.NotificationTemplateConfi
 	inElems := make([]*feishu.CardElement, 0)
 	for idx, m := range config.Matches {
 		hrE := feishu.NewCardElementHR()
-		mE := fs.getMetricElem(idx+1, m)
-		mTE := fs.getMetricTagElem(m)
+		mE := fs.getMetricElem(idx+1, *m)
+		mTE := fs.getMetricTagElem(*m)
 		inElems = append(inElems, hrE, mE, mTE)
 	}
 	return inElems
 }
 
 func (fs *FeishuNotifier) genCard(ctx *alerting.EvalContext, chatId string) (*feishu.MsgReq, error) {
-	config := GetNotifyTemplateConfig(ctx)
+	config := GetNotifyTemplateConfig(ctx, false, ctx.EvalMatches)
 	commonElem := fs.getCommonInfoMod(config)
 
 	msElems := fs.getMetricsMod(config)
@@ -193,7 +196,7 @@ func (fs *FeishuNotifier) genCard(ctx *alerting.EvalContext, chatId string) (*fe
 }
 
 func (fs *FeishuNotifier) genMsg(ctx *alerting.EvalContext, chatId string) (*feishu.MsgReq, error) {
-	config := GetNotifyTemplateConfig(ctx)
+	config := GetNotifyTemplateConfig(ctx, false, ctx.EvalMatches)
 	// 富文本: https://open.feishu.cn/document/ukTMukTMukTM/uMDMxEjLzATMx4yMwETM
 	return &feishu.MsgReq{
 		ChatId:  chatId,

@@ -65,8 +65,8 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		hn          = guestDesc.Name
 		domain      = guestDesc.Domain
 		gid         = guestDesc.Uuid
-		nics        = fsdriver.ToServerNics(guestDesc.Nics)
-		nicsStandby = fsdriver.ToServerNics(guestDesc.NicsStandby)
+		nics        = fsdriver.ToServerNics(guestDesc, guestDesc.Nics)
+		nicsStandby = fsdriver.ToServerNics(guestDesc, guestDesc.NicsStandby)
 		partition   = rootfs.GetPartition()
 		releaseInfo = rootfs.GetReleaseInfo(partition)
 	)
@@ -74,12 +74,21 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		hn = guestDesc.Hostname
 	}
 	for _, n := range nics {
-		var addr netutils.IPV4Addr
-		if addr, err = netutils.NewIPV4Addr(n.Ip); err != nil {
-			return nil, fmt.Errorf("Fail to get ip addr from %#v: %s", n, err)
+		if len(n.Ip) > 0 {
+			var addr netutils.IPV4Addr
+			if addr, err = netutils.NewIPV4Addr(n.Ip); err != nil {
+				return nil, errors.Wrapf(err, "Fail to get ip addr from %#v", n)
+			}
+			if netutils.IsPrivate(addr) {
+				ips = append(ips, addr.String())
+			}
 		}
-		if netutils.IsPrivate(addr) {
-			ips = append(ips, n.Ip)
+		if len(n.Ip6) > 0 {
+			var addr netutils.IPV6Addr
+			if addr, err = netutils.NewIPV6Addr(n.Ip6); err != nil {
+				return nil, errors.Wrapf(err, "Fail to get ipv6 addr from %#v", n)
+			}
+			ips = append(ips, addr.String())
 		}
 	}
 	if releaseInfo != nil {
@@ -93,6 +102,9 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		if len(releaseInfo.Language) > 0 {
 			ret.Language = releaseInfo.Language
 		}
+		if len(releaseInfo.CurrentVersion) > 0 {
+			ret.CurrentVersion = releaseInfo.CurrentVersion
+		}
 	}
 	ret.Os = rootfs.GetOs()
 
@@ -101,16 +113,16 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 	}
 
 	if deployInfo.IsInit {
-		if err = rootfs.CleanNetworkScripts(partition); err != nil {
+		if err := rootfs.CleanNetworkScripts(partition); err != nil {
 			return nil, errors.Wrap(err, "Clean network scripts")
 		}
 		if len(deployInfo.Deploys) > 0 {
-			if err = rootfs.DeployFiles(deployInfo.Deploys); err != nil {
+			if err := rootfs.DeployFiles(deployInfo.Deploys); err != nil {
 				return nil, errors.Wrap(err, "DeployFiles")
 			}
 		}
 		if len(deployInfo.UserData) > 0 {
-			if err = rootfs.DeployUserData(deployInfo.UserData); err != nil {
+			if err := rootfs.DeployUserData(deployInfo.UserData); err != nil {
 				return nil, errors.Wrap(err, "DeployUserData")
 			}
 		}
@@ -124,32 +136,37 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		}
 	}
 
-	if err = rootfs.DeployHostname(partition, hn, domain); err != nil {
-		return nil, errors.Wrap(err, "DeployHostname")
+	if err := rootfs.DeployHostname(partition, hn, domain); err != nil {
+		//return nil, errors.Wrap(err, "DeployHostname")
+		log.Errorf("DeployHostname failed %s", err)
 	}
-	if err = rootfs.DeployHosts(partition, hn, domain, ips); err != nil {
-		return nil, errors.Wrap(err, "DeployHosts")
+	if err := rootfs.DeployHosts(partition, hn, domain, ips); err != nil {
+		//return nil, errors.Wrap(err, "DeployHosts")
+		log.Errorf("DeployHosts failed %s", err)
 	}
 
 	if guestDesc.Hypervisor == comapi.HYPERVISOR_KVM {
-		if err = rootfs.DeployQgaBlackList(partition); err != nil {
-			return nil, fmt.Errorf("DeployQgaBlackList: %v", err)
+		if err := rootfs.DeployQgaService(partition); err != nil {
+			return nil, errors.Wrap(err, "DeployQgaService")
+		}
+		if err := rootfs.DeployQgaBlackList(partition); err != nil {
+			return nil, errors.Wrap(err, "DeployQgaBlackList")
 		}
 	}
 
-	if err = rootfs.DeployNetworkingScripts(partition, nics); err != nil {
+	if err := rootfs.DeployNetworkingScripts(partition, nics); err != nil {
 		return nil, errors.Wrap(err, "DeployNetworkingScripts")
 	}
 	if len(nicsStandby) > 0 {
-		if err = rootfs.DeployStandbyNetworkingScripts(partition, nics, nicsStandby); err != nil {
+		if err := rootfs.DeployStandbyNetworkingScripts(partition, nics, nicsStandby); err != nil {
 			return nil, errors.Wrap(err, "DeployStandbyNetworkingScripts")
 		}
 	}
-	if err = rootfs.DeployUdevSubsystemScripts(partition); err != nil {
+	if err := rootfs.DeployUdevSubsystemScripts(partition); err != nil {
 		return nil, errors.Wrap(err, "DeployUdevSubsystemScripts")
 	}
 	if deployInfo.IsInit {
-		if err = rootfs.DeployFstabScripts(partition, guestDesc.Disks); err != nil {
+		if err := rootfs.DeployFstabScripts(partition, guestDesc.Disks); err != nil {
 			return nil, errors.Wrap(err, "DeployFstabScripts")
 		}
 	}
@@ -165,8 +182,7 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 				return nil, errors.Wrap(err, "DeployPublicKey")
 			}
 			var secret string
-			if secret, err = rootfs.ChangeUserPasswd(partition, account, gid,
-				deployInfo.PublicKey.PublicKey, deployInfo.Password); err != nil {
+			if secret, err = rootfs.ChangeUserPasswd(partition, account, gid, deployInfo.PublicKey.PublicKey, deployInfo.Password, deployInfo.IsRandomPassword); err != nil {
 				return nil, errors.Wrap(err, "ChangeUserPasswd")
 			}
 			if len(secret) > 0 {
@@ -174,6 +190,10 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 			}
 			ret.Account = account
 		}
+	}
+
+	if err := rootfs.ConfigSshd(ret.Account, deployInfo.Password, 0); err != nil {
+		return nil, errors.Wrap(err, "ConfigSshd")
 	}
 
 	if err = rootfs.DeployYunionroot(partition, deployInfo.PublicKey, deployInfo.IsInit, deployInfo.EnableCloudInit); err != nil {

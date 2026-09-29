@@ -51,10 +51,13 @@ func init() {
 	NodeAlertManager = NewNodeAlertManager()
 }
 
+// +onecloud:swagger-gen-ignore
 type SV1AlertManager struct {
 	SAlertManager
 }
 
+// +onecloud:swagger-gen-model-singular=nodealert
+// +onecloud:swagger-gen-model-plural=nodealerts
 type SNodeAlertManager struct {
 	SCommonAlertManager
 }
@@ -69,6 +72,7 @@ func NewNodeAlertManager() *SNodeAlertManager {
 	return man
 }
 
+// +onecloud:swagger-gen-ignore
 type SV1Alert struct {
 	SAlert
 }
@@ -344,10 +348,7 @@ func (man *SNodeAlertManager) CustomizeFilterList(
 			return nil, err
 		}
 		mF := func(obj *SNodeAlert) (bool, error) {
-			settings := new(monitor.AlertSetting)
-			if err := obj.Settings.Unmarshal(settings); err != nil {
-				return false, errors.Wrapf(err, "alert %s unmarshal", obj.GetId())
-			}
+			settings := obj.Settings
 			for _, s := range settings.Conditions {
 				if s.Query.Model.Measurement == meaurement && len(s.Query.Model.Selects) == 1 {
 					if IsQuerySelectHasField(s.Query.Model.Selects[0], field) {
@@ -573,7 +574,12 @@ func (man *SNodeAlertManager) FetchCustomizeColumns(
 ) []monitor.NodeAlertDetails {
 	rows := make([]monitor.NodeAlertDetails, len(objs))
 
-	v1Rows := man.SCommonAlertManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	cObjs := make([]interface{}, len(objs))
+	for i := range objs {
+		obj := objs[i].(*SNodeAlert)
+		cObjs[i] = &SCommonAlert{obj.SAlert}
+	}
+	v1Rows := man.SCommonAlertManager.FetchCustomizeColumns(ctx, userCred, query, cObjs, fields, isList)
 
 	for i := range rows {
 		rows[i] = monitor.NodeAlertDetails{
@@ -699,7 +705,7 @@ func (alert *SV1Alert) UpdateIsEnabledStatus(ctx context.Context, userCred mccli
 				return err
 			}
 			db.Update(&alert.SAlert, func() error {
-				alert.SetStatus(userCred, V1AlertDisabledStatus, "")
+				alert.SetStatus(ctx, userCred, V1AlertDisabledStatus, "")
 				return nil
 			})
 		} else {
@@ -707,7 +713,7 @@ func (alert *SV1Alert) UpdateIsEnabledStatus(ctx context.Context, userCred mccli
 				return err
 			}
 			db.Update(&alert.SAlert, func() error {
-				alert.SetStatus(userCred, V1AlertEnabledStatus, "")
+				alert.SetStatus(ctx, userCred, V1AlertEnabledStatus, "")
 				return nil
 			})
 		}
@@ -828,11 +834,7 @@ func (alert *SNodeAlert) GetCommonAlertUpdateData(ctx context.Context, userCred 
 		input.Name = name
 	}
 
-	ds, err := DataSourceManager.GetDefaultSource()
-	if err != nil {
-		return nil, errors.Wrap(err, "get default data source")
-	}
-	tmpS := alert.getUpdateInput(name, details, ds.GetId())
+	tmpS := alert.getUpdateInput(name, details)
 	input.Settings = &tmpS.Settings
 
 	uData, err := alert.SCommonAlert.ValidateUpdateData(ctx, userCred, nil, tmpS.JSON(tmpS))
@@ -855,7 +857,6 @@ func (alert *SNodeAlert) ValidateUpdateData(
 func (alert *SNodeAlert) getUpdateInput(
 	name string,
 	details monitor.NodeAlertDetails,
-	dsId string,
 ) monitor.CommonAlertCreateInput {
 	data := monitor.NodeAlertCreateInput{
 		ResourceAlertV1CreateInput: monitor.ResourceAlertV1CreateInput{
@@ -872,7 +873,7 @@ func (alert *SNodeAlert) getUpdateInput(
 	}
 	data.Level = details.Level
 	out := data.ToCommonAlertCreateInput(name, details.Field, details.Measurement, details.DB)
-	out.Settings = *setAlertDefaultSetting(&out.Settings, dsId)
+	out.Settings = *setAlertDefaultSetting(&out.Settings)
 	return out
 }
 
@@ -894,6 +895,6 @@ func (alert *SNodeAlert) CustomizeDelete(
 	return alert.SCommonAlert.CustomizeDelete(ctx, userCred, query, data)
 }
 
-func (m *SNodeAlertManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (m *SNodeAlertManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	return q
 }

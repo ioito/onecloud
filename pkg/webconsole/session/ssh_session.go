@@ -16,8 +16,9 @@ package session
 
 import (
 	"context"
-	"fmt"
+	"net"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -27,6 +28,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/stringutils"
 
+	compute_api "yunion.io/x/onecloud/pkg/apis/compute"
 	api "yunion.io/x/onecloud/pkg/apis/webconsole"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/webconsole/helper"
@@ -42,27 +44,32 @@ type SSshSession struct {
 	name string
 	Host string
 
-	Port       int64
+	Port       int
 	PrivateKey string
 	Username   string
 	// 保持原有 Username ，不实用 cloudroot 的同时使用 PrivateKey
 	KeepUsername bool
 	Password     string
+
+	guestDetails *compute_api.ServerDetails
+	hostDetails  *compute_api.HostDetails
 }
 
-func NewSshSession(ctx context.Context, us *mcclient.ClientSession,
-	name, ip string, port int64, username, password string, KeepUsername bool) *SSshSession {
+func NewSshSession(ctx context.Context, us *mcclient.ClientSession, conn SSshConnectionInfo) *SSshSession {
 	ret := &SSshSession{
 		us:           us,
 		id:           stringutils.UUID4(),
-		Port:         port,
-		Host:         ip,
-		name:         name,
-		Username:     username,
-		KeepUsername: KeepUsername,
-		Password:     password,
+		Port:         conn.Port,
+		Host:         conn.IP,
+		name:         conn.Name,
+		Username:     conn.Username,
+		KeepUsername: conn.KeepUsername,
+		Password:     conn.Password,
+
+		guestDetails: conn.GuestDetails,
+		hostDetails:  conn.HostDetails,
 	}
-	if port <= 0 {
+	if conn.Port <= 0 {
 		ret.Port = 22
 	}
 	return ret
@@ -95,6 +102,10 @@ func (s *SSshSession) GetCommand() *exec.Cmd {
 	return nil
 }
 
+func (s *SSshSession) GetSafeCommandString() string {
+	return ""
+}
+
 func (s *SSshSession) IsNeedLogin() (bool, error) {
 	if len(s.Username) > 0 && len(s.Password) > 0 {
 		config := &ssh.ClientConfig{
@@ -105,7 +116,7 @@ func (s *SSshSession) IsNeedLogin() (bool, error) {
 				ssh.Password(s.Password),
 			},
 		}
-		addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
+		addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 		client, err := ssh.Dial("tcp", addr, config)
 		if err != nil {
 			return true, err
@@ -123,7 +134,7 @@ func (s *SSshSession) IsNeedLogin() (bool, error) {
 			return true, errors.Error("username is empty")
 		}
 	}
-	privateKey, err := helper.GetValidPrivateKey(s.Host, s.Port, s.Username, s.us.GetProjectId())
+	privateKey, err := helper.GetValidPrivateKey(s.Host, s.Port, s.Username, s.us)
 	if err != nil {
 		return true, errors.Wrap(err, "try to use cloud admin private_key for ssh login")
 	}
@@ -132,4 +143,25 @@ func (s *SSshSession) IsNeedLogin() (bool, error) {
 }
 
 func (s *SSshSession) Scan(d byte, send func(msg string)) {
+}
+
+func (s *SSshSession) GetDisplayInfo(ctx context.Context) (*SDisplayInfo, error) {
+	userInfo, err := fetchUserInfo(ctx, s.GetClientSession())
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchUserInfo")
+	}
+	dispInfo := SDisplayInfo{}
+	dispInfo.WaterMark = fetchWaterMark(userInfo)
+	if s.guestDetails != nil {
+		dispInfo.fetchGuestInfo(s.guestDetails)
+	} else if s.hostDetails != nil {
+		dispInfo.fetchHostInfo(s.hostDetails)
+	} else {
+		dispInfo.Ips = s.Host
+		if len(s.name) > 0 {
+			dispInfo.InstanceName = s.name
+		}
+	}
+
+	return &dispInfo, nil
 }

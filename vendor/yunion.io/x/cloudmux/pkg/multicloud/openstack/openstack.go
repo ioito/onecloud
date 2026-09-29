@@ -138,13 +138,14 @@ func (cli *SOpenStackClient) getProjectToken(projectId, projectName string) (osc
 }
 
 func (cli *SOpenStackClient) GetCloudRegionExternalIdPrefix() string {
-	return fmt.Sprintf("%s/%s/", CLOUD_PROVIDER_OPENSTACK, cli.cpcfg.Id)
+	return fmt.Sprintf("%s/%s", CLOUD_PROVIDER_OPENSTACK, cli.cpcfg.Id)
 }
 
 func (cli *SOpenStackClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{
 		Account: fmt.Sprintf("%s/%s", cli.project, cli.username),
 		Name:    cli.cpcfg.Name,
+		Id:      cli.tokenCredential.GetProjectDomainId(),
 
 		HealthStatus: api.CLOUD_PROVIDER_HEALTH_NORMAL,
 	}
@@ -435,11 +436,11 @@ func (cli *SOpenStackClient) getDefaultSession(regionName string) *oscli.ClientS
 }
 
 func (cli *SOpenStackClient) getDefaultClient() *oscli.Client {
-	client := oscli.NewClient(cli.authURL, 5, cli.debug, false)
+	client := oscli.NewClient(cli.authURL, 5, cli.debug, true)
 	client.SetHttpTransportProxyFunc(cli.cpcfg.ProxyFunc)
 	_client := client.GetClient()
 	ts, _ := _client.Transport.(*http.Transport)
-	_client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	_client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if cli.cpcfg.ReadOnly {
 			if req.Method == "GET" || req.Method == "HEAD" {
 				return nil, nil
@@ -462,7 +463,7 @@ func (cli *SOpenStackClient) getDefaultToken() (oscli.TokenCredential, error) {
 	if err != nil {
 		if e, ok := err.(*httputils.JSONClientError); ok {
 			if e.Class == "Unauthorized" {
-				return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, err.Error())
+				return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", err.Error())
 			}
 		}
 		return nil, errors.Wrap(err, "Authenticate")
@@ -487,8 +488,8 @@ func (cli *SOpenStackClient) GetRegion(regionId string) *SRegion {
 	return nil
 }
 
-func (cli *SOpenStackClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return cli.iregions
+func (cli *SOpenStackClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return cli.iregions, nil
 }
 
 func (cli *SOpenStackClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
@@ -578,6 +579,7 @@ func (self *SOpenStackClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,

@@ -15,50 +15,55 @@
 package compute
 
 import (
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"strconv"
 	"strings"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/fileutils"
 	"yunion.io/x/pkg/util/regutils"
 
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
+	"yunion.io/x/onecloud/pkg/apis/cloudcommon/db"
 	computeapi "yunion.io/x/onecloud/pkg/apis/compute"
 	schedapi "yunion.io/x/onecloud/pkg/apis/scheduler"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cmdline"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
-	"yunion.io/x/onecloud/pkg/util/cgrouputils"
+	"yunion.io/x/onecloud/pkg/util/cgrouputils/cpuset"
+	"yunion.io/x/onecloud/pkg/util/fileutils2"
 )
 
-var ErrEmtptyUpdate = errors.New("No valid update data")
+var ErrEmtptyUpdate = errors.Error("No valid update data")
 
 type ServerListOptions struct {
-	Zone               string   `help:"Zone ID or Name"`
+	_ struct{} `mcp-desc:"列出虚机。操作（启停/重启/删除/重置密码）前用本工具取 id，取到后立刻调用对应操作工具，不要只查询就结束"`
+
+	Zone               string   `help:"Zone ID or Name" mcp:"true"`
 	Wire               string   `help:"Wire ID or Name"`
-	Network            string   `help:"Network ID or Name"`
+	Network            string   `help:"Network ID or Name" mcp:"true"`
 	Disk               string   `help:"Disk ID or Name"`
-	Host               string   `help:"Host ID or Name"`
+	Host               string   `help:"Host ID or Name" mcp:"true"`
 	Baremetal          *bool    `help:"Show baremetal servers"`
 	Gpu                *bool    `help:"Show gpu servers"`
 	Secgroup           string   `help:"Secgroup ID or Name"`
 	AdminSecgroup      string   `help:"AdminSecgroup ID or Name"`
-	Hypervisor         string   `help:"Show server of hypervisor" choices:"kvm|esxi|container|baremetal|aliyun|azure|aws|huawei|ucloud|volcengine|zstack|openstack|google|ctyun|incloudsphere|nutanix|bingocloud|cloudpods|ecloud|jdcloud|remotefile|h3c|hcs|hcso|hcsop|proxmox|ksyun|baidu|cucloud|qingcloud"`
-	Region             string   `help:"Show servers in cloudregion"`
+	Hypervisor         string   `help:"Show server of hypervisor" choices:"kvm|esxi|pod|baremetal|aliyun|apsara|azure|aws|huawei|ucloud|volcengine|zstack|openstack|google|ctyun|incloudsphere|nutanix|bingocloud|cloudpods|ecloud|jdcloud|remotefile|h3c|hcs|hcso|hcsop|proxmox|ksyun|baidu|cucloud|qingcloud|oracle|sangfor|zettakit|uis|cas|cnware|rockbase" mcp:"true"`
+	Region             string   `help:"Show servers in cloudregion" mcp:"true"`
 	WithEip            *bool    `help:"Show Servers with EIP"`
 	WithoutEip         *bool    `help:"Show Servers without EIP"`
-	OsType             string   `help:"OS Type" choices:"linux|windows|vmware"`
-	Vpc                []string `help:"Vpc id or name"`
+	OsType             string   `help:"OS Type" choices:"linux|windows|vmware" mcp:"true"`
+	Vpc                []string `help:"Vpc id or name" mcp:"true"`
 	UsableServerForEip string   `help:"Eip id or name"`
 	WithoutUserMeta    *bool    `help:"Show Servers without user metadata"`
 	EipAssociable      *bool    `help:"Show Servers can associate with eip"`
-	Group              string   `help:"Instance Group ID or Name"`
 	HostSn             string   `help:"Host SN"`
-	IpAddr             string   `help:"Fileter by ip"`
-	IpAddrs            []string `help:"Fileter by ips"`
+	IpAddr             string   `help:"Filter by ip" mcp:"true"`
+	IpAddrs            []string `help:"Filter by ips"`
 
 	OrderByDisk    string `help:"Order by disk size" choices:"asc|desc"`
+	OrderByOsDist  string `help:"Order by os distribution" choices:"asc|desc"`
 	OrderByHost    string `help:"Order by host name" choices:"asc|desc"`
 	OrderByNetwork string `help:"Order by network name" choices:"asc|desc"`
 	OrderByIp      string `help:"Order by ip" choices:"asc|desc"`
@@ -78,7 +83,11 @@ type ServerListOptions struct {
 
 	WithUserMeta *bool `help:"filter by user metadata" negative:"without_user_meta"`
 
-	WithHost *bool `help:"filter guest with host or not" negative:"without_host"`
+	IsolateDeviceId            string `help:"filter guest with isolated device id" json:"isolate_device_id"`
+	WithHost                   *bool  `help:"filter guest with host or not" negative:"without_host"`
+	SnapshotpolicyId           string `help:"filter guest with snapshotpolicy or not" json:"snapshotpolicy_id"`
+	BindingDisksSnapshotpolicy *bool  `help:"filter guest with disks binding snapshotpolicy or not" negative:"no-binding-disks-snapshotpolicy" json:"binding_disks_snapshotpolicy"`
+	BindingSnapshotpolicy      *bool  `help:"filter guest with binding snapshotpolicy or not" negative:"no-binding-snapshotpolicy" json:"binding_snapshotpolicy"`
 }
 
 func (o *ServerListOptions) Params() (jsonutils.JSONObject, error) {
@@ -114,7 +123,13 @@ type ServerSSHLoginOptions struct {
 type ServerConvertToKvmOptions struct {
 	ServerIdsOptions
 
-	PreferHost string `help:"Perfer host id or name" json:"prefer_host"`
+	PreferHost        string `help:"Prefer host id or name" json:"prefer_host"`
+	SysDiskBackend    string `help:"Prefer disk backend for system disk, e.g. local/lvm/slvm/nfs/rbd" json:"sys_disk_backend"`
+	SysPreferStorage  string `help:"Prefer storage id or name for system disk" json:"sys_prefer_storage"`
+	SysDiskMedium     string `help:"Prefer medium for system disk, e.g. rotate/ssd/hybrid" json:"sys_disk_medium"`
+	DataDiskBackend   string `help:"Prefer disk backend for data disks, e.g. local/lvm/slvm/nfs/rbd" json:"data_disk_backend"`
+	DataPreferStorage string `help:"Prefer storage id or name for data disks" json:"data_prefer_storage"`
+	DataDiskMedium    string `help:"Prefer medium for data disks, e.g. rotate/ssd/hybrid" json:"data_disk_medium"`
 }
 
 func (o *ServerConvertToKvmOptions) Params() (jsonutils.JSONObject, error) {
@@ -122,13 +137,26 @@ func (o *ServerConvertToKvmOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerStartOptions struct {
+	_ struct{} `mcp-desc:"启动虚机（真正执行）。未知 id 时先 climc_server_list；拿到 id 后立刻调用，仅查询不算完成"`
+
 	ServerIdsOptions
 
 	QemuVersion string `help:"prefer qemu version" json:"qemu_version"`
+	AutoPrepaid *bool  `help:"Auto convert postpaid to prepaid"`
 }
 
 func (o *ServerStartOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(o), nil
+}
+
+// ServerStartRescueOptions 与启动参数相同，单独包装以免继承 server-start 的 mcp-desc。
+type ServerStartRescueOptions struct {
+	ServerStartOptions
+}
+
+// ServerStopRescueOptions 与启动参数相同，单独包装以免继承 server-start 的 mcp-desc。
+type ServerStopRescueOptions struct {
+	ServerStartOptions
 }
 
 type ServerIdsOptions struct {
@@ -187,6 +215,8 @@ func (o *ServerCreateBackupOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerShowOptions struct {
+	_ struct{} `mcp-desc:"查询单台虚拟机详情。ID 可用 climc_server_list 返回的 id/name；查看状态、配置、IP 等信息时使用"`
+
 	options.BaseShowOptions `id->help:"ID or name of the server"`
 }
 
@@ -241,82 +271,61 @@ func ParseServerDeployInfoList(list []string) ([]*computeapi.DeployConfig, error
 	return ret, nil
 }
 
-type ServerConfigs struct {
-	Manager    string `help:"Preferred cloudprovider where virtual server should bd created" json:"prefer_manager"`
-	Region     string `help:"Preferred region where virtual server should be created" json:"prefer_region"`
-	Zone       string `help:"Preferred zone where virtual server should be created" json:"prefer_zone"`
-	Wire       string `help:"Preferred wire where virtual server should be created" json:"prefer_wire"`
-	Host       string `help:"Preferred host where virtual server should be created" json:"prefer_host"`
-	BackupHost string `help:"Perfered host where virtual backup server should be created"`
+type ServerCreateCommonConfig struct {
+	Manager string   `help:"Preferred cloudprovider where virtual server should be created" json:"prefer_manager" mcp:"true"`
+	Region  string   `help:"Preferred region where virtual server should be created" json:"prefer_region" mcp:"true"`
+	Zone    string   `help:"Preferred zone where virtual server should be created" json:"prefer_zone" mcp:"true"`
+	Zones   []string `help:"Preferred zones where virtual server should be created" json:"prefer_zones"`
+	Wire    string   `help:"Preferred wire where virtual server should be created" json:"prefer_wire"`
+	Host    string   `help:"Preferred host where virtual server should be created" json:"prefer_host" mcp:"true"`
 
-	Hypervisor                   string `help:"Hypervisor type" choices:"kvm|esxi|baremetal|container|aliyun|azure|qcloud|aws|huawei|openstack|ucloud|volcengine|zstack|google|ctyun|incloudsphere|bingocloud|cloudpods|ecloud|jdcloud|remotefile|h3c|hcs|hcso|hcsop|proxmox"`
-	ResourceType                 string `help:"Resource type" choices:"shared|prepaid|dedicated"`
-	Backup                       bool   `help:"Create server with backup server"`
-	AutoSwitchToBackupOnHostDown bool   `help:"Auto switch to backup server on host down"`
-	Daemon                       *bool  `help:"Set as a daemon server" json:"is_daemon"`
-
-	Schedtag []string `help:"Schedule policy, key = aggregate name, value = require|exclude|prefer|avoid" metavar:"<KEY:VALUE>"`
-	Disk     []string `help:"
+	ResourceType   string   `help:"Resource type" choices:"shared|prepaid|dedicated"`
+	Schedtag       []string `help:"Schedule policy, key = aggregate name, value = require|exclude|prefer|avoid" metavar:"<KEY:VALUE>"`
+	Net            []string `help:"Network descriptions；可省略，省略时 MCP 自动用 random（等价 nets:[{exit:false}]）走自动调度" metavar:"NETWORK" mcp:"true"`
+	NetPortMapping []string `help:"Network port mapping, e.g. 'index=0,port=80,host_port=8080,protocol=<tcp|udp>,host_port_range=<int>-<int>,remote_ips=x.x.x.x|y.y.y.y'" short-token:"p"`
+	NetSchedtag    []string `help:"Network schedtag description, e.g. '0:<tag>:<strategy>'"`
+	IsolatedDevice []string `help:"Isolated device model or ID" metavar:"ISOLATED_DEVICE"`
+	Project        string   `help:"Owner project ID or Name" json:"tenant" mcp:"true"`
+	User           string   `help:"Owner user ID or Name"`
+	Count          int      `help:"Create multiple simultaneously" default:"1" mcp:"true"`
+	Disk           []string `help:"
 	Disk descriptions
 	size: 500M, 10G
+	auto_delete: true, false
 	fs: swap, ext2, ext3, ext4, xfs, ntfs, fat, hfsplus
+	fs_features: casefold
 	format: qcow2, raw, docker, iso, vmdk, vmdkflatver1, vmdkflatver2, vmdkflat, vmdksparse, vmdksparsever1, vmdksparsever2, vmdksesparse, vhd
 	driver: virtio, ide, scsi, sata, pvscsi
-	cache_mod: writeback, none, writethrough
+	cache_mode: writeback, none, writethrough
 	medium: rotate, ssd, hybrid
 	disk_type: sys, data
 	mountpoint: /, /opt
-	storage_type: local, rbd, nas, nfs
+	storage_type/backend: local, rbd, nas, nfs；公有云用 cloud-region-capability 的 storage_types2（如 cloud_essd）
 	snapshot_id: use snapshot-list get snapshot id
 	disk_id: use disk-list get disk id
 	storage_id: use storage-list get storage id
-	image_id: use image-list get image id
+	image_id: use image-list/cached-image-list get image id
 	for example:
-		--disk 'image_id=c2be02a4-7ff2-43e6-8a00-a489e04d2d6f,size=10G,driver=ide,storage_type=rbd'
+		--disk 'image_id=c2be02a4-7ff2-43e6-8a00-a489e04d2d6f,size=10G,driver=ide,storage_type=rbd,auto_delete=true'
+		--disk 'size=40g,image=<id>,backend=cloud_essd'
 		--disk 'size=500M'
-		--disk 'snpahost_id=1ceb8c6d-6571-451d-8957-4bd3a871af85'
-	" nargs:"+"`
-	DiskSchedtag   []string `help:"Disk schedtag description, e.g. '0:<tag>:<strategy>'"`
-	Net            []string `help:"Network descriptions" metavar:"NETWORK"`
-	NetSchedtag    []string `help:"Network schedtag description, e.g. '0:<tag>:<strategy>'"`
-	IsolatedDevice []string `help:"Isolated device model or ID" metavar:"ISOLATED_DEVICE"`
-	RaidConfig     []string `help:"Baremetal raid config" json:"-"`
-	Project        string   `help:"'Owner project ID or Name" json:"tenant"`
-	User           string   `help:"Owner user ID or Name"`
-	Count          int      `help:"Create multiple simultaneously" default:"1"`
+		--disk 'snapshot_id=1ceb8c6d-6571-451d-8957-4bd3a871af85'
+	" mcp:"true"`
+	DiskSchedtag []string `help:"Disk schedtag description, e.g. '0:<tag>:<strategy>'"`
 }
 
-func (o ServerConfigs) Data() (*computeapi.ServerConfigs, error) {
+func (o ServerCreateCommonConfig) Data() (*computeapi.ServerConfigs, error) {
 	data := &computeapi.ServerConfigs{
-		PreferManager:    o.Manager,
-		PreferRegion:     o.Region,
-		PreferZone:       o.Zone,
-		PreferWire:       o.Wire,
-		PreferHost:       o.Host,
-		PreferBackupHost: o.BackupHost,
-		Hypervisor:       o.Hypervisor,
-		ResourceType:     o.ResourceType,
-		Backup:           o.Backup,
-		Count:            o.Count,
-		IsDaemon:         o.Daemon,
-	}
-	for i, d := range o.Disk {
-		disk, err := cmdline.ParseDiskConfig(d, i)
-		if err != nil {
-			return nil, err
-		}
-		data.Disks = append(data.Disks, disk)
-	}
-	for _, dtag := range o.DiskSchedtag {
-		idx, tag, err := cmdline.ParseResourceSchedtagConfig(dtag)
-		if err != nil {
-			return nil, fmt.Errorf("ParseDiskSchedtag: %v", err)
-		}
-		if idx >= len(data.Disks) {
-			return nil, fmt.Errorf("Invalid disk index: %d", idx)
-		}
-		d := data.Disks[idx]
-		d.Schedtags = append(d.Schedtags, tag)
+		PreferManager: o.Manager,
+		PreferRegion:  o.Region,
+		PreferZone:    o.Zone,
+		PreferZones:   o.Zones,
+		PreferWire:    o.Wire,
+		PreferHost:    o.Host,
+		ResourceType:  o.ResourceType,
+		Count:         o.Count,
+		Networks:      make([]*computeapi.NetworkConfig, 0),
+		Disks:         make([]*computeapi.DiskConfig, 0),
 	}
 	for i, n := range o.Net {
 		net, err := cmdline.ParseNetworkConfig(n, i)
@@ -324,6 +333,19 @@ func (o ServerConfigs) Data() (*computeapi.ServerConfigs, error) {
 			return nil, err
 		}
 		data.Networks = append(data.Networks, net)
+	}
+	if len(o.NetPortMapping) != 0 {
+		pms, err := cmdline.ParseNetworkConfigPortMappings(o.NetPortMapping)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse network port mapping")
+		}
+		for idx, _ := range pms {
+			if idx >= len(data.Networks) {
+				return nil, errors.Errorf("not found %d network of index", idx)
+			}
+			pm := pms[idx]
+			data.Networks[idx].PortMappings = pm
+		}
 	}
 	for _, ntag := range o.NetSchedtag {
 		idx, tag, err := cmdline.ParseResourceSchedtagConfig(ntag)
@@ -343,6 +365,57 @@ func (o ServerConfigs) Data() (*computeapi.ServerConfigs, error) {
 		}
 		data.IsolatedDevices = append(data.IsolatedDevices, dev)
 	}
+	for _, tag := range o.Schedtag {
+		schedtag, err := cmdline.ParseSchedtagConfig(tag)
+		if err != nil {
+			return nil, err
+		}
+		data.Schedtags = append(data.Schedtags, schedtag)
+	}
+	for i, d := range o.Disk {
+		disk, err := cmdline.ParseDiskConfig(d, i)
+		if err != nil {
+			return nil, err
+		}
+		data.Disks = append(data.Disks, disk)
+	}
+	for _, dtag := range o.DiskSchedtag {
+		idx, tag, err := cmdline.ParseResourceSchedtagConfig(dtag)
+		if err != nil {
+			return nil, fmt.Errorf("ParseDiskSchedtag: %v", err)
+		}
+		if idx >= len(data.Disks) {
+			return nil, fmt.Errorf("Invalid disk index: %d", idx)
+		}
+		d := data.Disks[idx]
+		d.Schedtags = append(d.Schedtags, tag)
+	}
+	return data, nil
+}
+
+type ServerConfigs struct {
+	ServerCreateCommonConfig
+	Hypervisor                   string `help:"Hypervisor type" choices:"kvm|pod|esxi|baremetal|container|aliyun|apsara|azure|qcloud|aws|huawei|openstack|ucloud|volcengine|zstack|google|ctyun|incloudsphere|bingocloud|cloudpods|ecloud|jdcloud|remotefile|h3c|hcs|hcso|hcsop|proxmox|ksyun|baidu|cucloud|qingcloud|oracle|sangfor|zettakit|uis|cas|cnware|rockbase" mcp:"true"`
+	Backup                       bool   `help:"Create server with backup server"`
+	BackupHost                   string `help:"Preferred host where virtual backup server should be created"`
+	AutoSwitchToBackupOnHostDown bool   `help:"Auto switch to backup server on host down"`
+	Daemon                       *bool  `help:"Set as a daemon server" json:"is_daemon"`
+	QemuVersion                  string `help:"specific server guest start version" json:"qemu_version"`
+
+	RaidConfig      []string `help:"Baremetal raid config" json:"-"`
+	RootDiskMatcher string   `help:"Baremetal root disk matcher, e.g. 'device=/dev/sdb' 'size=900G' 'size_start=800G,size_end=900G'" json:"-"`
+}
+
+func (o ServerConfigs) Data() (*computeapi.ServerConfigs, error) {
+	data, err := o.ServerCreateCommonConfig.Data()
+	if err != nil {
+		return nil, err
+	}
+	data.Backup = o.Backup
+	data.PreferBackupHost = o.BackupHost
+	data.IsDaemon = o.Daemon
+	data.Hypervisor = o.Hypervisor
+	data.QemuVersion = o.QemuVersion
 	if len(o.RaidConfig) > 0 {
 		// if data.Hypervisor != "baremetal" {
 		// 	return nil, fmt.Errorf("RaidConfig is applicable to baremetal ONLY")
@@ -355,22 +428,22 @@ func (o ServerConfigs) Data() (*computeapi.ServerConfigs, error) {
 			data.BaremetalDiskConfigs = append(data.BaremetalDiskConfigs, raidConf)
 		}
 	}
-	for _, tag := range o.Schedtag {
-		schedtag, err := cmdline.ParseSchedtagConfig(tag)
+	if len(o.RootDiskMatcher) > 0 {
+		matcher, err := cmdline.ParseBaremetalRootDiskMatcher(o.RootDiskMatcher)
 		if err != nil {
 			return nil, err
 		}
-		data.Schedtags = append(data.Schedtags, schedtag)
+		data.BaremetalRootDiskMatcher = matcher
 	}
 	return data, nil
 }
 
 type ServerCloneOptions struct {
 	SOURCE      string `help:"Source server id or name"  json:"-"`
-	TARGET_NAME string `help:"Name of newly server" json:"name"`
+	TARGET_NAME string `help:"Name of the new server" json:"name"`
 	AutoStart   bool   `help:"Auto start server after it is created"`
 
-	EipBw         int    `help:"allocate EIP with bandwidth in MB when server is created" json:"eip_bw,omitzero"`
+	EipBw         int    `help:"allocate EIP with bandwidth in Mbps when server is created" json:"eip_bw,omitzero"`
 	EipChargeType string `help:"newly allocated EIP charge type" choices:"traffic|bandwidth" json:"eip_charge_type,omitempty"`
 	Eip           string `help:"associate with an existing EIP when server is created" json:"eip,omitempty"`
 }
@@ -388,77 +461,99 @@ func (o *ServerCloneOptions) Description() string {
 }
 
 type ServerCreateFromInstanceSnapshot struct {
-	InstaceSnapshotId string `help:"Instace snapshot id or name"`
-	NAME              string `help:"Name of newly server" json:"name"`
+	InstaceSnapshotId string `help:"Instance snapshot id or name"`
+	NAME              string `help:"Name of the new server" json:"name"`
 	AutoStart         bool   `help:"Auto start server after it is created"`
-	AllowDelete       bool   `help:"Unlock server to allow deleting"`
+	AllowDelete       bool   `help:"Allow deleting the server (disable_delete=false)"`
 
-	EipBw         int    `help:"allocate EIP with bandwidth in MB when server is created" json:"eip_bw,omitzero"`
+	EipBw         int    `help:"allocate EIP with bandwidth in Mbps when server is created" json:"eip_bw,omitzero"`
+	EipTxBw       int    `help:"allocate EIP with outbound bandwidth in Mbps when server is created" json:"eip_tx_bw,omitzero"`
+	EipRxBw       int    `help:"allocate EIP with inbound bandwidth in Mbps when server is created" json:"eip_rx_bw,omitzero"`
 	EipChargeType string `help:"newly allocated EIP charge type" choices:"traffic|bandwidth" json:"eip_charge_type,omitempty"`
 	Eip           string `help:"associate with an existing EIP when server is created" json:"eip,omitempty"`
 }
 
 type ServerCreateOptions struct {
+	_ struct{} `mcp-desc:"【创建虚拟机的最终动作】自动 forecast→创建→等待 running/ready。最少：name、规格。KVM/公有云：disk 含 image+backend；CAS/UIS/SangFor：hypervisor=cas 等，系统盘仅 size+backend（dir/fs），镜像用 cdrom=ISO(cached-image id)，并传 prefer-region。超时返回 wait_pending+server_id，用 climc_server_show 续查，勿重复创建"`
+
 	ServerCreateOptionalOptions
 
-	NAME string `help:"Name of server" json:"-"`
+	NAME string `help:"虚拟机名称模板；默认配合 generate-name 自动去重" json:"-" mcp:"required"`
 }
 
 type ServerCreateOptionalOptions struct {
 	ServerConfigs
 
-	MemSpec        string `help:"Memory size Or Instance Type" metavar:"MEMSPEC" json:"-"`
+	MemSpec        string `help:"Memory size Or Instance Type" metavar:"MEMSPEC" json:"-" mcp:"true"`
+	CpuSockets     int    `help:"Cpu sockets"`
 	EnableMemclean bool   `help:"clean guest memory after guest exit" json:"enable_memclean"`
+	EnableTpm      bool   `help:"enable tpm device" json:"enable_tpm"`
 
-	Keypair          string   `help:"SSH Keypair"`
-	Password         string   `help:"Default user password"`
-	LoginAccount     string   `help:"Guest login account"`
-	Iso              string   `help:"ISO image ID" metavar:"IMAGE_ID" json:"cdrom"`
-	IsoBootIndex     *int8    `help:"Iso bootindex" metavar:"IMAGE_BOOT_INDEX" json:"cdrom_boot_index"`
-	VcpuCount        int      `help:"#CPU cores of VM server, default 1" default:"1" metavar:"<SERVER_CPU_COUNT>" json:"vcpu_count" token:"ncpu"`
-	InstanceType     string   `help:"instance flavor"`
-	Vga              string   `help:"VGA driver" choices:"std|vmware|cirrus|qxl|virtio"`
-	Vdi              string   `help:"VDI protocool" choices:"vnc|spice"`
-	Bios             string   `help:"BIOS" choices:"BIOS|UEFI"`
-	Machine          string   `help:"Machine type" choices:"pc|q35"`
-	Desc             string   `help:"Description" metavar:"<DESCRIPTION>" json:"description"`
-	Boot             string   `help:"Boot device" metavar:"<BOOT_DEVICE>" choices:"disk|cdrom" json:"-"`
-	EnableCloudInit  bool     `help:"Enable cloud-init service"`
-	NoAccountInit    *bool    `help:"Not reset account password"`
-	AllowDelete      *bool    `help:"Unlock server to allow deleting" json:"-"`
-	ShutdownBehavior string   `help:"Behavior after VM server shutdown" metavar:"<SHUTDOWN_BEHAVIOR>" choices:"stop|terminate"`
-	AutoStart        bool     `help:"Auto start server after it is created"`
-	Deploy           []string `help:"Specify deploy files in virtual server file system" json:"-"`
-	DeployTelegraf   bool     `help:"Deploy telegraf agent if guest os is supported"`
-	Group            []string `help:"Group ID or Name of virtual server"`
-	System           bool     `help:"Create a system VM, sysadmin ONLY option" json:"is_system"`
-	TaskNotify       *bool    `help:"Setup task notify" json:"-"`
-	FakeCreate       *bool    `help:"Fake create server"`
-	DryRun           *bool    `help:"Dry run to test scheduler" json:"-"`
-	UserDataFile     string   `help:"user_data file path" json:"-"`
-	InstanceSnapshot string   `help:"instance snapshot" json:"instance_snapshot"`
-	Secgroups        []string `help:"secgroups" json:"secgroups"`
+	Keypair                string   `help:"SSH Keypair" mcp:"true"`
+	Password               string   `help:"Default user password" mcp:"true"`
+	LoginAccount           string   `help:"Guest login account" mcp:"true"`
+	Iso                    string   `help:"ISO image ID" metavar:"IMAGE_ID" json:"cdrom" mcp:"true"`
+	IsoBootIndex           *int8    `help:"Iso bootindex" metavar:"IMAGE_BOOT_INDEX" json:"cdrom_boot_index"`
+	VcpuCount              int      `help:"#CPU cores of VM server, default 1" default:"1" metavar:"<SERVER_CPU_COUNT>" json:"vcpu_count" token:"ncpu" mcp:"true"`
+	ExtraCpuCount          int      `help:"Extra allocate cpu count" json:"extra_cpu_count"`
+	InstanceType           string   `help:"instance flavor" mcp:"true"`
+	Vga                    string   `help:"VGA driver" choices:"std|vmware|cirrus|qxl|virtio"`
+	Vdi                    string   `help:"VDI protocol" choices:"vnc|spice"`
+	Bios                   string   `help:"BIOS" choices:"BIOS|UEFI" mcp:"true"`
+	Machine                string   `help:"Machine type" choices:"pc|q35"`
+	Desc                   string   `help:"Description" metavar:"<DESCRIPTION>" json:"description"`
+	Boot                   string   `help:"Boot device" metavar:"<BOOT_DEVICE>" choices:"disk|cdrom" json:"-"`
+	EnableCloudInit        bool     `help:"Enable cloud-init service"`
+	NoAccountInit          *bool    `help:"Not reset account password"`
+	AllowDelete            *bool    `help:"Allow deleting the server (disable_delete=false)" json:"-"`
+	ShutdownBehavior       string   `help:"Behavior after VM server shutdown" metavar:"<SHUTDOWN_BEHAVIOR>" choices:"stop|terminate|stop_release_gpu"`
+	AutoStart              bool     `help:"Auto start server after it is created" mcp:"true"`
+	Deploy                 []string `help:"Specify deploy files in virtual server file system" json:"-"`
+	DeployTelegraf         bool     `help:"Deploy telegraf agent if guest os is supported"`
+	Group                  []string `help:"Group ID or Name of virtual server"`
+	System                 bool     `help:"Create a system VM, sysadmin ONLY option" json:"is_system"`
+	TaskNotify             *bool    `help:"Setup task notify" json:"-"`
+	FakeCreate             *bool    `help:"Fake create server"`
+	FakeCreateFromBmImport *bool    `help:"Fake create from import baremetal"`
+	DryRun                 *bool    `help:"Dry run to validate create params (not preschedule)；MCP 创建会自动调 scheduler-forecast 预调度，一般无需手动传" json:"-" mcp:"true"`
+	UserDataFile           string   `help:"user_data file path" json:"-"`
+	InstanceSnapshot       string   `help:"instance snapshot" json:"instance_snapshot"`
+	Secgroups              []string `help:"Security group IDs or names" json:"secgroups"`
+	NetworkTags            []string `help:"GCP network tags, google only; when set, secgroups can be omitted" json:"network_tags"`
+	DisableSrcIpCheck      *bool    `help:"Disable source IP check" json:"-"`
+	DisableSrcMacCheck     *bool    `help:"Disable source MAC check" json:"-"`
 
-	OsType string `help:"os type, e.g. Linux, Windows, etc."`
+	OsType string `help:"os type, e.g. Linux, Windows, etc." mcp:"true"`
 
 	Duration  string `help:"valid duration of the server, e.g. 1H, 1D, 1W, 1M, 1Y, ADMIN ONLY option"`
 	AutoRenew bool   `help:"auto renew for prepaid server"`
 
 	AutoPrepaidRecycle bool `help:"automatically enable prepaid recycling after server is created successfully" json:"auto_prepaid_recycle,omitfalse"`
 
-	GenerateName bool `help:"name is generated by pattern" json:"-"`
+	// Kickstart related options
+	KickstartOSType         string `help:"Kickstart OS type" choices:"centos|rhel|fedora|openeuler|ubuntu" json:"-"`
+	KickstartConfigFile     string `help:"Kickstart configuration content file" json:"-"`
+	KickstartConfigURL      string `help:"Kickstart configuration URL" json:"-"`
+	KickstartEnabled        *bool  `help:"Enable kickstart" json:"-"`
+	KickstartMaxRetries     int    `help:"Kickstart max retries" default:"3" json:"-"`
+	KickstartTimeoutMinutes int    `help:"Kickstart timeout in minutes" default:"60" json:"-"`
 
-	EipBw         int    `help:"allocate EIP with bandwidth in MB when server is created" json:"eip_bw,omitzero"`
-	EipBgpType    string `help:"desired BGP type of newly alloated EIP" json:"eip_bgp_type,omitzero"`
+	GenerateName bool `help:"name is generated by pattern" json:"-" mcp:"true"`
+
+	EipBw         int    `help:"allocate EIP with bandwidth in Mbps when server is created" json:"eip_bw,omitzero"`
+	EipTxBw       int    `help:"allocate EIP with outbound bandwidth in Mbps when server is created" json:"eip_tx_bw,omitzero"`
+	EipRxBw       int    `help:"allocate EIP with inbound bandwidth in Mbps when server is created" json:"eip_rx_bw,omitzero"`
+	EipBgpType    string `help:"desired BGP type of newly allocated EIP" json:"eip_bgp_type,omitzero"`
 	EipChargeType string `help:"newly allocated EIP charge type" choices:"traffic|bandwidth" json:"eip_charge_type,omitempty"`
 	Eip           string `help:"associate with an existing EIP when server is created" json:"eip,omitempty"`
 
-	PublicIpBw         int    `help:"associate public ip with bandwidth in MB where server is created" json:"public_ip_bw,omitzero"`
+	PublicIpBw         int    `help:"associate public ip with bandwidth in Mbps when server is created" json:"public_ip_bw,omitzero"`
 	PublicIpChargeType string `help:"newly allocated public ip charge type" choices:"traffic|bandwidth" json:"public_ip_charge_type,omitempty"`
 
-	GuestImageID string `help:"create from guest image, need to specify the guest image id"`
+	GuestImageID string `help:"create from guest image, need to specify the guest image id" mcp:"true"`
 
-	EncryptKey string `help:"encryption key"`
+	EncryptKey string   `help:"encryption key"`
+	Tags       []string `help:"tags in the form of key=value"`
 }
 
 func (o *ServerCreateOptions) ToScheduleInput() (*schedapi.ScheduleInput, error) {
@@ -536,16 +631,20 @@ func (opts *ServerCreateOptionalOptions) OptionalParams() (*computeapi.ServerCre
 		AutoRenew:          opts.AutoRenew,
 		AutoPrepaidRecycle: opts.AutoPrepaidRecycle,
 		EipBw:              opts.EipBw,
+		EipTxBw:            opts.EipTxBw,
+		EipRxBw:            opts.EipRxBw,
 		EipBgpType:         opts.EipBgpType,
-		EipChargeType:      opts.EipChargeType,
+		EipChargeType:      billing_api.TNetChargeType(opts.EipChargeType),
 		PublicIpBw:         opts.PublicIpBw,
-		PublicIpChargeType: opts.PublicIpChargeType,
+		PublicIpChargeType: billing_api.TNetChargeType(opts.PublicIpChargeType),
 		Eip:                opts.Eip,
 		EnableCloudInit:    opts.EnableCloudInit,
 		OsType:             opts.OsType,
 		GuestImageID:       opts.GuestImageID,
 		Secgroups:          opts.Secgroups,
+		NetworkTags:        opts.NetworkTags,
 		EnableMemclean:     opts.EnableMemclean,
+		EnableTpm:          opts.EnableTpm,
 	}
 
 	params.ProjectId = opts.Project
@@ -554,8 +653,20 @@ func (opts *ServerCreateOptionalOptions) OptionalParams() (*computeapi.ServerCre
 		params.FakeCreate = *opts.FakeCreate
 	}
 
+	if opts.FakeCreateFromBmImport != nil {
+		params.FakeCreateFromBmImport = *opts.FakeCreateFromBmImport
+	}
+
 	if len(opts.EncryptKey) > 0 {
 		params.EncryptKeyId = &opts.EncryptKey
+	}
+	if opts.DisableSrcMacCheck != nil && *opts.DisableSrcMacCheck {
+		var srcMacCheck = false
+		params.SrcMacCheck = &srcMacCheck
+	}
+	if opts.DisableSrcIpCheck != nil && *opts.DisableSrcIpCheck {
+		var srcIpCheck = false
+		params.SrcIpCheck = &srcIpCheck
 	}
 
 	if regutils.MatchSize(opts.MemSpec) {
@@ -614,15 +725,72 @@ func (opts *ServerCreateOptionalOptions) OptionalParams() (*computeapi.ServerCre
 
 	params.IsSystem = &opts.System
 
+	// if kickstart os type is specified, then kickstart is enabled
+	if len(opts.KickstartOSType) > 0 {
+		if opts.KickstartConfigFile == "" && opts.KickstartConfigURL == "" {
+			return nil, fmt.Errorf("either --kickstart-config or --kickstart-config-url must be provided when --kickstart-os-type is specified")
+		}
+		if opts.KickstartConfigFile != "" && opts.KickstartConfigURL != "" {
+			return nil, fmt.Errorf("--kickstart-config and --kickstart-config-url cannot be both provided, choose one")
+		}
+
+		kickstartConfig := &computeapi.KickstartConfig{
+			OSType: opts.KickstartOSType,
+		}
+
+		if opts.KickstartConfigFile != "" {
+			ksconf, err := fileutils2.FileGetContents(opts.KickstartConfigFile)
+			if err != nil {
+				return nil, errors.Wrapf(err, "FileGetContents %s", opts.KickstartConfigFile)
+			}
+			kickstartConfig.Config = ksconf
+		}
+		if opts.KickstartConfigURL != "" {
+			kickstartConfig.ConfigURL = opts.KickstartConfigURL
+		}
+
+		// setting default value
+		if opts.KickstartEnabled != nil {
+			kickstartConfig.Enabled = opts.KickstartEnabled
+		} else {
+			enabled := true
+			kickstartConfig.Enabled = &enabled
+		}
+
+		if opts.KickstartMaxRetries > 0 {
+			kickstartConfig.MaxRetries = opts.KickstartMaxRetries
+		} else {
+			kickstartConfig.MaxRetries = 3
+		}
+
+		if opts.KickstartTimeoutMinutes > 0 {
+			kickstartConfig.TimeoutMinutes = opts.KickstartTimeoutMinutes
+		} else {
+			kickstartConfig.TimeoutMinutes = 60
+		}
+
+		params.KickstartConfig = kickstartConfig
+	}
+
 	return params, nil
 }
 
 func (opts *ServerCreateOptions) Params() (*computeapi.ServerCreateInput, error) {
-
 	params, err := opts.OptionalParams()
 	if err != nil {
 		return nil, err
 	}
+	meta := map[string]string{}
+	for _, v := range opts.Tags {
+		tag := strings.Split(v, "=")
+		if len(tag) != 2 {
+			return nil, fmt.Errorf("invalid tag %s", v)
+		}
+		prefix := db.USER_TAG_PREFIX
+		k, v := prefix+strings.TrimPrefix(tag[0], prefix), tag[1]
+		meta[k] = v
+	}
+	params.Metadata = meta
 
 	if opts.GenerateName {
 		params.GenerateName = opts.NAME
@@ -634,9 +802,12 @@ func (opts *ServerCreateOptions) Params() (*computeapi.ServerCreateInput, error)
 }
 
 type ServerStopOptions struct {
+	_ struct{} `mcp-desc:"停止虚机（真正执行）。未知 id 时先 climc_server_list；拿到 id 后立刻调用，仅查询不算完成"`
+
 	ID           []string `help:"ID or Name of server" json:"-"`
-	Force        *bool    `help:"Stop server forcefully" json:"is_force"`
-	StopCharging *bool    `help:"Stop charging when server stop"`
+	Force        *bool    `help:"Stop server forcefully" json:"is_force" mcp:"true"`
+	StopCharging *bool    `help:"Stop charging when server stop" mcp:"true"`
+	TimeoutSecs  *int     `help:"Guest stop timeout seconds" json:"timeout_secs" mcp:"true"`
 }
 
 func (o *ServerStopOptions) GetIds() []string {
@@ -658,7 +829,7 @@ type ServerUpdateOptions struct {
 	Desc             string `help:"Description" json:"description"`
 	Boot             string `help:"Boot device" choices:"disk|cdrom"`
 	Delete           string `help:"Lock server to prevent from deleting" choices:"enable|disable" json:"-"`
-	ShutdownBehavior string `help:"Behavior after VM server shutdown" choices:"stop|terminate"`
+	ShutdownBehavior string `help:"Behavior after VM server shutdown" choices:"stop|terminate|stop_release_gpu"`
 	Machine          string `help:"Machine type" choices:"q35|pc"`
 
 	IsDaemon *bool `help:"Daemon server" negative:"no-daemon"`
@@ -695,11 +866,14 @@ func (opts *ServerUpdateOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerDeleteOptions struct {
+	_ struct{} `mcp-desc:"删除虚机（真正执行；若 disable_delete 会先自动解锁）。未知 id 时先 climc_server_list；拿到 id 后立刻调用，仅查询不算完成"`
+
 	ServerIdsOptions
-	OverridePendingDelete *bool `help:"Delete server directly instead of pending delete" short-token:"f"`
-	DeleteSnapshots       *bool `help:"Delete server snapshots"`
-	DeleteDisks           *bool `help:"Delete server disks"`
-	DeleteEip             *bool `help:"Delete eip"`
+	OverridePendingDelete *bool `help:"Delete server directly instead of pending delete" short-token:"f" mcp:"true"`
+	DeleteSnapshots       *bool `help:"Delete server snapshots" mcp:"true"`
+	DeleteDisks           *bool `help:"Delete server disks" mcp:"true"`
+	DeleteEip             *bool `help:"Delete eip" mcp:"true"`
+	DeleteBastionServer   *bool `help:"Remove from bastion host" mcp:"true"`
 }
 
 func (o *ServerDeleteOptions) QueryParams() (jsonutils.JSONObject, error) {
@@ -721,6 +895,7 @@ type ServerDeployOptions struct {
 	Deploy         []string `help:"Specify deploy files in virtual server file system" json:"-"`
 	ResetPassword  bool     `help:"Force reset password"`
 	Password       string   `help:"Default user password"`
+	LoginAccount   string   `help:"Guest login account"`
 	AutoStart      bool     `help:"Auto start server after deployed"`
 	DeployTelegraf bool     `help:"Deploy telegraf if guest os supported"`
 }
@@ -737,6 +912,7 @@ func (opts *ServerDeployOptions) Params() (jsonutils.JSONObject, error) {
 		params.ResetPassword = opts.ResetPassword
 		params.Password = opts.Password
 		params.DeployTelegraf = opts.DeployTelegraf
+		params.LoginAccount = opts.LoginAccount
 	}
 	{
 		deployInfos, err := ParseServerDeployInfoList(opts.Deploy)
@@ -778,6 +954,20 @@ func (opts *ServerSecGroupsOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(map[string][]string{"secgroup_ids": opts.SecgroupIds}), nil
 }
 
+type ServerNetworkSecGroupsOptions struct {
+	ID           string   `help:"ID or Name of server" metavar:"Guest" json:"-"`
+	NetworkIndex *int     `help:"Guest network index" metavar:"Network Index"`
+	SecgroupIds  []string `help:"Ids of Security Groups" metavar:"Security Groups" positional:"true"`
+}
+
+func (o *ServerNetworkSecGroupsOptions) GetId() string {
+	return o.ID
+}
+
+func (opts *ServerNetworkSecGroupsOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(opts), nil
+}
+
 type ServerModifySrcCheckOptions struct {
 	ID          string `help:"ID or Name of server" metavar:"Guest" json:"-"`
 	SrcIpCheck  string `help:"Turn on/off src ip check" choices:"on|off"`
@@ -796,6 +986,16 @@ func (o *ServerModifySrcCheckOptions) Description() string {
 	return "Modify src ip, mac check settings"
 }
 
+type ServerDisableAutoMergeSnapshot struct {
+	ServerIdOptions
+
+	DisableAutoMergeSnapshot bool `help:"Disable auto merge snapshots"`
+}
+
+func (o *ServerDisableAutoMergeSnapshot) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
 type ServerSendKeyOptions struct {
 	ID   string `help:"ID or Name of server" metavar:"Guest" json:"-"`
 	KEYS string `help:"Special keys to send, eg. ctrl, alt, f12, shift, etc, separated by \"-\""`
@@ -810,10 +1010,44 @@ func (o *ServerSendKeyOptions) Params() (jsonutils.JSONObject, error) {
 	return options.StructToParams(o)
 }
 
+// Kickstart related options
+
+type ServerKickstartConfigOptions struct {
+	ServerIdOptions
+	OSType         string `help:"Kickstart OS type" choices:"centos|rhel|fedora|openeuler|ubuntu" json:"os_type"`
+	Config         string `help:"Kickstart configuration content" json:"config,omitempty"`
+	ConfigURL      string `help:"Kickstart configuration URL" json:"config_url,omitempty"`
+	Enabled        *bool  `help:"Enable kickstart" json:"enabled,omitempty"`
+	MaxRetries     int    `help:"Kickstart max retries" default:"3" json:"max_retries,omitempty"`
+	TimeoutMinutes int    `help:"Kickstart timeout in minutes" default:"60" json:"timeout_minutes,omitempty"`
+}
+
+func (o *ServerKickstartConfigOptions) Params() (jsonutils.JSONObject, error) {
+	if o.Config == "" && o.ConfigURL == "" {
+		return nil, fmt.Errorf("either --config or --config-url must be provided")
+	}
+	if o.Config != "" && o.ConfigURL != "" {
+		return nil, fmt.Errorf("--config and --config-url cannot be both provided, choose one")
+	}
+	return options.StructToParams(o)
+}
+
 func (o *ServerSendKeyOptions) Description() string {
 	return "Send keys to server"
 }
 
+type ServerKickstartCompleteOptions struct {
+	ServerIdOptions
+	Restart bool `help:"Restart the server after marking kickstart as completed" default:"true" json:"restart"`
+}
+
+func (o *ServerKickstartCompleteOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+// ServerMonitorOptions 不注册为 MCP tool（无 mcp-desc tag）：向虚机发送任意
+// HMP/QMP 命令（如 pmemsave/migrate）超出"监控"语义，经 LLM 通道可被提示注入
+// 无感知触发，禁止 AI 调用。仅保留 climc 命令行与受控 API 使用。
 type ServerMonitorOptions struct {
 	ServerIdOptions
 
@@ -840,7 +1074,7 @@ type ServerQgaCommand struct {
 	ServerIdOptions
 
 	COMMAND string `help:"qga command"`
-	Timeout int    `help:"qga command execute timeout (ms)"`
+	Timeout int    `help:"qga command execute timeout (s)"`
 }
 
 func (o *ServerQgaCommand) Params() (jsonutils.JSONObject, error) {
@@ -850,7 +1084,7 @@ func (o *ServerQgaCommand) Params() (jsonutils.JSONObject, error) {
 type ServerQgaPing struct {
 	ServerIdOptions
 
-	Timeout int `help:"qga command execute timeout (ms)"`
+	Timeout int `help:"qga command execute timeout (s)"`
 }
 
 func (o *ServerQgaPing) Params() (jsonutils.JSONObject, error) {
@@ -874,12 +1108,14 @@ func (o *ServerQgaGetNetwork) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerSetPasswordOptions struct {
+	_ struct{} `mcp-desc:"重置虚机密码（真正执行）。未知 id 时先 climc_server_list；拿到 id 后立刻调用，仅查询不算完成"`
+
 	ServerIdOptions
 
-	Username      string `help:"Which user to set password" json:"username"`
-	Password      string `help:"Password content" json:"password"`
-	ResetPassword bool   `help:"Force reset password"`
-	AutoStart     bool   `help:"Auto start server after reset password"`
+	Username      string `help:"Which user to set password" json:"username" mcp:"true"`
+	Password      string `help:"Password content" json:"password" mcp:"required"`
+	ResetPassword bool   `help:"Force reset password" mcp:"true"`
+	AutoStart     bool   `help:"Auto start server after reset password" mcp:"true"`
 }
 
 func (o *ServerSetPasswordOptions) Params() (jsonutils.JSONObject, error) {
@@ -914,6 +1150,8 @@ type ServerNicTrafficLimitOptions struct {
 	MAC            string `help:"guest network mac address"`
 	RxTrafficLimit *int64 `help:" rx traffic limit, unit Byte"`
 	TxTrafficLimit *int64 `help:" tx traffic limit, unit Byte"`
+	ChargeType     string `help:"nic charge type" choices:"bandwidth|traffic"`
+	BillingType    string `help:"nic billing type" choices:"prepaid|postpaid"`
 }
 
 func (o *ServerNicTrafficLimitOptions) Params() (jsonutils.JSONObject, error) {
@@ -953,7 +1191,7 @@ func (o *ServerSaveGuestImageOptions) Description() string {
 
 type ServerChangeOwnerOptions struct {
 	ID      string `help:"Server to change owner" json:"-"`
-	PROJECT string `help:"Project ID or change" json:"tenant"`
+	PROJECT string `help:"Target project ID or name" json:"tenant"`
 }
 
 func (o *ServerChangeOwnerOptions) GetId() string {
@@ -965,13 +1203,17 @@ func (o *ServerChangeOwnerOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerRebuildRootOptions struct {
+	_ struct{} `mcp-desc:"重装系统盘。ID 为虚机 id；可选 image、password、auto-start。先 climc_server_list / climc_image_list 定位"`
+
 	ID            string `help:"Server to rebuild root" json:"-"`
-	ImageId       string `help:"New root Image template ID" json:"image_id" token:"image"`
-	Keypair       string `help:"ssh Keypair used for login"`
+	ImageId       string `help:"New root Image template ID" json:"image_id" token:"image" mcp:"true"`
+	Keypair       string `help:"ssh Keypair used for login" mcp:"true"`
 	Password      string `help:"Default user password"`
-	NoAccountInit *bool  `help:"Not reset account password"`
-	AutoStart     *bool  `help:"Auto start server after it is created"`
-	AllDisks      *bool  `help:"Rebuild all disks including data disks"`
+	LoginAccount  string `help:"Guest login account" mcp:"true"`
+	NoAccountInit *bool  `help:"Not reset account password" mcp:"true"`
+	AutoStart     *bool  `help:"Auto start server after it is created" mcp:"true"`
+	AllDisks      *bool  `help:"Rebuild all disks including data disks" mcp:"true"`
+	UserData      string `hlep:"user data scripts"`
 }
 
 func (o *ServerRebuildRootOptions) GetId() string {
@@ -983,6 +1225,7 @@ func (o *ServerRebuildRootOptions) Params() (jsonutils.JSONObject, error) {
 	if err != nil {
 		return nil, err
 	}
+	params.Set("reset_password", jsonutils.JSONTrue)
 	if o.NoAccountInit != nil && *o.NoAccountInit {
 		params.Add(jsonutils.JSONFalse, "reset_password")
 	}
@@ -994,18 +1237,30 @@ func (o *ServerRebuildRootOptions) Description() string {
 }
 
 type ServerChangeConfigOptions struct {
-	ServerIdOptions
-	VcpuCount *int     `help:"New number of Virtual CPU cores" json:"vcpu_count" token:"ncpu"`
-	VmemSize  string   `help:"New memory size" json:"vmem_size" token:"vmem"`
-	Disk      []string `help:"Data disk description, from the 1st data disk to the last one, empty string if no change for this data disk"`
+	_ struct{} `mcp-desc:"调整虚机配置（CPU/内存/套餐）。ID 用 climc_server_list；传 ncpu/vmem 或 instance-type。改配前确认状态允许"`
 
-	InstanceType string `help:"Instance Type, e.g. S2.SMALL2 for qcloud"`
+	ServerIdOptions
+	VcpuCount     *int     `help:"New number of Virtual CPU cores" json:"vcpu_count" token:"ncpu" mcp:"true"`
+	ExtraCpuCount *int     `help:"Extra allocate cpu count" json:"extra_cpu_count" mcp:"true"`
+	CpuSockets    *int     `help:"Cpu sockets" mcp:"true"`
+	VmemSize      string   `help:"New memory size" json:"vmem_size" token:"vmem" mcp:"true"`
+	Disk          []string `help:"Data disk description, from the 1st data disk to the last one, empty string if no change for this data disk" mcp:"true"`
+
+	InstanceType string `help:"Instance Type, e.g. S2.SMALL2 for qcloud" mcp:"true"`
+
+	ForceStop *bool `help:"Force stop the server before changing config" json:"force_stop" mcp:"true"`
+
+	ResetTrafficLimits []string `help:"reset traffic limits, mac,rx,tx"`
+	SetTrafficLimits   []string `help:"set traffic limits, mac,rx,tx"`
 }
 
 func (o *ServerChangeConfigOptions) Params() (jsonutils.JSONObject, error) {
 	params, err := options.StructToParams(o)
 	if err != nil {
 		return nil, err
+	}
+	if o.ForceStop != nil && *o.ForceStop {
+		params.Set("force_stop", jsonutils.JSONTrue)
 	}
 	if len(o.Disk) > 0 {
 		params.Remove("disk.0")
@@ -1023,6 +1278,59 @@ func (o *ServerChangeConfigOptions) Params() (jsonutils.JSONObject, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if len(o.ResetTrafficLimits) > 0 {
+		// mac,rx_limit,tx_limit
+		// ab:bc:cd:ef:ad:fa,12312312,1231233
+		resetLimits := []*jsonutils.JSONDict{}
+		for i := range o.ResetTrafficLimits {
+			resetLimit := jsonutils.NewDict()
+			segs := strings.Split(o.ResetTrafficLimits[i], ",")
+			if len(segs) != 3 {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s", o.ResetTrafficLimits[i])
+			}
+			resetLimit.Set("mac", jsonutils.NewString(segs[0]))
+			rx, err := strconv.Atoi(segs[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s: %s", o.ResetTrafficLimits[i], err)
+			}
+			resetLimit.Set("rx_traffic_limit", jsonutils.NewInt(int64(rx)))
+			tx, err := strconv.Atoi(segs[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s: %s", o.ResetTrafficLimits[i], err)
+			}
+			resetLimit.Set("tx_traffic_limit", jsonutils.NewInt(int64(tx)))
+			resetLimits = append(resetLimits, resetLimit)
+		}
+		params.Set("reset_traffic_limits", jsonutils.Marshal(resetLimits))
+	}
+
+	if len(o.SetTrafficLimits) > 0 {
+		// mac,rx_limit,tx_limit
+		// ab:bc:cd:ef:ad:fa,12312312,1231233
+		setLimits := []*jsonutils.JSONDict{}
+		for i := range o.SetTrafficLimits {
+			setLimit := jsonutils.NewDict()
+			segs := strings.Split(o.SetTrafficLimits[i], ",")
+			if len(segs) != 3 {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s", o.SetTrafficLimits[i])
+			}
+			setLimit.Set("mac", jsonutils.NewString(segs[0]))
+			rx, err := strconv.Atoi(segs[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s: %s", o.SetTrafficLimits[i], err)
+			}
+			setLimit.Set("rx_traffic_limit", jsonutils.NewInt(int64(rx)))
+			tx, err := strconv.Atoi(segs[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid reset traffic limit input %s: %s", o.SetTrafficLimits[i], err)
+			}
+			setLimit.Set("tx_traffic_limit", jsonutils.NewInt(int64(tx)))
+			setLimits = append(setLimits, setLimit)
+		}
+		params.Set("set_traffic_limits", jsonutils.Marshal(setLimits))
+	}
+
 	if params.Size() == 0 {
 		return nil, ErrEmtptyUpdate
 	}
@@ -1047,8 +1355,11 @@ func (o *ServerResetOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerRestartOptions struct {
-	ID      []string `help:"ID of servers to operate" metavar:"SERVER" json:"-"`
-	IsForce *bool    `help:"Force reset or not; default false" json:"is_force"`
+	_ struct{} `mcp-desc:"重启虚机（真正执行）。未知 id 时先 climc_server_list；拿到 id 后立刻调用，仅查询不算完成"`
+
+	ID          []string `help:"ID of servers to operate" metavar:"SERVER" json:"-"`
+	IsForce     *bool    `help:"Force reset or not; default false" json:"is_force" mcp:"true"`
+	TimeoutSecs *int     `help:"Guest restart stop guest timeout" json:"timeout_secs" mcp:"true"`
 }
 
 func (o *ServerRestartOptions) GetIds() []string {
@@ -1097,7 +1408,7 @@ type ServerLiveMigrateOptions struct {
 	SkipKernelCheck *bool  `help:"Skip target kernel version check" json:"skip_kernel_check"`
 	EnableTLS       *bool  `help:"Enable tls migration" json:"enable_tls"`
 	QuicklyFinish   *bool  `help:"quickly finish, fix downtime after a few rounds of memory synchronization"`
-	MaxBandwidthMb  *int64 `help:"live migrate downtime, unit MB"`
+	MaxBandwidthMb  *int64 `help:"live migrate max bandwidth, unit MB"`
 
 	KeepDestGuestOnFailed *bool `help:"do not delete dest guest on migrate failed, for debug"`
 }
@@ -1112,7 +1423,7 @@ func (o *ServerLiveMigrateOptions) Params() (jsonutils.JSONObject, error) {
 
 type ServerSetLiveMigrateParamsOptions struct {
 	ID              string `help:"ID of server" json:"-"`
-	MaxBandwidthMB  *int64 `help:"live migrate downtime, unit MB"`
+	MaxBandwidthMB  *int64 `help:"live migrate max bandwidth, unit MB"`
 	DowntimeLimitMS *int64 `help:"live migrate downtime limit"`
 }
 
@@ -1154,8 +1465,10 @@ func (opts *ServerBatchMetadataOptions) Params() (jsonutils.JSONObject, error) {
 }
 
 type ServerAssociateEipOptions struct {
+	_ struct{} `mcp-desc:"将 EIP 绑定到虚机。需虚机 ID 与 EIP（climc_eip_list 的 id/name）"`
+
 	ServerIdOptions
-	EIP string `help:"ID or name of EIP to associate"`
+	EIP string `help:"ID or name of EIP to associate" mcp:"required"`
 }
 
 func (o *ServerAssociateEipOptions) Params() (jsonutils.JSONObject, error) {
@@ -1372,20 +1685,12 @@ type ServerCPUSetOptions struct {
 }
 
 func (o *ServerCPUSetOptions) Params() (jsonutils.JSONObject, error) {
-	sets := cgrouputils.ParseCpusetStr(o.SETS)
-	parts := strings.Split(sets, ",")
-	if len(parts) == 0 {
-		return nil, errors.New(fmt.Sprintf("Invalid cpu sets %q", o.SETS))
+	cpus, err := cpuset.Parse(o.SETS)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse cpuset failed")
 	}
 	input := &computeapi.ServerCPUSetInput{
-		CPUS: make([]int, 0),
-	}
-	for _, s := range parts {
-		sd, err := strconv.Atoi(s)
-		if err != nil {
-			return nil, errors.New(fmt.Sprintf("Not digit part %q", s))
-		}
-		input.CPUS = append(input.CPUS, sd)
+		CPUS: cpus.ToSlice(),
 	}
 	return jsonutils.Marshal(input), nil
 }
@@ -1396,6 +1701,49 @@ type ServerVncOptions struct {
 }
 
 func (o *ServerVncOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerScreenDumpOptions struct {
+	ServerIdOptions
+	ObjectName string
+}
+
+func (o *ServerScreenDumpOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerChangeDiskDriverOptions struct {
+	ServerIdOptions
+	DISK_ID string
+	Driver  string `help:"Driver of vDisk" choices:"virtio|ide|sata|scsi|pvscsi"`
+	Cache   string `help:"Cache mode of vDisk" choices:"writethrough|none|writeback|directsync"`
+	Aio     string `help:"Asynchronous IO mode of vDisk" choices:"native|threads"`
+}
+
+func (o *ServerChangeDiskDriverOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerSetNetworkNumQueues struct {
+	ServerIdOptions
+	MacAddr   string `help:"server network mac addr"`
+	NumQueues int    `help:"network num queues"`
+}
+
+func (o *ServerSetNetworkNumQueues) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerSetIsoOptions struct {
+	ServerIdOptions
+
+	CDROM_ORDINAL int64  `json:"cdrom_ordinal" help:"cdrom ordinal"`
+	ImageId       string `help:"Iso image id, eject on image id empty"`
+	BootIndex     *int8  `help:"Iso boot index"`
+}
+
+func (o *ServerSetIsoOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(o), nil
 }
 
@@ -1416,4 +1764,55 @@ type ServerAddSubIpsOptions struct {
 
 func (o *ServerAddSubIpsOptions) Params() (jsonutils.JSONObject, error) {
 	return jsonutils.Marshal(o), nil
+}
+
+type ServerUpdateSubIpsOptions struct {
+	ServerIdOptions
+
+	computeapi.GuestUpdateSubIpsInput
+}
+
+func (o *ServerUpdateSubIpsOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerSetOSInfoOptions struct {
+	ServerIdsOptions
+
+	computeapi.ServerSetOSInfoInput
+}
+
+func (o *ServerSetOSInfoOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerSetRootDiskMatcher struct {
+	ROOTDISKMATCHER string `help:"Baremetal root disk matcher, e.g. 'device=/dev/sdb' 'size=900G' 'size_start=800G,size_end=900G'" json:"-"`
+	ServerIdsOptions
+}
+
+func (o *ServerSetRootDiskMatcher) Params() (jsonutils.JSONObject, error) {
+	matcher, err := cmdline.ParseBaremetalRootDiskMatcher(o.ROOTDISKMATCHER)
+	if err != nil {
+		return nil, err
+	}
+	return jsonutils.Marshal(matcher), nil
+}
+
+type ServerSetTpmOptions struct {
+	ServerIdsOptions
+	EnableTpm bool `help:"Enable tpm device"`
+}
+
+func (o *ServerSetTpmOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type ServerChangeBillingTypeOptions struct {
+	ServerIdOptions
+	BillingType string `choices:"prepaid|postpaid"`
+}
+
+func (o *ServerChangeBillingTypeOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(map[string]string{"billing_type": o.BillingType}), nil
 }

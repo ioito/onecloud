@@ -16,14 +16,14 @@ package models
 
 import (
 	"context"
-	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/util/billing"
-	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/sqlchemy"
 
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
@@ -42,6 +42,88 @@ type IRegionDriver interface {
 	IKafkaDriver
 	IKubeClusterDriver
 
+	ILoadbalancerDriver
+	IVpcDriver
+	IEipDriver
+	ISnapshotDriver
+	ISecurityGroupDriver
+
+	GetDiskResetParams(snapshot *SSnapshot) *jsonutils.JSONDict
+	OnDiskReset(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, snapshot *SSnapshot, data jsonutils.JSONObject) error
+	OnSnapshotDelete(ctx context.Context, snapshot *SSnapshot, task taskman.ITask, data jsonutils.JSONObject) error
+
+	RequestSyncDiskBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, backup *SDiskBackup, task taskman.ITask) error
+	RequestCreateBackup(ctx context.Context, backup *SDiskBackup, snapshotId string, task taskman.ITask) error
+	RequestDeleteBackup(ctx context.Context, backup *SDiskBackup, task taskman.ITask) error
+	RequestCreateInstanceBackup(ctx context.Context, guest *SGuest, ib *SInstanceBackup, task taskman.ITask, params *jsonutils.JSONDict) error
+	RequestDeleteInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask) error
+	RequestSyncInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, ib *SInstanceBackup, task taskman.ITask) error
+	RequestSyncBackupStorageStatus(ctx context.Context, userCred mcclient.TokenCredential, bs *SBackupStorage, task taskman.ITask) error
+
+	RequestCreateInstanceSnapshot(ctx context.Context, guest *SGuest, isp *SInstanceSnapshot, task taskman.ITask, params *jsonutils.JSONDict) error
+	RequestDeleteInstanceSnapshot(ctx context.Context, isp *SInstanceSnapshot, task taskman.ITask) error
+	RequestResetToInstanceSnapshot(ctx context.Context, guest *SGuest, isp *SInstanceSnapshot, task taskman.ITask, params *jsonutils.JSONDict) error
+	RequestPackInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask, packageName string) error
+	RequestUnpackInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask, packageName string, metadataOnly bool) error
+
+	IsSupportedBillingCycle(bc billing.SBillingCycle, resource string) bool
+	GetSecgroupVpcid(vpcId string) string
+
+	RequestSyncDiskStatus(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, task taskman.ITask) error
+	RequestSyncSnapshotStatus(ctx context.Context, userCred mcclient.TokenCredential, snapshot *SSnapshot, task taskman.ITask) error
+	RequestSyncNatGatewayStatus(ctx context.Context, userCred mcclient.TokenCredential, natgateway *SNatGateway, task taskman.ITask) error
+	RequestSyncBucketStatus(ctx context.Context, userCred mcclient.TokenCredential, bucket *SBucket, task taskman.ITask) error
+	RequestSyncDBInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, backup *SDBInstanceBackup, task taskman.ITask) error
+
+	RequestCreateNetwork(ctx context.Context, userCred mcclient.TokenCredential, network *SNetwork, task taskman.ITask) error
+	RequestRemoteUpdateNetwork(ctx context.Context, userCred mcclient.TokenCredential, network *SNetwork, replaceTags bool, task taskman.ITask) error
+
+	ValidateCreateCdnData(ctx context.Context, userCred mcclient.TokenCredential, input api.CDNDomainCreateInput) (api.CDNDomainCreateInput, error)
+}
+
+type ISnapshotDriver interface {
+	// Region Driver Snapshot Policy Apis
+	ValidateCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, input *api.SSnapshotPolicyCreateInput) (*api.SSnapshotPolicyCreateInput, error)
+	RequestCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, sp *SSnapshotPolicy, task taskman.ITask) error
+	RequestSnapshotPolicyBindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *SSnapshotPolicy, diskIds []string, task taskman.ITask) error
+	RequestSnapshotPolicyUnbindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *SSnapshotPolicy, diskIds []string, task taskman.ITask) error
+	RequestDeleteSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, sp *SSnapshotPolicy, task taskman.ITask) error
+
+	// Region Driver Snapshot Apis
+	ValidateSnapshotDelete(ctx context.Context, snapshot *SSnapshot) error
+	ValidateCreateSnapshotData(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, storage *SStorage, input *api.SnapshotCreateInput) error
+	RequestCreateSnapshot(ctx context.Context, snapshot *SSnapshot, task taskman.ITask) error
+	RequestDeleteSnapshot(ctx context.Context, snapshot *SSnapshot, task taskman.ITask) error
+	SnapshotIsOutOfChain(disk *SDisk) bool
+}
+
+type ISecurityGroupDriver interface {
+	RequestCreateSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, secgroup *SSecurityGroup, rules api.SSecgroupRuleResourceSet) error
+	// 根据安全组归属vpc还是region进行过滤
+	GetSecurityGroupFilter(vpc *SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error)
+	GetDefaultSecurityGroupNamePrefix() string
+	CreateDefaultSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, vpc *SVpc) (*SSecurityGroup, error)
+	RequestPrepareSecurityGroups(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, secgroups []SSecurityGroup, vpc *SVpc, callback func(ids []string) error, task taskman.ITask) error
+	RequestDeleteSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, secgroup *SSecurityGroup, task taskman.ITask) error
+	ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error)
+	ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error)
+	ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error)
+}
+
+type IEipDriver interface {
+	GetEipDefaultChargeType() billing_api.TNetChargeType
+	ValidateEipChargeType(chargeType billing_api.TNetChargeType) error
+	ValidateCreateEipData(ctx context.Context, userCred mcclient.TokenCredential, input *api.SElasticipCreateInput) error
+}
+
+type IVpcDriver interface {
+	ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error)
+	IsVpcCreateNeedInputCidr() bool
+	RequestCreateVpc(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, vpc *SVpc, task taskman.ITask) error
+	RequestDeleteVpc(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, vpc *SVpc, task taskman.ITask) error
+}
+
+type ILoadbalancerDriver interface {
 	ValidateCreateLoadbalancerData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *api.LoadbalancerCreateInput) (*api.LoadbalancerCreateInput, error)
 	RequestCreateLoadbalancerInstance(ctx context.Context, userCred mcclient.TokenCredential, lb *SLoadbalancer, input *api.LoadbalancerCreateInput, task taskman.ITask) error
 	RequestDeleteLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *SLoadbalancer, task taskman.ITask) error
@@ -50,13 +132,15 @@ type IRegionDriver interface {
 	RequestSyncstatusLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *SLoadbalancer, task taskman.ITask) error
 	RequestRemoteUpdateLoadbalancer(ctx context.Context, userCred mcclient.TokenCredential, lb *SLoadbalancer, replaceTags bool, task taskman.ITask) error
 
-	RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SCachedLoadbalancerAcl, task taskman.ITask) error
-	RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SCachedLoadbalancerAcl, task taskman.ITask) error
-	RequestSyncLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SCachedLoadbalancerAcl, task taskman.ITask) error
+	RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SLoadbalancerAcl, task taskman.ITask) error
+	RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SLoadbalancerAcl, task taskman.ITask) error
+	RequestUpdateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SLoadbalancerAcl, task taskman.ITask) error
+	RequestLoadbalancerAclSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbacl *SLoadbalancerAcl, task taskman.ITask) error
 
 	IsCertificateBelongToRegion() bool
-	RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *SCachedLoadbalancerCertificate, task taskman.ITask) error
-	RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *SCachedLoadbalancerCertificate, task taskman.ITask) error
+	RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *SLoadbalancerCertificate, task taskman.ITask) error
+	RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *SLoadbalancerCertificate, task taskman.ITask) error
+	RequestLoadbalancerCertificateSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbcert *SLoadbalancerCertificate, task taskman.ITask) error
 
 	ValidateCreateLoadbalancerBackendGroupData(ctx context.Context, userCred mcclient.TokenCredential, lb *SLoadbalancer, input *api.LoadbalancerBackendGroupCreateInput) (*api.LoadbalancerBackendGroupCreateInput, error)
 	RequestCreateLoadbalancerBackendGroup(ctx context.Context, userCred mcclient.TokenCredential, lbbg *SLoadbalancerBackendGroup, task taskman.ITask) error
@@ -83,72 +167,6 @@ type IRegionDriver interface {
 	ValidateUpdateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, input *api.LoadbalancerListenerRuleUpdateInput) (*api.LoadbalancerListenerRuleUpdateInput, error)
 	RequestCreateLoadbalancerListenerRule(ctx context.Context, userCred mcclient.TokenCredential, lbr *SLoadbalancerListenerRule, task taskman.ITask) error
 	RequestDeleteLoadbalancerListenerRule(ctx context.Context, userCred mcclient.TokenCredential, lbr *SLoadbalancerListenerRule, task taskman.ITask) error
-
-	ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error)
-	IsVpcCreateNeedInputCidr() bool
-	GetEipDefaultChargeType() string
-	ValidateEipChargeType(chargeType string) error
-	ValidateCreateEipData(ctx context.Context, userCred mcclient.TokenCredential, input *api.SElasticipCreateInput) error
-	RequestCreateVpc(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, vpc *SVpc, task taskman.ITask) error
-	RequestDeleteVpc(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, vpc *SVpc, task taskman.ITask) error
-
-	// Region Driver Snapshot Policy Apis
-	//ValidateCreateSnapshotPolicyData(context.Context, mcclient.TokenCredential, *compute.SSnapshotPolicyCreateInput, mcclient.IIdentityProvider, *jsonutils.JSONDict) error
-	RequestUpdateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, sp *SSnapshotPolicy, input cloudprovider.SnapshotPolicyInput, task taskman.ITask) error
-	RequestApplySnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, task taskman.ITask, disk *SDisk, sp *SSnapshotPolicy, data jsonutils.JSONObject) error
-	RequestCancelSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, task taskman.ITask, disk *SDisk, sp *SSnapshotPolicy, data jsonutils.JSONObject) error
-	RequestPreSnapshotPolicyApply(ctx context.Context, userCred mcclient.TokenCredential, task taskman.ITask, disk *SDisk, sp *SSnapshotPolicy, data jsonutils.JSONObject) error
-
-	// Region Driver Snapshot Policy joint Disk Apis
-	ValidateCreateSnapshopolicyDiskData(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, snapshotPolicy *SSnapshotPolicy) error
-
-	// Region Driver Snapshot Apis
-	ValidateSnapshotDelete(ctx context.Context, snapshot *SSnapshot) error
-	ValidateCreateSnapshotData(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, storage *SStorage, input *api.SnapshotCreateInput) error
-	RequestCreateSnapshot(ctx context.Context, snapshot *SSnapshot, task taskman.ITask) error
-	RequestDeleteSnapshot(ctx context.Context, snapshot *SSnapshot, task taskman.ITask) error
-	SnapshotIsOutOfChain(disk *SDisk) bool
-	GetDiskResetParams(snapshot *SSnapshot) *jsonutils.JSONDict
-	OnDiskReset(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, snapshot *SSnapshot, data jsonutils.JSONObject) error
-	OnSnapshotDelete(ctx context.Context, snapshot *SSnapshot, task taskman.ITask, data jsonutils.JSONObject) error
-
-	RequestSyncDiskBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, backup *SDiskBackup, task taskman.ITask) error
-	RequestCreateBackup(ctx context.Context, backup *SDiskBackup, snapshotId string, task taskman.ITask) error
-	RequestDeleteBackup(ctx context.Context, backup *SDiskBackup, task taskman.ITask) error
-	RequestCreateInstanceBackup(ctx context.Context, guest *SGuest, ib *SInstanceBackup, task taskman.ITask, params *jsonutils.JSONDict) error
-	RequestDeleteInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask) error
-	RequestSyncInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, ib *SInstanceBackup, task taskman.ITask) error
-	RequestSyncBackupStorageStatus(ctx context.Context, userCred mcclient.TokenCredential, bs *SBackupStorage, task taskman.ITask) error
-
-	RequestCreateInstanceSnapshot(ctx context.Context, guest *SGuest, isp *SInstanceSnapshot, task taskman.ITask, params *jsonutils.JSONDict) error
-	RequestDeleteInstanceSnapshot(ctx context.Context, isp *SInstanceSnapshot, task taskman.ITask) error
-	RequestResetToInstanceSnapshot(ctx context.Context, guest *SGuest, isp *SInstanceSnapshot, task taskman.ITask, params *jsonutils.JSONDict) error
-	RequestPackInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask, packageName string) error
-	RequestUnpackInstanceBackup(ctx context.Context, ib *SInstanceBackup, task taskman.ITask, packageName string, metadataOnly bool) error
-
-	RequestCacheSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, vpc *SVpc, secgroup *SSecurityGroup, removeProjectId string, task taskman.ITask) error
-	RequestSyncSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, vpcId string, vpc *SVpc, secgroup *SSecurityGroup, removeProjectId, service string) (string, error)
-	GenerateSecurityGroupName(name string) string
-	IsAllowSecurityGroupNameRepeat() bool
-	IsSecurityGroupBelongVpc() bool
-	IsVpcBelongGlobalVpc() bool
-	IsSecurityGroupBelongGlobalVpc() bool //安全组子账号范围内可用
-	GetDefaultSecurityGroupVpcId() string
-	GetSecurityGroupVpcId(ctx context.Context, userCred mcclient.TokenCredential, region *SCloudregion, host *SHost, vpc *SVpc) (string, error)
-	GetSecurityGroupPublicScope(service string) rbacscope.TRbacScope
-
-	IsSupportedBillingCycle(bc billing.SBillingCycle, resource string) bool
-	GetSecgroupVpcid(vpcId string) string
-
-	RequestSyncDiskStatus(ctx context.Context, userCred mcclient.TokenCredential, disk *SDisk, task taskman.ITask) error
-	RequestSyncSnapshotStatus(ctx context.Context, userCred mcclient.TokenCredential, snapshot *SSnapshot, task taskman.ITask) error
-	RequestSyncNatGatewayStatus(ctx context.Context, userCred mcclient.TokenCredential, natgateway *SNatGateway, task taskman.ITask) error
-	RequestSyncBucketStatus(ctx context.Context, userCred mcclient.TokenCredential, bucket *SBucket, task taskman.ITask) error
-	RequestSyncDBInstanceBackupStatus(ctx context.Context, userCred mcclient.TokenCredential, backup *SDBInstanceBackup, task taskman.ITask) error
-
-	RequestCreateNetwork(ctx context.Context, userCred mcclient.TokenCredential, network *SNetwork, task taskman.ITask) error
-
-	ValidateCreateCdnData(ctx context.Context, userCred mcclient.TokenCredential, input api.CDNDomainCreateInput) (api.CDNDomainCreateInput, error)
 }
 
 type IDBInstanceDriver interface {
@@ -191,7 +209,6 @@ type IWafDriver interface {
 }
 
 type INasDriver interface {
-	RequestSyncAccessGroup(ctx context.Context, userCred mcclient.TokenCredential, fs *SFileSystem, mt *SMountTarget, ag *SAccessGroup, task taskman.ITask) error
 	IsSupportedNas() bool
 }
 
@@ -221,7 +238,7 @@ type IElasticcacheDriver interface {
 	RequestCreateElasticcacheAccount(ctx context.Context, userCred mcclient.TokenCredential, elasticcacheAccount *SElasticcacheAccount, task taskman.ITask) error
 	RequestCreateElasticcacheAcl(ctx context.Context, userCred mcclient.TokenCredential, elasticcacheAcl *SElasticcacheAcl, task taskman.ITask) error
 	RequestCreateElasticcacheBackup(ctx context.Context, userCred mcclient.TokenCredential, elasticcacheBackup *SElasticcacheBackup, task taskman.ITask) error
-	RequestRenewElasticcache(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *SElasticcache, bc billing.SBillingCycle) (time.Time, error)
+	RequestRenewElasticcache(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *SElasticcache, bc billing.SBillingCycle) error
 	RequestElasticcacheSetAutoRenew(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *SElasticcache, autoRenew bool, task taskman.ITask) error
 	RequestRestartElasticcache(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *SElasticcache, task taskman.ITask) error
 	RequestSyncElasticcache(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *SElasticcache, task taskman.ITask) error

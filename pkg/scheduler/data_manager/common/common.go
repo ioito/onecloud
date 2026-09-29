@@ -114,12 +114,15 @@ type ResourceStore[O lockman.ILockedObject] struct {
 	getId       func(O) string
 	getWatchId  func(*jsonutils.JSONDict) string
 	getDBObject FGetDBObject
+	onAdd       func(obj db.IModel)
+	onUpdate    func(oldObj *jsonutils.JSONDict, newObj db.IModel)
+	onDelete    func(obj *jsonutils.JSONDict)
 }
 
 func NewResourceStore[O lockman.ILockedObject](
 	modelMan db.IModelManager,
 	res informer.IResourceManager,
-) IResourceStore[O] {
+) *ResourceStore[O] {
 	return newResourceStore[O](modelMan, res, nil, nil, nil)
 }
 
@@ -129,7 +132,7 @@ func NewJointResourceStore[O lockman.ILockedObject](
 	getId func(O) string,
 	getWatchId func(*jsonutils.JSONDict) string,
 	getDBObject FGetDBObject,
-) IResourceStore[O] {
+) *ResourceStore[O] {
 	return newResourceStore(modelMan, res, getId, getWatchId, getDBObject)
 }
 
@@ -139,7 +142,7 @@ func newResourceStore[O lockman.ILockedObject](
 	getId func(O) string,
 	getWatchId func(*jsonutils.JSONDict) string,
 	getDBObject FGetDBObject,
-) IResourceStore[O] {
+) *ResourceStore[O] {
 	if getId == nil {
 		getId = func(o O) string {
 			return o.GetId()
@@ -163,7 +166,25 @@ func newResourceStore[O lockman.ILockedObject](
 		getId:       getId,
 		getWatchId:  getWatchId,
 		getDBObject: getDBObject,
+		onAdd:       nil,
+		onUpdate:    nil,
+		onDelete:    nil,
 	}
+}
+
+func (s *ResourceStore[O]) WithOnAdd(onAdd func(db.IModel)) *ResourceStore[O] {
+	s.onAdd = onAdd
+	return s
+}
+
+func (s *ResourceStore[O]) WithOnUpdate(onUpdate func(old *jsonutils.JSONDict, newObj db.IModel)) *ResourceStore[O] {
+	s.onUpdate = onUpdate
+	return s
+}
+
+func (s *ResourceStore[O]) WithOnDelete(onDelete func(*jsonutils.JSONDict)) *ResourceStore[O] {
+	s.onDelete = onDelete
+	return s
 }
 
 func (s *ResourceStore[O]) GetInformerResourceManager() informer.IResourceManager {
@@ -203,7 +224,13 @@ func (s *ResourceStore[O]) GetByPrefix(prefixId string) []O {
 }
 
 func (s *ResourceStore[O]) GetAll() []O {
-	ret := make([]O, 0)
+	// To avoid repeated slice growth during append, count first and preallocate capacity
+	count := 0
+	s.dataMap.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	ret := make([]O, 0, count)
 	s.dataMap.Range(func(key, value any) bool {
 		ret = append(ret, value.(O))
 		return true
@@ -220,6 +247,9 @@ func (s *ResourceStore[O]) Add(obj *jsonutils.JSONDict) {
 			tmpObj := v.Elem().Interface()
 			s.dataMap.Store(id, tmpObj)
 			log.Infof("Add %s %s", s.modelMan.Keyword(), obj.String())
+			if s.onAdd != nil {
+				s.onAdd(dbObj)
+			}
 		} else {
 			log.Errorf("Fetch %s by id %s error when created: %v", s.modelMan.Keyword(), id, err)
 		}
@@ -244,12 +274,15 @@ func (s *ResourceStore[O]) Update(oldObj, newObj *jsonutils.JSONDict) {
 	newObj = s.removeIgnoreKeys(newObj)
 	isEq := oldObj.String() == newObj.String()
 	if id != "" && !isEq {
-		dbObj, err := s.modelMan.FetchById(id)
+		dbObj, err := s.getDBObject(s.modelMan, id, newObj)
 		if err == nil {
 			v := reflect.ValueOf(dbObj)
 			tmpObj := v.Elem().Interface()
 			s.dataMap.Store(id, tmpObj)
 			log.Infof("Update %s %s", s.modelMan.Keyword(), newObj.String())
+			if s.onUpdate != nil {
+				s.onUpdate(oldObj, dbObj)
+			}
 		} else {
 			log.Errorf("Fetch %s by id %s error when updated: %v", s.modelMan.Keyword(), id, err)
 		}
@@ -261,6 +294,9 @@ func (s *ResourceStore[O]) Delete(obj *jsonutils.JSONDict) {
 	if id != "" {
 		s.dataMap.Delete(id)
 		log.Infof("Delete %s %s", s.modelMan.Keyword(), obj.String())
+		if s.onDelete != nil {
+			s.onDelete(obj)
+		}
 	}
 }
 

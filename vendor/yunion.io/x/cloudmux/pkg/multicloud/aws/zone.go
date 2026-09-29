@@ -93,8 +93,16 @@ func (self *SZone) GetIRegion() cloudprovider.ICloudRegion {
 }
 
 func (self *SZone) GetIHosts() ([]cloudprovider.ICloudHost, error) {
-	host := &SHost{zone: self}
-	return []cloudprovider.ICloudHost{host}, nil
+	hosts := []cloudprovider.ICloudHost{&SHost{zone: self}}
+	dedicatedHosts, err := self.region.GetDedicatedHosts(self.ZoneName)
+	if err != nil {
+		return nil, errors.Wrap(err, "GetDedicatedHosts")
+	}
+	for i := range dedicatedHosts {
+		dedicatedHosts[i].zone = self
+		hosts = append(hosts, &dedicatedHosts[i])
+	}
+	return hosts, nil
 }
 
 func (self *SZone) GetIHostById(id string) (cloudprovider.ICloudHost, error) {
@@ -143,7 +151,7 @@ func (self *SZone) getStorageByCategory(category string) (*SStorage, error) {
 			return storage, nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, category)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", category)
 }
 
 func (self *SZone) GetDescription() string {

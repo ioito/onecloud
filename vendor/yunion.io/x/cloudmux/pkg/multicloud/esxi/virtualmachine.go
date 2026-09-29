@@ -33,6 +33,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/imagetools"
 	"yunion.io/x/pkg/util/netutils"
@@ -75,7 +76,7 @@ type SVirtualMachine struct {
 	ihost     cloudprovider.ICloudHost
 	snapshots []SVirtualMachineSnapshot
 
-	guestIps map[string]string
+	guestIps map[string]sNicConfig
 
 	osInfo *imagetools.ImageInfo
 }
@@ -84,17 +85,6 @@ type VMFetcher interface {
 	FetchNoTemplateVMs() ([]*SVirtualMachine, error)
 	FetchTemplateVMs() ([]*SVirtualMachine, error)
 	FetchFakeTempateVMs(string) ([]*SVirtualMachine, error)
-}
-
-type byDiskType []SVirtualDisk
-
-func (d byDiskType) Len() int      { return len(d) }
-func (d byDiskType) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
-func (d byDiskType) Less(i, j int) bool {
-	if d[i].GetDiskType() == api.DISK_TYPE_SYS {
-		return true
-	}
-	return false
 }
 
 func NewVirtualMachine(manager *SESXiClient, vm *mo.VirtualMachine, dc *SDatacenter) *SVirtualMachine {
@@ -112,6 +102,10 @@ func (svm *SVirtualMachine) GetSecurityGroupIds() ([]string, error) {
 }
 
 func (svm *SVirtualMachine) GetTags() (map[string]string, error) {
+	// not support tags
+	if gotypes.IsNil(svm.manager.client.ServiceContent.CustomFieldsManager) {
+		return nil, cloudprovider.ErrNotSupported
+	}
 	ret := map[int32]string{}
 	for _, val := range svm.object.Entity().ExtensibleManagedObject.AvailableField {
 		ret[val.Key] = val.Name
@@ -139,6 +133,10 @@ func (svm *SVirtualMachine) GetTags() (map[string]string, error) {
 }
 
 func (svm *SVirtualMachine) SetTags(tags map[string]string, replace bool) error {
+	// not support tags
+	if gotypes.IsNil(svm.manager.client.ServiceContent.CustomFieldsManager) {
+		return cloudprovider.ErrNotSupported
+	}
 	oldTags, err := svm.GetTags()
 	if err != nil {
 		return errors.Wrapf(err, "GetTags")
@@ -211,7 +209,15 @@ func (svm *SVirtualMachine) GetGlobalId() string {
 }
 
 func (svm *SVirtualMachine) GetHostname() string {
-	return svm.GetName()
+	return ""
+}
+
+func (svm *SVirtualMachine) GetDescription() string {
+	vm := svm.getVirtualMachine()
+	if vm != nil && vm.Config != nil {
+		return vm.Config.Annotation
+	}
+	return ""
 }
 
 func (svm *SVirtualMachine) GetStatus() string {
@@ -241,6 +247,12 @@ func (svm *SVirtualMachine) Refresh() error {
 	var moObj mo.VirtualMachine
 	err := svm.manager.reference2Object(svm.object.Reference(), VIRTUAL_MACHINE_PROPS, &moObj)
 	if err != nil {
+		if e := errors.Cause(err); soap.IsSoapFault(e) {
+			_, ok := soap.ToSoapFault(e).VimFault().(types.ManagedObjectNotFound)
+			if ok {
+				return cloudprovider.ErrNotFound
+			}
+		}
 		return err
 	}
 	base.object = &moObj
@@ -258,7 +270,7 @@ func (svm *SVirtualMachine) GetInstanceType() string {
 	return ""
 }
 
-func (svm *SVirtualMachine) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (svm *SVirtualMachine) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	return cloudprovider.ErrNotImplemented
 }
 
@@ -266,33 +278,137 @@ func (svm *SVirtualMachine) RebuildRoot(ctx context.Context, desc *cloudprovider
 	return "", cloudprovider.ErrNotImplemented
 }
 
-func (svm *SVirtualMachine) DoRebuildRoot(ctx context.Context, imagePath string, uuid string) error {
+func (svm *SVirtualMachine) DoRebuildRoot(ctx context.Context, imagePath string, uuid string, uefi bool) error {
 	if len(svm.vdisks) == 0 {
 		return errors.Wrapf(errors.ErrNotFound, "empty vdisks")
 	}
-	return svm.rebuildDisk(ctx, &svm.vdisks[0], imagePath)
+	return svm.rebuildDisk(ctx, &svm.vdisks[0], imagePath, uefi)
 }
 
-func (svm *SVirtualMachine) rebuildDisk(ctx context.Context, disk *SVirtualDisk, imagePath string) error {
+func rebuildRootDiskBackupPath(filename string) string {
+	const suffix = ".vmdk"
+	if strings.HasSuffix(strings.ToLower(filename), suffix) {
+		return filename[:len(filename)-len(suffix)] + ".rebuild-bak.vmdk"
+	}
+	return filename + ".rebuild-bak.vmdk"
+}
+
+func (svm *SVirtualMachine) moveVirtualDiskFile(ctx context.Context, ds *SDatastore, src, dst string) error {
+	obj, err := ds.getDatastoreObj(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "getDatastoreObj")
+	}
+	fm := obj.NewFileManager(ds.datacenter.getObjectDatacenter(), true)
+	err = fm.Move(ctx, src, dst)
+	if err != nil {
+		return errors.Wrapf(err, "move %s -> %s", src, dst)
+	}
+	return nil
+}
+
+func (svm *SVirtualMachine) reattachNonRootDisks(ctx context.Context) error {
+	for i := 1; i < len(svm.vdisks); i++ {
+		err := svm.doDetachDisk(ctx, &svm.vdisks[i], false)
+		if err != nil {
+			return errors.Wrapf(err, "doDetachDisk %d", i)
+		}
+		err = svm.doAttachDisk(ctx, &svm.vdisks[i])
+		if err != nil {
+			return errors.Wrapf(err, "doAttachDisk: %d", i)
+		}
+	}
+	return nil
+}
+
+func (svm *SVirtualMachine) attachDisksInOriginalOrder(ctx context.Context, root *SVirtualDisk) error {
+	for i := 1; i < len(svm.vdisks); i++ {
+		err := svm.doDetachDisk(ctx, &svm.vdisks[i], false)
+		if err != nil {
+			return errors.Wrapf(err, "doDetachDisk %d", i)
+		}
+	}
+	err := svm.doAttachDisk(ctx, root)
+	if err != nil {
+		for i := 1; i < len(svm.vdisks); i++ {
+			if attachErr := svm.doAttachDisk(ctx, &svm.vdisks[i]); attachErr != nil {
+				log.Errorf("reattach disk %d after root attach failed: %s", i, attachErr)
+			}
+		}
+		return errors.Wrap(err, "doAttachDisk root")
+	}
+	for i := 1; i < len(svm.vdisks); i++ {
+		err = svm.doAttachDisk(ctx, &svm.vdisks[i])
+		if err != nil {
+			return errors.Wrapf(err, "doAttachDisk: %d", i)
+		}
+	}
+	return nil
+}
+
+func (svm *SVirtualMachine) restoreRootDiskAfterRebuild(ctx context.Context, disk *SVirtualDisk, ds *SDatastore, origPath, backupPath string) error {
+	if err := ds.Delete2(ctx, origPath, false, true); err != nil {
+		log.Errorf("delete rebuilt root disk %s before restore: %s", origPath, err)
+	}
+	if err := svm.moveVirtualDiskFile(ctx, ds, backupPath, origPath); err != nil {
+		return errors.Wrap(err, "rename backup root disk")
+	}
+	return svm.attachDisksInOriginalOrder(ctx, disk)
+}
+
+func (svm *SVirtualMachine) rebuildDisk(ctx context.Context, disk *SVirtualDisk, imagePath string, uefi bool) error {
 	uuid := disk.GetId()
 	sizeMb := disk.GetDiskSizeMB()
 	diskKey := disk.getKey()
 	ctlKey := disk.getControllerKey()
 	unitNumber := *disk.dev.GetVirtualDevice().UnitNumber
+	origPath := disk.GetFilename()
+	backupPath := rebuildRootDiskBackupPath(origPath)
 
-	err := svm.doDetachAndDeleteDisk(ctx, disk)
+	istorage, err := disk.GetIStorage()
+	if err != nil {
+		return errors.Wrap(err, "GetIStorage")
+	}
+	ds := istorage.(*SDatastore)
+
+	err = svm.doDetachDisk(ctx, disk, false)
 	if err != nil {
 		return err
 	}
-	return svm.createDiskInternal(ctx, SDiskConfig{
+
+	err = svm.moveVirtualDiskFile(ctx, ds, origPath, backupPath)
+	if err != nil {
+		if attachErr := svm.attachDisksInOriginalOrder(ctx, disk); attachErr != nil {
+			log.Errorf("reattach disks in original order after backup failed: %s", attachErr)
+		}
+		return errors.Wrapf(err, "backup root disk %s", origPath)
+	}
+	log.Infof("backup root disk %s -> %s", origPath, backupPath)
+
+	err = svm.createDiskInternal(ctx, SDiskConfig{
+		Uefi:          uefi,
 		SizeMb:        int64(sizeMb),
 		Uuid:          uuid,
 		ControllerKey: ctlKey,
 		UnitNumber:    unitNumber,
 		Key:           diskKey,
 		ImagePath:     imagePath,
+		DestPath:      origPath,
 		IsRoot:        len(imagePath) > 0,
+		Datastore:     ds,
 	}, false)
+	if err != nil {
+		if restoreErr := svm.restoreRootDiskAfterRebuild(ctx, disk, ds, origPath, backupPath); restoreErr != nil {
+			log.Errorf("restore root disk %s from %s failed: %s", origPath, backupPath, restoreErr)
+		}
+		return errors.Wrapf(err, "createDiskInternal")
+	}
+	if err = svm.reattachNonRootDisks(ctx); err != nil {
+		return err
+	}
+	if err = ds.Delete2(ctx, backupPath, false, true); err != nil {
+		log.Errorf("delete backup root disk %s: %s", backupPath, err)
+	}
+	return nil
 }
 
 func (svm *SVirtualMachine) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
@@ -373,6 +489,14 @@ func (svm *SVirtualMachine) GetIEIP() (cloudprovider.ICloudEIP, error) {
 	return nil, nil
 }
 
+func (svm *SVirtualMachine) GetCpuSockets() int {
+	vm := svm.getVirtualMachine()
+	if vm.Config != nil {
+		return int(svm.GetVcpuCount() / int(vm.Config.Hardware.NumCoresPerSocket))
+	}
+	return 1
+}
+
 func (svm *SVirtualMachine) GetVcpuCount() int {
 	return int(svm.getVirtualMachine().Summary.Config.NumCpu)
 }
@@ -439,7 +563,7 @@ func (vm *SVirtualMachine) getNormalizedOsInfo() *imagetools.ImageInfo {
 			osInfo := imagetools.NormalizeImageInfo("", string(osInfo.OsArch), string(osInfo.OsType), osInfo.OsDistribution, osInfo.OsVersion)
 			vm.osInfo = &osInfo
 		} else {
-			osInfo := imagetools.NormalizeImageInfo("", "", "", "", "")
+			osInfo := imagetools.NormalizeImageInfo(vm.GetName(), "", "", "", "")
 			vm.osInfo = &osInfo
 		}
 	}
@@ -647,11 +771,11 @@ func (svm *SVirtualMachine) doUnregister(ctx context.Context) error {
 }
 
 func (svm *SVirtualMachine) DeleteVM(ctx context.Context) error {
-	err := svm.CheckFileInfo(ctx)
+	err := svm.doDestroy(ctx)
 	if err != nil {
 		return svm.doUnregister(ctx)
 	}
-	return svm.doDestroy(ctx)
+	return nil
 }
 
 func (svm *SVirtualMachine) doDetachAndDeleteDisk(ctx context.Context, vdisk *SVirtualDisk) error {
@@ -682,6 +806,28 @@ func (svm *SVirtualMachine) doDetachDisk(ctx context.Context, vdisk *SVirtualDis
 		return nil
 	}
 	return vdisk.Delete(ctx)
+}
+
+func (svm *SVirtualMachine) doAttachDisk(ctx context.Context, vdisk *SVirtualDisk) error {
+	addSpec := types.VirtualDeviceConfigSpec{}
+	addSpec.Operation = types.VirtualDeviceConfigSpecOperationAdd
+	addSpec.Device = vdisk.dev
+
+	spec := types.VirtualMachineConfigSpec{}
+	spec.DeviceChange = []types.BaseVirtualDeviceConfigSpec{&addSpec}
+
+	vm := svm.getVmObj()
+
+	task, err := vm.Reconfigure(ctx, spec)
+	if err != nil {
+		return errors.Wrapf(err, "Reconfigure add disk %s", vdisk.GetName())
+	}
+
+	err = task.Wait(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "wait remove add %s task", vdisk.GetName())
+	}
+	return nil
 }
 
 func (svm *SVirtualMachine) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudprovider.ServerVncOutput, error) {
@@ -746,18 +892,24 @@ func (svm *SVirtualMachine) acquireVmrcUrl() (*cloudprovider.ServerVncOutput, er
 }
 
 func (svm *SVirtualMachine) ChangeConfig(ctx context.Context, config *cloudprovider.SManagedVMChangeConfig) error {
-	return svm.doChangeConfig(ctx, int32(config.Cpu), int64(config.MemoryMB), "", "")
+	return svm.doChangeConfig(ctx, int32(config.Cpu), int32(config.CpuSocket), int64(config.MemoryMB), "", "")
 }
 
 func (svm *SVirtualMachine) GetVersion() string {
 	return svm.getVirtualMachine().Config.Version
 }
 
-func (svm *SVirtualMachine) doChangeConfig(ctx context.Context, ncpu int32, vmemMB int64, guestId string, version string) error {
+func (svm *SVirtualMachine) doChangeConfig(ctx context.Context, ncpu, cpuSockets int32, vmemMB int64, guestId string, version string) error {
 	changed := false
 	configSpec := types.VirtualMachineConfigSpec{}
+	cpu := svm.GetVcpuCount()
 	if int(ncpu) != svm.GetVcpuCount() {
 		configSpec.NumCPUs = ncpu
+		cpu = int(ncpu)
+		changed = true
+	}
+	if cpuSockets > 0 && int(cpuSockets) != svm.GetCpuSockets() {
+		configSpec.NumCoresPerSocket = int32(cpu / int(cpuSockets))
 		changed = true
 	}
 	if int(vmemMB) != svm.GetVmemSizeMB() {
@@ -787,10 +939,6 @@ func (svm *SVirtualMachine) doChangeConfig(ctx context.Context, ncpu int32, vmem
 		return err
 	}
 	return svm.Refresh()
-}
-
-func (svm *SVirtualMachine) AssignSecurityGroup(secgroupId string) error {
-	return cloudprovider.ErrNotImplemented
 }
 
 func (svm *SVirtualMachine) SetSecurityGroups(secgroupIds []string) error {
@@ -875,7 +1023,12 @@ func (svm *SVirtualMachine) fetchHardwareInfo() error {
 		svm.devs[vdev.getKey()] = vdev
 	}
 	svm.rigorous()
-	sort.Sort(byDiskType(svm.vdisks))
+	for i := range svm.vdisks {
+		if svm.vdisks[i].GetDiskType() == api.DISK_TYPE_SYS {
+			svm.vdisks[i], svm.vdisks[0] = svm.vdisks[0], svm.vdisks[i]
+			break
+		}
+	}
 	return nil
 }
 
@@ -898,45 +1051,58 @@ func (svm *SVirtualMachine) getVdev(key int32) SVirtualDevice {
 
 func (svm *SVirtualMachine) getNetTags() string {
 	info := make([]string, 0)
-	moVM := svm.getVirtualMachine()
-	for _, net := range moVM.Guest.Net {
-		mac := netutils.FormatMacAddr(net.MacAddress)
-		ips := make([]string, 0)
-		for _, ip := range net.IpAddress {
-			if regutils.MatchIP4Addr(ip) && !strings.HasPrefix(ip, "169.254.") {
-				ips = append(ips, ip)
-			}
+	for _, nicConf := range svm.getGuestIps() {
+		info = append(info, nicConf.Mac, nicConf.Network)
+		info = append(info, nicConf.IPs...)
+	}
+	if len(info) > 0 {
+		return strings.Join(info, "/")
+	}
+	// guest.net 为空时回退读取虚拟网卡硬件配置
+	for i := range svm.vnics {
+		mac := svm.vnics[i].GetMAC()
+		network := svm.vnics[i].GetNetworkName()
+		if len(mac) == 0 && len(network) == 0 {
+			continue
 		}
-		if len(mac) > 0 && len(net.Network) > 0 && len(ips) > 0 {
-			info = append(info, mac, net.Network)
-			info = append(info, ips...)
-		}
+		info = append(info, mac, network)
 	}
 	return strings.Join(info, "/")
 }
 
-func (svm *SVirtualMachine) fetchGuestIps() map[string]string {
-	guestIps := make(map[string]string)
+type sNicConfig struct {
+	Mac     string
+	Network string
+	IPs     []string
+}
+
+func (svm *SVirtualMachine) fetchGuestIps() map[string]sNicConfig {
+	guestIps := make(map[string]sNicConfig)
 	moVM := svm.getVirtualMachine()
+	if moVM.Guest == nil {
+		return guestIps
+	}
 	for _, net := range moVM.Guest.Net {
 		if len(net.Network) == 0 {
 			continue
 		}
-		mac := netutils.FormatMacAddr(net.MacAddress)
+		nicConf := sNicConfig{}
+		nicConf.Mac = netutils.FormatMacAddr(net.MacAddress)
+		nicConf.Network = net.Network
 		for _, ip := range net.IpAddress {
 			if regutils.MatchIP4Addr(ip) && !strings.HasPrefix(ip, "169.254.") {
 				if !vmIPV4Filter.Contains(ip) {
 					continue
 				}
-				guestIps[mac] = ip
-				break
+				nicConf.IPs = append(nicConf.IPs, ip)
 			}
 		}
+		guestIps[nicConf.Mac] = nicConf
 	}
 	return guestIps
 }
 
-func (svm *SVirtualMachine) getGuestIps() map[string]string {
+func (svm *SVirtualMachine) getGuestIps() map[string]sNicConfig {
 	if svm.guestIps == nil {
 		svm.guestIps = svm.fetchGuestIps()
 	}
@@ -944,15 +1110,15 @@ func (svm *SVirtualMachine) getGuestIps() map[string]string {
 }
 
 func (svm *SVirtualMachine) GetIps() []string {
-	ips := make([]string, 0)
-	for _, ip := range svm.getGuestIps() {
-		ips = append(ips, ip)
+	iplists := make([]string, 0)
+	for _, nicConf := range svm.getGuestIps() {
+		iplists = append(iplists, nicConf.IPs...)
 	}
-	return ips
+	return iplists
 }
 
 func (svm *SVirtualMachine) GetVGADevice() string {
-	return fmt.Sprintf("%s", svm.vga.String())
+	return svm.vga.String()
 }
 
 var (
@@ -997,7 +1163,7 @@ func minDiskKey(devs []SVirtualDisk) int32 {
 func (svm *SVirtualMachine) FindController(ctx context.Context, driver string) ([]SVirtualDevice, error) {
 	aliasDrivers, ok := driverTable[driver]
 	if !ok {
-		return nil, fmt.Errorf("Unsupported disk driver %s", driver)
+		return nil, errors.Wrapf(errors.ErrNotFound, "Unsupported disk driver %s", driver)
 	}
 	var devs []SVirtualDevice
 	for _, alias := range aliasDrivers {
@@ -1064,7 +1230,7 @@ func (svm *SVirtualMachine) CreateDisk(ctx context.Context, opts *cloudprovider.
 		return "", err
 	}
 	if len(devs) == 0 {
-		return "", svm.createDriverAndDisk(ctx, ds, opts.SizeMb, opts.UUID, opts.Driver)
+		return "", svm.createDriverAndDisk(ctx, ds, opts.SizeMb, opts.UUID, opts.Driver, opts.Preallocation)
 	}
 	numDevBelowCtrl := make([]int, len(devs))
 	for i := range numDevBelowCtrl {
@@ -1096,11 +1262,12 @@ func (svm *SVirtualMachine) CreateDisk(ctx context.Context, opts *cloudprovider.
 		ControllerKey: ctrlKey,
 		Key:           diskKey,
 		Datastore:     ds,
+		Preallocation: opts.Preallocation,
 	}, true)
 }
 
 // createDriverAndDisk will create a driver and disk associated with the driver
-func (svm *SVirtualMachine) createDriverAndDisk(ctx context.Context, ds *SDatastore, sizeMb int, uuid string, driver string) error {
+func (svm *SVirtualMachine) createDriverAndDisk(ctx context.Context, ds *SDatastore, sizeMb int, uuid string, driver, preallocation string) error {
 	if driver != "scsi" && driver != "pvscsi" {
 		return fmt.Errorf("Driver %s is not supported", driver)
 	}
@@ -1129,52 +1296,79 @@ func (svm *SVirtualMachine) createDriverAndDisk(ctx context.Context, ds *SDatast
 			ImagePath:     "",
 			IsRoot:        false,
 			Datastore:     ds,
+			Preallocation: preallocation,
 		}, true)
 }
 
-func (svm *SVirtualMachine) getDatastoreAndRootImagePath() (string, *SDatastore, error) {
+func (svm *SVirtualMachine) getDatastoreAndRootImagePath(suffixCheck bool) (string, *SDatastore, error) {
 	layoutEx := svm.getLayoutEx()
 	if layoutEx == nil || len(layoutEx.File) == 0 {
 		return "", nil, fmt.Errorf("invalid LayoutEx")
 	}
-	file := layoutEx.File[0].Name
-	// find stroage
-	host := svm.GetIHost()
-	storages, err := host.GetIStorages()
-	if err != nil {
-		return "", nil, errors.Wrap(err, "host.GetIStorages")
-	}
-	var datastore *SDatastore
-	for i := range storages {
-		ds := storages[i].(*SDatastore)
-		if ds.HasFile(file) {
-			datastore = ds
-			break
+	for _, f := range layoutEx.File {
+		if suffixCheck && !strings.HasSuffix(f.Name, ".vmdk") {
+			continue
 		}
+		file := f.Name
+		// find stroage
+		host := svm.GetIHost()
+		storages, err := host.GetIStorages()
+		if err != nil {
+			return "", nil, errors.Wrap(err, "host.GetIStorages")
+		}
+		var datastore *SDatastore
+		for i := range storages {
+			ds := storages[i].(*SDatastore)
+			if ds.HasFile(file) {
+				datastore = ds
+				break
+			}
+		}
+		if datastore == nil {
+			return "", nil, fmt.Errorf("can't find storage associated with vm %q", svm.GetName())
+		}
+		if strings.HasSuffix(f.Name, ".vmdk") {
+			return datastore.getPathString(datastore.cleanPath(file)), datastore, nil
+		}
+		path := datastore.cleanPath(file)
+		vmDir := strings.Split(path, "/")[0]
+		return datastore.getPathString(fmt.Sprintf("%s/%s.vmdk", vmDir, vmDir)), datastore, nil
 	}
-	if datastore == nil {
-		return "", nil, fmt.Errorf("can't find storage associated with vm %q", svm.GetName())
-	}
-	path := datastore.cleanPath(file)
-	vmDir := strings.Split(path, "/")[0]
-	// TODO find a non-conflicting path
-	return datastore.getPathString(fmt.Sprintf("%s/%s.vmdk", vmDir, vmDir)), datastore, nil
+	return "", nil, fmt.Errorf("can't find root image path")
 }
 
 func (svm *SVirtualMachine) GetRootImagePath() (string, error) {
-	path, _, err := svm.getDatastoreAndRootImagePath()
+	path, _, err := svm.getDatastoreAndRootImagePath(true)
 	if err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func (svm *SVirtualMachine) CopyRootDisk(ctx context.Context, imagePath string) (string, error) {
-	newImagePath, datastore, err := svm.getDatastoreAndRootImagePath()
-	if err != nil {
-		return "", errors.Wrapf(err, "GetRootImagePath")
+func (svm *SVirtualMachine) CopyRootDisk(ctx context.Context, imagePath, destPath string, datastore *SDatastore) (string, error) {
+	var (
+		newImagePath string
+		err          error
+	)
+	if len(destPath) > 0 {
+		newImagePath = destPath
+		if datastore == nil {
+			_, datastore, err = svm.getDatastoreAndRootImagePath(false)
+			if err != nil {
+				return "", errors.Wrapf(err, "GetRootImagePath")
+			}
+		}
+	} else {
+		newImagePath, datastore, err = svm.getDatastoreAndRootImagePath(false)
+		if err != nil {
+			return "", errors.Wrapf(err, "GetRootImagePath")
+		}
 	}
-	fm := datastore.getDatastoreObj().NewFileManager(datastore.datacenter.getObjectDatacenter(), true)
+	ds, err := datastore.getDatastoreObj(ctx)
+	if err != nil {
+		return "", errors.Wrapf(err, "getDatastoreObj")
+	}
+	fm := ds.NewFileManager(datastore.datacenter.getObjectDatacenter(), true)
 	err = fm.Copy(ctx, imagePath, newImagePath)
 	if err != nil {
 		return "", errors.Wrapf(err, "unable to copy system disk %s -> %s", imagePath, newImagePath)
@@ -1187,29 +1381,38 @@ func (svm *SVirtualMachine) createDiskWithDeviceChange(ctx context.Context, devi
 	// copy disk
 	if len(config.ImagePath) > 0 {
 		config.IsRoot = true
-		config.ImagePath, err = svm.CopyRootDisk(ctx, config.ImagePath)
+		config.ImagePath, err = svm.CopyRootDisk(ctx, config.ImagePath, config.DestPath, config.Datastore)
 		if err != nil {
 			return errors.Wrap(err, "unable to copyRootDisk")
 		}
 	}
 
-	devSpec := NewDiskDev(int64(config.SizeMb), config)
+	devSpec, err := NewDiskDev(ctx, int64(config.SizeMb), config)
+	if err != nil {
+		return errors.Wrapf(err, "NewDiskDev")
+	}
 	spec := addDevSpec(devSpec)
 	if len(config.ImagePath) == 0 {
 		spec.FileOperation = types.VirtualDeviceConfigSpecFileOperationCreate
 	}
 	configSpec := types.VirtualMachineConfigSpec{}
 	configSpec.DeviceChange = append(deviceChange, spec)
+	if config.IsRoot {
+		configSpec.Firmware = "bios"
+		if config.Uefi {
+			configSpec.Firmware = "efi"
+		}
+	}
 
 	vmObj := svm.getVmObj()
 
 	task, err := vmObj.Reconfigure(ctx, configSpec)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "vmObj.Reconfigure")
 	}
 	err = task.Wait(ctx)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "task.Wait")
 	}
 	if !check {
 		return nil
@@ -1227,7 +1430,6 @@ func (svm *SVirtualMachine) createDiskWithDeviceChange(ctx context.Context, devi
 }
 
 func (svm *SVirtualMachine) createDiskInternal(ctx context.Context, config SDiskConfig, check bool) error {
-
 	return svm.createDiskWithDeviceChange(ctx, nil, config, check)
 }
 
@@ -1278,7 +1480,7 @@ func (svm *SVirtualMachine) CheckFileInfo(ctx context.Context) error {
 			if ds.HasFile(file.Name) {
 				_, err := ds.CheckFile(ctx, file.Name)
 				if err != nil {
-					return errors.Wrap(err, "ds.CheckFile")
+					return errors.Wrapf(err, "CheckFile %s", file.Name)
 				}
 				break
 			}
@@ -1601,7 +1803,18 @@ func (svm *SVirtualMachine) relocate(hostId string) error {
 		}
 	}
 	if !isShared {
-		config.Datastore = &targetHs.Datastore[0]
+		err := host.fetchDatastores()
+		if err != nil {
+			return errors.Wrapf(err, "fetchDatastores")
+		}
+		max := int64(0)
+		for i := range host.datastores {
+			ds := host.datastores[i].(*SDatastore)
+			if ds.GetCapacityFreeMB() > max {
+				max = ds.GetCapacityFreeMB()
+				config.Datastore = &targetHs.Datastore[i]
+			}
+		}
 	}
 	task, err := svm.getVmObj().Relocate(ctx, config, types.VirtualMachineMovePriorityDefaultPriority)
 	if err != nil {

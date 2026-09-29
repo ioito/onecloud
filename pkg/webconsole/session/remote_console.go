@@ -15,12 +15,15 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os/exec"
+	"strings"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/webconsole"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -30,22 +33,31 @@ import (
 )
 
 const (
-	VNC       = api.VNC
-	ALIYUN    = api.ALIYUN
-	QCLOUD    = api.QCLOUD
-	OPENSTACK = api.OPENSTACK
-	SPICE     = api.SPICE
-	WMKS      = api.WMKS
-	WS        = api.WS
-	VMRC      = api.VMRC
-	ZSTACK    = api.ZSTACK
-	CTYUN     = api.CTYUN
-	HUAWEI    = api.HUAWEI
-	HCS       = api.HCS
-	APSARA    = api.APSARA
-	JDCLOUD   = api.JDCLOUD
-	CLOUDPODS = api.CLOUDPODS
-	PROXMOX   = api.PROXMOX
+	VNC        = api.VNC
+	RDP        = api.RDP
+	ALIYUN     = api.ALIYUN
+	QCLOUD     = api.QCLOUD
+	OPENSTACK  = api.OPENSTACK
+	SPICE      = api.SPICE
+	WMKS       = api.WMKS
+	WS         = api.WS
+	VMRC       = api.VMRC
+	ZSTACK     = api.ZSTACK
+	CTYUN      = api.CTYUN
+	HUAWEI     = api.HUAWEI
+	HCS        = api.HCS
+	APSARA     = api.APSARA
+	JDCLOUD    = api.JDCLOUD
+	CLOUDPODS  = api.CLOUDPODS
+	PROXMOX    = api.PROXMOX
+	VOLCENGINE = api.VOLC_ENGINE
+	BAIDU      = api.BAIDU
+	SANGFOR    = api.SANGFOR
+	CNWARE     = api.CNWARE
+	KSYUN      = api.KSYUN
+	ECLOUD     = api.ECLOUD
+	ROCKBASE   = api.ROCKBASE
+	UCLOUD     = api.UCLOUD
 )
 
 type RemoteConsoleInfo struct {
@@ -90,6 +102,10 @@ func (info *RemoteConsoleInfo) GetCommand() *exec.Cmd {
 	return nil
 }
 
+func (info *RemoteConsoleInfo) GetSafeCommandString() string {
+	return ""
+}
+
 // Cleanup implements ISessionData interface
 func (info *RemoteConsoleInfo) Cleanup() error {
 	return nil
@@ -124,8 +140,10 @@ func (info *RemoteConsoleInfo) GetConnectParams() (string, error) {
 		return info.getQcloudURL()
 	case CLOUDPODS:
 		return info.getCloudpodsURL()
-	case OPENSTACK, VMRC, ZSTACK, CTYUN, HUAWEI, HCS, JDCLOUD, PROXMOX:
+	case OPENSTACK, VMRC, ZSTACK, CTYUN, HUAWEI, HCS, JDCLOUD, PROXMOX, SANGFOR, BAIDU, CNWARE, KSYUN, ECLOUD, ROCKBASE, UCLOUD:
 		return info.Url, nil
+	case VOLCENGINE:
+		return info.getVolcEngineURL()
 	default:
 		return "", fmt.Errorf("Can't convert protocol %s to connect params", info.Protocol)
 	}
@@ -158,16 +176,14 @@ func (info *RemoteConsoleInfo) getQcloudURL() (string, error) {
 
 func (info *RemoteConsoleInfo) getAliyunURL() (string, error) {
 	isWindows := "false"
-	if info.OsName == "Windows" {
+	if strings.EqualFold(info.OsName, "windows") {
 		isWindows = "true"
 	}
-	params := url.Values{
-		"vncUrl":     {info.Url},
-		"instanceId": {info.InstanceId},
-		"isWindows":  {isWindows},
-		"password":   {info.Password},
+	vncUrl, err := url.QueryUnescape(info.Url)
+	if err != nil {
+		return "", errors.Wrap(err, "url.QueryUnescape")
 	}
-	return info.getConnParamsURL(options.Options.AliyunConsoleAddr, params), nil
+	return fmt.Sprintf("%s?vncUrl=%s&instanceId=%s&isWindows=%s", options.Options.AliyunConsoleAddr, vncUrl, info.InstanceId, isWindows), nil
 }
 
 func (info *RemoteConsoleInfo) getCloudpodsURL() (string, error) {
@@ -176,6 +192,16 @@ func (info *RemoteConsoleInfo) getCloudpodsURL() (string, error) {
 		"data":         {info.ConnectParams},
 		"instanceId":   {info.InstanceId},
 		"instanceName": {info.InstanceName},
+	}
+	return info.getConnParamsURL(base, params), nil
+}
+
+func (info *RemoteConsoleInfo) getVolcEngineURL() (string, error) {
+	base := "https://console.volcengine.com/ecs/connect/vnc/"
+	params := url.Values{
+		"host":   {info.Url},
+		"Region": {info.Region},
+		"name":   {info.InstanceName},
 	}
 	return info.getConnParamsURL(base, params), nil
 }
@@ -196,4 +222,20 @@ func (info *RemoteConsoleInfo) getApsaraURL() (string, error) {
 
 func (info *RemoteConsoleInfo) GetRecordObject() *recorder.Object {
 	return nil
+}
+
+func (info *RemoteConsoleInfo) GetDisplayInfo(ctx context.Context) (*SDisplayInfo, error) {
+	userInfo, err := fetchUserInfo(ctx, info.GetClientSession())
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchUserInfo")
+	}
+	guestDetails, err := FetchServerInfo(ctx, info.GetClientSession(), info.Id)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchServerInfo")
+	}
+
+	dispInfo := SDisplayInfo{}
+	dispInfo.WaterMark = fetchWaterMark(userInfo)
+	dispInfo.fetchGuestInfo(guestDetails)
+	return &dispInfo, nil
 }

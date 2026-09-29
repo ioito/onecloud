@@ -89,8 +89,8 @@ func (self *SHuaweiGuestDriver) GetRebuildRootStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SHuaweiGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SHuaweiGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SHuaweiGuestDriver) GetDeployStatus() ([]string, error) {
@@ -98,7 +98,7 @@ func (self *SHuaweiGuestDriver) GetDeployStatus() ([]string, error) {
 }
 
 func (self *SHuaweiGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	if !utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_HUAWEI_SATA, api.STORAGE_HUAWEI_SAS, api.STORAGE_HUAWEI_SSD}) {
@@ -160,4 +160,8 @@ func (self *SHuaweiGuestDriver) IsNeedInjectPasswordByCloudInit() bool {
 
 func (self *SHuaweiGuestDriver) IsSupportSetAutoRenew() bool {
 	return false
+}
+
+func (self *SHuaweiGuestDriver) IsWindowsUserDataTypeNeedEncode() bool {
+	return true
 }

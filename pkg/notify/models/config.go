@@ -89,18 +89,50 @@ func (cm *SConfigManager) ValidateCreateData(ctx context.Context, userCred mccli
 	}
 	driver := GetDriver(input.Type)
 	// validate
-	message, err := driver.ValidateConfig(ctx, api.NotifyConfig{
-		SNotifyConfigContent: *input.Content,
-		Attribution:          input.Attribution,
-		DomainId:             input.ProjectDomainId,
-	})
-	if err != nil {
-		return input, errors.Wrapf(err, message)
+	if input.Type != api.MOBILE {
+		message, err := driver.ValidateConfig(ctx, api.NotifyConfig{
+			SNotifyConfigContent: *input.Content,
+			Attribution:          input.Attribution,
+			DomainId:             input.ProjectDomainId,
+		})
+		if err != nil {
+			return input, errors.Wrapf(err, "%s", message)
+		}
 	}
 	if len(input.Name) == 0 {
 		input.Name = input.Type
 	}
 	return input, nil
+}
+
+func (manager *SConfigManager) GetPropertyCapability(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	q := manager.Query()
+	configs := []SConfig{}
+	err := db.FetchModelObjects(manager, q, &configs)
+	if err != nil {
+		return nil, err
+	}
+	ret := struct {
+		System []string            `json:"system,allowempty"`
+		Domain map[string][]string `json:"domain,allowempty"`
+	}{
+		System: []string{},
+		Domain: map[string][]string{},
+	}
+
+	for _, config := range configs {
+		switch config.Attribution {
+		case api.CONFIG_ATTRIBUTION_SYSTEM:
+			ret.System = append(ret.System, config.Type)
+		case api.CONFIG_ATTRIBUTION_DOMAIN:
+			_, ok := ret.Domain[config.DomainId]
+			if !ok {
+				ret.Domain[config.DomainId] = []string{}
+			}
+			ret.Domain[config.DomainId] = append(ret.Domain[config.DomainId], config.Type)
+		}
+	}
+	return jsonutils.Marshal(ret), nil
 }
 
 func (c *SConfig) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
@@ -136,13 +168,15 @@ func (c *SConfig) ValidateUpdateData(ctx context.Context, userCred mcclient.Toke
 	// check if changed
 	if input.Content != nil {
 		driver := GetDriver(c.Type)
-		message, err := driver.ValidateConfig(ctx, api.NotifyConfig{
-			DomainId:             c.DomainId,
-			Attribution:          c.Attribution,
-			SNotifyConfigContent: *input.Content,
-		})
-		if err != nil {
-			return input, errors.Wrapf(err, message)
+		if c.Type != api.MOBILE {
+			message, err := driver.ValidateConfig(ctx, api.NotifyConfig{
+				SNotifyConfigContent: *input.Content,
+				Attribution:          c.Attribution,
+				DomainId:             c.DomainId,
+			})
+			if err != nil {
+				return input, errors.Wrapf(err, "%s", message)
+			}
 		}
 	}
 	return input, nil
@@ -162,7 +196,11 @@ func (c *SConfig) PostUpdate(ctx context.Context, userCred mcclient.TokenCredent
 
 func (c *SConfig) PreDelete(ctx context.Context, userCred mcclient.TokenCredential) {
 	c.SStandaloneResourceBase.PreDelete(ctx, userCred)
-	delete(ConfigMap, fmt.Sprintf("%s-%s", c.Type, c.DomainId))
+	key := fmt.Sprintf("%s-%s", c.Type, c.DomainId)
+	if c.Type == api.MOBILE || c.Type == api.EMAIL {
+		key = c.Type
+	}
+	delete(ConfigMap, key)
 }
 
 func (c *SConfig) CustomizeDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
@@ -338,7 +376,7 @@ func (cm *SConfigManager) PerformValidate(ctx context.Context, userCred mcclient
 		DomainId:             userCred.GetDomainId(),
 	})
 	if err != nil {
-		return output, errors.Wrapf(err, message)
+		return output, errors.Wrapf(err, "%s", message)
 	}
 	output.IsValid = true
 	output.Message = message
@@ -362,10 +400,11 @@ func (confManager *SConfigManager) InitializeData() error {
 			logclient.AddSimpleActionLog(&config, logclient.ACT_INIT_NOTIFY_CONFIGMAP, err, session.GetToken(), false)
 		}
 	}
+	log.Infoln("init ConfigMap:", jsonutils.Marshal(ConfigMap))
 	return nil
 }
 
-func (cm *SConfigManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (cm *SConfigManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	switch scope {
 	case rbacscope.ScopeDomain, rbacscope.ScopeProject:
 		q = q.Equals("attribution", api.CONFIG_ATTRIBUTION_DOMAIN)

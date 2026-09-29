@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
@@ -143,7 +142,7 @@ func (self *SVpc) addWire(wire *SWire) {
 }
 
 func (self *SVpc) getWireByZoneId(zoneId string) *SWire {
-	for i := 0; i <= len(self.iwires); i += 1 {
+	for i := 0; i < len(self.iwires); i += 1 {
 		wire := self.iwires[i].(*SWire)
 		if wire.zone.ZoneId == zoneId {
 			return wire
@@ -204,13 +203,13 @@ func (self *SVpc) fetchSecurityGroups() error {
 			return err
 		}
 		secgroups = append(secgroups, parts...)
-		if len(secgroups) >= total {
+		if len(secgroups) >= total || len(parts) == 0 {
 			break
 		}
 	}
 	self.secgroups = make([]cloudprovider.ICloudSecurityGroup, len(secgroups))
 	for i := 0; i < len(secgroups); i++ {
-		secgroups[i].vpc = self
+		secgroups[i].region = self.region
 		self.secgroups[i] = &secgroups[i]
 	}
 	return nil
@@ -234,7 +233,7 @@ func (self *SVpc) fetchRouteTables() error {
 			return err
 		}
 		routeTables = append(routeTables, parts...)
-		if len(routeTables) >= total {
+		if len(routeTables) >= total || len(parts) == 0 {
 			break
 		}
 	}
@@ -261,19 +260,6 @@ func (self *SVpc) GetIRouteTableById(routeTableId string) (cloudprovider.ICloudR
 }
 
 func (self *SVpc) Delete() error {
-	err := self.fetchSecurityGroups()
-	if err != nil {
-		log.Errorf("fetchSecurityGroup for VPC delete fail %s", err)
-		return err
-	}
-	for i := 0; i < len(self.secgroups); i += 1 {
-		secgroup := self.secgroups[i].(*SSecurityGroup)
-		err := self.region.DeleteSecurityGroup(secgroup.SecurityGroupId)
-		if err != nil {
-			log.Errorf("deleteSecurityGroup for VPC delete fail %s", err)
-			return err
-		}
-	}
 	return self.region.DeleteVpc(self.VpcId)
 }
 
@@ -304,7 +290,7 @@ func (self *SVpc) GetINatGateways() ([]cloudprovider.ICloudNatGateway, error) {
 			return nil, err
 		}
 		nats = append(nats, parts...)
-		if len(nats) >= total {
+		if len(nats) >= total || len(parts) == 0 {
 			break
 		}
 	}

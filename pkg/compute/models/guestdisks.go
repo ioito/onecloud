@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -30,6 +31,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SGuestdiskManager struct {
 	SGuestJointsManager
 	SDiskResourceBaseManager
@@ -54,6 +56,7 @@ func init() {
 
 }
 
+// +onecloud:model-api-gen
 type SGuestdisk struct {
 	SGuestJointsBase
 
@@ -62,11 +65,11 @@ type SGuestdisk struct {
 
 	ImagePath string `width:"256" charset:"ascii" nullable:"false" get:"user" create:"required"` // Column(VARCHAR(256, charset='ascii'), nullable=False)
 
-	Driver    string `width:"32" charset:"ascii" nullable:"true" list:"user" update:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
-	CacheMode string `width:"32" charset:"ascii" nullable:"true" list:"user" update:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
-	AioMode   string `width:"32" charset:"ascii" nullable:"true" get:"user" update:"user"`  // Column(VARCHAR(32, charset='ascii'), nullable=True)
-	Iops      int    `nullable:"true" default:"0"`
-	Bps       int    `nullable:"true" default:"0"` // Mb
+	Driver    string `width:"32" charset:"ascii" nullable:"true" list:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
+	CacheMode string `width:"32" charset:"ascii" nullable:"true" list:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
+	AioMode   string `width:"32" charset:"ascii" nullable:"true" get:"user"`  // Column(VARCHAR(32, charset='ascii'), nullable=True)
+	Iops      int    `nullable:"true" default:"0" list:"user" update:"user"`
+	Bps       int    `nullable:"true" default:"0" list:"user" update:"user"` // Mb
 
 	Mountpoint string `width:"256" charset:"utf8" nullable:"true" get:"user"` // Column(VARCHAR(256, charset='utf8'), nullable=True)
 
@@ -86,12 +89,13 @@ func (self *SGuestdisk) ValidateUpdateData(ctx context.Context, userCred mcclien
 			Filter(sqlchemy.NotEquals(guestdisk.Field("disk_id"), self.DiskId)).
 			Filter(sqlchemy.Equals(guestdisk.Field("index"), index)).CountWithError()
 		if err != nil {
-			return input, httperrors.NewInternalServerError("check disk index uniqueness fail %s", err)
+			return input, httperrors.NewInternalServerError("check disk index uniqueness failed %s", err)
 		}
 		if count > 0 {
 			return input, httperrors.NewInputParameterError("DISK Index %d has been occupied", index)
 		}
 	}
+
 	var err error
 	input.GuestJointBaseUpdateInput, err = self.SGuestJointsBase.ValidateUpdateData(ctx, userCred, query, input.GuestJointBaseUpdateInput)
 	if err != nil {
@@ -132,6 +136,7 @@ func (manager *SGuestdiskManager) FetchCustomizeColumns(
 			rows[i].Status = disk.Status
 			rows[i].DiskSize = disk.DiskSize
 			rows[i].DiskType = disk.DiskType
+			rows[i].AutoReset = disk.AutoReset
 			storage, _ := disk.GetStorage()
 			if storage != nil {
 				rows[i].StorageType = storage.StorageType
@@ -188,17 +193,22 @@ func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, 
 		Throughput: disk.Throughput,
 		Bps:        self.Bps,
 		Size:       disk.DiskSize,
+		PCIPath:    disk.PCIPath,
+		StorageId:  disk.StorageId,
 	}
 	desc.TemplateId = disk.GetTemplateId()
 	storage, _ := disk.GetStorage()
 	desc.StorageType = storage.StorageType
+	desc.StorageExternalId = storage.GetExternalId()
+	desc.StoragecacheId = storage.StoragecacheId
 	if len(desc.TemplateId) > 0 {
 		storagecacheimg := StoragecachedimageManager.GetStoragecachedimage(storage.StoragecacheId, desc.TemplateId)
 		if storagecacheimg != nil {
 			desc.ImagePath = storagecacheimg.Path
+			desc.ImageInfo.ImageExternalId = storagecacheimg.ExternalId
 		}
 	}
-	if host.HostType == api.HOST_TYPE_HYPERVISOR {
+	if utils.IsInStringArray(host.HostType, []string{api.HOST_TYPE_HYPERVISOR, api.HOST_TYPE_CONTAINER}) {
 		desc.StorageId = disk.StorageId
 		localpath := disk.GetPathAtHost(host)
 		if len(localpath) == 0 {
@@ -213,6 +223,7 @@ func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, 
 	desc.Index = self.Index
 	bootIndex := self.BootIndex
 	desc.BootIndex = &bootIndex
+	desc.AutoReset = disk.AutoReset
 
 	if len(disk.SnapshotId) > 0 {
 		needMerge := disk.GetMetadata(ctx, "merge_snapshot", nil)
@@ -226,6 +237,7 @@ func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, 
 				desc.Url = url
 			}
 		}
+		desc.SnapshotId = disk.SnapshotId
 	}
 	if fpath := disk.GetMetadata(ctx, api.DISK_META_REMOTE_ACCESS_PATH, nil); len(fpath) > 0 {
 		guest := self.getGuest()

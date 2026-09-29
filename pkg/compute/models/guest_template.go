@@ -133,7 +133,7 @@ func (gtm *SGuestTemplateManager) ValidateCreateData(
 
 func (gt *SGuestTemplate) PostCreate(ctx context.Context, userCred mcclient.TokenCredential,
 	ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	gt.SetStatus(userCred, computeapis.GT_READY, "")
+	gt.SetStatus(ctx, userCred, computeapis.GT_READY, "")
 	gt.updateCheckTime()
 	logclient.AddActionLogWithContext(ctx, gt, logclient.ACT_CREATE, nil, userCred, true)
 }
@@ -161,9 +161,11 @@ var HypervisorBrandMap = map[string]string{
 	computeapis.HYPERVISOR_HUAWEI:    computeapis.CLOUD_PROVIDER_HUAWEI,
 	computeapis.HYPERVISOR_OPENSTACK: computeapis.CLOUD_PROVIDER_OPENSTACK,
 	computeapis.HYPERVISOR_UCLOUD:    computeapis.CLOUD_PROVIDER_UCLOUD,
+	computeapis.HYPERVISOR_ROCKBASE:  computeapis.CLOUD_PROVIDER_ROCKBASE,
 	computeapis.HYPERVISOR_ZSTACK:    computeapis.CLOUD_PROVIDER_ZSTACK,
 	computeapis.HYPERVISOR_GOOGLE:    computeapis.CLOUD_PROVIDER_GOOGLE,
 	computeapis.HYPERVISOR_CTYUN:     computeapis.CLOUD_PROVIDER_CTYUN,
+	computeapis.HYPERVISOR_CNWARE:    computeapis.CLOUD_PROVIDER_CNWARE,
 }
 
 var BrandHypervisorMap = map[string]string{
@@ -176,9 +178,11 @@ var BrandHypervisorMap = map[string]string{
 	computeapis.CLOUD_PROVIDER_HUAWEI:    computeapis.HYPERVISOR_HUAWEI,
 	computeapis.CLOUD_PROVIDER_OPENSTACK: computeapis.HYPERVISOR_OPENSTACK,
 	computeapis.CLOUD_PROVIDER_UCLOUD:    computeapis.HYPERVISOR_UCLOUD,
+	computeapis.CLOUD_PROVIDER_ROCKBASE:  computeapis.HYPERVISOR_ROCKBASE,
 	computeapis.CLOUD_PROVIDER_ZSTACK:    computeapis.HYPERVISOR_ZSTACK,
 	computeapis.CLOUD_PROVIDER_GOOGLE:    computeapis.HYPERVISOR_GOOGLE,
 	computeapis.CLOUD_PROVIDER_CTYUN:     computeapis.HYPERVISOR_CTYUN,
+	computeapis.CLOUD_PROVIDER_CNWARE:    computeapis.HYPERVISOR_CNWARE,
 }
 
 func Hypervisor2Brand(hypervisor string) string {
@@ -360,8 +364,7 @@ func (gt *SGuestTemplate) getMoreDetails(ctx context.Context, userCred mcclient.
 	// sku deal
 	if len(input.InstanceType) > 0 {
 		skuOutput := computeapis.GuestTemplateSku{}
-		provider := GetDriver(gt.Hypervisor).GetProvider()
-		sku, err := ServerSkuManager.FetchSkuByNameAndProvider(input.InstanceType, provider, true)
+		sku, err := ServerSkuManager.FetchSkuByNameAndProvider(input.InstanceType, out.Provider, true)
 		if err != nil {
 			skuOutput.Name = input.InstanceType
 			skuOutput.MemorySizeMb = gt.VmemSize
@@ -390,7 +393,7 @@ func (gt *SGuestTemplate) getMoreDetails(ctx context.Context, userCred mcclient.
 
 	// keypair
 	if len(input.KeypairId) > 0 {
-		model, err := KeypairManager.FetchByIdOrName(userCred, input.KeypairId)
+		model, err := KeypairManager.FetchByIdOrName(ctx, userCred, input.KeypairId)
 		if err == nil {
 			keypair := model.(*SKeypair)
 			configInfo.Keypair = keypair.GetName()
@@ -520,7 +523,7 @@ func (gt *SGuestTemplate) PerformPublic(
 
 	// check if secgroup is public
 	if len(input.SecgroupId) > 0 {
-		model, err := SecurityGroupManager.FetchByIdOrName(userCred, input.SecgroupId)
+		model, err := SecurityGroupManager.FetchByIdOrName(ctx, userCred, input.SecgroupId)
 		if err != nil {
 			return nil, httperrors.NewResourceNotFoundError("there is no such secgroup %s descripted by guest template",
 				input.SecgroupId)
@@ -536,7 +539,7 @@ func (gt *SGuestTemplate) PerformPublic(
 	if len(input.Networks) > 0 {
 		for i := range input.Networks {
 			str := input.Networks[i].Network
-			model, err := NetworkManager.FetchByIdOrName(userCred, str)
+			model, err := NetworkManager.FetchByIdOrName(ctx, userCred, str)
 			if err != nil {
 				return nil, httperrors.NewResourceNotFoundError(
 					"there is no such secgroup %s descripted by guest template", str)
@@ -776,7 +779,7 @@ func (manager *SGuestTemplateManager) ListItemExportKeys(ctx context.Context,
 
 func (g *SGuest) PerformSaveTemplate(ctx context.Context, userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject, input computeapis.GuestSaveToTemplateInput) (jsonutils.JSONObject, error) {
-	g.SetStatus(userCred, computeapis.VM_TEMPLATE_SAVING, "save to template")
+	g.SetStatus(ctx, userCred, computeapis.VM_TEMPLATE_SAVING, "save to template")
 
 	if len(input.Name) == 0 && len(input.GenerateName) == 0 {
 		input.GenerateName = fmt.Sprintf("%s-template", g.Name)
@@ -798,14 +801,14 @@ func (gt *SGuestTemplate) inspect(ctx context.Context, userCred mcclient.TokenCr
 	_, err := GuestTemplateManager.validateContent(ctx, userCred, gt.GetOwnerId(), jsonutils.NewDict(), gt.Content.(*jsonutils.JSONDict))
 	if err == nil {
 		gt.updateCheckTime()
-		gt.SetStatus(userCred, computeapis.GT_READY, "inspect successfully")
+		gt.SetStatus(ctx, userCred, computeapis.GT_READY, "inspect successfully")
 		logclient.AddSimpleActionLog(gt, logclient.ACT_HEALTH_CHECK, "", userCred, true)
 		return nil
 	}
 	// invalid
 	gt.updateCheckTime()
 	reason := fmt.Sprintf("During the inspection, the guest template is not available: %s", err.Error())
-	gt.SetStatus(userCred, computeapis.GT_INVALID, reason)
+	gt.SetStatus(ctx, userCred, computeapis.GT_INVALID, reason)
 	logclient.AddSimpleActionLog(gt, logclient.ACT_HEALTH_CHECK, reason, userCred, false)
 	return nil
 }

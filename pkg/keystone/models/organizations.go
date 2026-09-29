@@ -39,6 +39,9 @@ import (
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
+var _ db.IModelManager = (*SOrganizationManager)(nil)
+var _ db.IModel = (*SOrganization)(nil)
+
 type SOrganizationManager struct {
 	SEnabledIdentityBaseResourceManager
 	db.SSharableBaseResourceManager
@@ -164,13 +167,6 @@ func (manager *SOrganizationManager) QueryDistinctExtraField(q *sqlchemy.SQuery,
 	return q, httperrors.ErrNotFound
 }
 
-type SOrganizationDetails struct {
-	api.EnabledIdentityBaseResourceDetails
-	apis.SharableResourceBaseInfo
-
-	SOrganization
-}
-
 func (manager *SOrganizationManager) FetchCustomizeColumns(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -178,13 +174,13 @@ func (manager *SOrganizationManager) FetchCustomizeColumns(
 	objs []interface{},
 	fields stringutils2.SSortedStrings,
 	isList bool,
-) []SOrganizationDetails {
-	rows := make([]SOrganizationDetails, len(objs))
+) []api.SOrganizationDetails {
+	rows := make([]api.SOrganizationDetails, len(objs))
 	infRows := manager.SEnabledIdentityBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	sharedRows := manager.SSharableBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	for i := range rows {
 		// org := objs[i].(*SOrganization)
-		rows[i] = SOrganizationDetails{
+		rows[i] = api.SOrganizationDetails{
 			EnabledIdentityBaseResourceDetails: infRows[i],
 			SharableResourceBaseInfo:           sharedRows[i],
 		}
@@ -433,7 +429,7 @@ func (org *SOrganization) PerformAddNode(
 			weight = &input.Weight
 			desc = input.Description
 		}
-		_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, labels[i], api.JoinLabels(labels[0:i+1]...), i+1, weight, desc)
+		_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, api.JoinLabels(labels[0:i+1]...), weight, desc)
 		if err != nil {
 			return nil, errors.Wrapf(err, "fail to insert node %s", api.JoinLabels(labels[i:i]...))
 		}
@@ -475,8 +471,8 @@ func (org *SOrganization) removeAll(ctx context.Context, userCred mcclient.Token
 	return nil
 }
 
-func (org *SOrganization) SetStatus(userCred mcclient.TokenCredential, status string, reason string) error {
-	return db.StatusBaseSetStatus(org, userCred, status, reason)
+func (org *SOrganization) SetStatus(ctx context.Context, userCred mcclient.TokenCredential, status string, reason string) error {
+	return db.StatusBaseSetStatus(ctx, org, userCred, status, reason)
 }
 
 func (org *SOrganization) startOrganizationSyncTask(
@@ -484,7 +480,7 @@ func (org *SOrganization) startOrganizationSyncTask(
 	userCred mcclient.TokenCredential,
 	resourceType string,
 ) error {
-	org.SetStatus(userCred, api.OrganizationStatusSync, "start sync task")
+	org.SetStatus(ctx, userCred, api.OrganizationStatusSync, "start sync task")
 	params := jsonutils.NewDict()
 	if len(resourceType) > 0 {
 		params.Add(jsonutils.NewString(resourceType), "resource_type")
@@ -526,7 +522,7 @@ func (org *SOrganization) syncIModelManagerTags(ctx context.Context, userCred mc
 		orgKeys[i] = fmt.Sprintf("%s%s", db.ORGANIZATION_TAG_PREFIX, keys[i])
 	}
 	{
-		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", userKeys, ctx, userCred, query)
+		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", "", userKeys, ctx, userCred, query)
 		if err != nil {
 			return errors.Wrap(err, "GetTagValueCountMap")
 		}
@@ -542,7 +538,7 @@ func (org *SOrganization) syncIModelManagerTags(ctx context.Context, userCred mc
 		}
 	}
 	{
-		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", orgKeys, ctx, userCred, query)
+		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", "", orgKeys, ctx, userCred, query)
 		if err != nil {
 			return errors.Wrap(err, "GetTagValueCountMap")
 		}
@@ -572,7 +568,7 @@ func (org *SOrganization) syncTagValueMap(ctx context.Context, tagVal map[string
 		if val, ok := tagVal[key]; ok && val != tagutils.NoValue {
 			labels = append(labels, val)
 			log.Debugf("%d %s %s %s", i, key, val, strings.Join(labels, "/"))
-			_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, val, api.JoinLabels(labels...), i+1, nil, "")
+			_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, api.JoinLabels(labels...), nil, "")
 			if err != nil {
 				return nil, errors.Wrapf(err, "fail to insert node %s", api.JoinLabels(labels...))
 			}
@@ -657,4 +653,17 @@ func (org *SOrganization) getProjectOrganization(tags map[string]string) (*api.S
 		}
 	}
 	return &ret, nil
+}
+
+func (org *SOrganization) PerformClean(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input api.OrganizationPerformCleanInput,
+) (jsonutils.JSONObject, error) {
+	err := org.removeAll(ctx, userCred)
+	if err != nil {
+		return nil, errors.Wrap(err, "removeAll")
+	}
+	return nil, nil
 }

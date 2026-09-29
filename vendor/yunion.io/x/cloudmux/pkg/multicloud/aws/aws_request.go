@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -60,7 +61,7 @@ func Unmarshal(r *request.Request) {
 		} else {
 			decoder = xml.NewDecoder(r.HTTPResponse.Body)
 		}
-		if r.ClientInfo.ServiceID == EC2_SERVICE_ID {
+		if r.ClientInfo.ServiceID == EC2_SERVICE_ID || r.ClientInfo.ServiceID == CDN_SERVICE_ID {
 			err := decoder.Decode(r.Data)
 			if err != nil {
 				r.Error = awserr.NewRequestFailure(
@@ -135,6 +136,13 @@ func Build(r *request.Request) {
 		log.Debugf("params: %s", body.Encode())
 	}
 
+	if r.ClientInfo.ServiceID == CDN_SERVICE_ID {
+		switch r.HTTPRequest.Method {
+		case "GET":
+			r.HTTPRequest.URL.RawQuery = body.Encode()
+			return
+		}
+	}
 	if r.ClientInfo.ServiceID == ROUTE53_SERVICE_ID {
 		switch r.HTTPRequest.Method {
 		case "GET":
@@ -219,7 +227,7 @@ func UnmarshalError(r *request.Request) {
 	}
 
 	if strings.Contains(respErr.Errors.Code, "NotFound") || strings.HasPrefix(respErr.Errors.Code, "NoSuch") {
-		r.Error = errors.Wrapf(cloudprovider.ErrNotFound, jsonutils.Marshal(respErr).String())
+		r.Error = errors.Wrapf(cloudprovider.ErrNotFound, "%s", jsonutils.Marshal(respErr).String())
 		return
 	}
 
@@ -261,7 +269,33 @@ func (self *SAwsClient) request(regionId, serviceName, serviceId, apiVersion str
 }
 
 func jsonRequest(cli *client.Client, apiName string, params map[string]string, retval interface{}) error {
-	method, path := "POST", "/"
+	method, path, isQuery := "POST", "/", false
+	for _, prefix := range []string{"List", "Get", "Describe"} {
+		if strings.HasPrefix(apiName, prefix) {
+			isQuery = true
+			break
+		}
+	}
+	if cli.ServiceID == CDN_SERVICE_ID {
+		for _, prefix := range []string{"List", "Get"} {
+			if strings.HasPrefix(apiName, prefix) {
+				method = "GET"
+			}
+		}
+		for k, v := range map[string]string{
+			"ListDistributions2020_05_31": "distribution",
+			"GetDistribution2020_05_31":   "distribution",
+		} {
+			if apiName == k {
+				path = fmt.Sprintf("/2020-05-31/%s", v)
+				if id, ok := params["Id"]; ok {
+					path = fmt.Sprintf("/2020-05-31/%s/%s", v, strings.TrimPrefix(id, "/"))
+					delete(params, "Id")
+				}
+			}
+		}
+	}
+
 	if cli.ServiceID == ROUTE53_SERVICE_ID {
 		for _, prefix := range []string{"List", "Get"} {
 			if strings.HasPrefix(apiName, prefix) {
@@ -276,6 +310,8 @@ func jsonRequest(cli *client.Client, apiName string, params map[string]string, r
 			"ListHostedZones":            "hostedzone",
 			"ListGeoLocations":           "geolocations",
 			"CreateHostedZone":           "hostedzone",
+			"GetTrafficPolicyInstance":   "trafficpolicyinstance",
+			"GetTrafficPolicy":           "trafficpolicy",
 			"GetHostedZone":              "",
 			"DeleteHostedZone":           "",
 			"AssociateVPCWithHostedZone": "",
@@ -314,12 +350,41 @@ func jsonRequest(cli *client.Client, apiName string, params map[string]string, r
 	}
 
 	req := cli.NewRequest(op, params, retval)
-	err := req.Send()
-	if err != nil {
+	retry := 1
+	if isQuery {
+		retry = 3
+	}
+	var err error
+	for i := 0; i < retry; i++ {
+		err = req.Send()
+		if err == nil {
+			return nil
+		}
 		if e, ok := err.(awserr.RequestFailure); ok && e.StatusCode() == 404 {
 			return cloudprovider.ErrNotFound
 		}
+		if isHTTPReqErrorRetryable(err) {
+			time.Sleep(time.Second * 10)
+			continue
+		}
 		return err
 	}
-	return nil
+	return err
+}
+
+func isHTTPReqErrorRetryable(err error) bool {
+	for _, code := range []string{
+		"EOF",
+		"i/o timeout",
+		"TLS handshake timeout",
+		"Client.Timeout exceeded while awaiting headers",
+		"connection reset by peer",
+		"context deadline exceeded",
+		"server misbehaving",
+	} {
+		if strings.Contains(err.Error(), code) {
+			return true
+		}
+	}
+	return false
 }

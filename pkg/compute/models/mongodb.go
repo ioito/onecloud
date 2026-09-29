@@ -23,7 +23,6 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/compare"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
@@ -43,6 +42,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=mongodb
+// +onecloud:swagger-gen-model-plural=mongodbs
 type SMongoDBManager struct {
 	db.SVirtualResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -92,7 +93,7 @@ type SMongoDB struct {
 	Port int `nullable:"false" list:"user" create:"optional"`
 	// 实例类型
 	// example: ha
-	Category string `nullable:"false" list:"user" create:"optional"`
+	Category string `width:"16" charset:"ascii" nullable:"false" list:"user" create:"optional"`
 
 	// 分片数量
 	// example: 3
@@ -103,7 +104,7 @@ type SMongoDB struct {
 	Iops           int `nullable:"true" list:"user" create:"optional"`
 
 	// 实例IP地址
-	IpAddr string `nullable:"false" list:"user"`
+	IpAddr string `width:"64" charset:"ascii" nullable:"true" list:"user"`
 
 	// 引擎
 	// example: MySQL
@@ -235,6 +236,15 @@ func (man *SMongoDBManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field st
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SMongoDBManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (manager *SMongoDBManager) BatchCreateValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input *api.MongoDBCreateInput) (*api.MongoDBCreateInput, error) {
 	return input, httperrors.NewNotImplementedError("Not Implemented")
 }
@@ -324,7 +334,7 @@ func (self *SMongoDB) PerformSyncstatus(ctx context.Context, userCred mcclient.T
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("MongoDB has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("MongoDB has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, self, "MongoDBSyncstatusTask", "")
@@ -336,32 +346,6 @@ func (self *SMongoDB) SetAutoRenew(autoRenew bool) error {
 		return nil
 	})
 	return err
-}
-
-func (self *SMongoDB) SaveRenewInfo(
-	ctx context.Context, userCred mcclient.TokenCredential,
-	bc *billing.SBillingCycle, expireAt *time.Time, billingType string,
-) error {
-	_, err := db.Update(self, func() error {
-		if billingType == "" {
-			billingType = billing_api.BILLING_TYPE_PREPAID
-		}
-		if self.BillingType == "" {
-			self.BillingType = billingType
-		}
-		if expireAt != nil && !expireAt.IsZero() {
-			self.ExpiredAt = *expireAt
-		} else {
-			self.BillingCycle = bc.String()
-			self.ExpiredAt = bc.EndAt(self.ExpiredAt)
-		}
-		return nil
-	})
-	if err != nil {
-		return errors.Wrapf(err, "db.Update")
-	}
-	db.OpsLog.LogEvent(self, db.ACT_RENEW, self.GetShortDesc(ctx), userCred)
-	return nil
 }
 
 func (self *SMongoDB) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
@@ -386,10 +370,10 @@ func (self *SMongoDB) StartDeleteTask(ctx context.Context, userCred mcclient.Tok
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.MONGO_DB_STATUS_DELETE_FAILED, err.Error())
+		self.SetStatus(ctx, userCred, api.MONGO_DB_STATUS_DELETE_FAILED, err.Error())
 		return err
 	}
-	return self.SetStatus(userCred, api.MONGO_DB_STATUS_DELETING, "")
+	return self.SetStatus(ctx, userCred, api.MONGO_DB_STATUS_DELETING, "")
 }
 
 func (self *SCloudregion) GetMongoDBs(managerId string) ([]SMongoDB, error) {
@@ -524,6 +508,14 @@ func (self *SMongoDB) SyncWithCloudMongoDB(ctx context.Context, userCred mcclien
 		self.MaxConnections = ext.GetMaxConnections()
 		self.NetworkAddress = ext.GetNetworkAddress()
 
+		self.BillingType = billing_api.TBillingType(ext.GetBillingType())
+		self.ExpiredAt = time.Time{}
+		self.AutoRenew = false
+		if self.BillingType == billing_api.BILLING_TYPE_PREPAID {
+			self.ExpiredAt = ext.GetExpiredAt()
+			self.AutoRenew = ext.IsAutoRenew()
+		}
+
 		if vpcId := ext.GetVpcId(); len(vpcId) > 0 {
 			vpc, err := db.FetchByExternalIdAndManagerId(VpcManager, vpcId, func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
 				return q.Equals("manager_id", self.ManagerId)
@@ -568,9 +560,11 @@ func (self *SMongoDB) SyncWithCloudMongoDB(ctx context.Context, userCred mcclien
 			Action: notifyclient.ActionSyncUpdate,
 		})
 	}
-	syncVirtualResourceMetadata(ctx, userCred, self, ext)
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -611,12 +605,11 @@ func (self *SCloudregion) newFromCloudMongoDB(ctx context.Context, userCred mccl
 		ins.CreatedAt = createdAt
 	}
 
-	ins.BillingType = ext.GetBillingType()
+	ins.BillingType = billing_api.TBillingType(ext.GetBillingType())
+	ins.ExpiredAt = time.Time{}
+	ins.AutoRenew = false
 	if ins.BillingType == billing_api.BILLING_TYPE_PREPAID {
-		expiredAt := ext.GetExpiredAt()
-		if !expiredAt.IsZero() {
-			ins.ExpiredAt = expiredAt
-		}
+		ins.ExpiredAt = ext.GetExpiredAt()
 		ins.AutoRenew = ext.IsAutoRenew()
 	}
 
@@ -664,8 +657,8 @@ func (self *SCloudregion) newFromCloudMongoDB(ctx context.Context, userCred mccl
 		Action: notifyclient.ActionSyncCreate,
 	})
 
-	syncVirtualResourceMetadata(ctx, userCred, &ins, ext)
-	SyncCloudProject(ctx, userCred, &ins, provider.GetOwnerId(), ext, provider.Id)
+	syncVirtualResourceMetadata(ctx, userCred, &ins, ext, false)
+	SyncCloudProject(ctx, userCred, &ins, provider.GetOwnerId(), ext, provider)
 	db.OpsLog.LogEvent(&ins, db.ACT_CREATE, ins.GetShortDesc(ctx), userCred)
 
 	return &ins, nil
@@ -678,6 +671,7 @@ type SMongoDBCountStat struct {
 }
 
 func (man *SMongoDBManager) TotalCount(
+	ctx context.Context,
 	scope rbacscope.TRbacScope,
 	ownerId mcclient.IIdentityProvider,
 	rangeObjs []db.IStandaloneModel,
@@ -689,7 +683,7 @@ func (man *SMongoDBManager) TotalCount(
 	mgq = scopeOwnerIdFilter(mgq, scope, ownerId)
 	mgq = CloudProviderFilter(mgq, mgq.Field("manager_id"), providers, brands, cloudEnv)
 	mgq = RangeObjectsFilter(mgq, rangeObjs, mgq.Field("cloudregion_id"), nil, mgq.Field("manager_id"), nil, nil)
-	mgq = db.ObjectIdQueryWithPolicyResult(mgq, man, policyResult)
+	mgq = db.ObjectIdQueryWithPolicyResult(ctx, mgq, man, policyResult)
 
 	sq := mgq.SubQuery()
 	q := sq.Query(sqlchemy.COUNT("total_mongodb_count"),
@@ -777,39 +771,21 @@ func (self *SMongoDB) PerformPostpaidExpire(ctx context.Context, userCred mcclie
 		return nil, httperrors.NewBadRequestError("self billing type is %s", self.BillingType)
 	}
 
-	bc, err := ParseBillingCycleInput(&self.SBillingResourceBase, input)
+	releaseAt, err := input.GetReleaseAt()
 	if err != nil {
 		return nil, err
 	}
 
-	err = self.SaveRenewInfo(ctx, userCred, bc, nil, billing_api.BILLING_TYPE_POSTPAID)
+	err = SaveReleaseAt(ctx, self, userCred, releaseAt)
 	return nil, err
 }
 
 func (self *SMongoDB) PerformCancelExpire(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	if err := self.CancelExpireTime(ctx, userCred); err != nil {
+	err := SaveReleaseAt(ctx, self, userCred, time.Time{})
+	if err != nil {
 		return nil, err
 	}
-
 	return nil, nil
-}
-
-func (self *SMongoDB) CancelExpireTime(ctx context.Context, userCred mcclient.TokenCredential) error {
-	if self.BillingType != billing_api.BILLING_TYPE_POSTPAID {
-		return httperrors.NewBadRequestError("self billing type %s not support cancel expire", self.BillingType)
-	}
-
-	_, err := sqlchemy.GetDB().Exec(
-		fmt.Sprintf(
-			"update %s set expired_at = NULL and billing_cycle = NULL where id = ?",
-			MongoDBManager.TableSpec().Name(),
-		), self.Id,
-	)
-	if err != nil {
-		return errors.Wrap(err, "self cancel expire time")
-	}
-	db.OpsLog.LogEvent(self, db.ACT_RENEW, "self cancel expire time", userCred)
-	return nil
 }
 
 func (self *SMongoDB) PerformRemoteUpdate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.MongoDBRemoteUpdateInput) (jsonutils.JSONObject, error) {
@@ -827,12 +803,15 @@ func (self *SMongoDB) StartRemoteUpdateTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
 	}
-	self.SetStatus(userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
+	self.SetStatus(ctx, userCred, apis.STATUS_UPDATE_TAGS, "StartRemoteUpdateTask")
 	return task.ScheduleRun(nil)
 }
 
 func (self *SMongoDB) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(self.ExternalId) == 0 {
+	if len(self.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := self.GetCloudaccount(); account != nil && account.ReadOnly {
 		return
 	}
 	err := self.StartRemoteUpdateTask(ctx, userCred, true, "")

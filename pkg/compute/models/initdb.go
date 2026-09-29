@@ -15,8 +15,13 @@
 package models
 
 import (
+	"time"
+
+	"yunion.io/x/log"
+
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/proxy"
+	"yunion.io/x/onecloud/pkg/compute/models/baremetal"
 )
 
 func InitDB() error {
@@ -40,12 +45,16 @@ func InitDB() error {
 		WireManager,
 		StorageManager,
 		SecurityGroupManager,
-		SecurityGroupCacheManager,
+		IpSetManager,
 		NetworkManager,
 		NetworkAddressManager,
 		NetworkIpMacManager,
 		GuestManager,
+		GuestnetworkManager,
 		HostManager,
+		GuestIsolatedDeviceManager,
+		IsolatedDeviceManager,
+		HostDmesgLogManager,
 		LoadbalancerCertificateManager,
 		LoadbalancerAclManager,
 		LoadbalancerManager,
@@ -53,7 +62,6 @@ func InitDB() error {
 		LoadbalancerListenerRuleManager,
 		LoadbalancerBackendGroupManager,
 		LoadbalancerBackendManager,
-		CachedLoadbalancerCertificateManager,
 		LoadbalancerClusterManager,
 		SchedtagManager,
 		DynamicschedtagManager,
@@ -73,10 +81,18 @@ func InitDB() error {
 		AccessGroupRuleManager,
 
 		GroupnetworkManager,
+
+		ElasticcacheManager,
+
+		baremetal.BaremetalProfileManager,
 	} {
+		now := time.Now()
 		err := manager.InitializeData()
 		if err != nil {
-			return err
+			log.Errorf("%s initializeData fail %s", manager.Keyword(), err)
+		}
+		if cost := time.Now().Sub(now); cost > time.Duration(time.Second)*15 {
+			log.Infof("%s initializeData cost %s", manager.Keyword(), cost.Round(time.Second))
 		}
 	}
 	return nil

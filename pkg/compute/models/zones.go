@@ -17,6 +17,7 @@ package models
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
@@ -33,6 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/hashcache"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -44,6 +46,8 @@ type SZoneManager struct {
 }
 
 var ZoneManager *SZoneManager
+
+var networkUsableZoneIdsCache = hashcache.NewCache(256, 10*time.Minute)
 
 func init() {
 	ZoneManager = &SZoneManager{
@@ -78,10 +82,14 @@ func (manager *SZoneManager) GetContextManagers() [][]db.IModelManager {
 
 func (zone *SZone) ValidateDeleteCondition(ctx context.Context, info *api.ZoneDetails) error {
 	var usage api.ZoneGeneralUsage
+	var err error
 	if info != nil {
 		usage = info.ZoneGeneralUsage
 	} else {
-		usage = zone.GeneralUsage()
+		usage, err = zone.GeneralUsage(ctx)
+		if err != nil {
+			return errors.Wrapf(err, "GeneralUsage")
+		}
 	}
 	if !usage.IsEmpty() {
 		return httperrors.NewNotEmptyError("not empty zone: %s", zone.Id)
@@ -93,16 +101,38 @@ func (manager *SZoneManager) Count() (int, error) {
 	return manager.Query().CountWithError()
 }
 
-func (zone *SZone) GeneralUsage() api.ZoneGeneralUsage {
+func (zone *SZone) GeneralUsage(ctx context.Context) (api.ZoneGeneralUsage, error) {
 	usage := api.ZoneGeneralUsage{}
-	usage.Hosts, _ = zone.HostCount("", "", tristate.None, "", tristate.None)
-	usage.HostsEnabled, _ = zone.HostCount("", "", tristate.True, "", tristate.None)
-	usage.Baremetals, _ = zone.HostCount("", "", tristate.None, "", tristate.True)
-	usage.BaremetalsEnabled, _ = zone.HostCount("", "", tristate.True, "", tristate.True)
-	usage.Wires, _ = zone.getWireCount()
-	usage.Networks, _ = zone.getNetworkCount()
-	usage.Storages, _ = zone.getStorageCount()
-	return usage
+	var err error
+	usage.Hosts, err = zone.HostCount("", "", tristate.None, "", tristate.None)
+	if err != nil {
+		return usage, errors.Wrapf(err, "Hosts")
+	}
+	usage.HostsEnabled, err = zone.HostCount("", "", tristate.True, "", tristate.None)
+	if err != nil {
+		return usage, errors.Wrapf(err, "HostsEnabled")
+	}
+	usage.Baremetals, err = zone.HostCount("", "", tristate.None, "", tristate.True)
+	if err != nil {
+		return usage, errors.Wrapf(err, "Baremetals")
+	}
+	usage.BaremetalsEnabled, err = zone.HostCount("", "", tristate.True, "", tristate.True)
+	if err != nil {
+		return usage, errors.Wrapf(err, "BaremetalsEnabled")
+	}
+	usage.Wires, err = zone.getWireCount()
+	if err != nil {
+		return usage, errors.Wrapf(err, "Wires")
+	}
+	usage.Networks, err = zone.getNetworkCount(ctx)
+	if err != nil {
+		return usage, errors.Wrapf(err, "getNetworkCount")
+	}
+	usage.Storages, err = zone.getStorageCount()
+	if err != nil {
+		return usage, errors.Wrapf(err, "getStorageCount")
+	}
+	return usage, nil
 }
 
 func (zone *SZone) HostCount(status string, hostStatus string, enabled tristate.TriState, hostType string, isBaremetal tristate.TriState) (int, error) {
@@ -139,8 +169,8 @@ func (zone *SZone) getStorageCount() (int, error) {
 	return q.CountWithError()
 }
 
-func (zone *SZone) getNetworkCount() (int, error) {
-	return getNetworkCount(nil, nil, rbacscope.ScopeSystem, nil, zone)
+func (zone *SZone) getNetworkCount(ctx context.Context) (int, error) {
+	return getNetworkCount(ctx, nil, nil, rbacscope.ScopeSystem, nil, zone)
 }
 
 func (manager *SZoneManager) FetchCustomizeColumns(
@@ -346,6 +376,13 @@ func (self *SZone) syncRemoveCloudZone(ctx context.Context, userCred mcclient.To
 	lockman.LockObject(ctx, self)
 	defer lockman.ReleaseObject(ctx, self)
 
+	cnt, err := self.getNetworkCount(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "getNetworkCount")
+	}
+	if cnt > 0 {
+		return httperrors.NewNotEmptyError("contains %d networks", cnt)
+	}
 	return self.purgeAll(ctx, provider.Id)
 }
 
@@ -356,7 +393,12 @@ func (self *SZone) syncWithCloudZone(ctx context.Context, userCred mcclient.Toke
 	}
 
 	diff, err := db.UpdateWithLock(ctx, self, func() error {
-		self.Name = extZone.GetName()
+		if options.Options.EnableSyncName {
+			newName, _ := db.GenerateAlterName(self, extZone.GetName())
+			if len(newName) > 0 && newName != self.Name {
+				self.Name = newName
+			}
+		}
 		self.Status = extZone.GetStatus()
 
 		self.IsEmulated = extZone.IsEmulated()
@@ -368,7 +410,7 @@ func (self *SZone) syncWithCloudZone(ctx context.Context, userCred mcclient.Toke
 		log.Errorf("syncWithCloudZone error %s", err)
 		return err
 	}
-	syncMetadata(ctx, userCred, self, extZone)
+	syncMetadata(ctx, userCred, self, extZone, false)
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
 }
@@ -404,7 +446,7 @@ func (manager *SZoneManager) newFromCloudZone(ctx context.Context, userCred mccl
 	if err != nil {
 		return nil, errors.Wrap(err, "SyncI18ns")
 	}
-	syncMetadata(ctx, userCred, &zone, extZone)
+	syncMetadata(ctx, userCred, &zone, extZone, false)
 
 	db.OpsLog.LogEvent(&zone, db.ACT_CREATE, zone.GetShortDesc(ctx), userCred)
 	return &zone, nil
@@ -644,7 +686,39 @@ func filterResult(q *sqlchemy.SQuery) ([]string, error) {
 	return results, nil
 }
 
+func networkUsableZoneIdsCacheKey(usableNet, usableVpc bool, query *api.ZoneListInput) string {
+	type cacheKey struct {
+		UsableNet       bool     `json:"usable_net"`
+		UsableVpc       bool     `json:"usable_vpc"`
+		CloudregionId   []string `json:"cloudregion_id,omitempty"`
+		CloudproviderId []string `json:"cloudprovider_id,omitempty"`
+	}
+	key := cacheKey{
+		UsableNet: usableNet,
+		UsableVpc: usableVpc,
+	}
+	if query != nil {
+		key.CloudregionId = query.CloudregionId
+		key.CloudproviderId = query.CloudproviderId
+	}
+	return jsonutils.Marshal(key).String()
+}
+
 func NetworkUsableZoneIds(usableNet, usableVpc bool, query *api.ZoneListInput) ([]string, error) {
+	cacheKey := networkUsableZoneIdsCacheKey(usableNet, usableVpc, query)
+	if cached := networkUsableZoneIdsCache.AtomicGet(cacheKey); cached != nil {
+		return cached.([]string), nil
+	}
+
+	ret, err := queryNetworkUsableZoneIds(usableNet, usableVpc, query)
+	if err != nil {
+		return nil, err
+	}
+	networkUsableZoneIdsCache.AtomicSet(cacheKey, ret)
+	return ret, nil
+}
+
+func queryNetworkUsableZoneIds(usableNet, usableVpc bool, query *api.ZoneListInput) ([]string, error) {
 	vpcs, err := zoneUsableVpc(usableVpc, query)
 	if err != nil {
 		return nil, errors.Wrap(err, "zoneUsableVpc")
@@ -729,6 +803,9 @@ func (manager *SZoneManager) ListItemFilter(
 
 	data := jsonutils.Marshal(query.DomainizedResourceListInput)
 	domainId, err := db.FetchQueryDomain(ctx, userCred, data)
+	if err != nil {
+		return nil, err
+	}
 	if len(domainId) > 0 {
 		q = q.In("cloudregion_id", getCloudRegionIdByDomainId(domainId))
 	}
@@ -778,7 +855,26 @@ func (manager *SZoneManager) ListItemFilter(
 		q = q.In("cloudregion_id", subq.SubQuery())
 	}
 
-	q, err = managedResourceFilterByRegion(q, query.RegionalFilterListInput, "", nil)
+	if query.ReadOnly != nil {
+		sq := CloudaccountManager.Query("provider").Equals("read_only", *query.ReadOnly).SubQuery()
+		regions := CloudregionManager.Query("id")
+		if *query.ReadOnly {
+			regions = regions.In("provider", sq)
+		} else {
+			regions = regions.Filter(
+				sqlchemy.OR(
+					sqlchemy.In(regions.Field("provider"), sq),
+					sqlchemy.Equals(regions.Field("provider"), api.CLOUD_PROVIDER_ONECLOUD),
+				),
+			)
+		}
+		q = q.In("cloudregion_id", regions.SubQuery())
+	}
+
+	q, err = managedResourceFilterByRegion(ctx, q, query.RegionalFilterListInput, "", nil)
+	if err != nil {
+		return nil, err
+	}
 
 	if len(query.Location) > 0 {
 		q = q.In("location", query.Location)
@@ -940,7 +1036,7 @@ func (manager *SZoneManager) ValidateCreateData(ctx context.Context, userCred mc
 			break
 		}
 	}
-	_region, err := CloudregionManager.FetchByIdOrName(nil, input.Cloudregion)
+	_region, err := CloudregionManager.FetchByIdOrName(ctx, nil, input.Cloudregion)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found cloudregion %s", input.Cloudregion)
@@ -951,7 +1047,7 @@ func (manager *SZoneManager) ValidateCreateData(ctx context.Context, userCred mc
 	input.CloudregionId = region.Id
 	input.Status = api.ZONE_ENABLE
 	if region.Provider != api.CLOUD_PROVIDER_ONECLOUD {
-		return nil, httperrors.NewNotSupportedError("not support create %s zone", region.Provider)
+		return nil, httperrors.NewNotSupportedError("creating %s zones is not supported for this region", region.Provider)
 	}
 
 	input.StatusStandaloneResourceCreateInput, err = manager.SStatusStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.StatusStandaloneResourceCreateInput)

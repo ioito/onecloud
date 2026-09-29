@@ -37,6 +37,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=tap_service
+// +onecloud:swagger-gen-model-plural=tap_services
 type SNetTapServiceManager struct {
 	db.SEnabledStatusStandaloneResourceBaseManager
 }
@@ -81,7 +83,7 @@ func (man *SNetTapServiceManager) ListItemFilter(
 	}
 
 	if len(query.HostId) > 0 {
-		hostObj, err := HostManager.FetchByIdOrName(userCred, query.HostId)
+		hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, query.HostId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(HostManager.Keyword(), query.HostId)
@@ -242,7 +244,7 @@ func (manager *SNetTapServiceManager) ValidateCreateData(
 	}
 	switch input.Type {
 	case api.TapServiceHost:
-		hostObj, err := HostManager.FetchByIdOrName(userCred, input.TargetId)
+		hostObj, err := HostManager.FetchByIdOrName(ctx, userCred, input.TargetId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", HostManager.Keyword(), input.TargetId)
@@ -272,7 +274,7 @@ func (manager *SNetTapServiceManager) ValidateCreateData(
 		}
 		input.TargetId = hostObj.GetId()
 	case api.TapServiceGuest:
-		guestObj, err := GuestManager.FetchByIdOrName(userCred, input.TargetId)
+		guestObj, err := GuestManager.FetchByIdOrName(ctx, userCred, input.TargetId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return input, errors.Wrapf(httperrors.ErrResourceNotFound, "%s %s", GuestManager.Keyword(), input.TargetId)

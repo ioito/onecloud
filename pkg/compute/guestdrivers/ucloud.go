@@ -15,15 +15,19 @@
 package guestdrivers
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/compute/models"
+	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
 
@@ -73,8 +77,8 @@ func (self *SUCloudGuestDriver) GetAttachDiskStatus() ([]string, error) {
 	return []string{api.VM_READY, api.VM_RUNNING}, nil
 }
 
-func (self *SUCloudGuestDriver) GetChangeConfigStatus(guest *models.SGuest) ([]string, error) {
-	return []string{api.VM_READY}, nil
+func (self *SUCloudGuestDriver) IsChangeInstanceTypeWhileRunningSupported(guest *models.SGuest) (bool, error) {
+	return false, nil
 }
 
 func (self *SUCloudGuestDriver) GetRebuildRootStatus() ([]string, error) {
@@ -86,7 +90,7 @@ func (self *SUCloudGuestDriver) GetGuestInitialStateAfterRebuild() string {
 }
 
 func (self *SUCloudGuestDriver) ValidateResizeDisk(guest *models.SGuest, disk *models.SDisk, storage *models.SStorage) error {
-	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY}) {
+	if !utils.IsInStringArray(guest.Status, []string{api.VM_READY, api.VM_START_RESIZE_DISK, api.VM_RESIZE_DISK}) {
 		return fmt.Errorf("Cannot resize disk when guest in status %s", guest.Status)
 	}
 	if !utils.IsInStringArray(storage.StorageType, []string{api.STORAGE_UCLOUD_CLOUD_SSD, api.STORAGE_UCLOUD_CLOUD_NORMAL}) {
@@ -114,4 +118,23 @@ func (self *SUCloudGuestDriver) GetInstanceCapability() cloudprovider.SInstanceC
 func init() {
 	driver := SUCloudGuestDriver{}
 	models.RegisterGuestDriver(&driver)
+}
+
+func (ucloud *SUCloudGuestDriver) ValidateGuestChangeConfigInput(ctx context.Context, guest *models.SGuest, input api.ServerChangeConfigInput) (*api.ServerChangeConfigSettings, error) {
+	confs, err := ucloud.SBaseGuestDriver.ValidateGuestChangeConfigInput(ctx, guest, input)
+	if err != nil {
+		return nil, errors.Wrap(err, "SBaseGuestDriver.ValidateGuestChangeConfigInput")
+	}
+
+	if len(input.InstanceType) > 0 {
+		if !strings.HasPrefix(guest.InstanceType, confs.InstanceTypeFamily) {
+			return nil, httperrors.NewInputParameterError("Cannot change config with different instance family")
+		}
+	}
+
+	return confs, nil
+}
+
+func (self *SUCloudGuestDriver) IsNeedCleanDisksAfterUndeploy() bool {
+	return false
 }

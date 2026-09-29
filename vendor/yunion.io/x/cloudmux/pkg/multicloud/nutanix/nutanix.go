@@ -133,7 +133,7 @@ func (cli *SNutanixClient) getDefaultClient(timeout time.Duration) *http.Client 
 	httputils.SetClientProxyFunc(client, proxy)
 
 	ts, _ := client.Transport.(*http.Transport)
-	client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if cli.cpcfg.ReadOnly {
 			if req.Method == "GET" {
 				return nil, nil
@@ -239,7 +239,7 @@ func (self *SNutanixClient) wait(taskId string) (string, error) {
 			return true, nil
 		}
 		if task.ProgressStatus == "Failed" {
-			return false, errors.Errorf(jsonutils.Marshal(task.MetaResponse).String())
+			return false, errors.Errorf("%s", jsonutils.Marshal(task.MetaResponse).String())
 		}
 		return false, nil
 	})
@@ -328,8 +328,13 @@ func (self *SNutanixClient) get(res string, id string, params url.Values, retVal
 	return nil
 }
 
+func (cli *SNutanixClient) GetCloudRegionExternalIdPrefix() string {
+	return fmt.Sprintf("%s/%s", CLOUD_PROVIDER_NUTANIX, cli.cpcfg.Id)
+}
+
 func (self *SNutanixClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{
+		Id:           self.GetAccountId(),
 		Account:      self.username,
 		Name:         self.cpcfg.Name,
 		HealthStatus: api.CLOUD_PROVIDER_HEALTH_NORMAL,
@@ -360,7 +365,7 @@ func (self *sNutanixError) ParseErrorFromJsonResponse(statusCode int, status str
 		body.Unmarshal(self)
 	}
 	if self.ErrorCode.Code == 1202 {
-		return errors.Wrapf(cloudprovider.ErrNotFound, self.Error())
+		return errors.Wrapf(cloudprovider.ErrNotFound, "%s", self.Error())
 	}
 	return self
 }
@@ -384,9 +389,9 @@ func _rawRequest(cli *http.Client, method httputils.THttpMethod, url string, hea
 	return httputils.Request(cli, context.Background(), method, url, header, body, debug)
 }
 
-func (self *SNutanixClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SNutanixClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	region := &SRegion{cli: self}
-	return []cloudprovider.ICloudRegion{region}
+	return []cloudprovider.ICloudRegion{region}, nil
 }
 
 func (self *SNutanixClient) getTask(id string) (*STask, error) {

@@ -120,12 +120,12 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 	guestdisks, _ := self.GetGuestDisks()
 
 	storageInfo := make([]baremetal.BaremetalStorage, 0)
-	totalSize := 0
+	totalSize := int64(0)
 	for i := 0; i < len(guestdisks); i += 1 {
 		disk := guestdisks[i].GetDisk()
 		storage, _ := disk.GetStorage()
 
-		totalSize += disk.DiskSize
+		totalSize += int64(disk.DiskSize)
 
 		if len(fakeHost.StorageType) == 0 {
 			fakeHost.StorageType = storage.StorageType
@@ -153,9 +153,9 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 
 	guestnics, err := self.GetNetworks("")
 	if err != nil || len(guestnics) == 0 {
-		msg := fmt.Sprintf("no network info on guest???? %s", err)
-		log.Errorf(msg)
-		return fmt.Errorf(msg)
+		msg := fmt.Sprintf("no network info on guest???? %v", err)
+		log.Errorf("%s", msg)
+		return fmt.Errorf("%s", msg)
 	}
 	fakeHost.AccessIp = guestnics[0].IpAddr
 	fakeHost.AccessMac = guestnics[0].MacAddr
@@ -187,21 +187,29 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 		}
 		ifname := fmt.Sprintf("eth%d", i)
 		brname := fmt.Sprintf("br%d", i)
+		net, err := guestnics[i].GetNetwork()
+		if err != nil {
+			return errors.Wrapf(err, "GetNetwork")
+		}
 		err = fakeHost.addNetif(ctx, userCred,
 			guestnics[i].MacAddr,
 			1,
-			guestnics[i].GetNetwork().WireId,
+			net.WireId,
+			"",
 			"",
 			1000,
 			nicType,
-			int8(i),
+			i,
 			tristate.True,
 			1500,
 			false,
 			&ifname,
 			&brname,
 			false,
-			false)
+			false,
+			false,
+			false,
+		)
 		if err != nil {
 			log.Errorf("fail to addNetInterface %d: %s", i, err)
 			fakeHost.RealDelete(ctx, userCred)
@@ -221,7 +229,7 @@ func (self *SGuest) doPrepaidRecycleNoLock(ctx context.Context, userCred mcclien
 			} else {
 				if externalId != storage.ExternalId {
 					msg := "inconsistent storage !!!!"
-					log.Errorf(msg)
+					log.Errorf("%s", msg)
 					fakeHost.RealDelete(ctx, userCred)
 					return errors.Wrap(httperrors.ErrConflict, msg)
 				}
@@ -349,7 +357,7 @@ func (self *SHost) PerformUndoPrepaidRecycle(ctx context.Context, userCred mccli
 	}
 
 	if len(guests) > 1 {
-		return nil, httperrors.NewInvalidStatusError("a recycle host shoud not allocate more than 1 guest")
+		return nil, httperrors.NewInvalidStatusError("a recycle host should not allocate more than 1 guest")
 	}
 
 	if !guests[0].IsInStatus(api.VM_READY, api.VM_RUNNING) {
@@ -398,7 +406,7 @@ func doUndoPrepaidRecycleLockHost(ctx context.Context, userCred mcclient.TokenCr
 func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCredential, host *SHost, server *SGuest) error {
 	if host.RealExternalId != server.ExternalId {
 		msg := "host and server external id not match!!!!"
-		log.Errorf(msg)
+		log.Errorf("%v", msg)
 		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 
@@ -418,12 +426,12 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 
 	if oHostCnt == 0 {
 		msg := "orthordox host not found???"
-		log.Errorf(msg)
+		log.Errorf("%s", msg)
 		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 	if oHostCnt > 1 {
 		msg := fmt.Sprintf("more than 1 (%d) orthordox host found???", oHostCnt)
-		log.Errorf(msg)
+		log.Errorf("%s", msg)
 		return errors.Wrap(httperrors.ErrConflict, msg)
 	}
 
@@ -432,8 +440,8 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 
 	err = q.First(&oHost)
 	if err != nil {
-		msg := fmt.Sprintf("fail to query orthordox host %s", err)
-		log.Errorf(msg)
+		msg := fmt.Sprintf("fail to query orthordox host %v", err)
+		log.Errorf("%s", msg)
 		return errors.Wrap(err, msg)
 	}
 
@@ -447,7 +455,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 			oHostStorage := oHost.GetHoststorageByExternalId(storage.ExternalId)
 			if oHostStorage == nil {
 				msg := fmt.Sprintf("oHost.GetHoststorageByExternalId not found %s", storage.ExternalId)
-				log.Errorf(msg)
+				log.Errorf("%s", msg)
 				return errors.Wrap(httperrors.ErrConflict, msg)
 			}
 		}
@@ -476,7 +484,7 @@ func doUndoPrepaidRecycleNoLock(ctx context.Context, userCred mcclient.TokenCred
 			oHostStorage := oHost.GetHoststorageByExternalId(storage.ExternalId)
 			if oHostStorage == nil {
 				msg := fmt.Sprintf("oHost.GetHoststorageByExternalId not found %s", storage.ExternalId)
-				log.Errorf(msg)
+				log.Errorf("%s", msg)
 				return errors.Wrap(httperrors.ErrConflict, msg)
 			}
 			oStorage := oHostStorage.GetStorage()
@@ -538,11 +546,11 @@ func (self *SHost) BorrowIpAddrsFromGuest(ctx context.Context, userCred mcclient
 		netif := self.GetNetInterface(guestnics[i].MacAddr, 1)
 		if netif == nil {
 			msg := fmt.Sprintf("fail to find netinterface for mac %s", guestnics[i].MacAddr)
-			log.Errorf(msg)
-			return fmt.Errorf(msg)
+			log.Errorf("%s", msg)
+			return fmt.Errorf("%s", msg)
 		}
 
-		err = self.EnableNetif(ctx, userCred, netif, "", guestnics[i].IpAddr, "", "", false, false)
+		err = self.EnableNetif(ctx, userCred, netif, "", guestnics[i].IpAddr, guestnics[i].Ip6Addr, "", "", false, false, false, false)
 		if err != nil {
 			log.Errorf("fail to enable netif %s %s", guestnics[i].IpAddr, err)
 			return err
@@ -582,6 +590,7 @@ func (host *SHost) SetGuestCreateNetworkAndDiskParams(ctx context.Context, userC
 				Network:  hn.NetworkId,
 				Mac:      netifs[i].Mac,
 				Address:  hn.IpAddr,
+				Address6: hn.Ip6Addr,
 				Reserved: true,
 			})
 			netIdx += 1
@@ -727,7 +736,17 @@ func (self *SHost) PerformRenewPrepaidRecycle(ctx context.Context, userCred mccl
 		return nil, httperrors.NewInputParameterError("invalid duration %s: %s", durationStr, err)
 	}
 
-	if !GetDriver(api.HOSTTYPE_HYPERVISOR[self.HostType]).IsSupportedBillingCycle(bc) {
+	hostDriver, err := self.GetHostDriver()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetHostDriver")
+	}
+
+	driver, err := GetDriver(hostDriver.GetHypervisor(), hostDriver.GetProvider())
+	if err != nil {
+		return nil, err
+	}
+
+	if !driver.IsSupportedBillingCycle(bc) {
 		return nil, httperrors.NewInputParameterError("unsupported duration %s", durationStr)
 	}
 

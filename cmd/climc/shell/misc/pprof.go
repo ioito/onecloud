@@ -19,15 +19,17 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"strings"
 	"syscall"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/util/signalutils"
 
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/modules"
-	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
@@ -37,6 +39,23 @@ func init() {
 		Service string `help:"Service type"`
 		Address string `help:"Service listen address"`
 		Gc      bool   `help:"run GC before taking the heap sample"`
+		Output  string `help:"Save pprof file to specified path instead of opening with go tool" short-token:"o"`
+	}
+
+	writeReaderToFile := func(input io.Reader, file *os.File) error {
+		if _, err := io.Copy(file, input); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	downloadToFile := func(input io.Reader, filepath string) error {
+		file, err := os.Create(filepath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		return writeReaderToFile(input, file)
 	}
 
 	downloadToTemp := func(input io.Reader, pattern string) (string, error) {
@@ -45,7 +64,7 @@ func init() {
 			return "", err
 		}
 		defer tmpfile.Close()
-		if _, err := io.Copy(tmpfile, input); err != nil {
+		if err := writeReaderToFile(input, tmpfile); err != nil {
 			return "", err
 		}
 		return tmpfile.Name(), nil
@@ -58,7 +77,7 @@ func init() {
 			svcUrl string
 		)
 		if len(opts.Service) > 0 {
-			svcUrl, err = s.GetServiceURL(opts.Service, "")
+			svcUrl, err = s.GetServiceURL(opts.Service, "", httputils.GET)
 			if err != nil {
 				return errors.Wrapf(err, "get service %s url", opts.Service)
 			}
@@ -66,6 +85,10 @@ func init() {
 			svcUrl = opts.Address
 		} else {
 			return fmt.Errorf("no service address provide")
+		}
+
+		if opts.Service == "identity" {
+			svcUrl = strings.TrimSuffix(svcUrl, "/v3")
 		}
 
 		params := jsonutils.NewDict()
@@ -76,6 +99,15 @@ func init() {
 		src, err = modules.GetNamedAddressPProfByType(s, svcUrl, pType, params)
 		if err != nil {
 			return err
+		}
+
+		// If output path is specified, save file and return
+		if len(opts.Output) > 0 {
+			if err := downloadToFile(src, opts.Output); err != nil {
+				return errors.Wrapf(err, "save pprof file to %s", opts.Output)
+			}
+			fmt.Printf("pprof file saved to: %s\n", opts.Output)
+			return nil
 		}
 
 		tempfile, err := downloadToTemp(src, pType)
@@ -125,7 +157,7 @@ func init() {
 	} {
 		pType := kind
 		R(&TraceOptions{}, fmt.Sprintf("pprof-%s", pType), fmt.Sprintf("pprof %s of backend service", pType), func(s *mcclient.ClientSession, args *TraceOptions) error {
-			port, err := netutils2.GetFreePort()
+			port, err := netutils.GetFreePort()
 			if err != nil {
 				return err
 			}

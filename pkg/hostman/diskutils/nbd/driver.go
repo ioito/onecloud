@@ -20,6 +20,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"yunion.io/x/log"
@@ -29,6 +30,7 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/diskutils/fsutils"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/kvmpart"
+	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/qemutils"
@@ -42,6 +44,7 @@ type NBDDriver struct {
 	imageRootBackFilePath string
 	imageInfo             qemuimg.SImageInfo
 	nbdDev                string
+	sessionHeld           bool
 }
 
 func NewNBDDriver(imageInfo qemuimg.SImageInfo) *NBDDriver {
@@ -51,26 +54,45 @@ func NewNBDDriver(imageInfo qemuimg.SImageInfo) *NBDDriver {
 	}
 }
 
-var lvmTool *SLVMImageConnectUniqueToolSet
+var lock *sync.Mutex
 
 func init() {
-	lvmTool = NewLVMImageConnectUniqueToolSet()
+	lock = new(sync.Mutex)
 }
 
-func (d *NBDDriver) Connect() error {
+func (d *NBDDriver) acquireSession(rootPath string) {
+	log.Infof("acquire nbd session for %s", rootPath)
+	lock.Lock()
+	d.sessionHeld = true
+}
+
+func (d *NBDDriver) releaseSession(rootPath string) {
+	if d.sessionHeld {
+		d.sessionHeld = false
+		lock.Unlock()
+		log.Infof("release nbd session for %s", rootPath)
+	}
+}
+
+func (d *NBDDriver) cleanupConnect(rootPath string) {
+	if len(d.nbdDev) > 0 {
+		d.putdownLVMs()
+		_ = d.disconnect()
+	}
+	d.releaseSession(rootPath)
+}
+
+func (d *NBDDriver) Connect(*apis.GuestDesc, string) error {
 	d.nbdDev = GetNBDManager().AcquireNbddev()
 	if len(d.nbdDev) == 0 {
 		return errors.Errorf("Cannot get nbd device")
 	}
 
 	rootPath := d.rootImagePath()
-	pathType, lock := lvmTool.Acquire(rootPath)
-	if pathType != NON_LVM_PATH {
-		lock.Lock()
-		defer lock.Unlock()
-	}
+	d.acquireSession(rootPath)
 
 	if err := QemuNbdConnect(d.imageInfo, d.nbdDev); err != nil {
+		d.cleanupConnect(rootPath)
 		return err
 	}
 	var tried uint = 0
@@ -79,27 +101,17 @@ func (d *NBDDriver) Connect() error {
 		err := d.findPartitions()
 		if err != nil {
 			log.Errorln(err.Error())
+			d.cleanupConnect(rootPath)
 			return err
 		}
 		tried += 1
 	}
 
-	log.Infof("path type %s: %v", d.nbdDev, pathType)
-	if pathType == LVM_PATH {
-		if _, err := d.setupLVMS(); err != nil {
-			return err
-		}
-	} else if pathType == PATH_TYPE_UNKNOWN {
-		hasLVM, err := d.setupLVMS()
-		log.Infof("%s hasLVM %v err %v", d.nbdDev, hasLVM, err)
-		if err != nil {
-			return err
-		}
-
-		// no lvm partition found and has partitions
-		if !hasLVM && len(d.partitions) > 0 {
-			lvmTool.CacheNonLvmImagePath(rootPath)
-		}
+	hasLVM, err := d.setupLVMS()
+	log.Infof("%s hasLVM %v err %v", d.nbdDev, hasLVM, err)
+	if err != nil {
+		d.cleanupConnect(rootPath)
+		return err
 	}
 	return nil
 }
@@ -193,20 +205,29 @@ func (d *NBDDriver) findLVMPartitions(partDev string) string {
 	return findVgname(partDev)
 }
 
+func (nbdDriver *NBDDriver) setupAndPutdownLVMS() error {
+	_, err := nbdDriver.setupLVMS()
+	if err != nil {
+		return err
+	}
+
+	if !nbdDriver.putdownLVMs() {
+		return errors.Errorf("failed putdown lvms")
+	}
+
+	return nil
+}
+
 func (d *NBDDriver) Disconnect() error {
-	if len(d.nbdDev) > 0 {
-		pathType, lock := lvmTool.Acquire(d.rootImagePath())
-		if pathType != NON_LVM_PATH {
-			lock.Lock()
-			defer lock.Unlock()
-		}
-		if !d.putdownLVMs() {
-			return fmt.Errorf("failed putdown lvm devices %s", d.nbdDev)
-		}
-		return d.disconnect()
-	} else {
+	rootPath := d.rootImagePath()
+	defer d.releaseSession(rootPath)
+	if len(d.nbdDev) == 0 {
 		return nil
 	}
+	if !d.putdownLVMs() {
+		return fmt.Errorf("failed putdown lvm devices %s", d.nbdDev)
+	}
+	return d.disconnect()
 }
 
 func (d *NBDDriver) disconnect() error {
@@ -237,16 +258,16 @@ func (d *NBDDriver) MakePartition(fs string) error {
 	return fsutils.Mkpartition(d.nbdDev, fs)
 }
 
-func (d *NBDDriver) FormatPartition(fs, uuid string) error {
-	return fsutils.FormatPartition(fmt.Sprintf("%sp1", d.nbdDev), fs, uuid)
+func (d *NBDDriver) FormatPartition(fs, uuid string, features *apis.FsFeatures) error {
+	return fsutils.FormatPartition(fmt.Sprintf("%sp1", d.nbdDev), fs, uuid, features)
 }
 
-func (d *NBDDriver) ResizePartition() error {
+func (d *NBDDriver) ResizePartition(string, string) error {
 	if d.IsLVMPartition() {
 		// do not resize LVM partition
 		return nil
 	}
-	return fsutils.ResizeDiskFs(d.nbdDev, 0)
+	return fsutils.ResizeDiskFs(d.nbdDev, 0, false)
 }
 
 func (d *NBDDriver) Zerofree() {
@@ -259,6 +280,45 @@ func (d *NBDDriver) Zerofree() {
 
 func (d *NBDDriver) IsLVMPartition() bool {
 	return len(d.lvms) > 0
+}
+
+func (d *NBDDriver) DetectIsUEFISupport(rootfs fsdriver.IRootFsDriver) bool {
+	return fsutils.DetectIsUEFISupport(rootfs, d.GetPartitions())
+}
+
+func (d *NBDDriver) DetectIsBIOSSupport(rootfs fsdriver.IRootFsDriver) bool {
+	return fsutils.DetectIsBIOSSupport(d.nbdDev, rootfs)
+}
+
+func (d *NBDDriver) MountRootfs(readonly bool) (fsdriver.IRootFsDriver, error) {
+	return fsutils.MountRootfs(readonly, d.GetPartitions())
+}
+
+func (d *NBDDriver) UmountRootfs(fd fsdriver.IRootFsDriver) error {
+	if part := fd.GetPartition(); part != nil {
+		return part.Umount()
+	}
+	return nil
+}
+
+func (d *NBDDriver) DeployGuestfs(req *apis.DeployParams) (res *apis.DeployGuestFsResponse, err error) {
+	return fsutils.DeployGuestfs(d, req)
+}
+
+func (d *NBDDriver) ResizeFs(*apis.ResizeFsParams) (*apis.Empty, error) {
+	return fsutils.ResizeFs(d, "")
+}
+
+func (d *NBDDriver) SaveToGlance(req *apis.SaveToGlanceParams) (*apis.SaveToGlanceResponse, error) {
+	return fsutils.SaveToGlance(d, req)
+}
+
+func (d *NBDDriver) FormatFs(req *apis.FormatFsParams) (*apis.Empty, error) {
+	return fsutils.FormatFs(d, req)
+}
+
+func (d *NBDDriver) ProbeImageInfo(req *apis.ProbeImageInfoPramas) (*apis.ImageInfo, error) {
+	return fsutils.ProbeImageInfo(d)
 }
 
 func getQemuNbdVersion() (string, error) {

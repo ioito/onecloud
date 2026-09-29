@@ -23,6 +23,8 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/qemuimgfmt"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
@@ -66,13 +68,20 @@ func (c *SLVMImageCache) GetDesc() *remotefile.SImageDesc {
 	}
 
 	return &remotefile.SImageDesc{
-		Size: sizeMb,
-		Name: c.GetName(),
+		SizeMb: sizeMb,
+		Name:   c.GetName(),
 	}
 }
 
 func (c *SLVMImageCache) Load() error {
 	log.Debugf("loading lvm imagecache %s", c.GetPath())
+	if c.Manager.Lvmlockd() {
+		err := lvmutils.LVActive(c.GetPath(), true, false)
+		if err != nil {
+			return errors.Wrap(err, "lvmlockd set lv shared")
+		}
+	}
+
 	origin, err := qemuimg.NewQemuImage(c.GetPath())
 	if err != nil {
 		return errors.Wrap(err, "NewQemuImage")
@@ -96,21 +105,34 @@ func (c *SLVMImageCache) Acquire(
 	if err != nil {
 		return errors.Wrapf(err, "LocalStorage.AcquireImage")
 	}
-	if c.Load() != nil {
+	if err := c.Load(); err != nil {
+		log.Errorf("failed load image cache %s %s, try create", c.imageId, err)
 		localImg, err := qemuimg.NewQemuImage(localImageCache.GetPath())
 		if err != nil {
 			return errors.Wrapf(err, "NewQemuImage for local image path %s", localImageCache.GetPath())
 		}
-		err = lvmutils.LvCreate(c.Manager.GetPath(), c.GetName(), localImg.SizeBytes)
+		lvSize := lvmutils.GetQcow2LvSize(localImg.SizeBytes/1024/1024) * 1024 * 1024
+		err = lvmutils.LvCreate(c.Manager.GetPath(), c.GetName(), lvSize)
 		if err != nil {
 			return errors.Wrap(err, "lvm image cache acquire")
 		}
+		log.Infof("lvm lockd with cache %s %v", c.GetPath(), c.Manager.Lvmlockd())
+		if c.Manager.Lvmlockd() {
+			err = lvmutils.LVActive(c.GetPath(), true, false)
+			if err != nil {
+				return errors.Wrap(err, "lvmlockd set lv shared")
+			}
+		}
 
+		targetImageFormat := "qcow2"
+		if localImg.Format != qemuimgfmt.QCOW2 {
+			targetImageFormat = "raw"
+		}
 		log.Infof("convert local image %s to lvm %s", c.imageId, c.GetPath())
-		err = procutils.NewRemoteCommandAsFarAsPossible(qemutils.GetQemuImg(),
-			"convert", "-W", "-m", "16", "-O", "raw", localImageCache.GetPath(), c.GetPath()).Run()
+		out, err := procutils.NewRemoteCommandAsFarAsPossible(qemutils.GetQemuImg(),
+			"convert", "-W", "-m", "16", "-O", targetImageFormat, localImageCache.GetPath(), c.GetPath()).Output()
 		if err != nil {
-			return errors.Wrapf(err, "convert local image %s to lvm %s", c.imageId, c.GetPath())
+			return errors.Wrapf(err, "convert local image %s to lvm %s: %s", c.imageId, c.GetPath(), out)
 		}
 		if len(input.ServerId) > 0 {
 			modules.Servers.Update(hostutils.GetComputeSession(context.Background()), input.ServerId, jsonutils.Marshal(map[string]float32{"progress": 100.0}))
@@ -135,9 +157,13 @@ func (c *SLVMImageCache) Remove(ctx context.Context) error {
 	go func() {
 		_, err := modules.Storagecachedimages.Detach(hostutils.GetComputeSession(ctx),
 			c.Manager.GetId(), c.imageId, nil)
-		if err != nil {
+		if err != nil && httputils.ErrorCode(err) != 404 {
 			log.Errorf("Fail to delete host cached image: %s", err)
 		}
 	}()
 	return nil
+}
+
+func (c *SLVMImageCache) GetAccessDirectory() (string, error) {
+	return "", errors.ErrNotImplemented
 }

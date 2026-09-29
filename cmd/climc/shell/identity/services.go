@@ -162,6 +162,18 @@ func init() {
 		return nil
 	})
 
+	type ServiceConfigShow2Options struct {
+		TYPE string `help:"service type"`
+	}
+	R(&ServiceConfigShow2Options{}, "service-config-show2", "Show configs of a service", func(s *mcclient.ClientSession, args *ServiceConfigShow2Options) error {
+		conf, err := modules.ServicesV3.GetConfig(s, args.TYPE)
+		if err != nil {
+			return err
+		}
+		fmt.Println(conf.PrettyString())
+		return nil
+	})
+
 	type ServiceConfigOptions struct {
 		SERVICE string   `help:"service name or id"`
 		Config  []string `help:"config options, can be a JSON, a YAML or a key=value pair, e.g:\n    * JSON\n      '{\"default\":{\"password_expiration_seconds\":300}}'\n    * YAML\n      default:\n        password_expiration_seconds: 300\n    * A key=value pair (under default section)\n      password_expiration_seconds=300\n"`
@@ -199,7 +211,13 @@ func init() {
 			}
 			key := strings.TrimSpace(c[:pos])
 			value := strings.TrimSpace(c[pos+1:])
-			config.Add(jsonutils.NewString(value), "config", "default", key)
+			var v jsonutils.JSONObject
+			if value == "true" || value == "false" {
+				v = jsonutils.NewBool(value == "true")
+			} else {
+				v = jsonutils.NewString(value)
+			}
+			config.Add(v, "config", "default", key)
 		}
 		nconf, err := modules.ServicesV3.PerformAction(s, args.SERVICE, "config", config)
 		if err != nil {

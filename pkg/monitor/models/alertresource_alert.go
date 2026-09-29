@@ -53,10 +53,12 @@ func GetAlertResourceAlertManager() *SAlertResourceAlertManager {
 	return alertResourceAlertManager
 }
 
+// +onecloud:swagger-gen-ignore
 type SAlertResourceAlertManager struct {
 	SAlertResourceJointsManager
 }
 
+// +onecloud:swagger-gen-ignore
 type SAlertResourceAlert struct {
 	SAlertResourceJointsBase
 
@@ -117,7 +119,7 @@ func (m *SAlertResourceAlertManager) ListItemFilter(ctx context.Context, q *sqlc
 	}
 	if len(input.AlertResourceId) > 0 {
 		masterM := m.GetMasterManager()
-		obj, err := masterM.FetchByIdOrName(userCred, input.AlertResourceId)
+		obj, err := masterM.FetchByIdOrName(ctx, userCred, input.AlertResourceId)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Get %s object", masterM.Keyword())
 		}
@@ -125,7 +127,7 @@ func (m *SAlertResourceAlertManager) ListItemFilter(ctx context.Context, q *sqlc
 	}
 	if len(input.AlertId) > 0 {
 		slaveM := m.GetSlaveManager()
-		obj, err := slaveM.FetchByIdOrName(userCred, input.AlertId)
+		obj, err := slaveM.FetchByIdOrName(ctx, userCred, input.AlertId)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Get %s object", slaveM.Keyword())
 		}

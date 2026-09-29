@@ -24,6 +24,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/imagetools"
+	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -132,9 +133,10 @@ func (self *ImageImportTask) Refresh() error {
 	return jsonutils.Update(self, task)
 }
 
-func (self *SRegion) GetImportImageTask(id string) (*ImageImportTask, error) {
-	params := map[string]string{
-		"ImportTaskId.1": id,
+func (self *SRegion) GetImportImageTasks(ids []string) ([]ImageImportTask, error) {
+	params := map[string]string{}
+	for i, id := range ids {
+		params[fmt.Sprintf("ImportTaskId.%d", i+1)] = id
 	}
 	ret := struct {
 		ImportImageTaskSet []ImageImportTask `xml:"importImageTaskSet>item"`
@@ -143,13 +145,20 @@ func (self *SRegion) GetImportImageTask(id string) (*ImageImportTask, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "DescribeImportImageTasks")
 	}
+	return ret.ImportImageTaskSet, nil
+}
 
-	for i := range ret.ImportImageTaskSet {
-		if ret.ImportImageTaskSet[i].TaskId == id {
-			return &ret.ImportImageTaskSet[i], nil
+func (self *SRegion) GetImportImageTask(id string) (*ImageImportTask, error) {
+	tasks, err := self.GetImportImageTasks([]string{id})
+	if err != nil {
+		return nil, err
+	}
+	for i := range tasks {
+		if tasks[i].TaskId == id {
+			return &tasks[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *ImageImportTask) IsEmulated() bool {
@@ -229,6 +238,9 @@ func (self *SImage) GetBlockDeviceNames() []string {
 	ret := []string{}
 	for _, dev := range self.BlockDeviceMapping {
 		ret = append(ret, dev.DeviceName)
+		if strings.HasPrefix(dev.DeviceName, "/dev/xvd") && !utils.IsInStringArray("/dev/sda", ret) { // 系统盘是/dev/xvda, 则不能指定devName 为 /dev/sda
+			ret = append(ret, "/dev/sda")
+		}
 	}
 	return ret
 }
@@ -239,7 +251,11 @@ func (self *SImage) GetSizeByte() int64 {
 
 func (self *SImage) getNormalizedImageInfo() *imagetools.ImageInfo {
 	if self.imgInfo == nil {
-		imgInfo := imagetools.NormalizeImageInfo("", self.Architecture, getImageOSType(*self), getImageOSDist(*self), getImageOSVersion(*self))
+		name := self.ImageName
+		if len(self.Description) > 0 && self.GetImageType() != cloudprovider.ImageTypeCustomized {
+			name = self.Description
+		}
+		imgInfo := imagetools.NormalizeImageInfo(name, self.Architecture, getImageOSType(*self), getImageOSDist(*self), getImageOSVersion(*self))
 		self.imgInfo = &imgInfo
 	}
 	return self.imgInfo
@@ -305,18 +321,18 @@ func (self *SImage) GetIStoragecache() cloudprovider.ICloudStoragecache {
 
 func (self *SRegion) ImportImage(name string, osArch string, osType string, osDist string, diskFormat string, bucket string, key string) (*ImageImportTask, error) {
 	params := map[string]string{
-		"Architecture":                   osArch,
-		"Hypervisor":                     "xen",
-		"Platform":                       osType,
-		"RoleName":                       "vmimport",
-		"TagSpecification":               "",
-		"TagSpecification.1.Tag.1.Key":   "Name",
-		"TagSpecification.1.Tag.1.Value": name,
-		"Description":                    fmt.Sprintf("vmimport %s - %s", name, osDist),
-		"DiskContainer.1.Format":         strings.ToUpper(diskFormat),
-		"DiskContainer.1.DeviceName":     "/dev/sda",
-		"DiskContainer.1.Url":            fmt.Sprintf("https://%s.%s/%s", bucket, self.getS3Endpoint(), key),
-		"LicenseType":                    "BYOL",
+		"Architecture":                    osArch,
+		"Hypervisor":                      "xen",
+		"Platform":                        osType,
+		"RoleName":                        "vmimport",
+		"TagSpecification.1.ResourceType": "import-image-task",
+		"TagSpecification.1.Tag.1.Key":    "Name",
+		"TagSpecification.1.Tag.1.Value":  name,
+		"Description":                     fmt.Sprintf("vmimport %s - %s", name, osDist),
+		"DiskContainer.1.Format":          strings.ToUpper(diskFormat),
+		"DiskContainer.1.DeviceName":      "/dev/sda",
+		"DiskContainer.1.Url":             fmt.Sprintf("s3://%s/%s", bucket, key),
+		"LicenseType":                     "BYOL",
 	}
 	ret := &ImageImportTask{region: self}
 	err := self.ec2Request("ImportImage", params, ret)
@@ -416,7 +432,7 @@ func (self *SRegion) GetImages(status ImageStatusType, owners []TImageOwnerType,
 	noVersionImages := make([]SImage, 0)
 	versionedImages := make(map[string][]SImage)
 	for i := range images {
-		key := fmt.Sprintf("%s%s", getImageOSDist(images[i]), getImageOSVersion(images[i]))
+		key := fmt.Sprintf("%s%s%s", getImageOSDist(images[i]), getImageOSVersion(images[i]), images[i].Architecture)
 		if len(key) == 0 {
 			noVersionImages = append(noVersionImages, images[i])
 			continue

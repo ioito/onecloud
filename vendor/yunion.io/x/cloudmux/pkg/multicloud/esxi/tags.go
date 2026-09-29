@@ -44,14 +44,6 @@ func (host *SHost) GetSysTags() map[string]string {
 	if dc != nil {
 		tags["datacenter"] = dc.GetName()
 	}
-	cluster, _ := host.GetCluster()
-	if cluster != nil {
-		tags["cluster"] = cluster.GetName()
-	}
-	resourcePool, _ := host.GetResourcePool()
-	if resourcePool != nil {
-		tags["resource_pool"] = resourcePool.Name()
-	}
 	paths := host.GetPath()
 	for i := 3; i < len(paths); i++ {
 		tags[fmt.Sprintf("folder_%d", i-3)] = paths[i]
@@ -69,7 +61,10 @@ func (svm *SVirtualMachine) GetSysTags() map[string]string {
 	for i := 3; i < len(paths); i++ {
 		meta[fmt.Sprintf("folder_%d", i-3)] = paths[i]
 	}
-	meta["networks"] = svm.getNetTags()
+	networks := svm.getNetTags()
+	if len(networks) > 0 {
+		meta["networks"] = networks
+	}
 	// meta["datacenter"] = svm.GetDatacenterPathString()
 	rp, _ := svm.getResourcePool()
 	if rp != nil {

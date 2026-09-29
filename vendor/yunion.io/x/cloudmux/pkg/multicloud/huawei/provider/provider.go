@@ -16,7 +16,6 @@ package provider
 
 import (
 	"context"
-	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -50,18 +49,6 @@ func (self *SHuaweiProviderFactory) GetMaxCloudEventKeepDays() int {
 	return 7
 }
 
-func (self *SHuaweiProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SHuaweiProviderFactory) IsSupportClouduserPolicy() bool {
-	return false
-}
-
-func (self *SHuaweiProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
 func (factory *SHuaweiProviderFactory) IsSupportCrossCloudEnvVpcPeering() bool {
 	return false
 }
@@ -90,13 +77,8 @@ func (self *SHuaweiProviderFactory) ValidateCreateCloudaccountData(ctx context.C
 	if len(input.AccessKeySecret) == 0 {
 		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "access_key_secret")
 	}
-	if len(input.Environment) == 0 {
-		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "environment")
-	}
-
 	output.Account = input.AccessKeyId
 	output.Secret = input.AccessKeySecret
-	output.AccessUrl = input.Environment
 
 	return output, nil
 }
@@ -116,24 +98,10 @@ func (self *SHuaweiProviderFactory) ValidateUpdateCloudaccountCredential(ctx con
 	return output, nil
 }
 
-func parseAccount(account string) (accessKey string, projectId string) {
-	segs := strings.Split(account, "/")
-	if len(segs) == 2 {
-		accessKey = segs[0]
-		projectId = segs[1]
-	} else {
-		accessKey = account
-		projectId = ""
-	}
-
-	return
-}
-
 func (self *SHuaweiProviderFactory) GetProvider(cfg cloudprovider.ProviderConfig) (cloudprovider.ICloudProvider, error) {
-	accessKey, projectId := parseAccount(cfg.Account)
 	client, err := huawei.NewHuaweiClient(
 		huawei.NewHuaweiClientConfig(
-			cfg.URL, accessKey, cfg.Secret, projectId,
+			cfg.Account, cfg.Secret,
 		).CloudproviderConfig(cfg),
 	)
 	if err != nil {
@@ -146,17 +114,10 @@ func (self *SHuaweiProviderFactory) GetProvider(cfg cloudprovider.ProviderConfig
 }
 
 func (self *SHuaweiProviderFactory) GetClientRC(info cloudprovider.SProviderInfo) (map[string]string, error) {
-	accessKey, projectId := parseAccount(info.Account)
-	data := strings.Split(info.Name, "-")
-	if len(info.Region) == 0 && len(data) >= 3 {
-		info.Region = strings.Join(data[len(data)-3:], "-")
-	}
 	return map[string]string{
-		"HUAWEI_CLOUD_ENV":  info.Url,
-		"HUAWEI_ACCESS_KEY": accessKey,
+		"HUAWEI_ACCESS_KEY": info.Account,
 		"HUAWEI_SECRET":     info.Secret,
-		"HUAWEI_REGION":     info.Region,
-		"HUAWEI_PROJECT":    projectId,
+		"HUAWEI_REGION":     huawei.HUAWEI_DEFAULT_REGION,
 	}, nil
 }
 
@@ -175,14 +136,14 @@ func (self *SHuaweiProvider) GetVersion() string {
 }
 
 func (self *SHuaweiProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(huawei.HUAWEI_API_VERSION), "api_version")
 	return info, nil
 }
 
-func (self *SHuaweiProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SHuaweiProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -196,9 +157,9 @@ func (self *SHuaweiProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) {
 	if err != nil {
 		return ret, err
 	}
-	ret.Amount = balance.AvailableAmount
+	ret.Amount = balance.Amount
 	ret.Status = api.CLOUD_PROVIDER_HEALTH_NORMAL
-	if balance.AvailableAmount < 0.0 && balance.CreditAmount < 0.0 {
+	if balance.Amount < 0.0 && balance.CreditAmount < 0.0 {
 		ret.Status = api.CLOUD_PROVIDER_HEALTH_ARREARS
 	}
 	return ret, nil
@@ -217,7 +178,7 @@ func (self *SHuaweiProvider) GetIamLoginUrl() string {
 }
 
 func (self *SHuaweiProvider) GetCloudRegionExternalIdPrefix() string {
-	return self.client.GetCloudRegionExternalIdPrefix()
+	return api.CLOUD_PROVIDER_HUAWEI + "/"
 }
 
 func (self *SHuaweiProvider) GetIProjects() ([]cloudprovider.ICloudProject, error) {
@@ -276,12 +237,8 @@ func (self *SHuaweiProvider) CreateICloudgroup(name, desc string) (cloudprovider
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SHuaweiProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SHuaweiProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return []cloudprovider.ICloudpolicy{}, nil
+func (self *SHuaweiProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SHuaweiProvider) GetIClouduserByName(name string) (cloudprovider.IClouduser, error) {
@@ -310,4 +267,20 @@ func (self *SHuaweiProvider) GetMetrics(opts *cloudprovider.MetricListOptions) (
 		return nil, errors.Wrapf(err, "GetMetrics")
 	}
 	return metrics, nil
+}
+
+func (self *SHuaweiProvider) GetISSLCertificates() ([]cloudprovider.ICloudSSLCertificate, error) {
+	return self.client.GetISSLCertificates()
+}
+
+func (self *SHuaweiProvider) GetISSLCertificate(certId string) (cloudprovider.ICloudSSLCertificate, error) {
+	return self.client.GetISSLCertificate(certId)
+}
+
+func (self *SHuaweiProvider) GetICloudCDNDomains() ([]cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomains()
+}
+
+func (self *SHuaweiProvider) GetICloudCDNDomainByName(name string) (cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomainByName(name)
 }

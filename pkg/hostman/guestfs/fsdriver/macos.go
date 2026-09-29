@@ -75,7 +75,7 @@ func (m *SMacOSRootFs) RootSignatures() []string {
 
 func (m *SMacOSRootFs) DeployPublicKey(rootfs IDiskPartition, uname string, pubkeys *deployapi.SSHKeys) error {
 	usrDir := fmt.Sprintf("/Users/%s", uname)
-	return DeployAuthorizedKeys(m.rootFs, usrDir, pubkeys, false)
+	return DeployAuthorizedKeys(m.rootFs, usrDir, pubkeys, false, false)
 }
 
 func (m *SMacOSRootFs) addScripts(lines []string) {
@@ -86,7 +86,7 @@ func (m *SMacOSRootFs) addScripts(lines []string) {
 	m.scripts = append(m.scripts, "")
 }
 
-func (m *SMacOSRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, publicKey, password string) (string, error) {
+func (m *SMacOSRootFs) ChangeUserPasswd(part IDiskPartition, account, gid, publicKey, password string, isRandomPassword bool) (string, error) {
 	lines := []string{
 		fmt.Sprintf("dscl . -passwd /Users/%s %s", account, password),
 		fmt.Sprintf("rm -fr /Users/%s/Library/Keychains/*", account),
@@ -113,10 +113,6 @@ func (m *SMacOSRootFs) DeployHostname(part IDiskPartition, hostname, domain stri
 }
 
 func (m *SMacOSRootFs) DeployHosts(part IDiskPartition, hn, domain string, ips []string) error {
-	return nil
-}
-
-func (m *SMacOSRootFs) DeployQgaBlackList(part IDiskPartition) error {
 	return nil
 }
 
@@ -209,4 +205,8 @@ func (m *SMacOSRootFs) CommitChanges(part IDiskPartition) error {
 	m.addScripts([]string{fmt.Sprintf("echo > %s", spath)})
 	cont = strings.Join(m.scripts, "\n") + "\n"
 	return m.rootFs.FilePutContents(spath, cont, false, false)
+}
+
+func (d *SMacOSRootFs) ConfigSshd(loginAccount, loginPassword string, sshPort int) error {
+	return nil
 }

@@ -30,7 +30,7 @@ import (
 )
 
 type SNetwork struct {
-	multicloud.SResourceBase
+	multicloud.SNetworkBase
 	VolcEngineTags
 	wire *SWire
 
@@ -73,12 +73,11 @@ func (subnet *SNetwork) GetStatus() string {
 }
 
 func (subnet *SNetwork) Refresh() error {
-	log.Debugf("Subnet refresh %s", subnet.SubnetId)
-	new, err := subnet.wire.zone.region.GetSubnetAttributes(subnet.SubnetId)
+	net, err := subnet.wire.zone.region.GetSubnetAttributes(subnet.SubnetId)
 	if err != nil {
 		return err
 	}
-	return jsonutils.Update(subnet, new)
+	return jsonutils.Update(subnet, net)
 }
 
 func (subnet *SNetwork) GetIWire() cloudprovider.ICloudWire {
@@ -89,9 +88,55 @@ func (subnet *SNetwork) GetProjectId() string {
 	return subnet.ProjectName
 }
 
+func (net *SNetwork) GetIp6Start() string {
+	if len(net.Ipv6CidrBlock) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.Ipv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		return prefix.Address.NetAddr(prefix.MaskLen).StepUp().StepUp().String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6End() string {
+	if len(net.Ipv6CidrBlock) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.Ipv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		end := prefix.Address.NetAddr(prefix.MaskLen).BroadcastAddr(prefix.MaskLen)
+		return end.StepDown().String()
+	}
+	return ""
+}
+
+func (net *SNetwork) GetIp6Mask() uint8 {
+	if len(net.Ipv6CidrBlock) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.Ipv6CidrBlock)
+		if err != nil {
+			return 0
+		}
+		return prefix.MaskLen
+	}
+	return 0
+}
+
+func (net *SNetwork) GetGateway6() string {
+	if len(net.Ipv6CidrBlock) > 0 {
+		prefix, err := netutils.NewIPV6Prefix(net.Ipv6CidrBlock)
+		if err != nil {
+			return ""
+		}
+		return prefix.Address.NetAddr(prefix.MaskLen).StepUp().String()
+	}
+	return ""
+}
+
 func (subnet *SNetwork) GetIpStart() string {
 	pref, _ := netutils.NewIPV4Prefix(subnet.CidrBlock)
 	startIp := pref.Address.NetAddr(pref.MaskLen)
+	startIp = startIp.StepUp()
 	startIp = startIp.StepUp()
 	return startIp.String()
 }
@@ -99,8 +144,6 @@ func (subnet *SNetwork) GetIpStart() string {
 func (subnet *SNetwork) GetIpEnd() string {
 	pref, _ := netutils.NewIPV4Prefix(subnet.CidrBlock)
 	endIp := pref.Address.BroadcastAddr(pref.MaskLen)
-	endIp = endIp.StepDown()
-	endIp = endIp.StepDown()
 	endIp = endIp.StepDown()
 	return endIp.String()
 }
@@ -144,7 +187,7 @@ func (region *SRegion) CreateSubnet(zoneId string, vpcId string, name string, ci
 	if err != nil {
 		return "", err
 	}
-	return body.GetString("Result", "SubnetId")
+	return body.GetString("SubnetId")
 }
 
 func (region *SRegion) DeleteSubnet(SubnetId string) error {
@@ -205,15 +248,12 @@ func (subnet *SNetwork) GetAllocTimeoutSeconds() int {
 	return 120
 }
 
-func (region *SRegion) GetSubnets(ids []string, zoneId string, vpcId string, pageNumber int, pageSize int) ([]SNetwork, int, error) {
-	if pageSize > 100 || pageSize <= 0 {
-		pageSize = 100
-	}
+func (region *SRegion) GetSubnets(ids []string, zoneId string, vpcId string) ([]SNetwork, error) {
 	params := make(map[string]string)
-	params["PageSize"] = fmt.Sprintf("%d", pageSize)
-	params["PageNumber"] = fmt.Sprintf("%d", pageNumber)
+	params["PageSize"] = "100"
+	pageNum := 1
 	for idx, id := range ids {
-		params[fmt.Sprintf("SubnetIds.%d", idx)] = id
+		params[fmt.Sprintf("SubnetIds.%d", idx+1)] = id
 	}
 	if len(zoneId) > 0 {
 		params["ZoneId"] = zoneId
@@ -222,18 +262,28 @@ func (region *SRegion) GetSubnets(ids []string, zoneId string, vpcId string, pag
 		params["VpcId"] = vpcId
 	}
 
-	body, err := region.vpcRequest("DescribeSubnets", params)
-	if err != nil {
-		return nil, 0, errors.Wrapf(err, "GetSubnets fail")
+	ret := []SNetwork{}
+	for {
+		params["PageNumber"] = fmt.Sprintf("%d", pageNum)
+		resp, err := region.vpcRequest("DescribeSubnets", params)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetSubnets fail")
+		}
+		part := struct {
+			Subnets    []SNetwork
+			TotalCount int
+		}{}
+		err = resp.Unmarshal(&part)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Unmarshal")
+		}
+		ret = append(ret, part.Subnets...)
+		if len(ret) >= part.TotalCount || len(part.Subnets) == 0 {
+			break
+		}
+		pageNum++
 	}
-
-	subnets := make([]SNetwork, 0)
-	err = body.Unmarshal(&subnets, "Result", "Subnets")
-	if err != nil {
-		return nil, 0, errors.Wrapf(err, "Unmarshal subnets fail")
-	}
-	total, _ := body.Int("Result", "TotalCount")
-	return subnets, int(total), nil
+	return ret, nil
 }
 
 func (region *SRegion) GetSubnetAttributes(SubnetId string) (*SNetwork, error) {
@@ -247,7 +297,7 @@ func (region *SRegion) GetSubnetAttributes(SubnetId string) (*SNetwork, error) {
 		log.Debugf("%s", body.PrettyString())
 	}
 	subnet := SNetwork{}
-	err = body.Unmarshal(&subnet, "Result")
+	err = body.Unmarshal(&subnet)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Unmarshal subnet fail")
 	}

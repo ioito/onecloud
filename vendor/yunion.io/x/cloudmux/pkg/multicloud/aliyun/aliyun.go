@@ -17,7 +17,7 @@ package aliyun
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -73,12 +73,14 @@ const (
 	ALIYUN_IMS_API_VERSION      = "2019-08-15"
 	ALIYUN_NAS_API_VERSION      = "2017-06-26"
 	ALIYUN_WAF_API_VERSION      = "2019-09-10"
+	ALIYUN_WAF_V2_API_VERSION   = "2021-10-01"
 	ALIYUN_MONGO_DB_API_VERSION = "2015-12-01"
 	ALIYUN_ES_API_VERSION       = "2017-06-13"
 	ALIYUN_KAFKA_API_VERSION    = "2019-09-16"
 	ALIYUN_K8S_API_VERSION      = "2015-12-15"
 	ALIYUN_OTS_API_VERSION      = "2016-06-20"
 	ALIYUN_RD_API_VERSION       = "2022-04-19"
+	ALIYUN_CAS_API_VERSION      = "2018-07-13"
 
 	ALIYUN_SERVICE_ECS      = "ecs"
 	ALIYUN_SERVICE_VPC      = "vpc"
@@ -92,6 +94,30 @@ const (
 	ALIYUN_SERVICE_MONGO_DB = "mongodb"
 
 	DefaultAssumeRoleName = "ResourceDirectoryAccountAccessRole"
+
+	ALIYUN_API_VERSION_ECS = "2014-05-26"
+	ALIYUN_API_VERSION_EIP = "2016-04-28"
+	ALIYUN_API_VERSION_ELB = "2016-04-28"
+	ALIYUN_API_VERSION_VGW = "2016-04-28"
+	ALIYUN_API_VERSION_NAS = "2017-06-26"
+	ALIYUN_API_VERSION_CON = "2018-12-01"
+	ALIYUN_API_VERSION_VHH = "2019-06-01"
+	ALIYUN_API_VERSION_BSS = "2017-12-14"
+	ALIYUN_API_VERSION_FC  = "2021-04-06"
+	ALIYUN_API_VERSION_NLB = "2022-04-30"
+	ALIYUN_API_VERSION_ALB = "2020-06-16"
+
+	ALIYUN_BSS_BILLING_METHOD_PREPAID  = "Subscription"
+	ALIYUN_BSS_BILLING_METHOD_POSTPAID = "PayAsYouGo"
+
+	ALIYUN_API_INTERVAL = 5 * time.Second
+
+	DEFAULT_SESSION_DURATION_SECONDS = 3600
+
+	ALIYUN_SERVICE_ALB = "alb"
+	ALIYUN_SERVICE_NLB = "nlb"
+	ALIYUN_SERVICE_OSS = "oss"
+	ALIYUN_SERVICE_EIP = "eip"
 )
 
 var (
@@ -153,8 +179,9 @@ type SAliyunClient struct {
 	ownerId string
 	arn     string
 
-	nasEndpoints map[string]string
-	vpcEndpoints map[string]string
+	nasEndpoints  map[string]string
+	vpcEndpoints  map[string]string
+	hbaseEndpoint map[string]string
 
 	iregions []cloudprovider.ICloudRegion
 	iBuckets []cloudprovider.ICloudBucket
@@ -198,7 +225,7 @@ func doRequest(client *sdk.Client, domain, apiVersion, apiName string, params ma
 			if e, ok := errors.Cause(err).(*alierr.ServerError); ok {
 				code := e.ErrorCode()
 				switch code {
-				case "InternalError":
+				case "InternalError", "AuthSiteFail":
 					if apiName != "QueryAccountBalance" {
 						return nil, err
 					}
@@ -214,7 +241,9 @@ func doRequest(client *sdk.Client, domain, apiVersion, apiName string, params ma
 					"InvalidAccessKeyId.Inactive",
 					"Forbidden.AccessKeyDisabled",
 					"Forbidden.AccessKey":
-					return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, err.Error())
+					return nil, errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", err.Error())
+				case "Forbidden.RAM":
+					return nil, errors.Wrapf(cloudprovider.ErrForbidden, "%s", err.Error())
 				case "404 Not Found", "InstanceNotFound":
 					return nil, errors.Wrap(cloudprovider.ErrNotFound, err.Error())
 				case "OperationDenied.NoStock":
@@ -298,7 +327,7 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 		"List":     requests.GET,
 		"Delete":   requests.DELETE,
 	} {
-		if strings.HasPrefix(apiName, prefix) {
+		if strings.HasPrefix(apiName, prefix) && !strings.HasPrefix(domain, "mongodb") {
 			method = _method
 			break
 		}
@@ -327,6 +356,27 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 		req.PathPattern = pathPattern
 		req.Method = method
 		req.GetHeaders()["Content-Type"] = "application/json"
+	} else if strings.HasPrefix(domain, "rocketmq") {
+		pathPattern, ok := params["PathPattern"]
+		if !ok {
+			return nil, errors.Errorf("Roa request missing pathPattern")
+		}
+		delete(params, "PathPattern")
+		req.PathPattern = pathPattern
+		req.Method = method
+		req.GetHeaders()["Content-Type"] = "application/json"
+	} else if strings.HasPrefix(domain, "fc") {
+		pathPattern, ok := params["PathPattern"]
+		if !ok {
+			return nil, errors.Errorf("Roa request missing pathPattern")
+		}
+		delete(params, "PathPattern")
+		req.PathPattern = fmt.Sprintf("/%s/%s", req.Version, strings.TrimPrefix(pathPattern, "/"))
+		req.Method = method
+		req.GetHeaders()["Content-Type"] = "application/json"
+	} else if strings.HasPrefix(domain, "mongodb") {
+		req.Method = requests.POST
+		req.GetHeaders()["Content-Type"] = "application/json"
 	}
 
 	resp, err := processCommonRequest(client, req)
@@ -343,7 +393,7 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 	if respBody.Contains("Code") {
 		code, _ := respBody.GetString("Code")
 		if len(code) > 0 && !utils.IsInStringArray(code, []string{"200", "Success"}) {
-			return nil, fmt.Errorf(respBody.String())
+			return nil, fmt.Errorf("%s", respBody.String())
 		}
 	}
 	return respBody, nil
@@ -427,23 +477,23 @@ func (self *SAliyunClient) fetchVpcEndpoints() error {
 func (self *SAliyunClient) _getSdkClient(regionId string) (*sdk.Client, error) {
 	transport := httputils.GetAdaptiveTransport(true)
 	transport.Proxy = self.cpcfg.ProxyFunc
-	ts := cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+	ts := cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 		params, err := url.ParseQuery(req.URL.RawQuery)
 		if err != nil {
 			return nil, errors.Wrapf(err, "ParseQuery(%s)", req.URL.RawQuery)
 		}
 		service := strings.Split(req.URL.Host, ".")[0]
 		action := params.Get("Action")
-		respCheck := func(resp *http.Response) {
+		respCheck := func(resp *http.Response) error {
 			if self.cpcfg.UpdatePermission != nil && resp.StatusCode >= 400 && resp.ContentLength > 0 {
-				body, err := ioutil.ReadAll(resp.Body)
+				body, err := io.ReadAll(resp.Body)
 				if err != nil {
-					return
+					return nil
 				}
-				resp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+				resp.Body = io.NopCloser(bytes.NewBuffer(body))
 				obj, err := jsonutils.Parse(body)
 				if err != nil {
-					return
+					return nil
 				}
 				ret := struct{ Code string }{}
 				obj.Unmarshal(&ret)
@@ -455,6 +505,7 @@ func (self *SAliyunClient) _getSdkClient(regionId string) (*sdk.Client, error) {
 					self.cpcfg.UpdatePermission(service, action)
 				}
 			}
+			return nil
 		}
 		for _, prefix := range []string{"Get", "List", "Describe", "Query"} {
 			if strings.HasPrefix(action, prefix) {
@@ -462,7 +513,7 @@ func (self *SAliyunClient) _getSdkClient(regionId string) (*sdk.Client, error) {
 			}
 		}
 		if self.cpcfg.ReadOnly {
-			return respCheck, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+			return respCheck, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s", action)
 		}
 		return respCheck, nil
 	})
@@ -652,12 +703,13 @@ func (client *SAliyunClient) getOssClientByEndpoint(endpoint string) (*oss.Clien
 	// oss use no timeout client so as to send/download large files
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
 	transport, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 		path, method := req.URL.Path, req.Method
-		respCheck := func(resp *http.Response) {
+		respCheck := func(resp *http.Response) error {
 			if client.cpcfg.UpdatePermission != nil && resp.StatusCode == 403 {
 				client.cpcfg.UpdatePermission("oss", fmt.Sprintf("%s %s", method, path))
 			}
+			return nil
 		}
 		if client.cpcfg.ReadOnly {
 			if req.Method == "GET" || req.Method == "HEAD" {
@@ -719,32 +771,45 @@ func (self *SAliyunClient) fetchBuckets() error {
 	if err != nil {
 		return errors.Wrap(err, "self.getOssClient")
 	}
-	result, err := osscli.ListBuckets()
-	if err != nil {
-		return errors.Wrap(err, "oss.ListBuckets")
-	}
-
-	if len(self.ownerId) == 0 {
-		self.ownerId = result.Owner.ID
-	}
-
 	ret := make([]cloudprovider.ICloudBucket, 0)
-	for _, bInfo := range result.Buckets {
-		regionId := bInfo.Location[4:]
-		region, err := self.getRegionByRegionId(regionId)
+
+	marker := ""
+	for {
+		opts := []oss.Option{oss.MaxKeys(100)}
+		if len(marker) > 0 {
+			opts = append(opts, oss.Marker(marker))
+		}
+		result, err := osscli.ListBuckets(opts...)
 		if err != nil {
-			log.Errorf("cannot find bucket's region %s", regionId)
-			continue
+			return errors.Wrap(err, "oss.ListBuckets")
 		}
-		b := SBucket{
-			region:       region.(*SRegion),
-			Name:         bInfo.Name,
-			Location:     bInfo.Location,
-			CreationDate: bInfo.CreationDate,
-			StorageClass: bInfo.StorageClass,
+
+		if len(self.ownerId) == 0 {
+			self.ownerId = result.Owner.ID
 		}
-		ret = append(ret, &b)
+
+		for _, bInfo := range result.Buckets {
+			regionId := bInfo.Location[4:]
+			region, err := self.getRegionByRegionId(regionId)
+			if err != nil {
+				log.Errorf("cannot find bucket's region %s", regionId)
+				continue
+			}
+			b := SBucket{
+				region:       region.(*SRegion),
+				Name:         bInfo.Name,
+				Location:     bInfo.Location,
+				CreationDate: bInfo.CreationDate,
+				StorageClass: bInfo.StorageClass,
+			}
+			ret = append(ret, &b)
+		}
+		if !result.IsTruncated {
+			break
+		}
+		marker = result.NextMarker
 	}
+
 	self.iBuckets = ret
 	return nil
 }
@@ -760,6 +825,7 @@ func (self *SAliyunClient) GetRegions() []SRegion {
 
 func (self *SAliyunClient) getSubAccount() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = self.GetAccountId()
 	subAccount.Name = self.cpcfg.Name
 	subAccount.Account = self.accessKey
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
@@ -784,7 +850,7 @@ func (self *SAliyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 
 	accounts, err := self.ListAccounts()
 	if err != nil {
-		if e, ok := errors.Cause(err).(*alierr.ServerError); ok && e.ErrorCode() == "EntityNotExists.ResourceDirectory" {
+		if e, ok := errors.Cause(err).(*alierr.ServerError); ok && (e.ErrorCode() == "EntityNotExists.ResourceDirectory" || e.ErrorCode() == "NoPermission") {
 			return ret, nil
 		}
 		return nil, errors.Wrapf(err, "ListAccounts")
@@ -794,6 +860,7 @@ func (self *SAliyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 		account := cloudprovider.SSubAccount{}
 		account.Name = fmt.Sprintf("%s/%s", accounts[i].DisplayName, self.cpcfg.Name)
 		account.Account = self.accessKey
+		account.Id = accountId
 		account.HealthStatus = api.CLOUD_PROVIDER_HEALTH_SUSPENDED
 		if strings.HasSuffix(accounts[i].Status, "Success") {
 			account.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
@@ -801,6 +868,7 @@ func (self *SAliyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 		if accounts[i].AccountId != accountId {
 			account.Name = fmt.Sprintf("%s/%s", accounts[i].DisplayName, accounts[i].AccountId)
 			account.Account = fmt.Sprintf("%s/%s", self.accessKey, accounts[i].AccountId)
+			account.Id = accounts[i].AccountId
 		}
 		ret = append(ret, account)
 	}
@@ -813,6 +881,7 @@ func (self *SAliyunClient) GetAccountId() string {
 	}
 	caller, err := self.GetCallerIdentity()
 	if err != nil {
+		log.Errorf("GetCallerIdentity fail %s", err)
 		return ""
 	}
 	self.ownerId = caller.AccountId
@@ -820,8 +889,8 @@ func (self *SAliyunClient) GetAccountId() string {
 	return self.ownerId
 }
 
-func (self *SAliyunClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.iregions
+func (self *SAliyunClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return self.iregions, nil
 }
 
 func (self *SAliyunClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
@@ -889,13 +958,7 @@ func (self *SAliyunClient) GetProjects() ([]SResourceGroup, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "GetResourceGroups")
 		}
-		for i := range parts {
-			parts[i].AccountId = self.accessKey
-			if len(self.accountId) > 0 {
-				parts[i].AccountId = self.accountId
-			}
-			resourceGroups = append(resourceGroups, parts[i])
-		}
+		resourceGroups = append(resourceGroups, parts...)
 		if len(resourceGroups) >= total {
 			break
 		}
@@ -929,29 +992,60 @@ func (self *SAliyunClient) GetResourceGroupIds() []string {
 }
 
 func (self *SAliyunClient) GetIProjects() ([]cloudprovider.ICloudProject, error) {
-	defer func() {
-		self.accountId = ""
-	}()
-	accounts, err := self.GetSubAccounts()
+	ret := []cloudprovider.ICloudProject{}
+	resourceGroups, err := self.GetProjects()
 	if err != nil {
 		return nil, err
 	}
-	ret := []cloudprovider.ICloudProject{}
-	for _, account := range accounts {
-		info := strings.Split(account.Account, "/")
-		if len(info) == 2 {
-			self.accountId = info[1]
-		}
-		resourceGroups, err := self.GetProjects()
-		if err != nil {
-			return nil, err
-		}
-		for i := range resourceGroups {
-			resourceGroups[i].AccountId = account.Account
-			ret = append(ret, &resourceGroups[i])
-		}
+	for i := range resourceGroups {
+		resourceGroups[i].client = self
+		ret = append(ret, &resourceGroups[i])
 	}
 	return ret, nil
+}
+
+func (self *SAliyunClient) scRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient(ALIYUN_DEFAULT_REGION)
+	if err != nil {
+		return nil, err
+	}
+	domain := "cas.aliyuncs.com"
+	return jsonRequest(client, domain, ALIYUN_CAS_API_VERSION, apiName, params, self.debug)
+}
+
+func (self *SAliyunClient) GetISSLCertificates() ([]cloudprovider.ICloudSSLCertificate, error) {
+	ret := make([]SSSLCertificate, 0)
+
+	for {
+		part, total, err := self.GetSSLCertificates(100, len(ret)/100+1)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetSSLCertificates")
+		}
+
+		ret = append(ret, part...)
+		if len(ret) >= total {
+			break
+		}
+	}
+
+	result := make([]cloudprovider.ICloudSSLCertificate, 0)
+	for i := range ret {
+		if !ret[i].BuyInAliyun {
+			continue
+		}
+		ret[i].client = self
+		result = append(result, &ret[i])
+	}
+	return result, nil
+}
+
+func (self *SAliyunClient) GetISSLCertificate(certId string) (cloudprovider.ICloudSSLCertificate, error) {
+	var res cloudprovider.ICloudSSLCertificate
+	res, err := self.GetSSLCertificate(certId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetSSLCertificate")
+	}
+	return res, nil
 }
 
 func (region *SAliyunClient) GetCapabilities() []string {
@@ -959,6 +1053,7 @@ func (region *SAliyunClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -979,6 +1074,8 @@ func (region *SAliyunClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_CDN + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_CONTAINER + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_TABLESTORE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_CERT,
+		cloudprovider.CLOUD_CAPABILITY_SNAPSHOT_POLICY,
 	}
 	return caps
 }

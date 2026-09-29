@@ -18,51 +18,47 @@ import (
 	"fmt"
 	"strings"
 
-	api "yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/pkg/errors"
 )
 
-// https://support.huaweicloud.com/api-iam/zh-cn_topic_0057845625.html
 type SProject struct {
 	client *SHuaweiClient
 
-	IsDomain    bool   `json:"is_domain"`
-	Description string `json:"description"`
-	Enabled     bool   `json:"enabled"`
-	ID          string `json:"id"`
-	ParentID    string `json:"parent_id"`
-	DomainID    string `json:"domain_id"`
-	Name        string `json:"name"`
+	IsDomain    bool
+	Description string
+	Enabled     bool
+	Id          string
+	ParentId    string
+	DomainId    string
+	Name        string
 }
 
-func (self *SProject) GetRegionID() string {
+func (self *SProject) GetRegionId() string {
 	return strings.Split(self.Name, "_")[0]
 }
 
-func (self *SProject) GetDescription() string {
-	return self.Description
-}
-
-func (self *SProject) GetHealthStatus() string {
-	if self.Enabled {
-		return api.CLOUD_PROVIDER_HEALTH_NORMAL
+func (self *SHuaweiClient) GetProjects() ([]SProject, error) {
+	if len(self.projects) > 0 {
+		ret := []SProject{}
+		for _, project := range self.projects {
+			ret = append(ret, project)
+		}
+		return ret, nil
 	}
-
-	return api.CLOUD_PROVIDER_HEALTH_SUSPENDED
-}
-
-func (self *SHuaweiClient) fetchProjects() ([]SProject, error) {
-	if self.projects != nil {
-		return self.projects, nil
+	self.projects = map[string]SProject{}
+	projects := []SProject{}
+	resp, err := self.list(SERVICE_IAM_V3, "", "auth/projects", nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "list projects")
 	}
-
-	huawei, _ := self.newGeneralAPIClient()
-	projects := make([]SProject, 0)
-	err := doListAll(huawei.Projects.List, nil, &projects)
-	if err == nil {
-		self.projects = projects
+	err = resp.Unmarshal(&projects, "projects")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
 	}
-
-	return projects, err
+	for _, project := range projects {
+		self.projects[project.Name] = project
+	}
+	return projects, nil
 }
 
 // obs 权限必须赋予到mos project之上
@@ -73,26 +69,22 @@ func (self *SHuaweiClient) GetMosProjectId() string {
 	}
 	for i := range projects {
 		if strings.ToLower(projects[i].Name) == "mos" {
-			return projects[i].ID
+			return projects[i].Id
 		}
 	}
 	return ""
 }
 
 func (self *SHuaweiClient) GetProjectById(projectId string) (SProject, error) {
-	projects, err := self.fetchProjects()
+	projects, err := self.GetProjects()
 	if err != nil {
 		return SProject{}, err
 	}
 
 	for _, project := range projects {
-		if project.ID == projectId {
+		if project.Id == projectId {
 			return project, nil
 		}
 	}
 	return SProject{}, fmt.Errorf("project %s not found", projectId)
-}
-
-func (self *SHuaweiClient) GetProjects() ([]SProject, error) {
-	return self.fetchProjects()
 }

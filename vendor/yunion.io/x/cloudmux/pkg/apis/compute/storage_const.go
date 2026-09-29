@@ -21,6 +21,7 @@ const (
 	STORAGE_VSAN  = "vsan"
 	STORAGE_NFS   = "nfs"
 	STORAGE_CIFS  = "cifs"
+	STORAGE_PMEM  = "pmem"
 
 	STORAGE_PUBLIC_CLOUD     = "cloud"
 	STORAGE_CLOUD_EFFICIENCY = "cloud_efficiency"
@@ -58,13 +59,16 @@ const (
 	STORAGE_CLOUD_BASIC   = "cloud_basic"
 	STORAGE_CLOUD_PREMIUM = "cloud_premium" //高性能云硬盘
 	STORAGE_CLOUD_HSSD    = "cloud_hssd"    //增强型SSD云硬盘
+	STORAGE_CLOUD_TSSD    = "cloud_tssd"    //极速型SSD云硬盘
+	STORAGE_CLOUD_BSSD    = "cloud_bssd"    //通用型SSD云硬盘
 
 	// huawei storage type
-	STORAGE_HUAWEI_SSD   = "SSD"   // 超高IO云硬盘
-	STORAGE_HUAWEI_SAS   = "SAS"   // 高IO云硬盘
-	STORAGE_HUAWEI_SATA  = "SATA"  // 普通IO云硬盘
-	STORAGE_HUAWEI_GPSSD = "GPSSD" // 通用型SSD
-	STORAGE_HUAWEI_ESSD  = "ESSD"  // 急速型SSD
+	STORAGE_HUAWEI_SSD    = "SSD"    // 超高IO云硬盘
+	STORAGE_HUAWEI_SAS    = "SAS"    // 高IO云硬盘
+	STORAGE_HUAWEI_SATA   = "SATA"   // 普通IO云硬盘
+	STORAGE_HUAWEI_GPSSD  = "GPSSD"  // 通用型SSD
+	STORAGE_HUAWEI_GPSSD2 = "GPSSD2" // 通用型SSD V2
+	STORAGE_HUAWEI_ESSD   = "ESSD"   // 急速型SSD
 
 	// openstack
 	STORAGE_OPENSTACK_ISCSI = "iscsi"
@@ -73,19 +77,36 @@ const (
 	// Ucloud storage type
 	STORAGE_UCLOUD_CLOUD_NORMAL         = "CLOUD_NORMAL"         // 普通云盘
 	STORAGE_UCLOUD_CLOUD_SSD            = "CLOUD_SSD"            // SSD云盘
+	STORAGE_UCLOUD_CLOUD_ESSD           = "CLOUD_ESSD"           // ESSD云盘
+	STORAGE_UCLOUD_CLOUD_RSSD           = "CLOUD_RSSD"           // RSSD云盘
 	STORAGE_UCLOUD_LOCAL_NORMAL         = "LOCAL_NORMAL"         // 普通本地盘
 	STORAGE_UCLOUD_LOCAL_SSD            = "LOCAL_SSD"            // SSD本地盘
 	STORAGE_UCLOUD_EXCLUSIVE_LOCAL_DISK = "EXCLUSIVE_LOCAL_DISK" // 独享本地盘
 
+	// RockBase storage type
+	STORAGE_ROCKBASE_CLOUD_NORMAL         = "CLOUD_NORMAL"         // 普通云盘
+	STORAGE_ROCKBASE_CLOUD_SSD            = "CLOUD_SSD"            // SSD云盘
+	STORAGE_ROCKBASE_CLOUD_ESSD           = "CLOUD_ESSD"           // ESSD云盘
+	STORAGE_ROCKBASE_CLOUD_RSSD           = "CLOUD_RSSD"           // RSSD云盘
+	STORAGE_ROCKBASE_LOCAL_NORMAL         = "LOCAL_NORMAL"         // 普通本地盘
+	STORAGE_ROCKBASE_LOCAL_SSD            = "LOCAL_SSD"            // SSD本地盘
+	STORAGE_ROCKBASE_EXCLUSIVE_LOCAL_DISK = "EXCLUSIVE_LOCAL_DISK" // 独享本地盘
+
 	// Zstack storage type
 	STORAGE_ZSTACK_LOCAL_STORAGE = "localstorage"
 	STORAGE_ZSTACK_CEPH          = "ceph"
+	STORAGE_ZSTACK_SHARED_BLOCK  = "sharedblock"
 
 	// Google storage type
-	STORAGE_GOOGLE_LOCAL_SSD   = "local-ssd"   //本地SSD暂存盘 (最多8个)
-	STORAGE_GOOGLE_PD_STANDARD = "pd-standard" //标准永久性磁盘
-	STORAGE_GOOGLE_PD_SSD      = "pd-ssd"      //SSD永久性磁盘
-	STORAGE_GOOGLE_PD_BALANCED = "pd-balanced" //平衡永久性磁盘
+	STORAGE_GOOGLE_LOCAL_SSD            = "local-ssd"            //本地SSD暂存盘 (最多8个)
+	STORAGE_GOOGLE_PD_STANDARD          = "pd-standard"          //标准永久性磁盘
+	STORAGE_GOOGLE_PD_SSD               = "pd-ssd"               //SSD永久性磁盘
+	STORAGE_GOOGLE_PD_BALANCED          = "pd-balanced"          //平衡永久性磁盘
+	STORAGE_GOOGLE_PD_EXTREME           = "pd-extreme"           //极端永久性磁盘
+	STORAGE_GOOGLE_HYPERDISK_THROUGHPUT = "hyperdisk-throughput" //Hyperdisk Throughput
+	STORAGE_GOOGLE_HYPERDISK_ML         = "hyperdisk-ml"         //Hyperdisk ML
+	STORAGE_GOOGLE_HYPERDISK_BALANCED   = "hyperdisk-balanced"   //平衡 Hyperdisk
+	STORAGE_GOOGLE_HYPERDISK_EXTREME    = "hyperdisk-extreme"    //Hyperdisk Extreme
 
 	// ctyun storage type
 	STORAGE_CTYUN_SSD        = "SSD"        // 超高IO云硬盘
@@ -100,16 +121,63 @@ const (
 	STORAGE_JDCLOUD_SSD = "ssd"         // SSD云硬盘
 	STORAGE_JDCLOUD_PHD = "premium-hdd" // HDD云硬盘
 
-	STORAGE_ECLOUD_CAPEBS = "capebs" // 容量盘
-	STORAGE_ECLOUD_EBS    = "ebs"    // 性能盘
-	STORAGE_ECLOUD_SSD    = "ssd"    // 高性能盘
-	STORAGE_ECLOUD_SSDEBS = "ssdebs" // 性能优化盘
+	STORAGE_ECLOUD_CAPEBS    = "capebs"   // 容量盘
+	STORAGE_ECLOUD_SSDEBS    = "ssdebs"   // 性能优化型
+	STORAGE_ECLOUD_SSD       = "ssd"      // 高性能盘
+	STORAGE_ECLOUD_CAPEBS_YC = "capebsyc" // 容量型-云创版
+	STORAGE_ECLOUD_SSDEBS_YC = "ssdebsyc" // 性能优化型-云创版
+	STORAGE_ECLOUD_SSDYC     = "ssdyc"    // 高性能型-云创版
+	STORAGE_ECLOUD_CAPEBS_ZX = "capebszx" // 经济型
+	STORAGE_ECLOUD_ESSDL1    = "essdl1"   // 极速型-L1
+	STORAGE_ECLOUD_ESSDL2    = "essdl2"   // 极速型-L2
+	STORAGE_ECLOUD_ESSDL3    = "essdl3"   // 极速型-L3
+	STORAGE_ECLOUD_ESSDYCL1  = "essdycl1" // 极速型-L1-云创版
+	// 系统盘
+	STORAGE_ECLOUD_LOCAL = "local" // 本地盘
+	// 弃用
+	STORAGE_ECLOUD_EBS    = "ebs"    // 弹性块存储
 	STORAGE_ECLOUD_SYSTEM = "system" // 系统盘
 
 	// volcengine storage type
 	STORAGE_VOLCENGINE_FlexPL = "ESSD_FlexPL" // 极速型SSD(单盘最大IOPS 5万)
 	STORAGE_VOLCENGINE_PL0    = "ESSD_PL0"    // 极速型SSD(单盘最大IOPS 1万)
 	STORAGE_VOLCENGINE_PTSSD  = "PTSSD"       // 性能型SSD(上一代产品)
+
+	STORAGE_FULL        = "full"
+	STORAGE_SYSTEM_FULL = "system_full"
+
+	// baidu storage type
+	STORAGE_BAIDU_SSD              = "ssd"              // 通用型SSD
+	STORAGE_BAIDU_PREMIUM_SSD      = "premium_ssd"      // 高性能云磁盘
+	STORAGE_BAIDU_HDD              = "hdd"              // 通用型HDD
+	STORAGE_BAIDU_ENHANCED_SSD_PL1 = "enhanced_ssd_pl1" // 增强型SSD_PL1
+	STORAGE_BAIDU_ENHANCED_SSD_PL2 = "enhanced_ssd_pl2" // 增强型SSD_PL2
+	STORAGE_BAIDU_ENHANCED_SSD_PL3 = "enhanced_ssd_pl3" // 增强型SSD_PL2
+
+	// ksyun storage type
+	// ESSD AutoPL云硬盘
+	STORAGE_KSYUN_ESSD_AUTO_PL = "ESSD_AutoPL"
+	// 极速型ESSD云硬盘
+	STORAGE_KSYUN_ESSD_PL1 = "ESSD_PL1"
+	STORAGE_KSYUN_ESSD_PL2 = "ESSD_PL2"
+	STORAGE_KSYUN_ESSD_PL3 = "ESSD_PL3"
+	// SSD3.0云硬盘
+	STORAGE_KSYUN_SSD3_0 = "SSD3.0"
+	// 高效云硬盘
+	STORAGE_KSYUN_EHDD = "EHDD"
+	// 本地SSD云硬盘
+	STORAGE_KSYUN_LOCAL_SSD = "Local_SSD"
+
+	// cnware storage type
+	STORAGE_CNWARE_FC_SAN = "fc-san"
+	STORAGE_CNWARE_IP_SAN = "ip-scan"
+	STORAGE_CNWARE_NAS    = "nas"
+	STORAGE_CNWARE_CEPH   = "ceph"
+	STORAGE_CNWARE_LOCAL  = "local"
+	STORAGE_CNWARE_NVME   = "nvme"
+
+	// ZettaKit
+	STORAGE_ZETTAKIT_NORMAL = "normal"
 )
 
 const (
@@ -120,3 +188,36 @@ const (
 	DISK_TYPE_SSD    = "ssd"
 	DISK_TYPE_HYBRID = "hybrid"
 )
+
+var ROCKBASE_STORAGES = []string{
+	STORAGE_ROCKBASE_LOCAL_SSD,
+	STORAGE_ROCKBASE_CLOUD_SSD,
+	STORAGE_ROCKBASE_LOCAL_NORMAL,
+	STORAGE_ROCKBASE_CLOUD_NORMAL,
+	STORAGE_ROCKBASE_CLOUD_ESSD,
+	STORAGE_ROCKBASE_CLOUD_RSSD,
+}
+
+var UCLOUD_STORAGES = []string{
+	STORAGE_UCLOUD_LOCAL_SSD,
+	STORAGE_UCLOUD_CLOUD_SSD,
+	STORAGE_UCLOUD_LOCAL_NORMAL,
+	STORAGE_UCLOUD_CLOUD_NORMAL,
+	STORAGE_UCLOUD_CLOUD_ESSD,
+	STORAGE_UCLOUD_CLOUD_RSSD,
+}
+
+var UCLOUD_LOCAL_STORAGES = []string{
+	STORAGE_UCLOUD_LOCAL_SSD,
+	STORAGE_UCLOUD_LOCAL_NORMAL,
+}
+
+var KSYUN_STORAGES = []string{
+	STORAGE_KSYUN_ESSD_AUTO_PL,
+	STORAGE_KSYUN_ESSD_PL1,
+	STORAGE_KSYUN_ESSD_PL2,
+	STORAGE_KSYUN_ESSD_PL3,
+	STORAGE_KSYUN_SSD3_0,
+	STORAGE_KSYUN_EHDD,
+	STORAGE_KSYUN_LOCAL_SSD,
+}

@@ -35,6 +35,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=dbinstancedatabase
+// +onecloud:swagger-gen-model-plural=dbinstancedatabases
 type SDBInstanceDatabaseManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -101,7 +103,7 @@ func (manager *SDBInstanceDatabaseManager) FetchOwnerId(ctx context.Context, dat
 	return db.FetchProjectInfo(ctx, data)
 }
 
-func (manager *SDBInstanceDatabaseManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SDBInstanceDatabaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		sq := DBInstanceManager.Query("id")
 		switch scope {
@@ -123,7 +125,7 @@ func (self *SDBInstanceDatabase) ValidateUpdateData(ctx context.Context, userCre
 		return input, errors.Wrapf(err, "SStatusStandaloneResourceBase.ValidateUpdateData")
 	}
 	if len(input.Name) > 0 && input.Name != self.Name {
-		return input, httperrors.NewForbiddenError("not allow update rds database name")
+		return input, httperrors.NewForbiddenError("updating RDS database name is not allowed")
 	}
 	return input, nil
 }
@@ -213,7 +215,7 @@ func (manager *SDBInstanceDatabaseManager) ValidateCreateData(ctx context.Contex
 	if len(input.DBInstance) == 0 {
 		return nil, httperrors.NewMissingParameterError("dbinstance")
 	}
-	_instance, err := DBInstanceManager.FetchByIdOrName(userCred, input.DBInstance)
+	_instance, err := DBInstanceManager.FetchByIdOrName(ctx, userCred, input.DBInstance)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("failed to found dbinstance %s", input.DBInstance)
@@ -224,7 +226,7 @@ func (manager *SDBInstanceDatabaseManager) ValidateCreateData(ctx context.Contex
 	input.DBInstanceId = instance.Id
 
 	if instance.Status != api.DBINSTANCE_RUNNING {
-		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s require status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
+		return nil, httperrors.NewInputParameterError("DBInstance %s(%s) status is %s; required status is %s", instance.Name, instance.Id, instance.Status, api.DBINSTANCE_RUNNING)
 	}
 	region, err := instance.GetRegion()
 	if err != nil {
@@ -257,7 +259,7 @@ func (self *SDBInstanceDatabase) PostCreate(ctx context.Context, userCred mcclie
 }
 
 func (self *SDBInstanceDatabase) StartDBInstanceDatabaseCreateTask(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_DATABASE_CREATING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_DATABASE_CREATING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceDatabaseCreateTask", self, userCred, params, parentTaskId, "", nil)
 	if err != nil {
 		return errors.Wrap(err, "NewTask")
@@ -451,7 +453,7 @@ func (self *SDBInstanceDatabase) CustomizeDelete(ctx context.Context, userCred m
 }
 
 func (self *SDBInstanceDatabase) StartDBInstanceDatabaseDeleteTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.DBINSTANCE_DATABASE_DELETING, "")
+	self.SetStatus(ctx, userCred, api.DBINSTANCE_DATABASE_DELETING, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "DBInstanceDatabaseDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
 		return err

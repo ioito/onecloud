@@ -22,15 +22,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/tristate"
 	"yunion.io/x/pkg/util/stringutils"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/apis/compute"
-	"yunion.io/x/onecloud/pkg/baremetal/profiles"
 	"yunion.io/x/onecloud/pkg/cloudcommon/types"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/ssh"
@@ -91,29 +89,58 @@ func (ipmi *SSHIPMI) ExecuteCommand(args ...string) ([]string, error) {
 	return ipmi.sshClient.Run(cmd.String())
 }
 
+// DefaultCipherSuites is the probe order for RMCP+ cipher suites.
+// 0 means do not pass -C (ipmitool default); 3 and 17 are common BMC requirements.
+var DefaultCipherSuites = []int{0, 3, 17}
+
 type LanPlusIPMI struct {
 	IPMIParser
-	host     string
-	user     string
-	password string
-	port     int
+	host           string
+	user           string
+	password       string
+	port           int
+	cipherSuite    int  // 0 = no -C; >0 = pass -C N
+	cipherResolved bool // true after Ensure/Detect or constructed with known suite > 0
 }
 
-func NewLanPlusIPMI(host, user, password string) *LanPlusIPMI {
+func NewLanPlusIPMI(host, user, password string) (*LanPlusIPMI, error) {
 	return NewLanPlusIPMIWithPort(host, user, password, 623)
 }
 
-func NewLanPlusIPMIWithPort(host, user, password string, port int) *LanPlusIPMI {
-	return &LanPlusIPMI{
-		host:     host,
-		user:     user,
-		password: password,
-		port:     port,
+func NewLanPlusIPMIWithPort(host, user, password string, port int) (*LanPlusIPMI, error) {
+	return NewLanPlusIPMIWithCipher(host, user, password, port, 0)
+}
+
+func NewLanPlusIPMIWithCipher(host, user, password string, port, cipherSuite int) (*LanPlusIPMI, error) {
+	ipmi := &LanPlusIPMI{
+		host:        host,
+		user:        user,
+		password:    password,
+		port:        port,
+		cipherSuite: cipherSuite,
 	}
+	// Known non-default suite from persisted config: skip re-detect.
+	if cipherSuite > 0 {
+		ipmi.cipherResolved = true
+		return ipmi, nil
+	}
+	if err := ipmi.ensureCipherSuite(); err != nil {
+		return nil, err
+	}
+	return ipmi, nil
 }
 
 func (ipmi *LanPlusIPMI) GetMode() string {
 	return "rmcp"
+}
+
+func (ipmi *LanPlusIPMI) SetCipherSuite(suite int) {
+	ipmi.cipherSuite = suite
+	ipmi.cipherResolved = true
+}
+
+func (ipmi *LanPlusIPMI) GetCipherSuite() int {
+	return ipmi.cipherSuite
 }
 
 func (ipmi *LanPlusIPMI) GetCommand(args ...string) (*procutils.Command, context.CancelFunc) {
@@ -123,9 +150,42 @@ func (ipmi *LanPlusIPMI) GetCommand(args ...string) (*procutils.Command, context
 		"-U", ipmi.user,
 		"-P", ipmi.password,
 	}
+	if ipmi.cipherSuite > 0 {
+		nArgs = append(nArgs, "-C", strconv.Itoa(ipmi.cipherSuite))
+	}
 	nArgs = append(nArgs, args...)
 	ctx, cancel := context.WithTimeout(context.Background(), ipmi.GetDefaultTimeout())
 	return procutils.NewCommandContext(ctx, "ipmitool", nArgs...), cancel
+}
+
+// ipmitool may exit with status 1 while still printing usable output (e.g. lan print
+// when optional LAN parameters fail to read). Treat exit 1 as success only when output
+// is non-empty and does not look like a hard failure.
+var ipmitoolErrorSubstrings = []string{
+	"Unable to establish IPMI",
+	"Unable to open interface",
+	"Authentication failed",
+	"Password verification failed",
+	"Invalid user name",
+	"Insufficient privilege level",
+	"Invalid command",
+	"Command not supported in present state",
+	"Get Channel Info command failed",
+	"Invalid channel",
+	"Error: Unable to open",
+}
+
+func ipmitoolOutputAcceptable(out []byte) bool {
+	if len(out) == 0 {
+		return false
+	}
+	s := string(out)
+	for _, p := range ipmitoolErrorSubstrings {
+		if strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
 }
 
 func (ipmi *LanPlusIPMI) ExecuteCommand(args ...string) ([]string, error) {
@@ -134,9 +194,42 @@ func (ipmi *LanPlusIPMI) ExecuteCommand(args ...string) ([]string, error) {
 	log.Debugf("[LanPlusIPMI] execute command: %s", cmd.String())
 	out, err := cmd.Output()
 	if err != nil {
+		exitCode, ok := cmd.GetExitStatus(err)
+		if ok && exitCode == 1 && ipmitoolOutputAcceptable(out) {
+			log.Warningf("[LanPlusIPMI] command %s exited with status 1 but output looks usable", cmd.String())
+			return ssh.ParseOutput(out), nil
+		}
 		return nil, err
 	}
 	return ssh.ParseOutput(out), nil
+}
+
+// DetectCipherSuite tries DefaultCipherSuites with a single chassis power status each.
+// On success it sets the working suite on the receiver and returns it.
+func (ipmi *LanPlusIPMI) DetectCipherSuite() (int, error) {
+	var errs []error
+	for _, suite := range DefaultCipherSuites {
+		ipmi.cipherSuite = suite
+		ipmi.cipherResolved = false
+		_, err := ipmi.ExecuteCommand("chassis", "power", "status")
+		if err == nil {
+			ipmi.SetCipherSuite(suite)
+			log.Infof("[LanPlusIPMI] detected cipher suite %d for %s", suite, ipmi.host)
+			return suite, nil
+		}
+		errs = append(errs, errors.Wrapf(err, "cipher suite %d", suite))
+		log.Debugf("[LanPlusIPMI] cipher suite %d failed for %s: %v", suite, ipmi.host, err)
+	}
+	return 0, errors.Wrapf(errors.NewAggregate(errs), "detect cipher suite for %s", ipmi.host)
+}
+
+// ensureCipherSuite uses a known suite when already resolved; otherwise runs DetectCipherSuite.
+func (ipmi *LanPlusIPMI) ensureCipherSuite() error {
+	if ipmi.cipherResolved {
+		return nil
+	}
+	_, err := ipmi.DetectCipherSuite()
+	return err
 }
 
 func GetSysGuid(exector IPMIExecutor) string {
@@ -197,7 +290,7 @@ func GetSysInfo(exector IPMIExecutor) (*types.SSystemInfo, error) {
 	return &info, err
 }
 
-func GetLanChannels(sysinfo *types.SSystemInfo) []int {
+/*func GetLanChannels(sysinfo *types.SSystemInfo) []int {
 	return profiles.GetLanChannel(sysinfo)
 }
 
@@ -207,14 +300,18 @@ func GetDefaultLanChannel(sysinfo *types.SSystemInfo) int {
 
 func GetRootId(sysinfo *types.SSystemInfo) int {
 	return profiles.GetRootId(sysinfo)
-}
+}*/
 
-func GetLanConfig(exector IPMIExecutor, channel int) (*types.SIPMILanConfig, error) {
+func GetLanConfig(exector IPMIExecutor, channel uint8) (*types.SIPMILanConfig, error) {
 	args := newArgs("lan", "print", channel)
 	lines, err := ExecuteCommands(exector, args)
 	if err != nil {
 		return nil, err
 	}
+	return parseLanConfig(lines), nil
+}
+
+func parseLanConfig(lines []string) *types.SIPMILanConfig {
 	ret := new(types.SIPMILanConfig)
 	for _, line := range lines {
 		key, val := stringutils.SplitKeyValue(line)
@@ -239,7 +336,208 @@ func GetLanConfig(exector IPMIExecutor, channel int) (*types.SIPMILanConfig, err
 			ret.VlanId = int(vlanId)
 		}
 	}
-	return ret, nil
+	return ret
+}
+
+// LanConfigCandidate pairs an IPMI channel with its reported LAN configuration.
+type LanConfigCandidate struct {
+	Channel uint8
+	Config  *types.SIPMILanConfig
+}
+
+// LanConfigProbeResult records the result of probing one IPMI LAN channel.
+type LanConfigProbeResult struct {
+	Channel uint8
+	Config  *types.SIPMILanConfig
+	Err     error
+}
+
+// LanConfigSelectionOptions controls how a discovered LAN channel is selected.
+type LanConfigSelectionOptions struct {
+	ConnectedIP         string
+	PersistedChannel    uint8
+	RequireConfiguredIP bool
+	// AllowFallback enables scanning channels 1-11 when no preferred channel
+	// yields a usable configuration. This should be false for OEM/model profiles
+	// (which are authoritative allowlists) and true only when no profile exists
+	// or the profile is the default/empty profile.
+	AllowFallback bool
+}
+
+// LanConfigDiscovery contains the selected configuration and all attempted probes.
+type LanConfigDiscovery struct {
+	Selected *LanConfigCandidate
+	Probes   []LanConfigProbeResult
+}
+
+func getLanConfigOnce(executor IPMIExecutor, channel uint8) (*types.SIPMILanConfig, error) {
+	args := newArgs("lan", "print", channel)
+	lines, err := executor.ExecuteCommand(args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseLanConfig(lines), nil
+}
+
+func isUsableLanConfig(config *types.SIPMILanConfig, requireConfiguredIP bool) bool {
+	if config == nil || len(config.Mac) == 0 {
+		return false
+	}
+	if _, err := net.ParseMAC(config.Mac.String()); err != nil {
+		return false
+	}
+	if !requireConfiguredIP {
+		return true
+	}
+	ipAddr := net.ParseIP(config.IPAddr)
+	return ipAddr != nil && !ipAddr.IsUnspecified()
+}
+
+func sameIPAddress(left, right string) bool {
+	leftIP := net.ParseIP(left)
+	rightIP := net.ParseIP(right)
+	return leftIP != nil && rightIP != nil && leftIP.Equal(rightIP)
+}
+
+func unusableLanConfigError(channel uint8, config *types.SIPMILanConfig, requireConfiguredIP bool) error {
+	if config == nil {
+		return errors.Errorf("LAN channel %d returned no configuration", channel)
+	}
+	if len(config.Mac) == 0 {
+		return errors.Errorf("LAN channel %d has no valid MAC address", channel)
+	}
+	if _, err := net.ParseMAC(config.Mac.String()); err != nil {
+		return errors.Errorf("LAN channel %d has invalid MAC address %q", channel, config.Mac)
+	}
+	if requireConfiguredIP {
+		ipAddr := net.ParseIP(config.IPAddr)
+		if ipAddr == nil {
+			return errors.Errorf("LAN channel %d has invalid IP address %q", channel, config.IPAddr)
+		}
+		if ipAddr.IsUnspecified() {
+			return errors.Errorf("LAN channel %d has unconfigured IP address %q", channel, config.IPAddr)
+		}
+	}
+	return errors.Errorf("LAN channel %d has unusable configuration", channel)
+}
+
+func selectLanConfig(probes []LanConfigProbeResult, opts LanConfigSelectionOptions) (*LanConfigCandidate, error) {
+	usable := make([]LanConfigCandidate, 0, len(probes))
+	var persisted *LanConfigCandidate
+	diagnostics := make([]error, 0, len(probes))
+	for _, probe := range probes {
+		if probe.Err != nil {
+			diagnostics = append(diagnostics, errors.Wrapf(probe.Err, "probe IPMI LAN channel %d", probe.Channel))
+			continue
+		}
+		if !isUsableLanConfig(probe.Config, opts.RequireConfiguredIP) {
+			diagnostics = append(diagnostics, unusableLanConfigError(probe.Channel, probe.Config, opts.RequireConfiguredIP))
+			continue
+		}
+		candidate := LanConfigCandidate{
+			Channel: probe.Channel,
+			Config:  probe.Config,
+		}
+		usable = append(usable, candidate)
+		if opts.ConnectedIP != "" && sameIPAddress(probe.Config.IPAddr, opts.ConnectedIP) {
+			return &candidate, nil
+		}
+		if persisted == nil && probe.Channel == opts.PersistedChannel {
+			persisted = &candidate
+		}
+	}
+	if persisted != nil {
+		return persisted, nil
+	}
+	if len(usable) == 1 {
+		return &usable[0], nil
+	}
+	if len(usable) > 1 {
+		channels := make([]uint8, len(usable))
+		for i := range usable {
+			channels[i] = usable[i].Channel
+		}
+		return nil, errors.Errorf("ambiguous IPMI LAN configurations on channels %v", channels)
+	}
+	if len(diagnostics) == 0 {
+		diagnostics = append(diagnostics, errors.Error("no IPMI LAN channels were probed"))
+	}
+	return nil, errors.Wrap(errors.NewAggregate(diagnostics), "no usable IPMI LAN configuration")
+}
+
+// DiscoverLanConfig probes IPMI LAN channels and safely selects one configuration.
+func DiscoverLanConfig(executor IPMIExecutor, preferredChannels []uint8, opts LanConfigSelectionOptions) (*LanConfigDiscovery, error) {
+	const (
+		minLanChannel uint8 = 1
+		maxLanChannel uint8 = 11
+	)
+
+	type channelProbe struct {
+		channel uint8
+		retry   bool
+	}
+	channels := make([]channelProbe, 0, maxLanChannel-minLanChannel+1)
+	seen := make([]bool, maxLanChannel+1)
+	addPreferredChannel := func(channel uint8) {
+		if channel < minLanChannel || channel > maxLanChannel || seen[channel] {
+			return
+		}
+		channels = append(channels, channelProbe{channel: channel, retry: true})
+		seen[channel] = true
+	}
+	for _, channel := range preferredChannels {
+		addPreferredChannel(channel)
+	}
+	addPreferredChannel(opts.PersistedChannel)
+	if opts.AllowFallback {
+		for channel := minLanChannel; channel <= maxLanChannel; channel++ {
+			if seen[channel] {
+				continue
+			}
+			channels = append(channels, channelProbe{channel: channel})
+		}
+	}
+
+	discovery := &LanConfigDiscovery{
+		Probes: make([]LanConfigProbeResult, 0, len(channels)),
+	}
+	for _, channel := range channels {
+		var config *types.SIPMILanConfig
+		var err error
+		if channel.retry {
+			config, err = GetLanConfig(executor, channel.channel)
+		} else {
+			config, err = getLanConfigOnce(executor, channel.channel)
+		}
+		probe := LanConfigProbeResult{
+			Channel: channel.channel,
+			Config:  config,
+			Err:     err,
+		}
+		discovery.Probes = append(discovery.Probes, probe)
+		if err != nil || !isUsableLanConfig(config, opts.RequireConfiguredIP) {
+			continue
+		}
+		candidate := &LanConfigCandidate{
+			Channel: channel.channel,
+			Config:  config,
+		}
+		if opts.ConnectedIP != "" && sameIPAddress(config.IPAddr, opts.ConnectedIP) {
+			discovery.Selected = candidate
+			return discovery, nil
+		}
+		if opts.ConnectedIP == "" && channel.channel == opts.PersistedChannel {
+			discovery.Selected = candidate
+			return discovery, nil
+		}
+	}
+
+	selected, err := selectLanConfig(discovery.Probes, opts)
+	discovery.Selected = selected
+	if err != nil {
+		return discovery, err
+	}
+	return discovery, nil
 }
 
 func tryExecuteCommand(exector IPMIExecutor, args ...string) ([]string, error) {
@@ -278,14 +576,14 @@ func doActions(exector IPMIExecutor, actionName string, args ...Args) error {
 	return nil
 }
 
-func SetLanDHCP(exector IPMIExecutor, lanChannel int) error {
+func SetLanDHCP(exector IPMIExecutor, lanChannel uint8) error {
 	args := newArgs("lan", "set", lanChannel, "ipsrc", "dhcp")
 	return doActions(exector, "set_lan_dhcp", args)
 }
 
 func SetLanStatic(
 	exector IPMIExecutor,
-	channel int,
+	channel uint8,
 	ip string,
 	mask string,
 	gateway string,
@@ -313,12 +611,12 @@ func SetLanStatic(
 	return doActions(exector, "set_lan_static", argss...)
 }
 
-func SetLanStaticIP(exector IPMIExecutor, channel int, ip string) error {
+func SetLanStaticIP(exector IPMIExecutor, channel uint8, ip string) error {
 	args := newArgs("lan", "set", channel, "ipaddr", ip)
 	return doActions(exector, "set_lan_static_ip", args)
 }
 
-func setLanAccess(exector IPMIExecutor, channel int, access string) error {
+func setLanAccess(exector IPMIExecutor, channel uint8, access string) error {
 	args := []Args{
 		newArgs("lan", "set", channel, "access", access),
 		// newArgs("lan", "set", channel, "auth", "ADMIN", "MD5"),
@@ -326,11 +624,11 @@ func setLanAccess(exector IPMIExecutor, channel int, access string) error {
 	return doActions(exector, "set_lan_access", args...)
 }
 
-func EnableLanAccess(exector IPMIExecutor, channel int) error {
+func EnableLanAccess(exector IPMIExecutor, channel uint8) error {
 	return setLanAccess(exector, channel, "on")
 }
 
-func ListLanUsers(exector IPMIExecutor, channel int) ([]compute.IPMIUser, error) {
+func ListLanUsers(exector IPMIExecutor, channel uint8) ([]compute.IPMIUser, error) {
 	args := newArgs("user", "list", channel)
 	ret, err := ExecuteCommands(exector, args)
 	if err != nil {
@@ -339,7 +637,7 @@ func ListLanUsers(exector IPMIExecutor, channel int) ([]compute.IPMIUser, error)
 	return sysutils.ParseIPMIUser(ret), nil
 }
 
-func CreateOrSetAdminUser(exector IPMIExecutor, channel int, rootId int, username string, password string) error {
+func CreateOrSetAdminUser(exector IPMIExecutor, channel uint8, rootId int, username string, password string) error {
 	users, err := ListLanUsers(exector, channel)
 	if err != nil {
 		return errors.Wrap(err, "List users")
@@ -372,7 +670,7 @@ func CreateOrSetAdminUser(exector IPMIExecutor, channel int, rootId int, usernam
 	return SetLanUserAdminPasswd(exector, channel, foundUser.Id, password)
 }
 
-func SetLanUserAdminPasswd(exector IPMIExecutor, channel int, id int, password string) error {
+func SetLanUserAdminPasswd(exector IPMIExecutor, channel uint8, id int, password string) error {
 	var err error
 	password, err = stringutils2.EscapeEchoString(password)
 	if err != nil {
@@ -403,7 +701,7 @@ func SetLanUserAdminPasswd(exector IPMIExecutor, channel int, id int, password s
 	return doActions(exector, "set_lan_user_password3", args...)
 }
 
-func SetIdUserPasswd(exector IPMIExecutor, channel int, id int, user string, password string) error {
+func SetIdUserPasswd(exector IPMIExecutor, channel uint8, id int, user string, password string) error {
 	args := newArgs("user", "set", "name", id, user)
 	if err := doActions(exector, fmt.Sprintf("set_id%d_name", id), args); err != nil {
 		return errors.Wrapf(err, "change root id %d to name %s", id, user)
@@ -522,7 +820,7 @@ func DoReboot(exector IPMIExecutor) error {
 	}
 
 	isValidStatus := func(s string) bool {
-		return utils.IsInStringArray(s, []string{types.POWER_STATUS_ON, types.POWER_STATUS_OFF})
+		return utils.IsInStringArray(s, []string{string(types.POWER_STATUS_ON), string(types.POWER_STATUS_OFF)})
 	}
 
 	for tried := 0; !isValidStatus(status) && tried <= maxTries; tried++ {
@@ -538,7 +836,7 @@ func DoReboot(exector IPMIExecutor) error {
 	}
 
 	// do shutdown
-	if status == types.POWER_STATUS_ON {
+	if status == string(types.POWER_STATUS_ON) {
 		if err := DoHardShutdown(exector); err != nil {
 			log.Errorf("DoHardShutdown: %v", err)
 		}
@@ -548,7 +846,7 @@ func DoReboot(exector IPMIExecutor) error {
 			if err != nil {
 				log.Errorf("DoReboot %d tries to get power status: %v", tried, err)
 			}
-			if status == types.POWER_STATUS_OFF {
+			if status == string(types.POWER_STATUS_OFF) {
 				break
 			}
 			time.Sleep(10 * time.Second)
@@ -557,7 +855,7 @@ func DoReboot(exector IPMIExecutor) error {
 
 	// do power on
 	status, _ = GetChassisPowerStatus(exector)
-	for tried := 0; status != types.POWER_STATUS_ON && tried < maxTries; tried++ {
+	for tried := 0; status != string(types.POWER_STATUS_ON) && tried < maxTries; tried++ {
 		if err := DoPowerOn(exector); err != nil {
 			log.Errorf("DoReboot %d tries to power on: %v", tried, err)
 		}
@@ -572,7 +870,7 @@ func DoReboot(exector IPMIExecutor) error {
 	if err != nil {
 		return errors.Wrap(err, "Get power status after power on")
 	}
-	if status != types.POWER_STATUS_ON {
+	if status != string(types.POWER_STATUS_ON) {
 		return errors.Errorf("do reboot fail to poweron, current status: %s", status)
 	}
 	return nil

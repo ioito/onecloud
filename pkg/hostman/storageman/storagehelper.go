@@ -19,7 +19,9 @@ import (
 
 	"yunion.io/x/jsonutils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
 
@@ -35,6 +37,21 @@ func (i *SDiskCreateByDiskinfo) String() string {
 	return fmt.Sprintf("disk_id: %s, disk_info: %s", i.DiskId, jsonutils.Marshal(i.DiskInfo))
 }
 
+type SDiskMigrate struct {
+	DiskId             string
+	Disk               IDisk
+	SrcStorageId       string
+	TemplateId         string
+	OutChainSnaps      []jsonutils.JSONObject
+	SnapsChain         []jsonutils.JSONObject
+	DiskBackingFile    string
+	SnapshotsUri       string
+	DiskUri            string
+	SysDiskHasTemplate bool
+
+	Storage IStorage
+}
+
 type SDiskReset struct {
 	SnapshotId    string
 	BackingDiskId string
@@ -46,47 +63,61 @@ type SDiskCleanupSnapshots struct {
 	DeleteSnapshots  []jsonutils.JSONObject
 }
 
-type SDiskBakcup struct {
-	SnapshotId              string              `json:"snapshot_id"`
-	BackupId                string              `json:"backup_id"`
-	BackupStorageId         string              `json:"backup_storage_id"`
-	BackupStorageAccessInfo *jsonutils.JSONDict `json:"backup_storage_access_info"`
+type SStorageDeleteSnapshots struct {
+	DiskId      string
+	SnapshotIds []string
+}
+
+type SStorageDeleteSnapshot struct {
+	DiskId      string
+	SnapshotId  string
+	SnapshotIds []string
+	EncryptInfo apis.SEncryptInfo
+}
+
+type SDiskBackup struct {
+	SnapshotId              string                        `json:"snapshot_id"`
+	SnapshotLocation        string                        `json:"snapshot_location"`
+	BackupId                string                        `json:"backup_id"`
+	BackupStorageId         string                        `json:"backup_storage_id"`
+	BackupStorageAccessInfo *api.SBackupStorageAccessInfo `json:"backup_storage_access_info"`
 
 	EncryptKeyId string `json:"encrypt_key_id"`
 
 	UserCred mcclient.TokenCredential
+
+	BackupFilePath string `json:"backup_file_path"`
 }
 
 type SStorageBackup struct {
 	BackupId                string
+	BackupLocalPath         string
 	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
+	BackupStorageAccessInfo *api.SBackupStorageAccessInfo
+	BackupFilePath          string
 }
 
 type SStoragePackBackup struct {
 	PackageName             string
 	BackupId                string
 	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
+	BackupStorageAccessInfo *api.SBackupStorageAccessInfo
 	Metadata                api.DiskBackupPackMetadata
-}
-
-type SStoragePackInstanceBackup struct {
-	PackageName             string
-	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
-	BackupIds               []string
-	Metadata                api.InstanceBackupPackMetadata
 }
 
 type SStorageUnpackInstanceBackup struct {
 	PackageName             string
 	BackupStorageId         string
-	BackupStorageAccessInfo *jsonutils.JSONDict
+	BackupStorageAccessInfo *api.SBackupStorageAccessInfo
 	MetadataOnly            *bool
 }
 
 type SStorageSaveToGlanceInfo struct {
 	UserCred mcclient.TokenCredential
 	DiskInfo *jsonutils.JSONDict
+}
+
+type SDiskResizeInput struct {
+	DiskInfo  jsonutils.JSONObject
+	GuestDesc *deployapi.GuestDesc
 }

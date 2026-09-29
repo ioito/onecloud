@@ -93,12 +93,12 @@ type LoadbalancerListenerListInput struct {
 type LoadbalancerListenerCreateInput struct {
 	apis.StatusStandaloneResourceCreateInput
 
-	// swagger: ignore
+	// swagger:ignore
 	Loadbalancer string `json:"loadbalancer" yunion-deprecated-by:"loadbalancer_id"`
 	// 负载均衡ID
 	LoadbalancerId string `json:"loadbalancer_id"`
 
-	//swagger: ignore
+	//swagger:ignore
 	BackendGroup   string `json:"backend_group" yunion-deprecated-by:"backend_group_id"`
 	BackendGroupId string `json:"backend_group_id"`
 
@@ -131,7 +131,7 @@ type LoadbalancerListenerCreateInput struct {
 
 	EgressMbps int `json:"egress_mbps"`
 
-	//swagger: ignore
+	//swagger:ignore
 	Certificate   string `json:"certificate" yunion-deprecated-by:"certificate_id"`
 	CertificateId string `json:"certificate_id"`
 
@@ -142,9 +142,9 @@ type LoadbalancerListenerCreateInput struct {
 	// default: on
 	// enmu: on, off
 	HealthCheck string `json:"health_check"`
-	// enum: tcp, udp, http
+	// enum: ["tcp", "udp", "http"]
 	HealthCheckType   string `json:"health_check_type"`
-	HealthCheckDomain string `json:"string"`
+	HealthCheckDomain string `json:"health_check_domain"`
 	HealthCheckPath   string `json:"health_check_path"`
 	// default: http_2xx,http_3xx
 	HealthCheckHttpCode string `json:"health_check_http_code"`
@@ -173,12 +173,16 @@ type LoadbalancerListenerCreateInput struct {
 	RedirectHost   string `json:"redirect_host"`
 	RedirectPath   string `json:"redirect_path"`
 
-	//swagger: ignore
+	//swagger:ignore
 	Acl string `json:"acl" yunion-deprecated-by:"acl_id"`
 
 	AclId     string `json:"acl_id"`
 	AclStatus string `json:"acl_status"`
 	AclType   string `json:"acl_type"`
+}
+
+func (input LoadbalancerListenerCreateInput) IsRedirect() bool {
+	return len(input.Redirect) > 0 && input.Redirect != LB_REDIRECT_OFF
 }
 
 func (self *LoadbalancerListenerCreateInput) Validate() error {
@@ -191,7 +195,13 @@ func (self *LoadbalancerListenerCreateInput) Validate() error {
 	if !utils.IsInStringArray(self.SendProxy, LB_SENDPROXY_CHOICES) {
 		return httperrors.NewInputParameterError("invalid send_proxy %s", self.SendProxy)
 	}
-	if !utils.IsInStringArray(self.Scheduler, LB_SCHEDULER_TYPES) {
+	if len(self.Redirect) == 0 {
+		self.Redirect = LB_REDIRECT_OFF
+	}
+	if !utils.IsInStringArray(self.Redirect, []string{LB_REDIRECT_OFF, LB_REDIRECT_RAW}) {
+		return httperrors.NewInputParameterError("invalid redirect %s", self.Redirect)
+	}
+	if !self.IsRedirect() && !utils.IsInStringArray(self.Scheduler, LB_SCHEDULER_TYPES) {
 		return httperrors.NewInputParameterError("invalid scheduler %s", self.Scheduler)
 	}
 	if len(self.StickySession) == 0 {
@@ -222,6 +232,9 @@ func (self *LoadbalancerListenerCreateInput) Validate() error {
 	}
 	if !utils.IsInStringArray(self.ListenerType, LB_LISTENER_TYPES) {
 		return httperrors.NewInputParameterError("invalid listener_type %s", self.ListenerType)
+	}
+	if self.IsRedirect() && !utils.IsInStringArray(self.ListenerType, LB_APP_LISTENER_TYPES) {
+		return httperrors.NewInputParameterError("redirect is only supported for http/https listeners")
 	}
 	if self.ListenerPort < 1 || self.ListenerPort > 65535 {
 		return httperrors.NewOutOfRangeError("listener_port out of range 1-65535")
@@ -272,12 +285,7 @@ func (self *LoadbalancerListenerCreateInput) Validate() error {
 			self.HealthCheckInterval = 30
 		}
 	}
-	if len(self.Redirect) == 0 {
-		self.Redirect = LB_REDIRECT_OFF
-	}
-	if !utils.IsInStringArray(self.Redirect, []string{LB_REDIRECT_OFF, LB_REDIRECT_RAW}) {
-		return httperrors.NewInputParameterError("invalid redirect %s", self.Redirect)
-	}
+
 	return nil
 }
 
@@ -286,7 +294,7 @@ type LoadbalancerListenerUpdateInput struct {
 
 	AclStatus *string `json:"acl_status"`
 	AclType   *string `json:"acl_type"`
-	//swagger: ignore
+	//swagger:ignore
 	Acl   *string `json:"acl" yunion-deprecated-by:"acl_id"`
 	AclId *string `json:"acl_id"`
 
@@ -313,7 +321,7 @@ type LoadbalancerListenerUpdateInput struct {
 	XForwardedFor *bool `json:"x_forwarded_for"`
 	Gzip          *bool `json:"gzip"`
 
-	//swagger: ignore
+	//swagger:ignore
 	Certificate   *string `json:"certificate" yunion-deprecated-by:"certificate_id"`
 	CertificateId *string `json:"certificate_id"`
 
@@ -324,7 +332,7 @@ type LoadbalancerListenerUpdateInput struct {
 	// default: on
 	// enmu: on, off
 	HealthCheck *string `json:"health_check"`
-	// enum: tcp, udp, http
+	// enum: ["tcp", "udp", "http"]
 	HealthCheckType   *string `json:"health_check_type"`
 	HealthCheckDomain *string `json:"string"`
 	HealthCheckPath   *string `json:"health_check_path"`

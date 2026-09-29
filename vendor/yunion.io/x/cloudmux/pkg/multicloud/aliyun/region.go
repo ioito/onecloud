@@ -151,6 +151,19 @@ func (self *SRegion) wafRequest(apiName string, params map[string]string) (jsonu
 	return jsonRequest(client, endpoint, ALIYUN_WAF_API_VERSION, apiName, params, self.client.debug)
 }
 
+func (self *SRegion) wafv2Request(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	if self.RegionId != "cn-hangzhou" && self.RegionId != "ap-southeast-1" {
+		return nil, cloudprovider.ErrNotSupported
+	}
+	params = self.client.SetResourceGropuId(params)
+	endpoint := fmt.Sprintf("wafopenapi.%s.aliyuncs.com", self.RegionId)
+	return jsonRequest(client, endpoint, ALIYUN_WAF_V2_API_VERSION, apiName, params, self.client.debug)
+}
+
 func (self *SRegion) esRequest(apiName string, params map[string]string, body interface{}) (jsonutils.JSONObject, error) {
 	client, err := self.getSdkClient()
 	if err != nil {
@@ -246,6 +259,15 @@ func (self *SRegion) kvsRequest(action string, params map[string]string) (jsonut
 	return jsonRequest(client, "r-kvstore.aliyuncs.com", ALIYUN_API_VERSION_KVS, action, params, self.client.debug)
 }
 
+func (self *SRegion) scRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	domain := "cas.aliyuncs.com"
+	return jsonRequest(client, domain, ALIYUN_CAS_API_VERSION, apiName, params, self.client.debug)
+}
+
 type LBRegion struct {
 	RegionEndpoint string
 	RegionId       string
@@ -297,7 +319,27 @@ func (self *SRegion) _lbRequest(client *sdk.Client, apiName string, domain strin
 	return jsonRequest(client, domain, ALIYUN_API_VERSION_LB, apiName, params, self.client.debug)
 }
 
-/////////////////////////////////////////////////////////////////////////////
+func (self *SRegion) albRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	params = self.client.SetResourceGropuId(params)
+	domain := fmt.Sprintf("alb.%s.aliyuncs.com", self.RegionId)
+	return jsonRequest(client, domain, ALIYUN_API_VERSION_ALB, apiName, params, self.client.debug)
+}
+
+func (self *SRegion) nlbRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	params = self.client.SetResourceGropuId(params)
+	domain := fmt.Sprintf("nlb.%s.aliyuncs.com", self.RegionId)
+	return jsonRequest(client, domain, ALIYUN_API_VERSION_NLB, apiName, params, self.client.debug)
+}
+
+// ///////////////////////////////////////////////////////////////////////////
 func (self *SRegion) GetId() string {
 	return self.RegionId
 }
@@ -424,8 +466,43 @@ func (self *SRegion) getZoneById(id string) (*SZone, error) {
 	return nil, fmt.Errorf("no such zone %s", id)
 }
 
+func (self *SRegion) getOrCreateZone(zoneId string, cache map[string]*SZone) (*SZone, error) {
+	if len(zoneId) == 0 {
+		return nil, fmt.Errorf("empty zone")
+	}
+	if cache != nil {
+		if zone, ok := cache[zoneId]; ok {
+			return zone, nil
+		}
+	}
+	zone := &SZone{
+		region: self,
+		ZoneId: zoneId,
+	}
+	if cache != nil {
+		cache[zoneId] = zone
+	}
+	return zone, nil
+}
+
+func (self *SRegion) initInstanceHost(vm *SInstance, zoneCache map[string]*SZone) error {
+	zone, err := self.getOrCreateZone(vm.ZoneId, zoneCache)
+	if err != nil {
+		return err
+	}
+	vm.host = zone.getHost()
+	return nil
+}
+
 func (self *SRegion) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
-	return self.GetInstance(id)
+	instance, err := self.GetInstance(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := self.initInstanceHost(instance, nil); err != nil {
+		return nil, err
+	}
+	return instance, nil
 }
 
 func (self *SRegion) GetIDiskById(id string) (cloudprovider.ICloudDisk, error) {
@@ -829,81 +906,38 @@ func (self *SRegion) UpdateInstancePassword(instId string, passwd string) error 
 }
 
 func (self *SRegion) GetIEips() ([]cloudprovider.ICloudEIP, error) {
-	eips, total, err := self.GetEips("", "", "", 0, 50)
+	eips, err := self.GetEips("", "", "")
 	if err != nil {
 		return nil, err
 	}
-	for len(eips) < total {
-		var parts []SEipAddress
-		parts, total, err = self.GetEips("", "", "", len(eips), 50)
-		if err != nil {
-			return nil, err
-		}
-		eips = append(eips, parts...)
-	}
 	ret := make([]cloudprovider.ICloudEIP, len(eips))
-	for i := 0; i < len(eips); i += 1 {
+	for i := range eips {
+		eips[i].region = self
 		ret[i] = &eips[i]
 	}
 	return ret, nil
 }
 
 func (self *SRegion) GetIEipById(eipId string) (cloudprovider.ICloudEIP, error) {
-	eips, total, err := self.GetEips(eipId, "", "", 0, 1)
+	eip, err := self.GetEip(eipId)
 	if err != nil {
 		return nil, err
 	}
-	if total == 0 {
-		return nil, cloudprovider.ErrNotFound
-	}
-	if total > 1 {
-		return nil, cloudprovider.ErrDuplicateId
-	}
-	return &eips[0], nil
+	return eip, nil
 }
 
 func (region *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroup, err := region.GetSecurityGroupDetails(secgroupId)
+	secgroup, err := region.GetSecurityGroup(secgroupId)
 	if err != nil {
 		return nil, err
 	}
 	return secgroup, nil
 }
 
-func (region *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, total, err := region.GetSecurityGroups(opts.VpcId, opts.Name, []string{}, 0, 0)
+func (region *SRegion) CreateISecurityGroup(opts *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
+	externalId, err := region.CreateSecurityGroup(opts)
 	if err != nil {
 		return nil, err
-	}
-	if total == 0 {
-		return nil, cloudprovider.ErrNotFound
-	}
-	if total > 1 {
-		return nil, cloudprovider.ErrDuplicateId
-	}
-	secgroups[0].region = region
-	return &secgroups[0], nil
-}
-
-func (region *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
-	externalId, err := region.CreateSecurityGroup(conf.VpcId, conf.Name, conf.Desc, conf.ProjectId)
-	if err != nil {
-		return nil, err
-	}
-	if conf.OnCreated != nil {
-		conf.OnCreated(externalId)
-	}
-	outRules := conf.OutRules
-	if len(outRules) > 0 && outRules[0].String() == "out:allow any" {
-		outRules = outRules[1:]
-	}
-	rules := append(conf.InRules, outRules...)
-	for _, rule := range rules {
-		rule.Priority = 101 - rule.Priority
-		err = region.addSecurityGroupRule(externalId, rule)
-		if err != nil {
-			return nil, err
-		}
 	}
 	return region.GetISecurityGroupById(externalId)
 }
@@ -918,10 +952,36 @@ func (region *SRegion) GetILoadBalancers() ([]cloudprovider.ICloudLoadbalancer, 
 		lbs[i].region = region
 		ilbs = append(ilbs, &lbs[i])
 	}
+
+	// 获取ALB实例
+	albs, err := region.GetAlbs()
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(albs); i++ {
+		albs[i].region = region
+		ilbs = append(ilbs, &albs[i])
+	}
+
+	// 获取NLB实例
+	nlbs, err := region.GetNlbs()
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(nlbs); i++ {
+		nlbs[i].region = region
+		ilbs = append(ilbs, &nlbs[i])
+	}
+
 	return ilbs, nil
 }
 
 func (region *SRegion) GetILoadBalancerById(loadbalancerId string) (cloudprovider.ICloudLoadbalancer, error) {
+	if strings.HasPrefix(loadbalancerId, "alb-") {
+		return region.GetAlbDetail(loadbalancerId)
+	} else if strings.HasPrefix(loadbalancerId, "nlb-") {
+		return region.GetNlbDetail(loadbalancerId)
+	}
 	return region.GetLoadbalancerDetail(loadbalancerId)
 }
 
@@ -1249,4 +1309,20 @@ func (self *SRegion) trialRequest(apiName string, params map[string]string) (jso
 	}
 	domain := fmt.Sprintf("actiontrail.%s.aliyuncs.com", self.RegionId)
 	return jsonRequest(client, domain, ALIYUN_API_VERSION_TRIAL, apiName, params, self.client.debug)
+}
+
+func (self *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	instances, err := self.GetInstances("", nil)
+	if err != nil {
+		return nil, err
+	}
+	zoneCache := make(map[string]*SZone)
+	ret := []cloudprovider.ICloudVM{}
+	for i := range instances {
+		if err := self.initInstanceHost(&instances[i], zoneCache); err != nil {
+			return nil, err
+		}
+		ret = append(ret, &instances[i])
+	}
+	return ret, nil
 }

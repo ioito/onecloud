@@ -38,6 +38,7 @@ const (
 	AUTH_METHOD_OIDC     = "oidc"
 	AUTH_METHOD_OAuth2   = "oauth2"
 	AUTH_METHOD_VERIFY   = "verify"
+	AUTH_METHOD_ASSUME   = "assume"
 
 	// AUTH_METHOD_ID_PASSWORD = 1
 	// AUTH_METHOD_ID_TOKEN    = 2
@@ -56,6 +57,8 @@ const (
 	EndpointInterfaceConsole  = "console"
 
 	EndpointInterfaceApigateway = "apigateway"
+
+	EndpointInterfaceSlave = "slave"
 
 	KeystoneDomainRoot = "<<keystone.domain.root>>"
 
@@ -116,8 +119,11 @@ var (
 			"ignore_nonrunning_guests",
 			"platform_name",
 			"enable_cloud_shell",
-			"enable_watermark",
 			"platform_names",
+			"enable_change_owner_auto_rename",
+			"default_handlers_whitelist_user_agents",
+			"metadata_server_ip4s",
+			"metadata_server_ip6s",
 		},
 	}
 
@@ -166,6 +172,7 @@ var (
 			"db_checksum_skip_init",
 			"db_checksum_tables",
 			"enable_db_checksum_tables",
+			"db_checksum_hash_algorithm",
 			"auto_sync_table",
 			"exit_after_db_init",
 			"global_virtual_resource_namespace",
@@ -212,6 +219,7 @@ var (
 			"force_dhcp_probe_ipmi",
 			"tftp_block_size_in_bytes",
 			"tftp_max_timeout_retries",
+			"enable_grub_tftp_download",
 			"lengthy_worker_count",
 			"short_worker_count",
 			// "default_ipmi_password",
@@ -234,6 +242,7 @@ var (
 			// kubeserver blacklist options
 			// ############################
 			"running_mode",
+			"enable_default_policy",
 		},
 	}
 )

@@ -16,6 +16,7 @@ package qcloud
 
 import (
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/pkg/util/netutils"
 )
 
 type SInstanceNic struct {
@@ -23,6 +24,7 @@ type SInstanceNic struct {
 
 	id      string
 	ipAddr  string
+	ip6Addr string
 	macAddr string
 	classic bool
 
@@ -37,7 +39,15 @@ func (self *SInstanceNic) GetIP() string {
 	return self.ipAddr
 }
 
+func (self *SInstanceNic) GetIP6() string {
+	return self.ip6Addr
+}
+
 func (self *SInstanceNic) GetMAC() string {
+	if len(self.macAddr) == 0 {
+		ip, _ := netutils.NewIPV4Addr(self.GetIP())
+		return ip.ToMac("00:16:")
+	}
 	return self.macAddr
 }
 

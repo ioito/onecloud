@@ -23,6 +23,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/cloudmux/pkg/apis/cloudid"
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
@@ -47,6 +48,7 @@ type SPolicy struct {
 	AttachmentCount               int       `xml:"AttachmentCount"`
 	CreateDate                    time.Time `xml:"CreateDate"`
 	UpdateDate                    time.Time `xml:"UpdateDate"`
+	PolicyType                    cloudid.TPolicyType
 }
 
 func (self *SPolicy) GetName() string {
@@ -54,7 +56,11 @@ func (self *SPolicy) GetName() string {
 }
 
 func (self *SPolicy) GetGlobalId() string {
-	return self.client.getIamCommonArn(self.Arn)
+	return self.Arn
+}
+
+func (self *SPolicy) GetPolicyType() cloudid.TPolicyType {
+	return self.PolicyType
 }
 
 func (self *SPolicy) GetDescription() string {
@@ -68,25 +74,6 @@ func (self *SPolicy) GetDescription() string {
 type SUserPolicies struct {
 	PolicyNames []string `xml:"PolicyNames>member"`
 	IsTruncated bool     `xml:"IsTruncated"`
-}
-
-func (self *SAwsClient) GetCustomPolicyMaps() (map[string]string, error) {
-	policyMaps := map[string]string{}
-	offset := ""
-	for {
-		part, err := self.ListPolicies(offset, 1000, false, "", "", "Local")
-		if err != nil {
-			return nil, errors.Wrapf(err, "ListPolicies")
-		}
-		for _, policy := range part.Policies {
-			policyMaps[policy.PolicyName] = policy.PolicyId
-		}
-		offset = part.Marker
-		if len(offset) == 0 || !part.IsTruncated {
-			break
-		}
-	}
-	return policyMaps, nil
 }
 
 func (self *SAwsClient) ListUserPolicies(userName string, marker string, maxItems int) (*SUserPolicies, error) {
@@ -136,16 +123,17 @@ func (self *SAwsClient) GetDocument(arn, versionId string) (*jsonutils.JSONDict,
 	return jsonObj.(*jsonutils.JSONDict), nil
 }
 
-func (self *SAwsClient) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (self *SAwsClient) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	ret := []cloudprovider.ICloudpolicy{}
 	marker := ""
 	for {
-		part, err := self.ListPolicies(marker, 1000, false, "", "PermissionsPolicy", "AWS")
+		part, err := self.ListPolicies(marker, 1000, false, "", "", "AWS")
 		if err != nil {
 			return nil, errors.Wrapf(err, "ListPolicies")
 		}
 		for i := range part.Policies {
 			part.Policies[i].client = self
+			part.Policies[i].PolicyType = cloudid.PolicyTypeSystem
 			ret = append(ret, &part.Policies[i])
 		}
 		marker = part.Marker
@@ -153,19 +141,15 @@ func (self *SAwsClient) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy,
 			break
 		}
 	}
-	return ret, nil
-}
 
-func (self *SAwsClient) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	ret := []cloudprovider.ICloudpolicy{}
-	marker := ""
 	for {
-		part, err := self.ListPolicies(marker, 1000, false, "", "PermissionsPolicy", "Local")
+		part, err := self.ListPolicies(marker, 1000, false, "", "", "Local")
 		if err != nil {
 			return nil, errors.Wrapf(err, "ListPolicies")
 		}
 		for i := range part.Policies {
 			part.Policies[i].client = self
+			part.Policies[i].PolicyType = cloudid.PolicyTypeCustom
 			ret = append(ret, &part.Policies[i])
 		}
 		marker = part.Marker
@@ -173,6 +157,7 @@ func (self *SAwsClient) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy,
 			break
 		}
 	}
+
 	return ret, nil
 }
 
@@ -245,11 +230,15 @@ type SAttachedPolicy struct {
 }
 
 func (self *SAttachedPolicy) GetGlobalId() string {
-	return self.client.getIamCommonArn(self.PolicyArn)
+	return self.PolicyArn
 }
 
 func (self *SAttachedPolicy) GetName() string {
 	return self.PolicyName
+}
+
+func (self *SAttachedPolicy) GetPolicyType() cloudid.TPolicyType {
+	return cloudid.PolicyTypeSystem
 }
 
 func (self *SAttachedPolicy) GetDescription() string {

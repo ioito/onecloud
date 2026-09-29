@@ -78,6 +78,13 @@ const (
 	HYPERVISOR_CUCLOUD        = "cucloud"
 	HYPERVISOR_QINGCLOUD      = "qingcloud"
 	HYPERVISOR_VOLCENGINE     = "volcengine"
+	HYPERVISOR_ORACLE         = "oracle"
+	HYPERVISOR_SANGFOR        = "sangfor"
+	HYPERVISOR_ZETTAKIT       = "zettakit"
+	HYPERVISOR_UIS            = "uis"
+	HYPERVISOR_CAS            = "cas"
+	HYPERVISOR_CNWARE         = "cnware"
+	HYPERVISOR_ROCKBASE  = "rockbase"
 )
 
 const (

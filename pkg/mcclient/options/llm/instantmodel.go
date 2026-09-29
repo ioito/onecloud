@@ -1,0 +1,108 @@
+package llm
+
+import (
+	"yunion.io/x/jsonutils"
+
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/mcclient/options"
+)
+
+type LLMInstantModelListOptions struct {
+	options.BaseListOptions
+
+	ModelName string `help:"filter by model name"`
+	ModelTag  string `help:"filter by model tag"`
+	LLMType   string `json:"llm_type" choices:"ollama|vllm|sglang|comfyui" help:"filter by llm type"`
+}
+
+func (o *LLMInstantModelListOptions) Params() (jsonutils.JSONObject, error) {
+	return options.ListStructToParams(o)
+}
+
+type LLMInstantModelShowOptions struct {
+	options.BaseShowOptions
+}
+
+func (o *LLMInstantModelShowOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type LLMInstantModelCreateOptions struct {
+	options.BaseCreateOptions
+
+	LLM_TYPE   string `help:"llm instant model type" choices:"ollama|vllm|sglang|comfyui" json:"llm_type"`
+	MODEL_NAME string `json:"model_name"`
+	MODEL_TAG  string `json:"model_tag"`
+
+	Source   string `help:"model source, e.g. huggingface" json:"source"`
+	RepoId   string `help:"huggingface repo id, e.g. Qwen/Qwen3-8B" json:"repo_id"`
+	Revision string `help:"huggingface revision, e.g. main or refs/pr/7" json:"revision"`
+	ImageId  string `json:"image_id"`
+
+	Mounts []string `json:"mounts"`
+}
+
+func (o *LLMInstantModelCreateOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type LLMInstantModelUpdateOptions struct {
+	options.BaseIdOptions
+
+	ImageId string `json:"image_id"`
+
+	Mounts []string `json:"mounts"`
+}
+
+func (o *LLMInstantModelUpdateOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(o), nil
+}
+
+type LLMInstantModelDeleteOptions struct {
+	options.BaseIdOptions
+}
+
+func (o *LLMInstantModelDeleteOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type LLMInstantModelImportOptions struct {
+	LLM_TYPE   string `help:"llm instant model type" choices:"ollama|vllm|sglang|comfyui" json:"llm_type"`
+	MODEL_NAME string `help:"model name to import, e.g. qwen3 or Qwen/Qwen3-VL-8B-Instruct" json:"model_name"`
+	MODEL_TAG  string `help:"model tag to import, e.g. 8b" json:"model_tag"`
+	REPO_ID    string `help:"huggingface repo id, e.g. Qwen/Qwen3-8B" json:"repo_id"`
+	REVISION   string `help:"huggingface revision, e.g. main or refs/pr/7" json:"revision"`
+}
+
+func (o *LLMInstantModelImportOptions) Params() (jsonutils.JSONObject, error) {
+	input := api.InstantModelImportInput{
+		ModelName: o.MODEL_NAME,
+		ModelTag:  o.MODEL_TAG,
+		LlmType:   api.LLMContainerType(o.LLM_TYPE),
+		RepoId:    o.REPO_ID,
+		Revision:  o.REVISION,
+	}
+	if o.REPO_ID != "" {
+		input.Source = api.InstantModelSourceHuggingFace
+	}
+	return jsonutils.Marshal(input), nil
+}
+
+type LLMInstantModelBackfillVramOptions struct {
+	DryRun bool `help:"preview without writing" json:"dry_run"`
+}
+
+func (o *LLMInstantModelBackfillVramOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(api.InstantModelBackfillVramInput{DryRun: o.DryRun}), nil
+}
+
+type LLMInstantModelCommunityRegistryOptions struct {
+}
+
+func (o *LLMInstantModelCommunityRegistryOptions) Params() (jsonutils.JSONObject, error) {
+	return nil, nil
+}
+
+func (o *LLMInstantModelCommunityRegistryOptions) Property() string {
+	return "community-registry"
+}

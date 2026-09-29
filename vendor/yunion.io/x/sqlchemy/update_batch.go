@@ -26,20 +26,29 @@ func (ts *STableSpec) UpdateBatch(data map[string]interface{}, filter map[string
 		return nil
 	}
 
+	qChar := ts.Database().backend.QuoteChar()
+
 	params := make([]interface{}, 0, len(data))
 	setter := make([]string, 0, len(data))
 	for k, v := range data {
-		setter = append(setter, fmt.Sprintf("`%s` = ?", k))
-		params = append(params, v)
+		col := ts.ColumnSpec(k)
+		if col == nil {
+			log.Warningf("UpdateBatch: column %s not found", k)
+			continue
+		}
+		setter = append(setter, fmt.Sprintf("%s%s%s = ?", qChar, k, qChar))
+		params = append(params, col.ConvertFromValue(v))
 	}
-	conds, condparams := getSQLFilters(filter)
+	conds, condparams := ts.getSQLFilters(filter, qChar)
 	params = append(params, condparams...)
 
 	buf := strings.Builder{}
 
-	buf.WriteString("UPDATE `")
+	buf.WriteString("UPDATE ")
+	buf.WriteString(qChar)
 	buf.WriteString(ts.Name())
-	buf.WriteString("` SET ")
+	buf.WriteString(qChar)
+	buf.WriteString(" SET ")
 	buf.WriteString(strings.Join(setter, ", "))
 
 	if len(conds) > 0 {
@@ -48,7 +57,7 @@ func (ts *STableSpec) UpdateBatch(data map[string]interface{}, filter map[string
 	}
 
 	if DEBUG_SQLCHEMY {
-		log.Infof("Update: %s %s", buf.String(), params)
+		log.Infof("UpdateBATCH: %s %s", buf.String(), params)
 	}
 
 	_, err := ts.Database().Exec(buf.String(), params...)

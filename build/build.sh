@@ -36,6 +36,12 @@ fi
 . $ROOT/vars
 
 BUILDROOT=$(mktemp -d 2>/dev/null || mktemp -d -t 'yunion')
+function cleanup {
+  rm -rf "$BUILDROOT"
+  echo "Deleted temp working directory $BUILDROOT"
+}
+# register the cleanup function to be called on the EXIT signal
+trap cleanup EXIT
 
 echo "Build root ${BUILDROOT}"
 
@@ -73,6 +79,8 @@ echo "# Yunion RPM spec
 %global pkgname yunion-$PKG
 %global homedir /var/run/%{owner}
 %global use_systemd $SERVICE
+%global debug_package %{nil}
+%global __strip /usr/bin/eu-strip
 
 Name: %{pkgname}
 Version: $VERSION
@@ -104,41 +112,87 @@ if [ -d $ROOT/root ]; then
   rsync -a $ROOT/root/ \$RPM_BUILD_ROOT
 fi
 
-%pre
+%pre" > $SPEC_FILE
+
+if [ -f $ROOT/preinst ]; then
+    cat $ROOT/preinst >> $SPEC_FILE
+else
+    echo "
 %if %{use_systemd}
 getent group %{owner} >/dev/null || /usr/sbin/groupadd -r %{owner}
 getent passwd %{owner} >/dev/null || /usr/sbin/useradd -r -s /sbin/nologin -d %{homedir} -M -g %{owner} %{owner}
 %endif
+" >> $SPEC_FILE
+fi
 
-%post
+echo "
+%post" >> $SPEC_FILE
+
+if [ -f $ROOT/postinst ]; then
+    cat $ROOT/postinst >> $SPEC_FILE
+else
+    echo "
 %if %{use_systemd}
-    mkdir -p /var/run/%{owner}
-    chown -R %{owner}:%{owner} /var/run/%{owner}
     /usr/bin/systemctl preset %{pkgname}.service >/dev/null 2>&1 ||:
 %endif
+" >> $SPEC_FILE
+fi
 
-%preun
+echo "
+%preun" >> $SPEC_FILE
+
+if [ -f $ROOT/prerm ]; then
+    cat $ROOT/prerm >> $SPEC_FILE
+else
+    echo "
 %if %{use_systemd}
     /usr/bin/systemctl --no-reload disable %{pkgname}.service >/dev/null 2>&1 || :
     /usr/bin/systemctl stop %{pkgname}.service >/dev/null 2>&1 ||:
 %endif
+" >> $SPEC_FILE
+fi
 
-%postun
+echo "
+%postun" >> $SPEC_FILE
+
+if [ -f $ROOT/postrm ]; then
+    cat $ROOT/postrm >> $SPEC_FILE
+else
+    echo "
 %if %{use_systemd}
     /usr/bin/systemctl daemon-reload >/dev/null 2>&1 ||:
 %endif
+" >> $SPEC_FILE
+fi
 
+echo -n "
 %files
 %doc
 $BIN_PATH/$PKG
-$(for b in $EXTRA_BINS; do echo $BIN_PATH/$b; done)
-" > $SPEC_FILE
+" >> $SPEC_FILE
+
+for b in $EXTRA_BINS; do
+    echo $BIN_PATH/$b >> $SPEC_FILE
+done
 
 if [ -d $ROOT/root/ ]; then
     find $ROOT/root/ -type f | sed -e "s:$ROOT/root::g" >> $SPEC_FILE
 fi
 
-rpmbuild --define "_topdir $BUILDROOT" -bb $SPEC_FILE
+TARGET=
+case "$GOARCH" in
+    "arm64" | "aarch64" | "arm")
+        TARGET="--target aarch64-redhat-linux"
+        ;;
+    "amd64" | "x86" | "i686" | "i386" | "x86_64")
+        TARGET="--target x86_64-redhat-linux"
+        ;;
+    "riscv64")
+        TARGET="--target riscv64-linux"
+        ;;
+esac
+
+rpmbuild --define "_topdir $BUILDROOT" -bb $SPEC_FILE $TARGET
 
 find $RPM_DIR -type f | while read f; do
 	d="$(dirname "$f")"
@@ -146,5 +200,3 @@ find $RPM_DIR -type f | while read f; do
 	mkdir -p "$d"
 	cp $f $d
 done
-
-rm -fr $BUILDROOT

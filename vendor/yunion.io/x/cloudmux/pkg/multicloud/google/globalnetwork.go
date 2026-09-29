@@ -62,6 +62,31 @@ func (self *SGlobalNetwork) Refresh() error {
 	return jsonutils.Update(self, gvpc)
 }
 
+func (self *SGlobalNetwork) GetISecurityGroups() ([]cloudprovider.ICloudSecurityGroup, error) {
+	firewalls, err := self.client.GetFirewalls(self.SelfLink, 0, "")
+	if err != nil {
+		return nil, err
+	}
+	groups := map[string]*SSecurityGroup{}
+	for i := range firewalls {
+		if len(firewalls[i].TargetTags) == 0 {
+			continue
+		}
+		_, ok := groups[firewalls[i].TargetTags[0]]
+		if !ok {
+			groups[firewalls[i].TargetTags[0]] = &SSecurityGroup{Rules: []SFirewall{}}
+		}
+		groups[firewalls[i].TargetTags[0]].gvpc = self
+		groups[firewalls[i].TargetTags[0]].Tag = firewalls[i].TargetTags[0]
+		groups[firewalls[i].TargetTags[0]].Rules = append(groups[firewalls[i].TargetTags[0]].Rules, firewalls[i])
+	}
+	ret := []cloudprovider.ICloudSecurityGroup{}
+	for _, group := range groups {
+		ret = append(ret, group)
+	}
+	return ret, nil
+}
+
 func (cli *SGoogleClient) GetGlobalNetwork(id string) (*SGlobalNetwork, error) {
 	net := &SGlobalNetwork{client: cli}
 	return net, cli.ecsGet("global/networks", id, net)
@@ -86,18 +111,19 @@ func (cli *SGoogleClient) GetGlobalNetworks(maxResults int, pageToken string) ([
 	if err != nil {
 		return nil, errors.Wrap(err, "ecsList")
 	}
-	if resp.Contains("items") {
-		err = resp.Unmarshal(&networks, "items")
-		if err != nil {
-			return nil, errors.Wrap(err, "resp.Unmarshal")
-		}
+	ret := struct {
+		Items []SGlobalNetwork
+	}{}
+	err = resp.Unmarshal(&ret)
+	if err != nil {
+		return nil, errors.Wrap(err, "resp.Unmarshal")
 	}
-	return networks, nil
+	return ret.Items, nil
 }
 
 func (self *SGoogleClient) CreateGlobalNetwork(name string, desc string) (*SGlobalNetwork, error) {
 	body := map[string]interface{}{
-		"name":                  name,
+		"name":                  normalizeString(name),
 		"description":           desc,
 		"autoCreateSubnetworks": false,
 		"mtu":                   1460,
@@ -130,6 +156,14 @@ func (self *SGoogleClient) GetICloudGlobalVpcs() ([]cloudprovider.ICloudGlobalVp
 	for i := range gvpcs {
 		gvpcs[i].client = self
 		ret = append(ret, &gvpcs[i])
+	}
+	sharedVpcs, err := self.GetSharedGlobalNetworks()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetSharedVpcs")
+	}
+	for i := range sharedVpcs {
+		sharedVpcs[i].client = self
+		ret = append(ret, &sharedVpcs[i])
 	}
 	return ret, nil
 }

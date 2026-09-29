@@ -40,6 +40,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
 
+// +onecloud:swagger-gen-model-singular=dbinstance_sku
+// +onecloud:swagger-gen-model-plural=dbinstance_skus
 type SDBInstanceSkuManager struct {
 	db.SEnabledStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -119,7 +121,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 	}
 
 	if domainStr := query.ProjectDomainId; len(domainStr) > 0 {
-		domain, err := db.TenantCacheManager.FetchDomainByIdOrName(context.Background(), domainStr)
+		domain, err := db.TenantCacheManager.FetchDomainByIdOrName(ctx, domainStr)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("domains", domainStr)
@@ -131,7 +133,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 
 	q = listItemDomainFilter(q, query.Providers, query.ProjectDomainId)
 
-	q, err = managedResourceFilterByRegion(q, query.RegionalFilterListInput, "", nil)
+	q, err = managedResourceFilterByRegion(ctx, q, query.RegionalFilterListInput, "", nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "managedResourceFilterByRegion")
 	}
@@ -162,7 +164,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 	for k, zoneIds := range map[string][]string{"zone1": query.Zone1, "zone2": query.Zone2, "zone3": query.Zone3} {
 		ids := []string{}
 		for _, zoneId := range zoneIds {
-			zone, err := ZoneManager.FetchByIdOrName(userCred, zoneId)
+			zone, err := ZoneManager.FetchByIdOrName(ctx, userCred, zoneId)
 			if err != nil {
 				if errors.Cause(err) == sql.ErrNoRows {
 					return nil, httperrors.NewResourceNotFoundError2("zone", zoneId)
@@ -587,7 +589,7 @@ func (self *SCloudregion) newDBInstanceSkuFromCloudSku(ctx context.Context, user
 	sku := &SDBInstanceSku{}
 	sku.SetModelManager(DBInstanceSkuManager, sku)
 
-	skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.DBInstanceBase, self.ExternalId, externalId)
+	skuUrl := self.getMetaUrl(meta.DBInstanceBase, externalId)
 	err = meta.Get(skuUrl, sku)
 	if err != nil {
 		return errors.Wrapf(err, "Get")
@@ -651,6 +653,9 @@ func SyncRegionDBInstanceSkus(ctx context.Context, userCred mcclient.TokenCreden
 		log.Errorf("failed to fetch cloudregions: %v", err)
 		return
 	}
+	if len(cloudregions) == 0 {
+		return
+	}
 
 	meta, err := yunionmeta.FetchYunionmeta(ctx)
 	if err != nil {
@@ -682,9 +687,8 @@ func SyncRegionDBInstanceSkus(ctx context.Context, userCred mcclient.TokenCreden
 		db.Metadata.SetValue(ctx, skuMeta, db.SKU_METADAT_KEY, newMd5, userCred)
 
 		result := DBInstanceSkuManager.SyncDBInstanceSkus(ctx, userCred, &region, xor)
-		msg := result.Result()
-		notes := fmt.Sprintf("sync rds sku for region %s result: %s", region.Name, msg)
-		log.Debugf(notes)
+		notes := fmt.Sprintf("sync rds sku for region %s result: %s", region.Name, result.Result())
+		log.Debugf("%s", notes)
 	}
 
 }

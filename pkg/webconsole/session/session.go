@@ -15,8 +15,10 @@
 package session
 
 import (
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/base64"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -42,7 +44,16 @@ var (
 
 func init() {
 	Manager = NewSessionManager()
-	AES_KEY = fmt.Sprintf("webconsole-%f", rand.Float32())
+	// the key encrypts all console session tokens of this process; it must
+	// be cryptographically unpredictable (previously it was derived from
+	// rand.Float32 with only ~24 bits of entropy and could be brute forced
+	// offline to forge session tokens). Sessions live in process memory
+	// only, so a per-process random key is sufficient.
+	keyBytes := make([]byte, 32)
+	if _, err := cryptorand.Read(keyBytes); err != nil {
+		log.Fatalf("generate session key: %v", err)
+	}
+	AES_KEY = base64.URLEncoding.EncodeToString(keyBytes)
 }
 
 type SSessionManager struct {
@@ -89,10 +100,18 @@ func (man *SSessionManager) Get(accessToken string) (*SSession, bool) {
 		return nil, false
 	}
 	s := obj.(*SSession)
+	// the presented token must be exactly the one issued for this session,
+	// so sessions can not be taken over by any other token
+	if s.AccessToken != accessToken {
+		log.Errorf("access token mismatch for session %s", s.Id)
+		return nil, false
+	}
 	protocol := s.GetProtocol()
 	if protocol != SPICE && time.Since(s.AccessedAt) < AccessInterval {
-		log.Warningf("Protol: %q, Token: %s, Session: %s can't be accessed during %s, last accessed at: %s", s.GetProtocol(), accessToken, s.Id, AccessInterval, s.AccessedAt)
-		return nil, false
+		if !(protocol == WS && o.Options.KeepWebsocketSession) {
+			log.Warningf("Protol: %q, Token: %s, Session: %s can't be accessed during %s, last accessed at: %s", s.GetProtocol(), utils.TruncateString(accessToken, 16), s.Id, AccessInterval, s.AccessedAt)
+			return nil, false
+		}
 	}
 	s.AccessedAt = time.Now()
 	return s, true
@@ -102,6 +121,14 @@ type ISessionData interface {
 	command.ICommand
 	IsNeedLogin() (bool, error)
 	GetId() string
+	GetDisplayInfo(ctx context.Context) (*SDisplayInfo, error)
+}
+
+type ISessionCommand interface {
+	command.ICommand
+
+	GetInstanceName() string
+	GetIPs() []string
 }
 
 type RandomSessionData struct {
@@ -124,6 +151,28 @@ func (s *RandomSessionData) IsNeedLogin() (bool, error) {
 	return false, nil
 }
 
+func (s *RandomSessionData) GetDisplayInfo(ctx context.Context) (*SDisplayInfo, error) {
+	userInfo, err := fetchUserInfo(ctx, s.GetClientSession())
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchUserInfo")
+	}
+	dispInfo := SDisplayInfo{}
+	dispInfo.WaterMark = fetchWaterMark(userInfo)
+	dispInfo.InstanceName = s.GetSafeCommandString()
+	si, ok := s.ICommand.(ISessionCommand)
+	if ok {
+		iName := si.GetInstanceName()
+		if iName != "" {
+			dispInfo.InstanceName = iName
+		}
+		ips := si.GetIPs()
+		if len(ips) > 0 {
+			dispInfo.Ips = strings.Join(ips, ",")
+		}
+	}
+	return &dispInfo, nil
+}
+
 type SSession struct {
 	ISessionData
 	Id            string
@@ -133,10 +182,12 @@ type SSession struct {
 	recorder      recorder.Recoder
 }
 
-func (s *SSession) GetConnectParams(params url.Values) (string, error) {
+func (s *SSession) GetConnectParams(params url.Values, dispInfo *SDisplayInfo) (string, error) {
 	if params == nil {
-		params = url.Values(make(map[string][]string))
+		params = url.Values{}
 	}
+
+	params = dispInfo.populateParams(params)
 
 	apiUrl, err := url.Parse(o.Options.ApiServer)
 	if err != nil {
@@ -159,6 +210,11 @@ func (s *SSession) GetConnectParams(params url.Values) (string, error) {
 		params.Set("login_error_message", fmt.Sprintf("%v", err))
 	}
 	params.Set("is_need_login", fmt.Sprintf("%v", isNeedLogin))
+
+	if len(o.Options.RefererWhitelist) > 0 {
+		params.Set("referer_whitelist", strings.Join(o.Options.RefererWhitelist, ","))
+	}
+
 	return params.Encode(), nil
 }
 

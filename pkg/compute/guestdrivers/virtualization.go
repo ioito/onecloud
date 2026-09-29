@@ -28,7 +28,6 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/compute/models"
-	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
@@ -73,15 +72,15 @@ func (self *SVirtualizedGuestDriver) GetNamedNetworkConfiguration(guest *models.
 			Ifname: "",
 		})
 	}
-	reUse := false
-	if len(netConfig.Address) > 0 && !options.Options.EnablePreAllocateIpAddr && !utils.IsInStringArray(host.GetProviderName(), []string{api.CLOUD_PROVIDER_ONECLOUD, api.CLOUD_PROVIDER_VMWARE, api.CLOUD_PROVIDER_CLOUDPODS}) {
-		reUse = true
-	}
-	return net, nicConfs, api.IPAllocationStepdown, reUse, nil
+	// reUse := false
+	// if len(netConfig.Address) > 0 && !options.Options.EnablePreAllocateIpAddr && !utils.IsInStringArray(host.GetProviderName(), []string{api.CLOUD_PROVIDER_ONECLOUD, api.CLOUD_PROVIDER_VMWARE, api.CLOUD_PROVIDER_CLOUDPODS}) {
+	//	reUse = true
+	// }
+	return net, nicConfs, api.IPAllocationStepdown, false, nil
 }
 
-func (self *SVirtualizedGuestDriver) GetRandomNetworkTypes() []string {
-	return []string{api.NETWORK_TYPE_GUEST}
+func (self *SVirtualizedGuestDriver) GetRandomNetworkTypes() []api.TNetworkType {
+	return []api.TNetworkType{api.NETWORK_TYPE_GUEST}
 }
 
 func (self *SVirtualizedGuestDriver) wireAvaiableForGuest(guest *models.SGuest, wire *models.SWire) (bool, error) {
@@ -101,9 +100,13 @@ func (self *SVirtualizedGuestDriver) Attach2RandomNetwork(guest *models.SGuest, 
 	}
 	hostNetifs := host.GetHostNetInterfaces()
 	netsAvaiable := make([]models.SNetwork, 0)
-	netTypes := guest.GetDriver().GetRandomNetworkTypes()
+	driver, err := guest.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+	netTypes := driver.GetRandomNetworkTypes()
 	if len(netConfig.NetType) > 0 {
-		netTypes = []string{netConfig.NetType}
+		netTypes = []api.TNetworkType{api.TNetworkType(netConfig.NetType)}
 	}
 
 	var sriovWires []string
@@ -116,9 +119,9 @@ func (self *SVirtualizedGuestDriver) Attach2RandomNetwork(guest *models.SGuest, 
 			dev, _ := idev.(*models.SIsolatedDevice)
 			sriovWires = []string{dev.WireId}
 		} else {
-			wires, err := models.IsolatedDeviceManager.FindUnusedNicWiresByModel(netConfig.SriovDevice.Model)
+			wires, err := models.IsolatedDeviceManager.FindAvailableNicWiresByModel(netConfig.SriovDevice.Model)
 			if err != nil {
-				return nil, errors.Wrap(err, "FindUnusedNicWiresByModel")
+				return nil, errors.Wrap(err, "FindAvailableNicWiresByModel")
 			}
 			sriovWires = wires
 		}
@@ -148,9 +151,9 @@ func (self *SVirtualizedGuestDriver) Attach2RandomNetwork(guest *models.SGuest, 
 
 		var net *models.SNetwork
 		if netConfig.Private {
-			net, _ = wire.GetCandidatePrivateNetwork(userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
+			net, _ = wire.GetCandidatePrivateNetwork(ctx, userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
 		} else {
-			net, _ = wire.GetCandidateAutoAllocNetwork(userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
+			net, _ = wire.GetCandidateAutoAllocNetwork(ctx, userCred, userCred, models.NetworkManager.AllowScope(userCred), netConfig.Exit, netTypes)
 		}
 		if net != nil {
 			netsAvaiable = append(netsAvaiable, *net)
@@ -159,11 +162,12 @@ func (self *SVirtualizedGuestDriver) Attach2RandomNetwork(guest *models.SGuest, 
 	if len(netsAvaiable) == 0 {
 		return nil, fmt.Errorf("No appropriate host virtual network...")
 	}
-	if len(netConfig.Address) > 0 {
+	if len(netConfig.Address) > 0 || len(netConfig.Address6) > 0 {
 		addr, _ := netutils.NewIPV4Addr(netConfig.Address)
+		addr6, _ := netutils.NewIPV6Addr(netConfig.Address6)
 		netsAvaiableForAddr := make([]models.SNetwork, 0)
 		for i := range netsAvaiable {
-			if netsAvaiable[i].IsAddressInRange(addr) {
+			if (len(netConfig.Address) == 0 || netsAvaiable[i].IsAddressInRange(addr)) && (len(netConfig.Address6) == 0 || netsAvaiable[i].IsAddress6InRange(addr6)) {
 				netsAvaiableForAddr = append(netsAvaiableForAddr, netsAvaiable[i])
 			}
 		}
@@ -197,13 +201,26 @@ func (self *SVirtualizedGuestDriver) Attach2RandomNetwork(guest *models.SGuest, 
 		Network:             selNet,
 		PendingUsage:        pendingUsage,
 		IpAddr:              netConfig.Address,
+		Ip6Addr:             netConfig.Address6,
 		NicDriver:           netConfig.Driver,
 		BwLimit:             netConfig.BwLimit,
+		RxBwLimit:           netConfig.RxBwLimit,
+		TxBwLimit:           netConfig.TxBwLimit,
 		Virtual:             netConfig.Vip,
 		TryReserved:         netConfig.Reserved,
 		AllocDir:            api.IPAllocationDefault,
 		RequireDesignatedIP: netConfig.RequireDesignatedIP,
+		RequireIPv6:         netConfig.RequireIPv6,
+		StrictIPv6:          netConfig.StrictIPv6,
 		NicConfs:            nicConfs,
+
+		IsDefault: netConfig.IsDefault,
+
+		// 端口映射（port_mapping）仅 kvm / pod 支持，透传避免自动网络调度时丢失
+		PortMappings: netConfig.PortMappings,
+
+		BillingType: netConfig.BillingType,
+		ChargeType:  netConfig.ChargeType,
 	})
 	return gn, err
 }
@@ -281,7 +298,8 @@ func (self *SVirtualizedGuestDriver) RequestStopGuestForDelete(ctx context.Conte
 		host, _ = guest.GetHost()
 	}
 	if host != nil && host.GetEnabled() && host.HostStatus == api.HOST_ONLINE {
-		return guest.StartGuestStopTask(ctx, task.GetUserCred(), true, false, task.GetTaskId())
+		stopTimeout := 0
+		return guest.StartGuestStopTask(ctx, task.GetUserCred(), &stopTimeout, true, false, task.GetTaskId())
 	}
 	if host != nil && !jsonutils.QueryBoolean(task.GetParams(), "purge", false) {
 		return fmt.Errorf("fail to contact host")
@@ -301,7 +319,7 @@ func (self *SVirtualizedGuestDriver) ValidateCreateDataOnHost(ctx context.Contex
 
 		cnt, err := host.GetGuestCount()
 		if err != nil {
-			return nil, httperrors.NewInternalServerError("GetGuestCount fail %s", err)
+			return nil, httperrors.NewInternalServerError("GetGuestCount failed %s", err)
 		}
 		if cnt >= 1 {
 			return nil, httperrors.NewInsufficientResourceError("host has been occupied")
@@ -310,8 +328,8 @@ func (self *SVirtualizedGuestDriver) ValidateCreateDataOnHost(ctx context.Contex
 	return input, nil
 }
 
-func (self *SVirtualizedGuestDriver) PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, data *jsonutils.JSONDict) error {
-	return guest.StartGueststartTask(ctx, userCred, data, "")
+func (self *SVirtualizedGuestDriver) PerformStart(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, data *jsonutils.JSONDict, parentTaskId string) error {
+	return guest.StartGueststartTask(ctx, userCred, data, parentTaskId)
 }
 
 func (self *SVirtualizedGuestDriver) CheckDiskTemplateOnStorage(ctx context.Context, userCred mcclient.TokenCredential, imageId string, format string, storageId string, task taskman.ITask) error {
@@ -373,7 +391,7 @@ func (self *SVirtualizedGuestDriver) StartResumeTask(ctx context.Context, userCr
 }
 
 func (self *SVirtualizedGuestDriver) StartGuestSaveImage(ctx context.Context, userCred mcclient.TokenCredential, guest *models.SGuest, params *jsonutils.JSONDict, parentTaskId string) error {
-	guest.SetStatus(userCred, api.VM_START_SAVE_DISK, "")
+	guest.SetStatus(ctx, userCred, api.VM_START_SAVE_DISK, "")
 	if task, err := taskman.TaskManager.NewTask(ctx, "GuestSaveImageTask", guest, userCred, params, parentTaskId, "", nil); err != nil {
 		return err
 	} else {
@@ -384,7 +402,7 @@ func (self *SVirtualizedGuestDriver) StartGuestSaveImage(ctx context.Context, us
 
 func (self *SVirtualizedGuestDriver) StartGuestSaveGuestImage(ctx context.Context, userCred mcclient.TokenCredential,
 	guest *models.SGuest, params *jsonutils.JSONDict, parentTaskId string) error {
-	guest.SetStatus(userCred, api.VM_START_SAVE_DISK, "")
+	guest.SetStatus(ctx, userCred, api.VM_START_SAVE_DISK, "")
 	if task, err := taskman.TaskManager.NewTask(ctx, "GuestSaveGuestImageTask", guest, userCred, params, parentTaskId,
 		"", nil); err != nil {
 		return err

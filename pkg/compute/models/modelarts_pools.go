@@ -152,6 +152,15 @@ func (man *SModelartsPoolManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fi
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SModelartsPoolManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (man *SModelartsPoolManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input api.ModelartsPoolCreateInput) (api.ModelartsPoolCreateInput, error) {
 	var err error
 	if input.NodeCount <= 0 {
@@ -164,13 +173,13 @@ func (man *SModelartsPoolManager) ValidateCreateData(ctx context.Context, userCr
 	if err != nil {
 		return input, httperrors.NewInputParameterError("invalid cidr: %s", input.Cidr)
 	}
-	_, err = validators.ValidateModel(userCred, CloudproviderManager, &input.CloudproviderId)
+	_, err = validators.ValidateModel(ctx, userCred, CloudproviderManager, &input.CloudproviderId)
 	if err != nil {
 		return input, err
 	}
 	input.ManagerId = input.CloudproviderId
 
-	_, err = validators.ValidateModel(userCred, CloudregionManager, &input.CloudregionId)
+	_, err = validators.ValidateModel(ctx, userCred, CloudregionManager, &input.CloudregionId)
 	if err != nil {
 		return input, err
 	}
@@ -304,7 +313,7 @@ func (self *SModelartsPool) ValidateDeleteCondition(ctx context.Context, info js
 		return httperrors.NewInvalidStatusError("ModelartsPool is locked, cannot delete")
 	}
 	if utils.IsInStringArray(self.Status, []string{api.MODELARTS_POOL_STATUS_CREATING, api.MODELARTS_POOL_STATUS_DELETING}) {
-		return httperrors.NewInvalidStatusError("ModelartsPool status cannot support delete")
+		return httperrors.NewInvalidStatusError("ModelartsPool cannot be deleted in current status")
 	}
 	return self.SStatusStandaloneResourceBase.ValidateDeleteCondition(ctx, nil)
 }
@@ -328,10 +337,10 @@ func (self *SModelartsPool) StartCreateTask(ctx context.Context, userCred mcclie
 		return task.ScheduleRun(nil)
 	}()
 	if err != nil {
-		self.SetStatus(userCred, api.MODELARTS_POOL_STATUS_ERROR, err.Error())
+		self.SetStatus(ctx, userCred, api.MODELARTS_POOL_STATUS_ERROR, err.Error())
 		return err
 	}
-	self.SetStatus(userCred, api.MODELARTS_POOL_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.MODELARTS_POOL_STATUS_CREATING, "")
 	return nil
 }
 
@@ -347,7 +356,7 @@ func (modelarts *SModelartsPool) PerformSyncstatus(
 		return nil, err
 	}
 	if count > 0 {
-		return nil, httperrors.NewBadRequestError("ModelartsPool has %d task active, can't sync status", count)
+		return nil, httperrors.NewBadRequestError("ModelartsPool has %d active tasks and cannot sync status", count)
 	}
 
 	return nil, StartResourceSyncStatusTask(ctx, userCred, modelarts, "ModelartsPoolSyncstatusTask", "")
@@ -379,7 +388,7 @@ func (self *SModelartsPool) StartDeleteTask(ctx context.Context, userCred mcclie
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.MODELARTS_POOL_STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, api.MODELARTS_POOL_STATUS_DELETING, "")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -397,7 +406,7 @@ func (self *SModelartsPool) StartChangeConfigTask(ctx context.Context, userCred 
 	if err != nil {
 		return err
 	}
-	self.SetStatus(userCred, api.MODELARTS_POOL_STATUS_CHANGE_CONFIG, "")
+	self.SetStatus(ctx, userCred, api.MODELARTS_POOL_STATUS_CHANGE_CONFIG, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -446,7 +455,7 @@ func (self *SModelartsPool) SyncWithCloudModelartsPool(ctx context.Context, user
 		}
 
 		self.Status = ext.GetStatus()
-		self.BillingType = ext.GetBillingType()
+		self.BillingType = billing_api.TBillingType(ext.GetBillingType())
 		self.InstanceType = instanceName
 		self.WorkType = ext.GetWorkType()
 		self.CpuArch = sku.CpuArch
@@ -457,12 +466,12 @@ func (self *SModelartsPool) SyncWithCloudModelartsPool(ctx context.Context, user
 		return errors.Wrapf(err, "db.Update")
 	}
 
-	err = syncVirtualResourceMetadata(ctx, userCred, self, ext)
-	if err != nil {
-		return errors.Wrapf(err, "syncVirtualResourceMetadata")
+	if account := self.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, self, ext, account.ReadOnly)
 	}
+
 	if provider := self.GetCloudprovider(); provider != nil {
-		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider.Id)
+		SyncCloudProject(ctx, userCred, self, provider.GetOwnerId(), ext, provider)
 	}
 	db.OpsLog.LogSyncUpdate(self, diff, userCred)
 	return nil
@@ -490,11 +499,11 @@ func (self *SCloudregion) newFromCloudModelartsPool(ctx context.Context, userCre
 	}
 	pool.CpuArch = sku.CpuArch
 
-	pool.BillingType = ext.GetBillingType()
+	pool.BillingType = billing_api.TBillingType(ext.GetBillingType())
+	pool.ExpiredAt = time.Time{}
+	pool.AutoRenew = false
 	if pool.BillingType == billing_api.BILLING_TYPE_PREPAID {
-		if expired := ext.GetExpiredAt(); !expired.IsZero() {
-			pool.ExpiredAt = expired
-		}
+		pool.ExpiredAt = ext.GetExpiredAt()
 		pool.AutoRenew = ext.IsAutoRenew()
 	}
 
@@ -514,9 +523,9 @@ func (self *SCloudregion) newFromCloudModelartsPool(ctx context.Context, userCre
 	}
 
 	// 同步标签
-	syncVirtualResourceMetadata(ctx, userCred, &pool, ext)
+	syncVirtualResourceMetadata(ctx, userCred, &pool, ext, false)
 	// 同步项目归属
-	SyncCloudProject(ctx, userCred, &pool, provider.GetOwnerId(), ext, provider.Id)
+	SyncCloudProject(ctx, userCred, &pool, provider.GetOwnerId(), ext, provider)
 
 	db.OpsLog.LogEvent(&pool, db.ACT_CREATE, pool.GetShortDesc(ctx), userCred)
 

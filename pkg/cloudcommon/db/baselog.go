@@ -26,6 +26,7 @@ import (
 	"yunion.io/x/sqlchemy"
 	"yunion.io/x/sqlchemy/backends/clickhouse"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -133,6 +134,10 @@ func (lb *SLogBase) GetRecordTime() time.Time {
 	return time.Time{}
 }
 
+func (manager *SLogBaseManager) RawFetchById(idStr string) (IModel, error) {
+	return FetchById(manager.GetIModelManager(), idStr)
+}
+
 func (manager *SLogBaseManager) FetchById(idStr string) (IModel, error) {
 	return FetchById(manager.GetIModelManager(), idStr)
 }
@@ -144,4 +149,19 @@ func (l *SLogBase) ValidateUpdateData(
 	data jsonutils.JSONObject,
 ) (jsonutils.JSONObject, error) {
 	return nil, errors.Wrap(httperrors.ErrForbidden, "not allow")
+}
+
+// 操作日志列表
+func (manager *SLogBaseManager) ListItemFilter(
+	ctx context.Context,
+	q *sqlchemy.SQuery,
+	userCred mcclient.TokenCredential,
+	input apis.LogBaseListInput,
+) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SModelBaseManager.ListItemFilter(ctx, q, userCred, input.ModelBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SModelBaseManager.ListItemFilter")
+	}
+	return q, nil
 }

@@ -23,8 +23,8 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/billing"
-	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/utils"
+	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -44,14 +44,6 @@ type SQcloudRegionDriver struct {
 func init() {
 	driver := SQcloudRegionDriver{}
 	models.RegisterRegionDriver(&driver)
-}
-
-func (self *SQcloudRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return true
-}
-
-func (self *SQcloudRegionDriver) GenerateSecurityGroupName(name string) string {
-	return name
 }
 
 func (self *SQcloudRegionDriver) GetProvider() string {
@@ -93,12 +85,7 @@ func (self *SQcloudRegionDriver) RequestCreateLoadbalancerListener(ctx context.C
 				if err != nil {
 					return nil, errors.Wrapf(err, "GetCertificate")
 				}
-
-				lbcert, err := models.CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate(ctx, userCred, provider, lblis, cert)
-				if err != nil {
-					return nil, errors.Wrap(err, "CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate")
-				}
-				opts.CertificateId = lbcert.ExternalId
+				opts.CertificateId = cert.ExternalId
 			}
 		}
 
@@ -138,7 +125,12 @@ func (self *SQcloudRegionDriver) RequestCreateLoadbalancerListener(ctx context.C
 			return nil, errors.Wrapf(err, "GetICloudLoadbalancerBackendGroup")
 		}
 		for i := range backends {
-			_, err := iLbbg.AddBackendServer(backends[i].ExternalId, backends[i].Port, backends[i].Weight)
+			opts := &cloudprovider.SLoadbalancerBackend{
+				Weight:     backends[i].Weight,
+				Port:       backends[i].Port,
+				ExternalId: backends[i].ExternalId,
+			}
+			_, err := iLbbg.AddBackendServer(opts)
 			if err != nil {
 				return nil, errors.Wrapf(err, "AddBackendServer")
 			}
@@ -235,7 +227,7 @@ func (self *SQcloudRegionDriver) RequestCreateLoadbalancerListenerRule(ctx conte
 
 func (self *SQcloudRegionDriver) ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error) {
 	cidrV := validators.NewIPv4PrefixValidator("cidr_block")
-	if err := cidrV.Validate(jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
+	if err := cidrV.Validate(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
 		return input, err
 	}
 
@@ -261,7 +253,7 @@ func (self *SQcloudRegionDriver) ValidateUpdateLoadbalancerBackendData(ctx conte
 
 func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerListenerRuleData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input *api.LoadbalancerListenerRuleCreateInput) (*api.LoadbalancerListenerRuleCreateInput, error) {
 	if len(input.Path) == 0 {
-		return nil, httperrors.NewInputParameterError("path can not be emtpy")
+		return nil, httperrors.NewInputParameterError("path cannot be empty")
 	}
 	return input, nil
 }
@@ -278,34 +270,6 @@ func (self *SQcloudRegionDriver) ValidateCreateLoadbalancerBackendData(ctx conte
 func (self *SQcloudRegionDriver) RequestSyncLoadbalancerBackend(ctx context.Context, userCred mcclient.TokenCredential, lbb *models.SLoadbalancerBackend, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		return nil, cloudprovider.ErrNotImplemented
-	})
-	return nil
-}
-
-func (self *SQcloudRegionDriver) RequestPreSnapshotPolicyApply(ctx context.Context, userCred mcclient.
-	TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy, data jsonutils.JSONObject) error {
-
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-
-		if sp == nil {
-			return data, nil
-		}
-		storage, _ := disk.GetStorage()
-		region, _ := storage.GetRegion()
-		spcache, err := models.SnapshotPolicyCacheManager.FetchSnapshotPolicyCache(sp.GetId(),
-			region.GetId(), storage.ManagerId)
-		if err != nil {
-			return nil, err
-		}
-		iRegion, err := spcache.GetIRegion(ctx)
-		if err != nil {
-			return nil, err
-		}
-		err = iRegion.CancelSnapshotPolicyToDisks(spcache.GetExternalId(), disk.GetExternalId())
-		if err != nil {
-			return nil, err
-		}
-		return data, nil
 	})
 	return nil
 }
@@ -363,7 +327,7 @@ func (self *SQcloudRegionDriver) ValidateCreateDBInstanceBackupData(ctx context.
 	switch instance.Engine {
 	case api.DBINSTANCE_TYPE_MYSQL:
 		if instance.Category == api.QCLOUD_DBINSTANCE_CATEGORY_BASIC {
-			return input, httperrors.NewNotSupportedError("Qcloud Basic MySQL instance not support create backup")
+			return input, httperrors.NewNotSupportedError("creating backups for Qcloud Basic MySQL instances is not supported")
 		}
 	}
 	return input, nil
@@ -374,7 +338,7 @@ func (self *SQcloudRegionDriver) ValidateCreateDBInstanceAccountData(ctx context
 }
 
 func (self *SQcloudRegionDriver) ValidateCreateDBInstanceDatabaseData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, instance *models.SDBInstance, input api.DBInstanceDatabaseCreateInput) (api.DBInstanceDatabaseCreateInput, error) {
-	return input, httperrors.NewNotSupportedError("Not support create Qcloud databases")
+	return input, httperrors.NewNotSupportedError("Creating Qcloud databases is not supported")
 }
 
 func (self *SQcloudRegionDriver) ValidateDBInstanceAccountPrivilege(ctx context.Context, userCred mcclient.TokenCredential, instance *models.SDBInstance, account string, privilege string) error {
@@ -407,13 +371,6 @@ func (self *SQcloudRegionDriver) IsSupportedElasticcache() bool {
 	return true
 }
 
-func (self *SQcloudRegionDriver) GetSecurityGroupPublicScope(service string) rbacscope.TRbacScope {
-	if service == "redis" {
-		return rbacscope.ScopeProject
-	}
-	return rbacscope.ScopeSystem
-}
-
 func (self *SQcloudRegionDriver) ValidateCreateElasticcacheAccountData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	elasticCacheV := validators.NewModelIdOrNameValidator("elasticcache", "elasticcache", ownerId)
 	accountTypeV := validators.NewStringChoicesValidator("account_type", choices.NewChoices("normal")).Default("normal")
@@ -426,14 +383,14 @@ func (self *SQcloudRegionDriver) ValidateCreateElasticcacheAccountData(ctx conte
 	}
 
 	for _, v := range keyV {
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return nil, err
 		}
 	}
 
 	ec := elasticCacheV.Model.(*models.SElasticcache)
 	if ec.Engine == "redis" && ec.EngineVersion == "2.8" {
-		return nil, httperrors.NewNotSupportedError("redis version 2.8 not support create account")
+		return nil, httperrors.NewNotSupportedError("creating accounts for Redis 2.8 is not supported")
 	}
 
 	passwd, _ := data.GetString("password")
@@ -543,6 +500,9 @@ func (self *SQcloudRegionDriver) RequestElasticcacheAccountResetPassword(ctx con
 		}
 
 		err = iec.UpdateAuthMode(noAuth, pwd)
+		if err != nil {
+			return errors.Wrap(err, "qcloudRegionDriver.RequestElasticcacheAccountResetPassword.UpdateAuthMode")
+		}
 	} else {
 		err = iea.UpdateAccount(input)
 		if err != nil {
@@ -611,4 +571,60 @@ func (self *SQcloudRegionDriver) ValidateCreateCdnData(ctx context.Context, user
 		}
 	}
 	return input, nil
+}
+
+func (self *SQcloudRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	for i := range input.Rules {
+		rule := &input.Rules[i]
+		if rule.Priority == nil {
+			return nil, httperrors.NewMissingParameterError("priority")
+		}
+
+		if *rule.Priority < 0 || *rule.Priority > 99 {
+			return nil, httperrors.NewInputParameterError("invalid priority %d, range 0-99", *rule.Priority)
+		}
+
+		if len(rule.TargetType) == 0 {
+			rule.TargetType = api.SecurityGroupRuleTargetTypeCidr
+		}
+		switch rule.TargetType {
+		case api.SecurityGroupRuleTargetTypeCidr:
+		case api.SecurityGroupRuleTargetTypeIpSet:
+			ipSet, err := validateSecgroupIpSet(ctx, userCred, rule.CIDR, input.CloudproviderId, input.CloudregionId, true)
+			if err != nil {
+				return nil, err
+			}
+			rule.CIDR = ipSet.Id
+		default:
+			return nil, httperrors.NewInputParameterError("unsupported target type %s", rule.TargetType)
+		}
+	}
+	return input, nil
+}
+
+func (self *SQcloudRegionDriver) ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	rule := input
+	if rule.Priority == nil {
+		return nil, httperrors.NewMissingParameterError("priority")
+	}
+
+	if *rule.Priority < 0 || *rule.Priority > 99 {
+		return nil, httperrors.NewInputParameterError("invalid priority %d, range 0-99", *rule.Priority)
+	}
+
+	return validateManagedSecgroupRuleCreateWithIpSet(ctx, userCred, input, self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupRuleInput)
+}
+
+func (self *SQcloudRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	if input.Priority != nil && (*input.Priority < 0 || *input.Priority > 99) {
+		return nil, httperrors.NewInputParameterError("invalid priority %d, range 0-99", *input.Priority)
+	}
+
+	return validateManagedSecgroupRuleUpdateWithIpSet(ctx, userCred, input, "", "", self.SManagedVirtualizationRegionDriver.ValidateUpdateSecurityGroupRuleInput)
+}
+
+func (self *SQcloudRegionDriver) GetSecurityGroupFilter(vpc *models.SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error) {
+	return func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Equals("cloudregion_id", vpc.CloudregionId).Equals("manager_id", vpc.ManagerId)
+	}, nil
 }

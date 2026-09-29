@@ -37,7 +37,10 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	modules "yunion.io/x/onecloud/pkg/mcclient/modules/identity"
 	"yunion.io/x/onecloud/pkg/notify/options"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
@@ -93,7 +96,7 @@ func (nm *SNotificationManager) ValidateCreateData(ctx context.Context, userCred
 	// check robot
 	robots := []string{}
 	for i := range input.Robots {
-		_robot, err := validators.ValidateModel(userCred, RobotManager, &input.Robots[i])
+		_robot, err := validators.ValidateModel(ctx, userCred, RobotManager, &input.Robots[i])
 		if err != nil && !input.IgnoreNonexistentReceiver {
 			return input, err
 		}
@@ -185,10 +188,10 @@ func (n *SNotification) CustomizeCreate(ctx context.Context, userCred mcclient.T
 
 func (n *SNotification) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	n.SStatusStandaloneResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
-	n.SetStatus(userCred, api.NOTIFICATION_STATUS_RECEIVED, "")
+	n.SetStatus(ctx, userCred, api.NOTIFICATION_STATUS_RECEIVED, "")
 	task, err := taskman.TaskManager.NewTask(ctx, "NotificationSendTask", n, userCred, nil, "", "")
 	if err != nil {
-		n.SetStatus(userCred, api.NOTIFICATION_STATUS_FAILED, "NewTask")
+		n.SetStatus(ctx, userCred, api.NOTIFICATION_STATUS_FAILED, "NewTask")
 		return
 	}
 	task.ScheduleRun(nil)
@@ -209,10 +212,7 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 
 	topic, err := TopicManager.TopicByEvent(input.Event)
 	if err != nil {
-		return output, errors.Wrapf(err, "unable fetch subscriptions by event %q", input.Event)
-	}
-	if topic == nil {
-		return output, nil
+		return output, errors.Wrapf(err, "TopicByEvent")
 	}
 	receiverIds := make(map[string]uint32)
 	receiverIds1, err := SubscriberManager.getReceiversSent(ctx, topic.Id, input.ProjectDomainId, input.ProjectId)
@@ -233,6 +233,9 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 		for robot, groupTime := range _robots {
 			robots[robot] = groupTime
 		}
+	}
+	for _, id := range input.RobotIds {
+		robots[id] = 0
 	}
 
 	var webhookRobots []string
@@ -259,21 +262,21 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 
 	message := jsonutils.Marshal(input.ResourceDetails).String()
 
-	// append default receiver
-	if len(input.Event) == 0 {
-		for _, receiver := range input.ReceiverIds {
-			// receiverIds = append(receiverIds, api.SReceiverWithGroupTimes{ReceiverId: receiver})
-			if _, ok := receiverIds[receiver]; !ok {
-				receiverIds[receiver] = 0
-			}
+	for _, receiver := range input.ReceiverIds {
+		// receiverIds = append(receiverIds, api.SReceiverWithGroupTimes{ReceiverId: receiver})
+		if _, ok := receiverIds[receiver]; !ok {
+			receiverIds[receiver] = 0
 		}
 	}
 
 	receiverIdList := []string{}
-	for k, _ := range receiverIds {
+	for k := range receiverIds {
 		receiverIdList = append(receiverIdList, k)
 	}
 	receivers, err := ReceiverManager.FetchByIdOrNames(ctx, receiverIdList...)
+	if err != nil {
+		return output, errors.Wrap(err, "fetch receiver")
+	}
 	webconsoleContacts := sets.NewString()
 	idSet := sets.NewString()
 	for i := range receivers {
@@ -305,11 +308,13 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 	}
 	// normal contact type
 	for _, ct := range contactTypes {
-		if ct == api.MOBILE {
+		if ct == api.MOBILE && !topic.CanSendSms() {
+			log.Infof("skip mobile notify for topic %q: enable_sms=%s sms_template=%q", topic.Name, topic.EnableSms, topic.SmsTemplate)
 			continue
 		}
 		err := nm.create(ctx, userCred, ct, realReceiverIds, nil, input.Priority, event.GetId(), topic.GetId(), topic.Type)
 		if err != nil {
+			log.Errorf("unable to create notification for %s: %v", ct, err)
 			output.FailedList = append(output.FailedList, api.FailedElem{
 				ContactType: ct,
 				Reason:      err.Error(),
@@ -318,6 +323,7 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 	}
 	err = nm.createWithWebhookRobots(ctx, userCred, webhookRobots, input.Priority, event.GetId(), topic.Type)
 	if err != nil {
+		log.Errorf("unable to create notification for webhook robots: %v", err)
 		output.FailedList = append(output.FailedList, api.FailedElem{
 			ContactType: api.WEBHOOK,
 			Reason:      err.Error(),
@@ -326,10 +332,117 @@ func (nm *SNotificationManager) PerformEventNotify(ctx context.Context, userCred
 	// robot
 	err = nm.createWithRobots(ctx, userCred, realRobot, input.Priority, event.GetId(), topic.Type)
 	if err != nil {
+		log.Errorf("unable to create notification for robots: %v", err)
 		output.FailedList = append(output.FailedList, api.FailedElem{
 			ContactType: api.ROBOT,
 			Reason:      err.Error(),
 		})
+	}
+	return output, nil
+}
+
+func (nm *SNotificationManager) PerformContactNotify(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.NotificationManagerContactNotifyInput) (api.NotificationManagerEventNotifyOutput, error) {
+	var output api.NotificationManagerEventNotifyOutput
+
+	params := api.SendParams{
+		Title:   input.Subject,
+		Message: input.Body,
+		EmailMsg: api.SEmailMessage{
+			Body: input.Body,
+		},
+		DomainId: userCred.GetDomainId(),
+	}
+	// 机器人订阅
+	if len(input.RobotIds) > 0 {
+		robots := []SRobot{}
+		q := RobotManager.Query().In("id", input.RobotIds)
+		err := db.FetchModelObjects(RobotManager, q, &robots)
+		if err != nil {
+			output.FailedList = append(output.FailedList, api.FailedElem{ContactType: "robot", Reason: errors.Wrapf(err, "unable to fetch robots:%s", jsonutils.Marshal(input.RobotIds).String()).Error()})
+			return output, errors.Wrapf(err, "unable to fetch robots:%s", jsonutils.Marshal(input.RobotIds).String())
+		}
+		for _, robot := range robots {
+			go func(ctx context.Context, userCred mcclient.TokenCredential, robot SRobot, params api.SendParams) {
+				params.Header = robot.Header
+				params.Body = robot.Body
+				params.MsgKey = robot.MsgKey
+				params.SecretKey = robot.SecretKey
+				params.Receivers = api.SNotifyReceiver{
+					Contact: robot.Address,
+				}
+				driver := GetDriver(fmt.Sprintf("%s-robot", robot.Type))
+				err = driver.Send(ctx, params)
+				if err != nil {
+					logclient.AddSimpleActionLog(&robot, "contact send", err, userCred, false)
+				}
+			}(ctx, userCred, robot, params)
+		}
+	}
+	// 传入接受人id声明map保证唯一
+	receivermap := map[string]struct{}{}
+	for _, receiverId := range input.ReceiverIds {
+		receivermap[receiverId] = struct{}{}
+	}
+	// 存在角色接受人
+	if len(input.RoleIds) > 0 {
+		s := auth.GetAdminSession(ctx, options.Options.Region)
+		query := jsonutils.NewDict()
+		query.Set("roles", jsonutils.NewStringArray(input.RoleIds))
+		query.Set("effective", jsonutils.JSONTrue)
+		listRet, err := modules.RoleAssignments.List(s, query)
+		if err != nil {
+			return output, errors.Wrap(err, "unable to list RoleAssignments")
+		}
+		userList := []struct {
+			User struct {
+				Id string `json:"id"`
+			} `json:"user"`
+		}{}
+		jsonutils.Update(&userList, listRet.Data)
+		for _, user := range userList {
+			receivermap[user.User.Id] = struct{}{}
+		}
+	}
+	// 声明接受人数组
+	receiverIds := []string{}
+	// 输入接受人与角色去重
+	for receiverId := range receivermap {
+		receiverIds = append(receiverIds, receiverId)
+	}
+	// 接受人ID存在的情况下
+	if len(receiverIds) > 0 {
+		receivers, err := ReceiverManager.FetchByIDs(ctx, receiverIds...)
+		if err != nil {
+			return output, errors.Wrap(err, "FetchByIDs")
+		}
+		// 对于每个接受人根据通知渠道逐一发送
+		for _, receiver := range receivers {
+			// 用户没有启用的情况
+			if receiver.Enabled.IsNone() {
+				continue
+			}
+			// 获取启用的通知渠道
+			enabledContactTypes, err := receiver.GetEnabledContactTypes()
+			if err != nil {
+				continue
+			}
+			for _, contactType := range input.ContactTypes {
+				// 通知渠道没有启用
+				if !utils.IsInStringArray(contactType, enabledContactTypes) {
+					continue
+				}
+				// 发送
+				go func(ctx context.Context, userCred mcclient.TokenCredential, contactType string, receiver SReceiver, params api.SendParams) {
+					contact, _ := receiver.GetContact(contactType)
+					params.Receivers = api.SNotifyReceiver{Contact: contact}
+					driver := GetDriver(contactType)
+					err = driver.Send(ctx, params)
+					if err != nil {
+						logclient.AddSimpleActionLog(&receiver, "contact send", err, userCred, false)
+					}
+				}(ctx, userCred, contactType, receiver, params)
+			}
+		}
 	}
 	return output, nil
 }
@@ -376,11 +489,9 @@ func (nm *SNotificationManager) create(ctx context.Context, userCred mcclient.To
 	n.SetModelManager(nm, n)
 	task, err := taskman.TaskManager.NewTask(ctx, "NotificationSendTask", n, userCred, nil, "", "")
 	if err != nil {
-		log.Errorf("NotificationSendTask newTask error %v", err)
-	} else {
-		task.ScheduleRun(nil)
+		return errors.Wrapf(err, "NewTask")
 	}
-	return nil
+	return task.ScheduleRun(nil)
 }
 
 func (nm *SNotificationManager) createWithWebhookRobots(ctx context.Context, userCred mcclient.TokenCredential, webhookRobotIds []string, priority, eventId string, topicType string) error {
@@ -518,7 +629,7 @@ func (n *SNotification) ReceiverNotificationsNotOK() ([]SReceiverNotification, e
 
 func (n *SNotification) receiveDetails(userCred mcclient.TokenCredential, scope string) ([]api.ReceiveDetail, error) {
 	RQ := ReceiverManager.Query("id", "name")
-	q := ReceiverNotificationManager.Query("receiver_id", "notification_id", "receiver_type", "contact", "send_at", "send_by", "status", "failed_reason").Equals("notification_id", n.Id)
+	q := ReceiverNotificationManager.Query("receiver_id", "notification_id", "receiver_type", "contact", "send_at", "send_by", "status", "failed_reason").Equals("notification_id", n.Id).IsNotEmpty("receiver_id").IsNullOrEmpty("contact")
 	s := rbacscope.TRbacScope(scope)
 
 	switch s {
@@ -602,7 +713,7 @@ func (nm *SNotificationManager) FetchOwnerId(ctx context.Context, data jsonutils
 	return db.FetchUserInfo(ctx, data)
 }
 
-func (nm *SNotificationManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (nm *SNotificationManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner == nil {
 		return q
 	}
@@ -711,9 +822,65 @@ func (n *SNotification) TaskInsert() error {
 	return NotificationManager.TableSpec().Insert(context.Background(), n)
 }
 
+func mobileEventTemplateParam(no api.SsNotification) string {
+	dict := jsonutils.NewDict()
+	setVar := func(key, val string) {
+		val = strings.TrimSpace(val)
+		if val == "" {
+			return
+		}
+		rs := []rune(val)
+		if len(rs) > 32 {
+			val = string(rs[:32])
+		}
+		dict.Set(key, jsonutils.NewString(val))
+	}
+	if no.AdvanceDays > 0 {
+		setVar("advance_days", fmt.Sprintf("%d", no.AdvanceDays))
+	}
+	setVar("resource_type", no.Event.ResourceType())
+	msg, err := jsonutils.ParseString(no.Message)
+	if err == nil {
+		for _, key := range []string{"name", "project", "brand", "status", "billing_type"} {
+			val, _ := msg.GetString(key)
+			setVar(key, val)
+		}
+		if no.AdvanceDays == 0 {
+			if days, _ := msg.Int("advance_days"); days > 0 {
+				setVar("advance_days", fmt.Sprintf("%d", days))
+			}
+		}
+	}
+	return dict.String()
+}
+
+func (n *SNotification) getMobileTemplate(ctx context.Context, topicId, lang string, no api.SsNotification) (api.SendParams, error) {
+	params := api.SendParams{}
+	if len(n.EventId) > 0 {
+		if len(topicId) == 0 {
+			return params, errors.Errorf("no topic for mobile event %s", no.Event.String())
+		}
+		obj, err := TopicManager.FetchById(topicId)
+		if err != nil {
+			return params, errors.Wrapf(err, "get topic by id")
+		}
+		topic := obj.(*STopic)
+		if !topic.CanSendSms() {
+			return params, errors.Errorf("topic %s disable sms or empty sms template", topic.GetName())
+		}
+		params.RemoteTemplate = strings.TrimSpace(topic.SmsTemplate)
+		params.Message = mobileEventTemplateParam(no)
+		return params, nil
+	}
+	return TemplateManager.FillWithTemplate(ctx, lang, no)
+}
+
 // 获取消息文案
 func (n *SNotification) GetTemplate(ctx context.Context, topicId, lang string, no api.SsNotification) (api.SendParams, error) {
-	if len(n.EventId) == 0 || n.ContactType == api.MOBILE {
+	if n.ContactType == api.MOBILE {
+		return n.getMobileTemplate(ctx, topicId, lang, no)
+	}
+	if len(n.EventId) == 0 {
 		return TemplateManager.FillWithTemplate(ctx, lang, no)
 	}
 
@@ -734,8 +901,10 @@ func (n *SNotification) GetTemplate(ctx context.Context, topicId, lang string, n
 		return out, errors.Wrapf(err, "unable to parse json from %q", no.Message)
 	}
 	msg := msgObj.(*jsonutils.JSONDict)
-	if info, _ := TemplateManager.GetCompanyInfo(ctx); len(info.Name) > 0 {
-		msg.Set("brand", jsonutils.NewString(info.Name))
+	if !msg.Contains("brand") {
+		if info, _ := TemplateManager.GetCompanyInfo(ctx); len(info.Name) > 0 {
+			msg.Set("brand", jsonutils.NewString(info.Name))
+		}
 	}
 	webhookMsg := jsonutils.NewDict()
 	webhookMsg.Set("resource_type", jsonutils.NewString(rtStr))
@@ -788,35 +957,35 @@ func (n *SNotification) GetTemplate(ctx context.Context, topicId, lang string, n
 		stemplateTitle, err = template.New("template").Parse(topic.TitleCn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_CN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse title_cn template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse title cn %s", topic.TitleCn))
 		}
 		stemplateContent, err = template.New("template").Parse(topic.ContentCn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_CN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse content_cn template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse content cn %s", topic.ContentCn))
 		}
 	case api.TEMPLATE_LANG_EN:
 		stemplateTitle, err = template.New("template").Parse(topic.TitleEn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_EN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse title_en template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse title en %s", topic.TitleEn))
 		}
 		stemplateContent, err = template.New("template").Parse(topic.ContentEn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_CN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse content_en template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse content en %s", topic.ContentEn))
 		}
 	default:
 		failedReason = append(failedReason, errors.Errorf("empty lang"))
 		stemplateTitle, err = template.New("template").Parse(topic.TitleEn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_EN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse title_en template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse topic en %s", topic.TitleEn))
 		}
 		stemplateContent, err = template.New("template").Parse(topic.ContentEn)
 		if err != nil {
 			stemplateTitle, _ = template.New("template").Parse(api.COMMON_TITLE_CN)
-			failedReason = append(failedReason, errors.Errorf("unable to parse content_en template:%s", err.Error()))
+			failedReason = append(failedReason, errors.Wrapf(err, "parse content en: %s", topic.ContentEn))
 		}
 	}
 	if len(failedReason) > 0 {

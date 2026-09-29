@@ -28,6 +28,7 @@ func init() {
 		MODULE string `help:"module name"`
 		FIELD  string `help:"distinct field name to query"`
 		Extra  bool   `help:"query extra distinct field"`
+		Scope  string `help:"resource scope" choices:"system|domain|project"`
 	}
 	R(&DistinctFieldOption{}, "distinct-field", "Query values of a distinct field for a module", func(s *mcclient.ClientSession, args *DistinctFieldOption) error {
 		mod, err := modulebase.GetModule(s, args.MODULE)
@@ -43,6 +44,9 @@ func init() {
 		} else {
 			params.Add(jsonutils.NewString(args.FIELD), "field")
 		}
+		if len(args.Scope) > 0 {
+			params.Add(jsonutils.NewString(args.Scope), "scope")
+		}
 		result, err := mod.Get(s, "distinct-field", params)
 		if err != nil {
 			return err
@@ -50,4 +54,29 @@ func init() {
 		fmt.Println(result)
 		return nil
 	})
+
+	type DistinctFieldsOption struct {
+		MODULE        string   `help:"module name"`
+		Field         []string `help:"distinct field name to query"`
+		ExtraField    []string `help:"distinct field name to query"`
+		ExtraResource string
+		Scope         string `help:"resource scope" choices:"system|domain|project"`
+	}
+	R(&DistinctFieldsOption{}, "distinct-fields", "Query values of a distinct fields for a module", func(s *mcclient.ClientSession, args *DistinctFieldsOption) error {
+		mod, err := modulebase.GetModule(s, args.MODULE)
+		if err != nil || mod == nil {
+			if err != nil {
+				return fmt.Errorf("module %s not found %s", args.MODULE, err)
+			}
+			return fmt.Errorf("No module %s found", args.MODULE)
+		}
+		params := jsonutils.Marshal(args)
+		result, err := mod.Get(s, "distinct-fields", params)
+		if err != nil {
+			return err
+		}
+		fmt.Println(result)
+		return nil
+	})
+
 }

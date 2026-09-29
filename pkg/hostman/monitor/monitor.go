@@ -26,6 +26,7 @@ import (
 )
 
 type StringCallback func(string)
+type BlockJobEventCallback func(*Event)
 
 type BlockJob struct {
 	server string
@@ -103,6 +104,23 @@ type QemuBlock struct {
 			} `json:"backing-image"`
 		}
 	}
+}
+
+type QemuNamedBlockNode struct {
+	NodeName    string `json:"node-name"`
+	Driver      string `json:"drv"`
+	File        string `json:"file"`
+	BackingFile string `json:"backing_file"`
+	Image       struct {
+		Filename string `json:"filename"`
+	} `json:"image"`
+}
+
+func (n QemuNamedBlockNode) Filename() string {
+	if n.Image.Filename != "" {
+		return n.Image.Filename
+	}
+	return n.File
 }
 
 type MigrationInfo struct {
@@ -186,7 +204,7 @@ func (self *BlockJob) CalcOffset(preOffset int64) {
 
 type Monitor interface {
 	Connect(host string, port int) error
-	ConnectWithSocket(address string) error
+	ConnectWithSocket(address string, timeout time.Duration) error
 	Disconnect()
 	IsConnected() bool
 
@@ -199,8 +217,9 @@ type Monitor interface {
 	GetVersion(StringCallback)
 	GetBlockJobCounts(func(jobs int))
 	GetBlockJobs(func([]BlockJob))
+	GetBlockJobsWithError(func([]BlockJob, error))
 	QueryPci(callback QueryPciCallback)
-	GetScsiNumQueues(callback func(int64))
+	InfoQtree(cb StringCallback)
 
 	GetCpuCount(func(count int))
 	AddCpu(cpuIndex int, callback StringCallback)
@@ -210,6 +229,7 @@ type Monitor interface {
 	GetMemdevList(MemdevListCallback)
 
 	GetBlocks(callback func([]QemuBlock))
+	GetNamedBlockNodes(callback func([]QemuNamedBlockNode, error))
 	EjectCdrom(dev string, callback StringCallback)
 	ChangeCdrom(dev string, path string, callback StringCallback)
 
@@ -219,10 +239,13 @@ type Monitor interface {
 
 	ObjectAdd(objectType string, params map[string]string, callback StringCallback)
 	DriveAdd(bus, node string, params map[string]string, callback StringCallback)
-	DeviceAdd(dev string, params map[string]string, callback StringCallback)
+	DeviceAdd(dev string, params map[string]interface{}, callback StringCallback)
+	DeviceAddCpu(dev string, params map[string]interface{}, callback StringCallback)
 
 	XBlockdevChange(parent, node, child string, callback StringCallback)
 	BlockStream(drive string, callback StringCallback)
+	BlockStreamToBase(device, base, jobId string, callback StringCallback)
+	BlockCommit(device, top, base string, callback StringCallback)
 	DriveMirror(callback StringCallback, drive, target, syncMode, format string, unmap, blockReplication bool, speed int64)
 	DriveBackup(callback StringCallback, drive, target, syncMode, format string)
 	BlockJobComplete(drive string, cb StringCallback)
@@ -252,6 +275,7 @@ type Monitor interface {
 	NetdevAdd(id, netType string, params map[string]string, callback StringCallback)
 	NetdevDel(id string, callback StringCallback)
 
+	ScreenDump(savePath string, callback StringCallback)
 	SaveState(statFilePath string, callback StringCallback)
 	QueryMachines(callback QueryMachinesCallback)
 	Quit(StringCallback)
@@ -276,6 +300,15 @@ type SBaseMonitor struct {
 	mutex   *sync.Mutex
 	writing bool
 	reading bool
+}
+
+// StringParams preserves string-valued device properties while callers migrate to typed QMP arguments.
+func StringParams(params map[string]string) map[string]interface{} {
+	ret := make(map[string]interface{}, len(params))
+	for k, v := range params {
+		ret[k] = v
+	}
+	return ret
 }
 
 func NewBaseMonitor(server, sid string, OnMonitorConnected MonitorSuccFunc, OnMonitorDisConnect, OnMonitorTimeout MonitorErrorFunc) *SBaseMonitor {
@@ -305,6 +338,12 @@ func (m *SBaseMonitor) onConnectSuccess(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	// set rwc hand
 	m.rwc = conn
+}
+
+func (m *SBaseMonitor) SetReadDeadlineTimeout(duration time.Duration) {
+	if m.rwc != nil {
+		m.rwc.SetReadDeadline(time.Now().Add(duration))
+	}
 }
 
 func (m *SBaseMonitor) Connect(host string, port int) error {

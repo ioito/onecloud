@@ -20,7 +20,9 @@ import (
 	"net"
 	"net/http"
 
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/tristate"
+	"yunion.io/x/pkg/util/httputils"
 
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/appsrv"
@@ -48,13 +50,16 @@ func getBmAgentUrl(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 	if len(ipAddr) == 0 {
 		ipAddr, _, err = net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			httperrors.NewInternalServerError("Parse remote ip error %s", err)
+			httperrors.NewInternalServerError("Parse remote ip failed: %s", err)
 			return
 		}
 	}
-
-	n, _ := models.NetworkManager.GetOnPremiseNetworkOfIP(ipAddr, "", tristate.None)
+	log.Infof("getBmAgentUrl request ipaddr %s", ipAddr)
+	n, err := models.NetworkManager.GetOnPremiseNetworkOfIP(ipAddr, "", tristate.None)
 	if n == nil {
+		if err != nil {
+			log.Errorf("failed get network of ip %s: %s", ipAddr, err)
+		}
 		httperrors.NotFoundError(ctx, w, "Network not found")
 		return
 	}
@@ -67,26 +72,33 @@ func getBmAgentUrl(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	fmt.Fprintf(w, bmAgent.ManagerUri)
+	ret := fmt.Sprintf("%s %s", bmAgent.ManagerUri, ipAddr)
+	fmt.Fprintf(w, "%s", ret)
 }
 
 func getBmPrepareScript(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	if len(options.Options.BaremetalPreparePackageUrl) == 0 {
+	bmPreparePackageUrl := options.Options.BaremetalPreparePackageUrl
+	if bmPreparePackageUrl == "" {
+		apiServer := options.Options.ApiServer
+		if len(apiServer) > 0 {
+			bmPreparePackageUrl = fmt.Sprintf("%s/baremetal-prepare/baremetal_prepare.tar.gz", apiServer)
+		}
+	}
+	if len(bmPreparePackageUrl) == 0 {
 		httperrors.NotAcceptableError(ctx, w, "Baremetal package not prepared")
 		return
 	}
-	regionUrl, err := auth.GetPublicServiceURL("compute_v2", options.Options.Region, "")
+	regionUrl, err := auth.GetPublicServiceURL("compute_v2", options.Options.Region, "", httputils.POST)
 	if err != nil {
 		httperrors.InternalServerError(ctx, w, "%v", err)
 		return
 	}
 	userCred := auth.FetchUserCredential(ctx, policy.FilterPolicyCredential)
 	var script string
-	script += fmt.Sprintf("curl -fsSL -k -o ./baremetal_prepare.tar.gz %s;",
-		options.Options.BaremetalPreparePackageUrl)
-	script += "mkdir ./baremetal_prepare;"
+	script += fmt.Sprintf("curl -fsSL -k -o ./baremetal_prepare.tar.gz %s;", bmPreparePackageUrl)
+	script += "mkdir -p ./baremetal_prepare;"
 	script += "tar -zxf ./baremetal_prepare.tar.gz -C ./baremetal_prepare;"
 	script += fmt.Sprintf("./baremetal_prepare/prepare.sh %s %s",
 		userCred.GetTokenString(), regionUrl)
-	fmt.Fprintf(w, script)
+	fmt.Fprintf(w, "%s", script)
 }

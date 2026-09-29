@@ -15,20 +15,24 @@
 package compute
 
 import (
+	"yunion.io/x/jsonutils"
+
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cmdline"
+	"yunion.io/x/onecloud/pkg/mcclient/options"
 )
 
 type DiskCreateOptions struct {
-	Manager string `help:"Preferred manager where virtual server should be created" json:"prefer_manager_id"`
-	Region  string `help:"Preferred region where virtual server should be created" json:"prefer_region_id"`
-	Zone    string `help:"Preferred zone where virtual server should be created" json:"prefer_zone_id"`
-	Wire    string `help:"Preferred wire where virtual server should be created" json:"prefer_wire_id"`
-	Host    string `help:"Preferred host where virtual server should be created" json:"prefer_host_id"`
-	Count   int    `help:"Count to create" json:"count"`
+	Manager string   `help:"Preferred manager where disk should be created" json:"prefer_manager_id"`
+	Region  string   `help:"Preferred region where disk should be created" json:"prefer_region_id"`
+	Zone    string   `help:"Preferred zone where disk should be created" json:"prefer_zone_id"`
+	Zones   []string `help:"Preferred zones where disk should be created" json:"prefer_zones"`
+	Wire    string   `help:"Preferred wire where disk should be created" json:"prefer_wire_id"`
+	Host    string   `help:"Preferred host where disk should be created" json:"prefer_host_id"`
+	Count   int      `help:"Count to create" json:"count"`
 
 	NAME       string   `help:"Name of the disk"`
-	DISKDESC   string   `help:"Image size or size of virtual disk"`
+	DISKDESC   string   `help:"Disk config, e.g. 'size=10G' or 'image=<id>,size=40G,backend=local'"`
 	Desc       string   `help:"Description" metavar:"Description"`
 	Storage    string   `help:"ID or name of storage where the disk is created"`
 	Hypervisor string   `help:"Hypervisor of this disk, used by schedule"`
@@ -60,6 +64,7 @@ func (o DiskCreateOptions) Params() (*api.DiskCreateInput, error) {
 		PreferManager: o.Manager,
 		PreferRegion:  o.Region,
 		PreferZone:    o.Zone,
+		PreferZones:   o.Zones,
 		PreferWire:    o.Wire,
 		PreferHost:    o.Host,
 		DiskConfig:    config,
@@ -73,4 +78,171 @@ func (o DiskCreateOptions) Params() (*api.DiskCreateInput, error) {
 	}
 	params.BackupId = o.BackupId
 	return params, nil
+}
+
+type DiskIdOptions struct {
+	ID string `help:"ID or Name of disk"`
+}
+
+func (o *DiskIdOptions) GetId() string {
+	return o.ID
+}
+
+func (o *DiskIdOptions) Params() (jsonutils.JSONObject, error) {
+	return nil, nil
+}
+
+// DiskShowOptions 单独包装，避免 DiskIdOptions 被其它 Perform 复用时误注册。
+type DiskShowOptions struct {
+	_ struct{} `mcp-desc:"查询单块硬盘详情。ID 可用 climc_disk_list 返回的 id/name"`
+
+	DiskIdOptions
+}
+
+type DiskResizeOptions struct {
+	_ struct{} `mcp-desc:"硬盘扩容。DISK 为硬盘 id/name，SIZE 为目标容量（如 100G）；扩容前可用 climc_disk_list / climc_disk_show 确认"`
+
+	DISK string `help:"ID or name of disk"`
+	SIZE string `help:"Size of disk"`
+}
+
+type DiskDeleteOptions struct {
+	_ struct{} `mcp-desc:"删除硬盘。若尚不知 id，先用 climc_disk_list 定位；删除前确认未被虚机占用或已卸载"`
+
+	ID                    []string `help:"ID of disks to delete" metavar:"DISK"`
+	OverridePendingDelete bool     `help:"Delete disk directly instead of pending delete" short-token:"f" mcp:"true"`
+	DeleteSnapshots       bool     `help:"Delete disk snapshots before delete disk" mcp:"true"`
+}
+
+type DiskMigrateOptions struct {
+	DiskIdOptions
+
+	TargetStorageId string `help:"Disk migrate target storage id or name" json:"target_storage_id"`
+}
+
+func (o *DiskMigrateOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type DiskChangeStorageTypeOptions struct {
+	DiskIdOptions
+
+	StorageType string `help:"Disk migrate target storage type" json:"storage_type"`
+}
+
+func (o *DiskChangeStorageTypeOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type DiskResetTemplateOptions struct {
+	DiskIdOptions
+
+	TemplateId string `help:"reset disk template id" json:"template_id"`
+}
+
+func (o *DiskResetTemplateOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+type DiskRebuildOptions struct {
+	options.ResourceIdOptions
+	BackupId                                  string `help:"disk backup id" json:"backup_id"`
+	TemplateId                                string `help:"disk template id" json:"template_id"`
+	Size                                      string `help:"disk size in MB" json:"size"`
+	Fs                                        string `help:"disk fs type"`
+	FsFeatureF2fsCaseInsensitive              *bool  `help:"f2fs enable CaseInsensitive" json:"-"`
+	FsFeatureF2fsOverprovisionRatioPercentage *int   `help:"f2fs OverprovisionRatioPercentage" json:"-"`
+	FsFeatureExt4CaseInsensitive              *bool  `help:"ext4 enable CaseInsensitive" json:"-"`
+	FsFeatureExt4ReservedBlocksPercentage     *int   `help:"ext4 ReservedBlocksPercentage" json:"-"`
+}
+
+func (o *DiskRebuildOptions) Params() (jsonutils.JSONObject, error) {
+	res := api.DiskRebuildInput{}
+	if o.BackupId != "" {
+		res.BackupId = &o.BackupId
+	}
+	if o.TemplateId != "" {
+		res.TemplateId = &o.TemplateId
+	}
+	if o.Size != "" {
+		res.Size = &o.Size
+	}
+	if o.Fs != "" {
+		res.Fs = &o.Fs
+	}
+
+	if o.FsFeatureExt4CaseInsensitive != nil || o.FsFeatureExt4ReservedBlocksPercentage != nil {
+		if res.FsFeatures == nil {
+			res.FsFeatures = &api.DiskFsFeatures{}
+		}
+		res.FsFeatures.Ext4 = &api.DiskFsExt4Features{}
+		if o.FsFeatureExt4CaseInsensitive != nil {
+			res.FsFeatures.Ext4.CaseInsensitive = *o.FsFeatureExt4CaseInsensitive
+		}
+		if o.FsFeatureExt4ReservedBlocksPercentage != nil {
+			res.FsFeatures.Ext4.ReservedBlocksPercentage = *o.FsFeatureExt4ReservedBlocksPercentage
+		}
+	}
+	if o.FsFeatureF2fsCaseInsensitive != nil || o.FsFeatureF2fsOverprovisionRatioPercentage != nil {
+		if res.FsFeatures == nil {
+			res.FsFeatures = &api.DiskFsFeatures{}
+		}
+		res.FsFeatures.F2fs = &api.DiskFsF2fsFeatures{}
+		if o.FsFeatureF2fsCaseInsensitive != nil {
+			res.FsFeatures.F2fs.CaseInsensitive = *o.FsFeatureF2fsCaseInsensitive
+		}
+		if o.FsFeatureF2fsOverprovisionRatioPercentage != nil {
+			res.FsFeatures.F2fs.OverprovisionRatioPercentage = *o.FsFeatureF2fsOverprovisionRatioPercentage
+		}
+	}
+	return jsonutils.Marshal(res), nil
+}
+
+type DiskListOptions struct {
+	_ struct{} `mcp-desc:"列出硬盘。可用 search/server-id/unused 等过滤；查详情用 climc_disk_show，扩容用 climc_disk_resize，删除用 climc_disk_delete"`
+
+	options.BaseListOptions
+	Unused        *bool    `help:"Show unused disks" mcp:"true"`
+	Share         *bool    `help:"Show Share storage disks" mcp:"true"`
+	Local         *bool    `help:"Show Local storage disks" mcp:"true"`
+	ServerId      []string `help:"Guest ID or name" mcp:"true"`
+	GuestStatus   string   `help:"Guest Status" mcp:"true"`
+	OrderByServer string   `help:"Order By Server"`
+	Storage       string   `help:"Storage ID or name" mcp:"true"`
+	Type          string   `help:"Disk type" choices:"sys|data|swap|volume" mcp:"true"`
+	CloudType     string   `help:"Public cloud or private cloud" choices:"Public|Private" mcp:"true"`
+
+	OrderByGuestCount string `help:"Order By Guest Count"`
+
+	BillingType string `help:"billing type" choices:"postpaid|prepaid" mcp:"true"`
+
+	SnapshotpolicyId string `help:"snapshotpolicy id"`
+
+	StorageHostId               string `help:"filter disk by host" mcp:"true"`
+	BindingServerSnapshotpolicy *bool  `help:"filter disk by binding server snapshotpolicy" negative:"no-binding-server-snapshotpolicy"`
+	BindingSnapshotpolicy       *bool  `help:"filter disk by binding snapshotpolicy" negative:"no-binding-snapshotpolicy"`
+}
+
+func (opts *DiskListOptions) Params() (jsonutils.JSONObject, error) {
+	params, err := options.ListStructToParams(opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(opts.CloudType) > 0 {
+		if opts.CloudType == "Public" {
+			params.Add(jsonutils.JSONTrue, "public_cloud")
+		} else if opts.CloudType == "Private" {
+			params.Add(jsonutils.JSONTrue, "private_cloud")
+		}
+	}
+	return params, nil
+}
+
+type DiskChangeBillingTypeOptions struct {
+	DiskIdOptions
+	BillingType string `choices:"prepaid|postpaid"`
+}
+
+func (o *DiskChangeBillingTypeOptions) Params() (jsonutils.JSONObject, error) {
+	return jsonutils.Marshal(map[string]string{"billing_type": o.BillingType}), nil
 }

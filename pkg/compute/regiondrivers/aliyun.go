@@ -49,14 +49,6 @@ func init() {
 	models.RegisterRegionDriver(&driver)
 }
 
-func (self *SAliyunRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return true
-}
-
-func (self *SAliyunRegionDriver) GenerateSecurityGroupName(name string) string {
-	return name
-}
-
 func (self *SAliyunRegionDriver) GetProvider() string {
 	return api.CLOUD_PROVIDER_ALIYUN
 }
@@ -71,12 +63,12 @@ func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerData(ctx context.Cont
 
 	if input.ChargeType == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
 		if input.EgressMbps < 1 || input.EgressMbps > 5000 {
-			return nil, httperrors.NewInputParameterError("egress_mbps shoud be 1-5000 mbps")
+			return nil, httperrors.NewInputParameterError("egress_mbps should be 1-5000 mbps")
 		}
 	}
 
 	if input.AddressType == api.LB_ADDR_TYPE_INTRANET && input.ChargeType == api.LB_CHARGE_TYPE_BY_BANDWIDTH {
-		return nil, httperrors.NewUnsupportOperationError("intranet loadbalancer not support bandwidth charge type")
+		return nil, httperrors.NewUnsupportOperationError("intranet loadbalancer does not support bandwidth charge type")
 	}
 
 	return self.SManagedVirtualizationRegionDriver.ValidateCreateLoadbalancerData(ctx, userCred, ownerId, input)
@@ -92,10 +84,10 @@ func (self *SAliyunRegionDriver) ValidateCreateLoadbalancerBackendGroupData(ctx 
 		break
 	case api.LB_BACKENDGROUP_TYPE_MASTER_SLAVE:
 		if len(input.Backends) != 2 {
-			return nil, httperrors.NewInputParameterError("master slave backendgorup must contain two backend")
+			return nil, httperrors.NewInputParameterError("master-slave backend group must contain two backends")
 		}
 	default:
-		return nil, httperrors.NewInputParameterError("Unsupport backendgorup type %s", input.Type)
+		return nil, httperrors.NewInputParameterError("Unsupported backend group type %s", input.Type)
 	}
 	for _, backend := range input.Backends {
 		if len(backend.ExternalId) == 0 {
@@ -118,13 +110,13 @@ func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerBackendData(ctx conte
 	switch lbbg.Type {
 	case api.LB_BACKENDGROUP_TYPE_DEFAULT:
 		if input.Port != nil {
-			return nil, httperrors.NewInputParameterError("%s backend group not support change port", lbbg.Type)
+			return nil, httperrors.NewInputParameterError("%s backend group does not support changing port", lbbg.Type)
 		}
 	case api.LB_BACKENDGROUP_TYPE_NORMAL:
 		return input, nil
 	case api.LB_BACKENDGROUP_TYPE_MASTER_SLAVE:
 		if input.Port != nil || input.Weight != nil {
-			return input, httperrors.NewInputParameterError("%s backend group not support change port or weight", lbbg.Type)
+			return input, httperrors.NewInputParameterError("%s backend group does not support changing port or weight", lbbg.Type)
 		}
 	default:
 		return nil, httperrors.NewInputParameterError("Unknown backend group type %s", lbbg.Type)
@@ -191,7 +183,7 @@ func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerListenerData(ctx cont
 			supportRegions = append(supportRegions, "Aliyun/"+region)
 		}
 		if !utils.IsInStringArray(region.ExternalId, supportRegions) {
-			return nil, httperrors.NewUnsupportOperationError("cloudregion %s(%s) not support %v scheduler", region.Name, region.Id, input.Scheduler)
+			return nil, httperrors.NewUnsupportOperationError("cloudregion %s(%s) does not support %v scheduler", region.Name, region.Id, input.Scheduler)
 		}
 	}
 
@@ -200,24 +192,6 @@ func (self *SAliyunRegionDriver) ValidateUpdateLoadbalancerListenerData(ctx cont
 	}
 
 	return input, nil
-}
-
-func (self *SAliyunRegionDriver) ValidateCreateSnapshopolicyDiskData(ctx context.Context,
-	userCred mcclient.TokenCredential, disk *models.SDisk, snapshotPolicy *models.SSnapshotPolicy) error {
-	//err := self.SManagedVirtualizationRegionDriver.ValidateCreateSnapshopolicyDiskData(ctx, userCred, disk, snapshotPolicy)
-	//if err != nil {
-	//	return nil
-	//}
-	//// In Aliyun, One disk only apply one snapshot policy
-	//ret, err := models.SnapshotPolicyDiskManager.FetchAllByDiskID(ctx, userCred, disk.GetId())
-	//if err != nil {
-	//	return err
-	//}
-	//if len(ret) != 0 {
-	//	return httperrors.NewBadRequestError("One disk could't attach two snapshot policy in aliyun; please detach last one first.")
-	//}
-	//return nil
-	return nil
 }
 
 func (self *SAliyunRegionDriver) ValidateCreateSnapshotData(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, storage *models.SStorage, input *api.SnapshotCreateInput) error {
@@ -234,16 +208,16 @@ func (self *SAliyunRegionDriver) IsSecurityGroupBelongVpc() bool {
 
 func (self *SAliyunRegionDriver) ValidateDBInstanceRecovery(ctx context.Context, userCred mcclient.TokenCredential, instance *models.SDBInstance, backup *models.SDBInstanceBackup, input api.SDBInstanceRecoveryConfigInput) error {
 	if !utils.IsInStringArray(instance.Engine, []string{api.DBINSTANCE_TYPE_MYSQL, api.DBINSTANCE_TYPE_SQLSERVER}) {
-		return httperrors.NewNotSupportedError("Aliyun %s not support recovery", instance.Engine)
+		return httperrors.NewNotSupportedError("Aliyun %s does not support recovery", instance.Engine)
 	}
 	if instance.Engine == api.DBINSTANCE_TYPE_MYSQL {
 		if backup.DBInstanceId != instance.Id {
-			return httperrors.NewUnsupportOperationError("Aliyun %s only support recover from it self backups", instance.Engine)
+			return httperrors.NewUnsupportOperationError("Aliyun %s only supports recovery from its own backups", instance.Engine)
 		}
 		if !((utils.IsInStringArray(instance.EngineVersion, []string{"8.0", "5.7"}) &&
 			instance.StorageType == api.ALIYUN_DBINSTANCE_STORAGE_TYPE_LOCAL_SSD &&
 			instance.Category == api.ALIYUN_DBINSTANCE_CATEGORY_HA) || (instance.EngineVersion == "5.6" && instance.Category == api.ALIYUN_DBINSTANCE_CATEGORY_HA)) {
-			return httperrors.NewUnsupportOperationError("Aliyun %s only 8.0 and 5.7 high_availability local_ssd or 5.6 high_availability support recovery from it self backups", instance.Engine)
+			return httperrors.NewUnsupportOperationError("Aliyun %s only 8.0 and 5.7 high_availability local_ssd or 5.6 high_availability support recovery from its own backups", instance.Engine)
 		}
 	}
 	if len(input.Databases) == 0 {
@@ -254,7 +228,7 @@ func (self *SAliyunRegionDriver) ValidateDBInstanceRecovery(ctx context.Context,
 
 func (self *SAliyunRegionDriver) ValidateCreateDBInstanceData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, input api.DBInstanceCreateInput, skus []models.SDBInstanceSku, network *models.SNetwork) (api.DBInstanceCreateInput, error) {
 	if input.BillingType == billing_api.BILLING_TYPE_PREPAID && len(input.MasterInstanceId) > 0 {
-		return input, httperrors.NewInputParameterError("slave dbinstance not support prepaid billing type")
+		return input, httperrors.NewInputParameterError("slave dbinstance does not support prepaid billing type")
 	}
 
 	if network != nil {
@@ -297,13 +271,13 @@ func (self *SAliyunRegionDriver) ValidateCreateDBInstanceData(ctx context.Contex
 				break
 			case "5.7", "8.0":
 				if master.Category != api.ALIYUN_DBINSTANCE_CATEGORY_HA {
-					return input, httperrors.NewInputParameterError("Not support create readonly dbinstance for MySQL %s %s", master.EngineVersion, master.Category)
+					return input, httperrors.NewInputParameterError("Creating read-only DB instance is not supported for MySQL %s %s", master.EngineVersion, master.Category)
 				}
 				if master.StorageType != api.ALIYUN_DBINSTANCE_STORAGE_TYPE_LOCAL_SSD {
-					return input, httperrors.NewInputParameterError("Not support create readonly dbinstance for MySQL %s %s with storage type %s, only support %s", master.EngineVersion, master.Category, master.StorageType, api.ALIYUN_DBINSTANCE_STORAGE_TYPE_LOCAL_SSD)
+					return input, httperrors.NewInputParameterError("Creating read-only DB instance is not supported for MySQL %s %s with storage type %s; supported: %s", master.EngineVersion, master.Category, master.StorageType, api.ALIYUN_DBINSTANCE_STORAGE_TYPE_LOCAL_SSD)
 				}
 			default:
-				return input, httperrors.NewInputParameterError("Not support create readonly dbinstance for MySQL %s", master.EngineVersion)
+				return input, httperrors.NewInputParameterError("Creating read-only DB instance is not supported for MySQL %s", master.EngineVersion)
 			}
 		case api.DBINSTANCE_TYPE_SQLSERVER:
 			if master.Category != api.ALIYUN_DBINSTANCE_CATEGORY_ALWAYSON || master.EngineVersion != "2017_ent" {
@@ -313,7 +287,7 @@ func (self *SAliyunRegionDriver) ValidateCreateDBInstanceData(ctx context.Contex
 				return input, httperrors.NewInputParameterError("SQL Server cannot have more than seven read-only dbinstances")
 			}
 		default:
-			return input, httperrors.NewInputParameterError("Not support create readonly dbinstance with master dbinstance engine %s", master.Engine)
+			return input, httperrors.NewInputParameterError("Creating read-only DB instance is not supported with master dbinstance engine %s", master.Engine)
 		}
 	}
 
@@ -339,7 +313,7 @@ func (self *SAliyunRegionDriver) ValidateCreateDBInstanceData(ctx context.Contex
 
 	if len(input.Name) > 0 {
 		if strings.HasPrefix(input.Description, "http://") || strings.HasPrefix(input.Description, "https://") {
-			return input, httperrors.NewInputParameterError("Description can not start with http:// or https://")
+			return input, httperrors.NewInputParameterError("Description cannot start with http:// or https://")
 		}
 	}
 
@@ -363,7 +337,7 @@ func (self *SAliyunRegionDriver) IsSupportedBillingCycle(bc billing.SBillingCycl
 
 func (self *SAliyunRegionDriver) ValidateCreateDBInstanceAccountData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, instance *models.SDBInstance, input api.DBInstanceAccountCreateInput) (api.DBInstanceAccountCreateInput, error) {
 	if len(input.Name) < 2 || len(input.Name) > 16 {
-		return input, httperrors.NewInputParameterError("Aliyun DBInstance account name length shoud be 2~16 characters")
+		return input, httperrors.NewInputParameterError("Aliyun DBInstance account name length should be 2~16 characters")
 	}
 
 	DENY_KEY := map[string][]string{
@@ -380,7 +354,7 @@ func (self *SAliyunRegionDriver) ValidateCreateDBInstanceAccountData(ctx context
 			return input, httperrors.NewInputParameterError("invalid character %s for account name", string(s))
 		}
 		if s == '_' && (i == 0 || i == len(input.Name)) {
-			return input, httperrors.NewInputParameterError("account name can not start or end with _")
+			return input, httperrors.NewInputParameterError("account name cannot start or end with _")
 		}
 	}
 
@@ -450,7 +424,7 @@ func (self *SAliyunRegionDriver) ValidateCreateElasticcacheAccountData(ctx conte
 	}
 
 	for _, v := range keyV {
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return nil, err
 		}
 	}
@@ -661,7 +635,7 @@ func (self *SAliyunRegionDriver) GetMaxElasticcacheSecurityGroupCount() int {
 
 func (self *SAliyunRegionDriver) ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error) {
 	cidrV := validators.NewIPv4PrefixValidator("cidr_block")
-	if err := cidrV.Validate(jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
+	if err := cidrV.Validate(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
 		return input, err
 	}
 
@@ -689,55 +663,6 @@ func (self *SAliyunRegionDriver) IsSupportedNas() bool {
 	return true
 }
 
-func (self *SAliyunRegionDriver) RequestSyncAccessGroup(ctx context.Context, userCred mcclient.TokenCredential, fs *models.SFileSystem, mt *models.SMountTarget, ag *models.SAccessGroup, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		if mt.AccessGroupId == api.DEFAULT_ACCESS_GROUP {
-			return jsonutils.Marshal(
-				map[string]string{
-					"access_group_id": fmt.Sprintf("DEFAULT_%s_GROUP_NAME", strings.ToUpper(mt.NetworkType)),
-				}), nil
-		}
-		caches, err := ag.GetAccessGroupCaches()
-		if err != nil {
-			return nil, errors.Wrapf(err, "ag.GetAccessGroupCaches")
-		}
-		for i := range caches {
-			if caches[i].CloudregionId == fs.CloudregionId &&
-				caches[i].ManagerId == fs.ManagerId &&
-				caches[i].FileSystemType == fs.FileSystemType &&
-				caches[i].NetworkType == mt.NetworkType {
-				if len(caches[i].ExternalId) > 0 {
-					err := caches[i].SyncRules(ctx)
-					if err != nil {
-						return nil, errors.Wrapf(err, "cache.SyncRules")
-					}
-					return jsonutils.Marshal(map[string]string{"access_group_id": caches[i].ExternalId}), nil
-				}
-				err := caches[i].CreateIAccessGroup(ctx)
-				if err != nil {
-					return nil, errors.Wrapf(err, "CreateIAccessGroup")
-				}
-				return jsonutils.Marshal(map[string]string{"access_group_id": caches[i].ExternalId}), nil
-			}
-		}
-		opts := models.SAccessGroupCacheRegisterInput{
-			Name:           ag.Name,
-			Desc:           ag.Description,
-			ManagerId:      fs.ManagerId,
-			CloudregionId:  fs.CloudregionId,
-			NetworkType:    mt.NetworkType,
-			FileSystemType: fs.FileSystemType,
-			AccessGroupId:  ag.Id,
-		}
-		cache, err := models.AccessGroupCacheManager.Register(ctx, &opts)
-		if err != nil {
-			return nil, errors.Wrapf(err, "Register")
-		}
-		return jsonutils.Marshal(map[string]string{"access_group_id": cache.ExternalId}), nil
-	})
-	return nil
-}
-
 func (self *SAliyunRegionDriver) ValidateCreateWafInstanceData(ctx context.Context, userCred mcclient.TokenCredential, input api.WafInstanceCreateInput) (api.WafInstanceCreateInput, error) {
 	if !regutils.DOMAINNAME_REG.MatchString(input.Name) {
 		return input, httperrors.NewInputParameterError("invalid domain name %s", input.Name)
@@ -750,5 +675,75 @@ func (self *SAliyunRegionDriver) ValidateCreateWafInstanceData(ctx context.Conte
 }
 
 func (self *SAliyunRegionDriver) ValidateCreateWafRuleData(ctx context.Context, userCred mcclient.TokenCredential, waf *models.SWafInstance, input api.WafRuleCreateInput) (api.WafRuleCreateInput, error) {
-	return input, httperrors.NewUnsupportOperationError("not supported create rule")
+	return input, httperrors.NewUnsupportOperationError("creating rules is not supported")
+}
+
+func (self *SAliyunRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	ipSetCidrs := map[int]string{}
+	for i := range input.Rules {
+		rule := &input.Rules[i]
+		if rule.Priority == nil {
+			return nil, httperrors.NewMissingParameterError("priority")
+		}
+
+		if *rule.Priority < 1 || *rule.Priority > 100 {
+			return nil, httperrors.NewInputParameterError("invalid priority %d, range 1-100", *rule.Priority)
+		}
+
+		if len(rule.Ports) > 0 && strings.Contains(input.Rules[i].Ports, ",") {
+			return nil, httperrors.NewInputParameterError("invalid ports %s", input.Rules[i].Ports)
+		}
+
+		if len(rule.TargetType) == 0 {
+			rule.TargetType = api.SecurityGroupRuleTargetTypeCidr
+		}
+		switch rule.TargetType {
+		case api.SecurityGroupRuleTargetTypeCidr:
+		case api.SecurityGroupRuleTargetTypeIpSet:
+			ipSet, err := validateSecgroupIpSet(ctx, userCred, rule.CIDR, input.CloudproviderId, input.CloudregionId, true)
+			if err != nil {
+				return nil, err
+			}
+			ipSetCidrs[i] = ipSet.Id
+			rule.CIDR = ""
+		default:
+			return nil, httperrors.NewInputParameterError("unsupported target type %s", rule.TargetType)
+		}
+	}
+	input, err := self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupInput(ctx, userCred, input)
+	if err != nil {
+		return nil, err
+	}
+	for i, cidr := range ipSetCidrs {
+		input.Rules[i].CIDR = cidr
+	}
+	return input, nil
+}
+
+func (self *SAliyunRegionDriver) ValidateCreateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleCreateInput) (*api.SSecgroupRuleCreateInput, error) {
+	rule := input
+	if rule.Priority == nil {
+		return nil, httperrors.NewMissingParameterError("priority")
+	}
+
+	if *rule.Priority < 1 || *rule.Priority > 100 {
+		return nil, httperrors.NewInputParameterError("invalid priority %d, range 1-100", *rule.Priority)
+	}
+
+	if len(rule.Ports) > 0 && strings.Contains(input.Ports, ",") {
+		return nil, httperrors.NewInputParameterError("invalid ports %s", input.Ports)
+	}
+	return validateManagedSecgroupRuleCreateWithIpSet(ctx, userCred, input, self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupRuleInput)
+}
+
+func (self *SAliyunRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	if input.Priority != nil && (*input.Priority < 1 || *input.Priority > 100) {
+		return nil, httperrors.NewInputParameterError("invalid priority %d, range 1-100", *input.Priority)
+	}
+
+	if input.Ports != nil && strings.Contains(*input.Ports, ",") {
+		return nil, httperrors.NewInputParameterError("invalid ports %s", *input.Ports)
+	}
+
+	return validateManagedSecgroupRuleUpdateWithIpSet(ctx, userCred, input, "", "", self.SManagedVirtualizationRegionDriver.ValidateUpdateSecurityGroupRuleInput)
 }

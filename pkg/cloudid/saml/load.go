@@ -22,4 +22,5 @@ import (
 	_ "yunion.io/x/onecloud/pkg/cloudid/saml/providers/google"
 	_ "yunion.io/x/onecloud/pkg/cloudid/saml/providers/huawei"
 	_ "yunion.io/x/onecloud/pkg/cloudid/saml/providers/qcloud"
+	_ "yunion.io/x/onecloud/pkg/cloudid/saml/providers/volcengine"
 )

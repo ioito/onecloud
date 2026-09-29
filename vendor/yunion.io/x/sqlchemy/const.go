@@ -48,8 +48,10 @@ const (
 const (
 	// TAG_IGNORE is a field tag that indicates the field is ignored, not represents a table column
 	TAG_IGNORE = "ignore"
-	// TAG_NAME is a field tag that indicates the column name of this field
+	// TAG_NAME is a field tag that indicates the column name of this field, obsolete, use TAG_SQL_NAME instead!
 	TAG_NAME = "name"
+	// TAG_SQL_NAME is a field tag that indicates the column name of this field, superceeds TAG_NAME!
+	TAG_SQL_NAME = "sql_name"
 	// TAG_WIDTH is a field tag that indicates the width of the column, like VARCHAR(15)
 	// Supported by: mysql
 	TAG_WIDTH = "width"
@@ -81,4 +83,7 @@ const (
 	TAG_CREATE_TIMESTAMP = "created_at"
 	// TAG_ALLOW_ZERO is a field tag that indicates whether the column allow zero value
 	TAG_ALLOW_ZERO = "allow_zero"
+	// TAG_OLD_NAME is a field indicate the colume was renamed from an old name,
+	// sync table will do renaming of coolumn instead of creating a new column
+	TAG_OLD_NAME = "old_name"
 )

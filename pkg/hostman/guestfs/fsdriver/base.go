@@ -31,6 +31,7 @@ import (
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
+	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
 
@@ -59,6 +60,11 @@ func (d *sGuestRootFsDriver) DeployFiles(deploys []*deployapi.DeployContent) err
 		if len(deploy.Path) == 0 {
 			return fmt.Errorf("Deploy file missing param path")
 		}
+		clean, err := fileutils2.CleanGuestDeployPath(deploy.Path)
+		if err != nil {
+			return errors.Wrap(err, "deploy path")
+		}
+		deploy.Path = clean
 		dirname := filepath.Dir(deploy.Path)
 		if !d.GetPartition().Exists(dirname, caseInsensitive) {
 			modeRWXOwner := syscall.S_IRWXU | syscall.S_IRGRP | syscall.S_IXGRP | syscall.S_IROTH | syscall.S_IXOTH
@@ -148,18 +154,34 @@ func (r *sGuestRootFsDriver) AllowAdminLogin() bool {
 	return true
 }
 
+func (m *sGuestRootFsDriver) DeployQgaBlackList(part IDiskPartition) error {
+	return nil
+}
+
+func (r *sGuestRootFsDriver) DeployQgaService(part IDiskPartition) error {
+	return nil
+}
+
+func (l *sGuestRootFsDriver) MountProcfs() bool {
+	return false
+}
+
+func (l *sGuestRootFsDriver) IsWindowsVirtioNetSupport(IDiskPartition) bool {
+	return false
+}
+
 const (
 	modeAuthorizedKeysRWX = syscall.S_IRUSR | syscall.S_IWUSR | syscall.S_IXUSR
 	modeAuthorizedKeysRW  = syscall.S_IRUSR | syscall.S_IWUSR
 )
 
-func deployAuthorizedKeys(rootFs IDiskPartition, authFile string, uid, gid int, pubkeys *deployapi.SSHKeys, replace bool) error {
+func deployAuthorizedKeys(rootFs IDiskPartition, authFile string, uid, gid int, pubkeys *deployapi.SSHKeys, replace bool, admin bool) error {
 	var oldKeys = ""
 	if !replace {
 		bOldKeys, _ := rootFs.FileGetContents(authFile, false)
 		oldKeys = string(bOldKeys)
 	}
-	newKeys := MergeAuthorizedKeys(oldKeys, pubkeys)
+	newKeys := MergeAuthorizedKeys(oldKeys, pubkeys, admin)
 	if err := rootFs.FilePutContents(authFile, newKeys, false, false); err != nil {
 		return fmt.Errorf("Put keys to %s: %v", authFile, err)
 	}
@@ -172,7 +194,7 @@ func deployAuthorizedKeys(rootFs IDiskPartition, authFile string, uid, gid int, 
 	return nil
 }
 
-func DeployAuthorizedKeys(rootFs IDiskPartition, usrDir string, pubkeys *deployapi.SSHKeys, replace bool) error {
+func DeployAuthorizedKeys(rootFs IDiskPartition, usrDir string, pubkeys *deployapi.SSHKeys, replace bool, admin bool) error {
 	usrStat := rootFs.Stat(usrDir, false)
 	if usrStat != nil {
 		sshDir := path.Join(usrDir, ".ssh")
@@ -192,18 +214,24 @@ func DeployAuthorizedKeys(rootFs IDiskPartition, usrDir string, pubkeys *deploya
 				return err
 			}
 		}
-		return deployAuthorizedKeys(rootFs, authFile, uid, gid, pubkeys, replace)
+		return deployAuthorizedKeys(rootFs, authFile, uid, gid, pubkeys, replace, admin)
 	}
 	return nil
 }
 
-func MergeAuthorizedKeys(oldKeys string, pubkeys *deployapi.SSHKeys) string {
+const sshKeySignature = "@yunioncloudpods"
+
+func MergeAuthorizedKeys(oldKeys string, pubkeys *deployapi.SSHKeys, isAdmin bool) string {
 	var allkeys = make(map[string]string)
 	if len(oldKeys) > 0 {
 		for _, line := range strings.Split(oldKeys, "\n") {
 			line = strings.TrimSpace(line)
 			dat := strings.Split(line, " ")
 			if len(dat) > 1 {
+				if len(dat) > 2 && dat[2] == sshKeySignature {
+					// skip ssh keys with signature
+					continue
+				}
 				if _, ok := allkeys[dat[1]]; !ok {
 					allkeys[dat[1]] = line
 				}
@@ -218,13 +246,19 @@ func MergeAuthorizedKeys(oldKeys string, pubkeys *deployapi.SSHKeys) string {
 			}
 		}
 	}
-	for _, k := range []string{pubkeys.PublicKey, pubkeys.AdminPublicKey, pubkeys.ProjectPublicKey} {
+	var candiateKeys []string
+	if isAdmin {
+		candiateKeys = []string{pubkeys.AdminPublicKey, pubkeys.ProjectPublicKey}
+	} else {
+		candiateKeys = []string{pubkeys.PublicKey}
+	}
+	for _, k := range candiateKeys {
 		if len(k) > 0 {
 			k = strings.TrimSpace(k)
 			dat := strings.Split(k, " ")
 			if len(dat) > 1 {
 				if _, ok := allkeys[dat[1]]; !ok {
-					allkeys[dat[1]] = k
+					allkeys[dat[1]] = strings.Join([]string{dat[0], dat[1], sshKeySignature}, " ")
 				}
 			}
 		}
@@ -243,18 +277,14 @@ func DeployAdminAuthorizedKeys(s *mcclient.ClientSession) error {
 		return errors.Wrapf(err, "mkdir .ssh %s", output)
 	}
 
-	query := jsonutils.NewDict()
-	query.Set("admin", jsonutils.JSONTrue)
-	ret, err := modules.Sshkeypairs.List(s, query)
+	keypairs, err := modules.Sshkeypairs.FetchAdminKeypairsBySession(s.GetContext(), s)
 	if err != nil {
 		return errors.Wrap(err, "modules.Sshkeypairs.List")
 	}
-	if len(ret.Data) == 0 {
+	if len(keypairs) == 0 {
 		return errors.Wrap(httperrors.ErrNotFound, "Not found admin sshkey")
 	}
-	keys := ret.Data[0]
-	adminPublicKey, _ := keys.GetString("public_key")
-	pubKeys := &deployapi.SSHKeys{AdminPublicKey: adminPublicKey}
+	pubKeys := &deployapi.SSHKeys{AdminPublicKey: keypairs[0].PublicKey}
 
 	var oldKeys string
 	authFile := path.Join(sshDir, "authorized_keys")
@@ -265,7 +295,7 @@ func DeployAdminAuthorizedKeys(s *mcclient.ClientSession) error {
 		}
 		oldKeys = string(output)
 	}
-	newKeys := MergeAuthorizedKeys(oldKeys, pubKeys)
+	newKeys := MergeAuthorizedKeys(oldKeys, pubKeys, true)
 	if output, err := procutils.NewRemoteCommandAsFarAsPossible(
 		"sh", "-c", fmt.Sprintf("echo '%s' > %s", newKeys, authFile)).Output(); err != nil {
 		return errors.Wrapf(err, "write public keys: %s", output)

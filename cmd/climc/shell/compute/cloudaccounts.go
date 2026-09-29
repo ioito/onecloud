@@ -17,14 +17,14 @@ package compute
 import (
 	"yunion.io/x/onecloud/cmd/climc/shell"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
-	"yunion.io/x/onecloud/pkg/mcclient/options"
+	options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
 )
 
 func init() {
 
 	cmd := shell.NewResourceCmd(&modules.Cloudaccounts).WithKeyword("cloud-account")
 	cmd.List(&options.CloudaccountListOptions{})
-	cmd.Show(&options.SCloudAccountIdOptions{})
+	cmd.Show(&options.CloudaccountShowOptions{})
 	cmd.Delete(&options.SCloudAccountIdOptions{})
 	cmd.Update(&options.SCloudAccountUpdateBaseOptions{})
 	// cmd.PerformClassWithKeyword("preparenets-vmware", "prepare-nets", &options.SVMwareCloudAccountPrepareNetsOptions{})
@@ -41,6 +41,7 @@ func init() {
 	cmd.CreateWithKeyword("create-hcs", &options.SHCSAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-hcsop", &options.SHcsOpCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-ucloud", &options.SUcloudCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-rockbase", &options.SRockbaseAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-volcengine", &options.SVolcengineCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-zstack", &options.SZStackCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-s3", &options.SS3CloudAccountCreateOptions{})
@@ -60,6 +61,10 @@ func init() {
 	cmd.CreateWithKeyword("create-baidu", &options.SBaiduCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-cucloud", &options.SCucloudCloudAccountCreateOptions{})
 	cmd.CreateWithKeyword("create-qingcloud", &options.SQingCloudCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-oracle", &options.SOracleCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-cephfs", &options.SCephFSCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-cnware", &options.SCNwareCloudAccountCreateOptions{})
+	cmd.CreateWithKeyword("create-oceanbase", &options.SOceanbaseCloudAccountCreateOptions{})
 
 	cmd.UpdateWithKeyword("update-vmware", &options.SVMwareCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-aliyun", &options.SAliyunCloudAccountUpdateOptions{})
@@ -72,6 +77,7 @@ func init() {
 	cmd.UpdateWithKeyword("update-hcso", &options.SHCSOAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-hcs", &options.SHCSAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-ucloud", &options.SUcloudCloudAccountUpdateOptions{})
+	cmd.UpdateWithKeyword("update-rockbase", &options.SRockbaseAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-volcengine", &options.SVolcengineCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-zstack", &options.SZStackCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-s3", &options.SS3CloudAccountUpdateOptions{})
@@ -86,6 +92,8 @@ func init() {
 	cmd.UpdateWithKeyword("update-baidu", &options.SBaiduCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-cucloud", &options.SCucloudCloudAccountUpdateOptions{})
 	cmd.UpdateWithKeyword("update-qingcloud", &options.SQingCloudCloudAccountUpdateOptions{})
+	cmd.UpdateWithKeyword("update-cnware", &options.SCNwareCloudAccountUpdateOptions{})
+	cmd.UpdateWithKeyword("update-oceanbase", &options.SOceanbaseCloudAccountUpdateOptions{})
 
 	cmd.Perform("update-credential", &options.CloudaccountUpdateCredentialOptions{})
 
@@ -101,6 +109,7 @@ func init() {
 	cmd.PerformWithKeyword("update-credential-hcso", "update-credential", &options.SHCSOAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-hcs", "update-credential", &options.SHCSOAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-ucloud", "update-credential", &options.SUcloudCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("update-credential-rockbase", "update-credential", &options.SRockbaseAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-volcengine", "update-credential", &options.SVolcengineCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-zstack", "update-credential", &options.SZStackCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-s3", "update-credential", &options.SS3CloudAccountUpdateCredentialOptions{})
@@ -115,6 +124,7 @@ func init() {
 	cmd.PerformWithKeyword("update-credential-baidu", "update-credential", &options.SBaiduCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-cucloud", "update-credential", &options.SCucloudCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("update-credential-qingcloud", "update-credential", &options.SQingCloudCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("update-credential-cnware", "update-credential", &options.SCNwareCloudAccountUpdateCredentialOptions{})
 
 	cmd.PerformWithKeyword("test-connectivity-google", "test-connectivity", &options.SGoogleCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-vmware", "test-connectivity", &options.SVMwareCloudAccountUpdateCredentialOptions{})
@@ -125,12 +135,14 @@ func init() {
 	cmd.PerformWithKeyword("test-connectivity-openstack", "test-connectivity", &options.SOpenStackCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-huawei", "test-connectivity", &options.SHuaweiCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-ucloud", "test-connectivity", &options.SUcloudCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("test-connectivity-rockbase", "test-connectivity", &options.SRockbaseAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-volcengine", "test-connectivity", &options.SVolcengineCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-zstack", "test-connectivity", &options.SZStackCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-s3", "test-connectivity", &options.SS3CloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-ctyun", "test-connectivity", &options.SCtyunCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-jdcloud", "test-connectivity", &options.SJDcloudCloudAccountUpdateCredentialOptions{})
 	cmd.PerformWithKeyword("test-connectivity-cloudpods", "test-connectivity", &options.SCloudpodsCloudAccountUpdateCredentialOptions{})
+	cmd.PerformWithKeyword("test-connectivity-oceanbase", "test-connectivity", &options.SOceanbaseCloudAccountUpdateCredentialOptions{})
 
 	cmd.Perform("enable", &options.SCloudAccountIdOptions{})
 	cmd.Perform("disable", &options.SCloudAccountIdOptions{})
@@ -149,5 +161,4 @@ func init() {
 	cmd.Get("change-owner-candidate-domains", &options.SCloudAccountIdOptions{})
 	cmd.Get("enrollment-accounts", &options.SCloudAccountIdOptions{})
 	cmd.Get("balance", &options.SCloudAccountIdOptions{})
-	cmd.Get("saml", &options.SCloudAccountIdOptions{})
 }

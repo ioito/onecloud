@@ -14,7 +14,14 @@
 
 package compute
 
-import "yunion.io/x/onecloud/pkg/apis"
+import (
+	"reflect"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/gotypes"
+
+	"yunion.io/x/onecloud/pkg/apis"
+)
 
 type LoadbalancerBackendGroupDetails struct {
 	apis.StatusStandaloneResourceDetails
@@ -22,8 +29,11 @@ type LoadbalancerBackendGroupDetails struct {
 
 	SLoadbalancerBackendGroup
 
+	LoadbalancerHealthCheck string `json:"loadbalancer_health_check"`
+
 	LbListenerCount int `json:"lb_listener_count"`
 
+	IsDefault bool   `json:"is_default"`
 	ProjectId string `json:"tenant_id"`
 }
 
@@ -58,25 +68,27 @@ type LoadbalancerBackendGroupFilterListInput struct {
 type LoadbalancerBackendGroupCreateInput struct {
 	apis.StatusStandaloneResourceCreateInput
 
-	//swagger: ignore
+	//swagger:ignore
 	Loadbalancer string `json:"loadbalancer" yunion-deprecated-by:"loadbalancer_id"`
 	// 负载均衡ID
-	LoadbalancerId string `json:"loadbalancer_id"`
+	LoadbalancerId            string `json:"loadbalancer_id"`
+	Scheduler                 string `json:"scheduler"`
+	LoadbalancerHealthCheckId string `json:"loadbalancer_health_check_id"`
 
 	Type string `json:"type"`
 
 	Backends []struct {
-		Index       int
-		Weight      int
-		Port        int
-		Id          string
-		Name        string
-		ExternalId  string
-		BackendType string
-		BackendRole string
-		Address     string
-		ZoneId      string
-		HostName    string
+		Index       int    `json:"index"`
+		Weight      int    `json:"weight"`
+		Port        int    `json:"port"`
+		Id          string `json:"id"`
+		Name        string `json:"name"`
+		ExternalId  string `json:"external_id"`
+		BackendType string `json:"backend_type"`
+		BackendRole string `json:"backend_role"`
+		Address     string `json:"address"`
+		ZoneId      string `json:"zone_id"`
+		HostName    string `json:"host_name"`
 	} `json:"backends"`
 }
 
@@ -90,4 +102,46 @@ type LoadbalancerBackendGroupListInput struct {
 	NoRef *bool `json:"no_ref"`
 
 	Type []string `json:"type"`
+}
+
+type ListenerRuleBackendGroup struct {
+	// 后端服务器组组ID
+	Id string `json:"id"`
+	// swagger:ignore
+	Name string `json:"name"`
+	// swagger:ignore
+	ExternalId string `json:"external_id"`
+}
+
+type ListenerRuleBackendGroups []ListenerRuleBackendGroup
+
+func (groups ListenerRuleBackendGroups) String() string {
+	return jsonutils.Marshal(groups).String()
+}
+
+func (groups ListenerRuleBackendGroups) IsZero() bool {
+	return len(groups) == 0
+}
+
+type ListenerRuleRedirectPool struct {
+	RegionPools  map[string]ListenerRuleBackendGroups `json:"region_pools"`
+	CountryPools map[string]ListenerRuleBackendGroups `json:"country_pools"`
+}
+
+func (pool ListenerRuleRedirectPool) String() string {
+	return jsonutils.Marshal(pool).String()
+}
+
+func (pool ListenerRuleRedirectPool) IsZero() bool {
+	return len(pool.RegionPools) == 0 && len(pool.CountryPools) == 0
+}
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(&ListenerRuleBackendGroups{}), func() gotypes.ISerializable {
+		return &ListenerRuleBackendGroups{}
+	})
+
+	gotypes.RegisterSerializable(reflect.TypeOf(&ListenerRuleRedirectPool{}), func() gotypes.ISerializable {
+		return &ListenerRuleRedirectPool{}
+	})
 }

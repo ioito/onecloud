@@ -15,10 +15,12 @@
 package monitor
 
 import (
+	"reflect"
 	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 
 	"yunion.io/x/onecloud/pkg/apis"
 )
@@ -84,19 +86,37 @@ type AlertSetting struct {
 	Conditions []AlertCondition `json:"conditions"`
 }
 
-type AlertCondition struct {
-	Type      string     `json:"type"`
-	Query     AlertQuery `json:"query"`
-	Reducer   Condition  `json:"reducer"`
-	Evaluator Condition  `json:"evaluator"`
-	Operator  string     `json:"operator"`
+func (s AlertSetting) String() string {
+	return jsonutils.Marshal(s).String()
 }
 
+func (s AlertSetting) IsZero() bool {
+	return len(s.Conditions) == 0
+}
+
+type AlertCondition struct {
+	Type         string             `json:"type"`
+	Query        AlertQuery         `json:"query"`
+	Reducer      Condition          `json:"reducer"`
+	ReducerOrder ResultReducerOrder `json:"reducer_order"`
+	Evaluator    Condition          `json:"evaluator"`
+	Operator     string             `json:"operator"`
+}
+
+type ResultReducerOrder string
+
+const (
+	RESULT_REDUCER_ORDER_ASC  ResultReducerOrder = "asc"
+	RESULT_REDUCER_ORDER_DESC ResultReducerOrder = "desc"
+)
+
 type AlertQuery struct {
-	Model        MetricQuery `json:"model"`
-	DataSourceId string      `json:"data_source_id"`
-	From         string      `json:"from"`
-	To           string      `json:"to"`
+	Model MetricQuery `json:"model"`
+	From  string      `json:"from"`
+	To    string      `json:"to"`
+	// 查询结果 reducer，执行 p95 这些操作
+	ResultReducer      *Condition         `json:"result_reducer"`
+	ResultReducerOrder ResultReducerOrder `json:"result_reducer_order"`
 }
 
 type AlertCreateInput struct {
@@ -121,12 +141,13 @@ type AlertCreateInput struct {
 	UsedBy              string `json:"used_by"`
 	// customize info
 	CustomizeConfig jsonutils.JSONObject `json:"customize_config"`
+	Reason          string               `json:"reason"`
 }
 
 type MeterCustomizeConfig struct {
-	UnitDesc string
-	Name     string
-	Currency string
+	UnitDesc string `json:"unit_desc"`
+	Name     string `json:"name"`
+	Currency string `json:"currency"`
 }
 
 type AlertUpdateInput struct {
@@ -148,6 +169,8 @@ type AlertUpdateInput struct {
 	NoDataState string `json:"no_data_state"`
 	// 报警执行错误将当前报警状态设置为对应的状态
 	ExecutionErrorState string `json:"execution_error_state"`
+	// 报警原因
+	Reason string `json:"reason"`
 }
 
 type AlertListInput struct {
@@ -156,6 +179,7 @@ type AlertListInput struct {
 	apis.StatusStandaloneResourceListInput
 	// 以报警是否启用/禁用过滤列表
 	// Enabled *bool `json:"enabled"`
+	MonitorResourceId []string `json:"monitor_resource_id"`
 }
 
 type AlertDetails struct {
@@ -179,12 +203,14 @@ type ResultLogEntry struct {
 
 // EvalMatch represents the series violating the threshold.
 type EvalMatch struct {
-	Condition string            `json:"condition"`
-	Value     *float64          `json:"value"`
-	ValueStr  string            `json:"value_str"`
-	Metric    string            `json:"metric"`
-	Tags      map[string]string `json:"tags"`
-	Unit      string            `json:"unit"`
+	Condition    string               `json:"condition"`
+	Value        *float64             `json:"value"`
+	ValueStr     string               `json:"value_str"`
+	Metric       string               `json:"metric"`
+	Tags         map[string]string    `json:"tags"`
+	Unit         string               `json:"unit"`
+	AlertDetails jsonutils.JSONObject `json:"alert_details"`
+	IsRecovery   bool                 `json:"is_recovery"`
 }
 
 type AlertTestRunOutput struct {
@@ -209,3 +235,19 @@ type AlertPauseInput struct {
 
 	Paused bool `json:"paused"`
 }
+
+func init() {
+	gotypes.RegisterSerializable(reflect.TypeOf(&AlertSetting{}), func() gotypes.ISerializable {
+		return &AlertSetting{}
+	})
+}
+
+type EvaluatorType string
+
+const (
+	EvaluatorTypeGT           EvaluatorType = "gt"
+	EvaluatorTypeLT           EvaluatorType = "lt"
+	EvaluatorTypeEQ           EvaluatorType = "eq"
+	EvaluatorTypeWithinRange  EvaluatorType = "within_range"
+	EvaluatorTypeOutsideRange EvaluatorType = "outside_range"
+)

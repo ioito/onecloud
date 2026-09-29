@@ -75,6 +75,9 @@ func prepareServer() error {
 	}
 
 	err = parser.ParseArgs(os.Args[1:], false)
+	if err != nil {
+		return errors.Wrap(err, "ParseArgs")
+	}
 	options := parser.Options().(*Options)
 
 	if options.Help {
@@ -101,7 +104,7 @@ func prepareServer() error {
 		return errors.Wrapf(httperrors.ErrInputParameter, "cert %s not found", options.Cert)
 	}
 
-	app := appsrv.NewApplication("samldemo", 4, false)
+	app := appsrv.NewApplication("samldemo", 4, 10, false)
 
 	saml, err := samlutils.NewSAMLInstance(options.Entity, options.Cert, options.Key)
 	if err != nil {

@@ -23,8 +23,11 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/appctx"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/version"
 
 	"yunion.io/x/onecloud/pkg/appsrv"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/yunionconf"
 )
 
 type DelayTaskFunc func(context.Context, interface{}) (jsonutils.JSONObject, error)
@@ -69,6 +72,7 @@ func (t *workerTask) Run() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorf("DelayTask panic: %s", r)
+			yunionconf.BugReport.SendBugReport(t.ctx, version.GetShortString(), string(debug.Stack()), errors.Errorf("%s", r))
 			debug.PrintStack()
 			switch val := r.(type) {
 			case string:
@@ -139,6 +143,7 @@ func (t *delayWorkerTask) Run() {
 		if r := recover(); r != nil {
 			log.Errorln("DelayTaskWithoutReqctx panic: ", r)
 			debug.PrintStack()
+			yunionconf.BugReport.SendBugReport(t.ctx, version.GetShortString(), string(debug.Stack()), errors.Errorf("%s", r))
 		}
 	}()
 
@@ -184,7 +189,10 @@ func (w *SWorkManager) Stop() {
 	}
 }
 
-func NewWorkManger(onFailed OnTaskFailed, onCompleted OnTaskCompleted, workerCount int) *SWorkManager {
+func NewWorkManger(name string, onFailed OnTaskFailed, onCompleted OnTaskCompleted, workerCount int) *SWorkManager {
+	if len(name) == 0 {
+		name = "RequestWorker"
+	}
 	if workerCount <= 0 {
 		workerCount = 1
 	}
@@ -192,6 +200,6 @@ func NewWorkManger(onFailed OnTaskFailed, onCompleted OnTaskCompleted, workerCou
 		onFailed:    onFailed,
 		onCompleted: onCompleted,
 		worker: appsrv.NewWorkerManager(
-			"RequestWorker", workerCount, appsrv.DEFAULT_BACKLOG, false),
+			name, workerCount, appsrv.DEFAULT_BACKLOG, false),
 	}
 }

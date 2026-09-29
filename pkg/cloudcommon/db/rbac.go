@@ -62,6 +62,8 @@ func isObjectRbacAllowedResult(ctx context.Context, model IModel, userCred mccli
 	case rbacscope.ScopeUser:
 		if ownerId != nil && objOwnerId != nil && (ownerId.GetUserId() == objOwnerId.GetUserId() || objOwnerId.GetUserId() == "" || (model.IsSharable(ownerId) && action == policy.PolicyActionGet)) {
 			requireScope = rbacscope.ScopeUser
+		} else if ownerId != nil && objOwnerId != nil && ownerId.GetProjectId() == objOwnerId.GetProjectId() {
+			requireScope = rbacscope.ScopeProject
 		} else if ownerId != nil && objOwnerId != nil && ownerId.GetProjectDomainId() == objOwnerId.GetProjectDomainId() {
 			requireScope = rbacscope.ScopeDomain
 		} else {
@@ -156,7 +158,7 @@ func IsAllowList(scope rbacscope.TRbacScope, userCred mcclient.TokenCredential, 
 	if userCred == nil {
 		return rbacutils.PolicyDeny
 	}
-	return userCred.IsAllow(scope, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionList)
+	return policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionList)
 }
 
 func IsAdminAllowList(userCred mcclient.TokenCredential, manager IResource) rbacutils.SPolicyResult {
@@ -175,7 +177,7 @@ func IsAllowCreate(scope rbacscope.TRbacScope, userCred mcclient.TokenCredential
 	if userCred == nil {
 		return rbacutils.PolicyDeny
 	}
-	return userCred.IsAllow(scope, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionCreate)
+	return policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionCreate)
 }
 
 func IsAdminAllowCreate(userCred mcclient.TokenCredential, manager IResource) rbacutils.SPolicyResult {
@@ -194,7 +196,7 @@ func IsAllowClassPerform(scope rbacscope.TRbacScope, userCred mcclient.TokenCred
 	if userCred == nil {
 		return rbacutils.PolicyDeny
 	}
-	return userCred.IsAllow(scope, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionPerform, action)
+	return policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), manager.KeywordPlural(), policy.PolicyActionPerform, action)
 }
 
 func IsAdminAllowClassPerform(userCred mcclient.TokenCredential, manager IResource, action string) rbacutils.SPolicyResult {
@@ -213,7 +215,7 @@ func IsAllowGet(ctx context.Context, scope rbacscope.TRbacScope, userCred mcclie
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionGet)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionGet)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowGet %s", err)
@@ -239,7 +241,7 @@ func IsAllowGetSpec(ctx context.Context, scope rbacscope.TRbacScope, userCred mc
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionGet, spec)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionGet, spec)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowGetSpec %s", err)
@@ -265,7 +267,7 @@ func IsAllowPerform(ctx context.Context, scope rbacscope.TRbacScope, userCred mc
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionPerform, action)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionPerform, action)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowPerform %s", err)
@@ -291,7 +293,7 @@ func IsAllowUpdate(ctx context.Context, scope rbacscope.TRbacScope, userCred mcc
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionUpdate)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionUpdate)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowUpdate %s", err)
@@ -317,7 +319,7 @@ func IsAllowUpdateSpec(ctx context.Context, scope rbacscope.TRbacScope, userCred
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionUpdate, spec)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionUpdate, spec)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowUpdateSpec %s", err)
@@ -343,7 +345,7 @@ func IsAllowDelete(ctx context.Context, scope rbacscope.TRbacScope, userCred mcc
 	if userCred == nil {
 		return false
 	}
-	result := userCred.IsAllow(scope, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionDelete)
+	result := policy.PolicyManager.Allow(scope, userCred, consts.GetServiceType(), obj.KeywordPlural(), policy.PolicyActionDelete)
 	err := objectConfirmPolicyTags(ctx, obj, result)
 	if err != nil {
 		log.Errorf("IsAllowDelete %s", err)

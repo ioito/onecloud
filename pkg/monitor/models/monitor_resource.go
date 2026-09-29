@@ -16,8 +16,8 @@ package models
 
 import (
 	"context"
-	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +40,23 @@ import (
 var (
 	MonitorResourceManager *SMonitorResourceManager
 )
+
+// validateTopQueryInput 验证 TopQueryInput 参数并返回解析后的值
+func validateTopQueryInput(input monitor.TopQueryInput) (startTime time.Time, endTime time.Time, top int, err error) {
+	startTime = input.StartTime
+	endTime = input.EndTime
+	if startTime.IsZero() || endTime.IsZero() {
+		return time.Time{}, time.Time{}, 0, httperrors.NewInputParameterError("start_time and end_time must be specified")
+	}
+	if startTime.After(endTime) {
+		return time.Time{}, time.Time{}, 0, httperrors.NewInputParameterError("start_time must be before end_time")
+	}
+	top = *input.Top
+	if top <= 0 {
+		top = 5 // 默认返回 top 5
+	}
+	return startTime, endTime, top, nil
+}
 
 type IMonitorResourceCache interface {
 	Get(resId string) (jsonutils.JSONObject, bool)
@@ -92,6 +109,8 @@ func (manager *SMonitorResourceManager) GetModelSets() *MonitorResModelSets {
 	return manager.monitorResModelSets
 }
 
+// +onecloud:swagger-gen-model-singular=monitorresource
+// +onecloud:swagger-gen-model-plural=monitorresources
 type SMonitorResourceManager struct {
 	db.SVirtualResourceBaseManager
 	db.SEnabledResourceBaseManager
@@ -128,6 +147,17 @@ func (manager *SMonitorResourceManager) GetMonitorResources(input monitor.Monito
 		return nil, errors.Wrap(err, "SMonitorResourceManager FetchModelObjects err")
 	}
 	return monitorResources, nil
+}
+
+func (man *SMonitorResourceManager) GetMonitorResourceByResId(id string) (*SMonitorResource, error) {
+	resources, err := MonitorResourceManager.GetMonitorResources(monitor.MonitorResourceListInput{ResId: []string{id}})
+	if err != nil {
+		return nil, errors.Wrapf(err, "SMonitorResourceManager GetMonitorResources by resId: %s", id)
+	}
+	if len(resources) == 0 {
+		return nil, errors.Errorf("SMonitorResourceManager GetMonitorResources by resId: %s not found", id)
+	}
+	return &resources[0], nil
 }
 
 type SdeleteRes struct {
@@ -168,7 +198,7 @@ func (manager *SMonitorResourceManager) DeleteMonitorResources(ctx context.Conte
 func (manager *SMonitorResourceManager) GetMonitorResourceById(id string) (*SMonitorResource, error) {
 	iModel, err := db.FetchById(manager, id)
 	if err != nil {
-		return nil, errors.Wrapf(err, fmt.Sprintf("GetMonitorResourceById:%s err", id))
+		return nil, errors.Wrapf(err, "GetMonitorResourceById:%s err", id)
 	}
 	return iModel.(*SMonitorResource), nil
 }
@@ -178,6 +208,11 @@ func (manager *SMonitorResourceManager) ListItemFilter(
 	userCred mcclient.TokenCredential,
 	query monitor.MonitorResourceListInput,
 ) (*sqlchemy.SQuery, error) {
+	// 如果指定了时间段和 top 参数，执行特殊的 top 查询
+	if query.Top != nil {
+		return manager.getTopResourcesByAlertCount(ctx, q, userCred, query)
+	}
+
 	var err error
 	q, err = manager.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, query.VirtualResourceListInput)
 	if err != nil {
@@ -201,7 +236,13 @@ func (manager *SMonitorResourceManager) FieldListFilter(q *sqlchemy.SQuery, quer
 		q.In("res_id", query.ResId)
 	}
 	if len(query.ResName) != 0 {
-		q.Contains("name", query.ResName)
+		q = q.Filter(sqlchemy.OR(
+			sqlchemy.Contains(q.Field("name"), query.ResName),
+			sqlchemy.Equals(q.Field("res_id"), query.ResName),
+		))
+	}
+	if len(query.AlertStates) != 0 {
+		q.In("alert_state", query.AlertStates)
 	}
 	return q
 }
@@ -210,13 +251,125 @@ func (man *SMonitorResourceManager) OrderByExtraFields(
 	ctx context.Context,
 	q *sqlchemy.SQuery,
 	userCred mcclient.TokenCredential,
-	input monitor.SuggestSysAlertListInput,
+	input monitor.MonitorResourceListInput,
 ) (*sqlchemy.SQuery, error) {
 	var err error
 	q, err = man.SVirtualResourceBaseManager.OrderByExtraFields(ctx, q, userCred, input.VirtualResourceListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SVirtualResourceBaseManager.OrderByExtraFields")
 	}
+	return q, nil
+}
+
+// getTopResourcesByAlertCount 查询指定时间段内报警数量最多的 top N 资源
+func (man *SMonitorResourceManager) getTopResourcesByAlertCount(
+	ctx context.Context,
+	q *sqlchemy.SQuery,
+	userCred mcclient.TokenCredential,
+	query monitor.MonitorResourceListInput,
+) (*sqlchemy.SQuery, error) {
+	// 验证时间段和 top 参数
+	startTime, endTime, top, err := validateTopQueryInput(query.TopQueryInput)
+	if err != nil {
+		return nil, err
+	}
+
+	// 查询指定时间段内的 AlertRecord
+	recordQuery := AlertRecordManager.Query("res_ids", "res_type")
+	recordQuery = recordQuery.GE("created_at", startTime).LE("created_at", endTime)
+	recordQuery = recordQuery.IsNotNull("res_type").IsNotEmpty("res_type")
+	recordQuery = recordQuery.IsNotEmpty("res_ids")
+
+	// 如果指定了 ResType，添加过滤条件
+	if len(query.ResType) > 0 {
+		recordQuery = recordQuery.Equals("res_type", query.ResType)
+	}
+
+	// 应用权限过滤 - 使用 FilterByOwner 方法
+	// 从 query 中获取 scope，如果没有则使用默认值
+	scope := rbacscope.ScopeSystem
+	if len(query.VirtualResourceListInput.Scope) > 0 {
+		scope = rbacscope.TRbacScope(query.VirtualResourceListInput.Scope)
+	}
+	recordQuery = AlertRecordManager.SMonitorScopedResourceManager.FilterByOwner(
+		ctx, recordQuery, AlertRecordManager, userCred, userCred, scope)
+
+	// 执行查询获取所有记录
+	type RecordRow struct {
+		ResIds  string
+		ResType string
+	}
+	rows := make([]RecordRow, 0)
+	err = recordQuery.All(&rows)
+	if err != nil {
+		return nil, errors.Wrap(err, "query alert records")
+	}
+
+	// 统计每个资源的报警数量
+	resourceAlertCount := make(map[string]int)
+	for _, row := range rows {
+		if len(row.ResIds) == 0 {
+			continue
+		}
+		// 解析 res_ids（逗号分隔）
+		resIds := strings.Split(row.ResIds, ",")
+		for _, resId := range resIds {
+			resId = strings.TrimSpace(resId)
+			if len(resId) > 0 {
+				// 如果指定了 ResType，需要匹配 res_type
+				if len(query.ResType) > 0 && row.ResType != query.ResType {
+					continue
+				}
+				resourceAlertCount[resId]++
+			}
+		}
+	}
+
+	// 转换为切片并按报警数量排序
+	type ResourceCount struct {
+		ResId string
+		Count int
+	}
+	resourceCounts := make([]ResourceCount, 0, len(resourceAlertCount))
+	for resId, count := range resourceAlertCount {
+		resourceCounts = append(resourceCounts, ResourceCount{
+			ResId: resId,
+			Count: count,
+		})
+	}
+
+	// 按报警数量降序排序
+	for i := 0; i < len(resourceCounts)-1; i++ {
+		for j := i + 1; j < len(resourceCounts); j++ {
+			if resourceCounts[i].Count < resourceCounts[j].Count {
+				resourceCounts[i], resourceCounts[j] = resourceCounts[j], resourceCounts[i]
+			}
+		}
+	}
+
+	// 获取 top N 的资源 ID
+	topResIds := make([]string, 0, top)
+	for i := 0; i < top && i < len(resourceCounts); i++ {
+		topResIds = append(topResIds, resourceCounts[i].ResId)
+	}
+
+	if len(topResIds) == 0 {
+		// 如果没有找到任何记录，返回空查询
+		return q.FilterByFalse(), nil
+	}
+
+	// 用 top res_id 过滤 MonitorResource 查询
+	q, err = man.SVirtualResourceBaseManager.ListItemFilter(ctx, q, userCred, query.VirtualResourceListInput)
+	if err != nil {
+		return nil, err
+	}
+	q, err = man.SEnabledResourceBaseManager.ListItemFilter(ctx, q, userCred, query.EnabledResourceBaseListInput)
+	if err != nil {
+		return nil, err
+	}
+	q = man.FieldListFilter(q, query)
+	q = q.In("res_id", topResIds)
+
 	return q, nil
 }
 
@@ -253,31 +406,60 @@ func (man *SMonitorResourceManager) FetchCustomizeColumns(
 ) []monitor.MonitorResourceDetails {
 	rows := make([]monitor.MonitorResourceDetails, len(objs))
 	virtRows := man.SVirtualResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	resIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i] = monitor.MonitorResourceDetails{
 			VirtualResourceDetails: virtRows[i],
 		}
-		rows[i] = objs[i].(*SMonitorResource).getMoreDetails(rows[i])
+		mr := objs[i].(*SMonitorResource)
+		resIds[i] = mr.ResId
+		_, object := MonitorResourceManager.GetResourceObj(mr.ResId)
+		if object != nil {
+			object.Unmarshal(&rows[i])
+		}
+	}
+	sq := MonitorResourceAlertManager.Query().In("monitor_resource_id", resIds).SubQuery()
+	q := sq.Query(
+		sq.Field("monitor_resource_id"),
+		sqlchemy.COUNT("count", sq.Field("row_id")),
+	).GroupBy(sq.Field("monitor_resource_id"))
+	mrs := []struct {
+		MonitorResourceId string
+		Count             int64
+	}{}
+	err := q.All(&mrs)
+	if err != nil {
+		log.Errorf("query monitor resource alert error: %v", err)
+		return rows
+	}
+	mrMap := make(map[string]int64)
+	for _, mr := range mrs {
+		mrMap[mr.MonitorResourceId] = mr.Count
+	}
+	for i := range rows {
+		rows[i].AttachAlertCount = mrMap[resIds[i]]
 	}
 	return rows
 }
 
-func (self *SMonitorResource) AttachAlert(ctx context.Context, userCred mcclient.TokenCredential, alertId string) error {
+func (self *SMonitorResource) AttachAlert(ctx context.Context, userCred mcclient.TokenCredential, alertId string, metric string, match monitor.EvalMatch) (*SMonitorResourceAlert, error) {
 	iModel, _ := db.NewModelObject(MonitorResourceAlertManager)
 	input := monitor.MonitorResourceJointCreateInput{
 		MonitorResourceId: self.ResId,
 		AlertId:           alertId,
 		AlertState:        monitor.MONITOR_RESOURCE_ALERT_STATUS_ATTACH,
+		Metric:            metric,
+		Data:              match,
 	}
 	data := input.JSON(&input)
 	err := data.Unmarshal(iModel)
 	if err != nil {
-		return errors.Wrap(err, "MonitorResourceJointCreateInput unmarshal to joint err")
+		return nil, errors.Wrap(err, "MonitorResourceJointCreateInput unmarshal to joint err")
 	}
 	if err := MonitorResourceAlertManager.TableSpec().Insert(ctx, iModel); err != nil {
-		return errors.Wrap(err, "insert MonitorResourceJoint model err")
+		return nil, errors.Wrap(err, "insert MonitorResourceJoint model err")
 	}
-	return nil
+	return iModel.(*SMonitorResourceAlert), nil
 }
 
 func (self *SMonitorResource) UpdateAlertState() error {
@@ -319,20 +501,6 @@ func (self *SMonitorResource) DetachJoint(ctx context.Context, userCred mcclient
 	return nil
 }
 
-func (self *SMonitorResource) getMoreDetails(out monitor.MonitorResourceDetails) monitor.MonitorResourceDetails {
-	joints, err := MonitorResourceAlertManager.GetJoinsByListInput(monitor.
-		MonitorResourceJointListInput{MonitorResourceId: self.ResId})
-	if err != nil {
-		log.Errorf("getMoreDetails err:%v", err)
-	}
-	_, object := MonitorResourceManager.GetResourceObj(self.ResId)
-	if object != nil {
-		object.Unmarshal(&out)
-	}
-	out.AttachAlertCount = int64(len(joints))
-	return out
-}
-
 type AlertStatusCount struct {
 	CountId    int64
 	AlertState string
@@ -351,7 +519,7 @@ func (manager *SMonitorResourceManager) GetPropertyAlert(ctx context.Context, us
 		if owner == nil {
 			owner = userCred
 		}
-		query = manager.FilterByOwner(query, manager, userCred, owner, rbacscope.TRbacScope(scope))
+		query = manager.FilterByOwner(ctx, query, manager, userCred, owner, rbacscope.TRbacScope(scope))
 		query = query.AppendField(sqlchemy.COUNT("count_id", query.Field("id")))
 		input := monitor.MonitorResourceListInput{ResType: resType}
 		query = manager.FieldListFilter(query, input)
@@ -379,21 +547,43 @@ func (manager *SMonitorResourceManager) GetPropertyAlert(ctx context.Context, us
 	return result, nil
 }
 
-func (manager *SMonitorResourceManager) UpdateMonitorResourceAttachJoint(ctx context.Context,
-	userCred mcclient.TokenCredential, alertRecord *SAlertRecord) error {
-	//if !utils.IsInStringArray(alertRecord.ResType, []string{monitor.METRIC_RES_TYPE_HOST,
-	//	monitor.METRIC_RES_TYPE_GUEST, monitor.METRIC_RES_TYPE_AGENT}) {
-	//	return nil
-	//}
-	resType := alertRecord.ResType
+func (manager *SMonitorResourceManager) UpdateMonitorResourceAttachJointByRecord(ctx context.Context, userCred mcclient.TokenCredential, record *SAlertRecord) error {
+	matches, _ := record.GetEvalData()
+	input := &UpdateMonitorResourceAlertInput{
+		AlertId:       record.AlertId,
+		Matches:       matches,
+		ResType:       record.ResType,
+		AlertState:    record.State,
+		SendState:     record.SendState,
+		TriggerTime:   record.CreatedAt,
+		AlertRecordId: record.GetId(),
+	}
+	if err := manager.UpdateMonitorResourceAttachJoint(ctx, userCred, input); err != nil {
+		return errors.Wrap(err, "UpdateMonitorResourceAttachJoint")
+	}
+	return nil
+}
+
+type UpdateMonitorResourceAlertInput struct {
+	AlertId       string
+	Matches       []monitor.EvalMatch
+	ResType       string
+	AlertState    string
+	SendState     string
+	TriggerTime   time.Time
+	AlertRecordId string
+}
+
+func (manager *SMonitorResourceManager) UpdateMonitorResourceAttachJoint(ctx context.Context, userCred mcclient.TokenCredential, input *UpdateMonitorResourceAlertInput) error {
+	resType := input.ResType
 	if resType == monitor.METRIC_RES_TYPE_AGENT {
 		resType = monitor.METRIC_RES_TYPE_GUEST
 	}
-	matches, _ := alertRecord.GetEvalData()
+	matches := input.Matches
 	errs := make([]error, 0)
 	matchResourceIds := make([]string, 0)
-	for _, matche := range matches {
-		resId := matche.Tags[monitor.MEASUREMENT_TAG_ID[alertRecord.ResType]]
+	for _, match := range matches {
+		resId := monitor.GetMeasurementResourceId(match.Tags, input.ResType)
 		if len(resId) == 0 {
 			continue
 		}
@@ -404,19 +594,30 @@ func (manager *SMonitorResourceManager) UpdateMonitorResourceAttachJoint(ctx con
 			continue
 		}
 		for _, res := range monitorResources {
-			err := res.UpdateAttachJoint(alertRecord, matche)
+			err := res.UpdateAttachJoint(ctx, userCred, input, match)
 			if err != nil {
-				errs = append(errs, err)
+				errs = append(errs, errors.Wrap(err, "UpdateAttachJoint"))
 			}
 		}
 	}
-	resourceAlerts, err := MonitorResourceAlertManager.GetJoinsByListInput(monitor.MonitorResourceJointListInput{AlertId: alertRecord.AlertId})
+	resourceAlerts, err := MonitorResourceAlertManager.GetJoinsByListInput(monitor.MonitorResourceJointListInput{
+		AlertId:    input.AlertId,
+		AlertState: input.AlertState,
+	})
 	if err != nil {
-		return errors.Wrapf(err, "get monitor_resource_joint by alertId:%s err", alertRecord.AlertId)
+		return errors.Wrapf(err, "get monitor_resource_joint by alertId: %s", input.AlertId)
 	}
 	deleteJointIds := make([]int64, 0)
 	for _, joint := range resourceAlerts {
-		if utils.IsInStringArray(joint.MonitorResourceId, matchResourceIds) {
+		metricName := joint.Metric
+		isMetricFound := false
+		for _, match := range matches {
+			if match.Metric == metricName {
+				isMetricFound = true
+				break
+			}
+		}
+		if utils.IsInStringArray(joint.MonitorResourceId, matchResourceIds) && isMetricFound {
 			continue
 		}
 		deleteJointIds = append(deleteJointIds, joint.RowId)
@@ -424,37 +625,56 @@ func (manager *SMonitorResourceManager) UpdateMonitorResourceAttachJoint(ctx con
 	if len(deleteJointIds) != 0 {
 		err = MonitorResourceAlertManager.DetachJoint(ctx, userCred, monitor.MonitorResourceJointListInput{JointId: deleteJointIds})
 		if err != nil {
-			return errors.Wrapf(err, "DetachJoint by alertId:%s err", alertRecord.AlertId)
+			return errors.Wrapf(err, "DetachJoint by alertId:%s err", input.AlertId)
 		}
 	}
 	return errors.NewAggregate(errs)
 }
 
-func (self *SMonitorResource) UpdateAttachJoint(alertRecord *SAlertRecord, match monitor.EvalMatch) error {
-	joints, err := MonitorResourceAlertManager.GetJoinsByListInput(monitor.MonitorResourceJointListInput{MonitorResourceId: self.
-		ResId, AlertId: alertRecord.AlertId})
+func (self *SMonitorResource) UpdateAttachJoint(ctx context.Context, userCred mcclient.TokenCredential, input *UpdateMonitorResourceAlertInput, match monitor.EvalMatch) error {
+	joints, err := MonitorResourceAlertManager.GetJoinsByListInput(
+		monitor.MonitorResourceJointListInput{
+			MonitorResourceId: self.ResId,
+			AlertId:           input.AlertId,
+			Metric:            match.Metric,
+		})
 	if err != nil {
-		return errors.Wrapf(err, "SMonitorResource:%s UpdateAttachJoint err", self.Name)
+		return errors.Wrapf(err, "SMonitorResource: %s(%s) get joints by monitorResourceId %q , metric %q and alertId %q", self.Name, self.Id, self.ResId, match.Metric, input.AlertId)
 	}
 	errs := make([]error, 0)
-	// 报警时发现没有进行关联，增加attach
-	if len(joints) == 0 {
-		self.AttachAlert(context.Background(), nil, alertRecord.AlertId)
-		joints, _ = MonitorResourceAlertManager.GetJoinsByListInput(monitor.
-			MonitorResourceJointListInput{MonitorResourceId: self.
-			ResId, AlertId: alertRecord.AlertId})
-	}
+	updateJoints := make([]SMonitorResourceAlert, 0)
 	for _, joint := range joints {
-		err := joint.UpdateAlertRecordData(alertRecord, &match)
-		if err != nil {
-			errs = append(errs, errors.Wrapf(err, "joint %s:%s %s:%s UpdateAlertRecordData err",
-				MonitorResourceAlertManager.GetMasterFieldName(), self.ResId,
-				MonitorResourceAlertManager.GetSlaveFieldName(), alertRecord.AlertId))
+		if joint.Metric == match.Metric {
+			tmpJoint := joint
+			updateJoints = append(updateJoints, tmpJoint)
 		}
 	}
-	self.UpdateAlertState()
+	// 报警时发现没有进行关联，增加attach
+	if len(updateJoints) == 0 {
+		newJoint, err := self.AttachAlert(ctx, userCred, input.AlertId, match.Metric, match)
+		if err != nil {
+			log.Errorf("attach alert error: %s", err)
+		}
+		log.Infof("Attach Alert joint: %#v, match: %s", newJoint, jsonutils.Marshal(match))
+		if err := newJoint.UpdateAlertRecordData(ctx, userCred, input, &match); err != nil {
+			errs = append(errs, errors.Wrapf(err, "new joint %s:%s %s:%s UpdateAlertRecordData err",
+				MonitorResourceAlertManager.GetMasterFieldName(), self.ResId,
+				MonitorResourceAlertManager.GetSlaveFieldName(), input.AlertId))
+		}
+	} else {
+		for _, joint := range updateJoints {
+			err := joint.UpdateAlertRecordData(ctx, userCred, input, &match)
+			if err != nil {
+				errs = append(errs, errors.Wrapf(err, "joint %s:%s %s:%s UpdateAlertRecordData err",
+					MonitorResourceAlertManager.GetMasterFieldName(), self.ResId,
+					MonitorResourceAlertManager.GetSlaveFieldName(), input.AlertId))
+			}
+		}
+	}
+	if err := self.UpdateAlertState(); err != nil {
+		errs = append(errs, errors.Wrapf(err, "UpdateAlertState"))
+	}
 	return errors.NewAggregate(errs)
-
 }
 
 func (manager *SMonitorResourceManager) GetResourceObj(id string) (bool, jsonutils.JSONObject) {
@@ -582,4 +802,25 @@ func newMonitorResourceCreateInput(input jsonutils.JSONObject, typ string) jsonu
 	}
 
 	return monitorResource
+}
+
+type MonitorResourceDoActionF func(obj *SMonitorResource, ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *monitor.MonitorResourceDoActionInput) (jsonutils.JSONObject, error)
+
+var (
+	monitorResourceDoActionMap = make(map[string]MonitorResourceDoActionF)
+)
+
+func RegisterMonitorResourceDoAction(action string, f MonitorResourceDoActionF) {
+	if _, ok := monitorResourceDoActionMap[action]; ok {
+		log.Fatalf("action %s already registered for monitor resource do action", action)
+	}
+	monitorResourceDoActionMap[action] = f
+}
+
+func (res *SMonitorResource) PerformDoAction(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *monitor.MonitorResourceDoActionInput) (jsonutils.JSONObject, error) {
+	f, ok := monitorResourceDoActionMap[input.Action]
+	if !ok {
+		return nil, errors.Errorf("action %q not found for monitor resource do action", input.Action)
+	}
+	return f(res, ctx, userCred, query, input)
 }

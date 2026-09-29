@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -294,12 +293,22 @@ func (m *HmpMonitor) DriveAdd(bus, node string, params map[string]string, callba
 	m.Query(fmt.Sprintf("%s %s %s", cmd, bus, strings.Join(paramsKvs, ",")), callback)
 }
 
-func (m *HmpMonitor) DeviceAdd(dev string, params map[string]string, callback StringCallback) {
+func (m *HmpMonitor) DeviceAdd(dev string, params map[string]interface{}, callback StringCallback) {
 	var paramsKvs = []string{}
 	for k, v := range params {
-		paramsKvs = append(paramsKvs, fmt.Sprintf("%s=%s", k, v))
+		paramsKvs = append(paramsKvs, fmt.Sprintf("%s=%s", k, hmpDeviceValue(v)))
 	}
 	m.Query(fmt.Sprintf("device_add %s,%s", dev, strings.Join(paramsKvs, ",")), callback)
+}
+
+func hmpDeviceValue(value interface{}) interface{} {
+	if value, ok := value.(bool); ok {
+		if value {
+			return "on"
+		}
+		return "off"
+	}
+	return value
 }
 
 func (m *HmpMonitor) MigrateSetDowntime(dtSec float64, callback StringCallback) {
@@ -407,6 +416,14 @@ func (m *HmpMonitor) GetBlockJobs(callback func([]BlockJob)) {
 	m.Query("info block-jobs", cb)
 }
 
+func (m *HmpMonitor) GetBlockJobsWithError(callback func([]BlockJob, error)) {
+	m.GetBlockJobs(func(jobs []BlockJob) { callback(jobs, nil) })
+}
+
+func (m *HmpMonitor) WatchBlockJob(device string, callback BlockJobEventCallback) (func(), error) {
+	return nil, errors.Errorf("block job events require QMP")
+}
+
 func (m *HmpMonitor) ReloadDiskBlkdev(device, path string, callback StringCallback) {
 	m.Query(fmt.Sprintf("reload_disk_snapshot_blkdev -n %s %s", device, path), callback)
 }
@@ -440,8 +457,20 @@ func (m *HmpMonitor) BlockStream(drive string, callback StringCallback) {
 	m.Query(cmd, callback)
 }
 
+func (m *HmpMonitor) GetNamedBlockNodes(callback func([]QemuNamedBlockNode, error)) {
+	callback(nil, errors.Errorf("query-named-block-nodes requires QMP"))
+}
+
+func (m *HmpMonitor) BlockStreamToBase(device, base string, callback StringCallback) {
+	callback("block-stream with base requires QMP")
+}
+
+func (m *HmpMonitor) BlockCommit(device, top, base string, callback StringCallback) {
+	callback("block-commit requires QMP")
+}
+
 func (m *HmpMonitor) BlockJobComplete(drive string, callback StringCallback) {
-	m.Query(fmt.Sprintf("block_job_complete"), callback)
+	m.Query("block_job_complete", callback)
 }
 
 func (m *HmpMonitor) BlockReopenImage(drive, newImagePath, format string, cb StringCallback) {
@@ -568,38 +597,15 @@ func (m *HmpMonitor) QueryMachines(callback QueryMachinesCallback) {
 	go callback(nil, "unsupported query machines for hmp")
 }
 
+func (m *HmpMonitor) ScreenDump(savePath string, callback StringCallback) {
+	m.HumanMonitorCommand(fmt.Sprintf("screendump %s", savePath), callback)
+}
+
 func (m *HmpMonitor) Quit(cb StringCallback) {
 	m.Query("quit", cb)
 }
 
-func getScsiNumQueues(output string) int64 {
-	var lines = strings.Split(strings.TrimSuffix(output, "\r\n"), "\r\n")
-	for i, line := range lines {
-		line := strings.TrimSpace(line)
-		if strings.HasPrefix(line, "dev: virtio-scsi-device") {
-			if len(lines) <= i+1 {
-				log.Errorf("failed parse num queues")
-				return -1
-			}
-			line = strings.TrimSpace(lines[i+1])
-			segs := strings.Split(line, " ")
-			numQueue, err := strconv.ParseInt(segs[2], 10, 0)
-			if err != nil {
-				log.Errorf("failed parse num queue %s", err)
-				return -1
-			} else {
-				return numQueue
-			}
-		}
-	}
-	return -1
-}
-
-func (m *HmpMonitor) GetScsiNumQueues(callback func(int64)) {
-	cb := func(output string) {
-		numQueues := getScsiNumQueues(output)
-		callback(numQueues)
-	}
+func (m *HmpMonitor) InfoQtree(cb StringCallback) {
 	m.Query("info qtree", cb)
 }
 

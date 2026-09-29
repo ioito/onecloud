@@ -18,11 +18,10 @@ import (
 	"yunion.io/x/jsonutils"
 
 	"yunion.io/x/onecloud/pkg/apihelper"
-	"yunion.io/x/onecloud/pkg/apis"
+	compute_api "yunion.io/x/onecloud/pkg/apis/compute"
+	keystone_api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
-	compute_models "yunion.io/x/onecloud/pkg/compute/models"
-	keystone_models "yunion.io/x/onecloud/pkg/keystone/models"
 	"yunion.io/x/onecloud/pkg/mcclient/modulebase"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/identity"
@@ -60,88 +59,57 @@ type (
 )
 
 // +onecloud:swagger-gen-ignore
-type Details struct {
-	//com_apis.CloudproviderDetails
-	//Host          string
-	HostId        string
-	Zone          string
-	zoneId        string
-	zoneExtId     string
-	Cloudregion   string
-	CloudregionId string
-	Tenant        string
-	TenantId      string
-	Brand         string
-	DomainId      string
-	ProjectDomain string
-	Ips           string
-	Account       string
-	apis.MetadataResourceInfo
-}
-
-// +onecloud:swagger-gen-ignore
 type Guest struct {
-	compute_models.SGuest
-	Details
-	// VIP
-	Vip string `json:"vip"`
-	// VIP's eip
-	VipEip string `json:"vip_eip"`
-	// 浮动IP
-	Eip string `json:"eip"`
-	// 浮动IP类型
-	EipMode string `json:"eip_mode"`
+	db.SModelBase
+	compute_api.ServerDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type Host struct {
-	Id string
-	compute_models.SHost
-	Details
+	db.SModelBase
+	compute_api.HostDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SRds struct {
-	compute_models.SDBInstance
-	Details
+	db.SModelBase
+	compute_api.DBInstanceDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SRedis struct {
-	compute_models.SElasticcache
-	Details
+	db.SModelBase
+	compute_api.ElasticcacheDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SOss struct {
-	compute_models.SBucket
-	Details
+	db.SModelBase
+	compute_api.BucketDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SStorage struct {
-	Id string
-	compute_models.SStorage
-	Details
+	db.SModelBase
+	compute_api.StorageDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SAccount struct {
-	Id string
-	compute_models.SCloudaccount
-	Details
+	db.SModelBase
+	compute_api.CloudaccountDetail
 }
 
 // +onecloud:swagger-gen-ignore
 type SDomain struct {
-	Id string
-	keystone_models.SDomain
+	db.SModelBase
+	keystone_api.DomainDetails
 }
 
 // +onecloud:swagger-gen-ignore
 type SProject struct {
-	Id string
-	keystone_models.SProject
+	db.SModelBase
+	keystone_api.ProjectDetails
 }
 
 func (s Servers) ModelManager() modulebase.IBaseManager {
@@ -159,6 +127,10 @@ func (s Servers) AddModel(i db.IModel) {
 
 func (s Servers) Copy() apihelper.IModelSet {
 	return s
+}
+
+func (set Servers) IncludeDetails() bool {
+	return false
 }
 
 func (s Servers) GetResType() string {
@@ -180,6 +152,10 @@ func (h Hosts) AddModel(i db.IModel) {
 
 func (h Hosts) Copy() apihelper.IModelSet {
 	return h
+}
+
+func (set Hosts) IncludeDetails() bool {
+	return false
 }
 
 func (h Hosts) ModelManager() modulebase.IBaseManager {
@@ -221,6 +197,10 @@ func (r Rds) Copy() apihelper.IModelSet {
 	return r
 }
 
+func (set Rds) IncludeDetails() bool {
+	return false
+}
+
 func (r Rds) GetResType() string {
 	return monitor.METRIC_RES_TYPE_RDS
 }
@@ -246,6 +226,10 @@ func (r Redis) Copy() apihelper.IModelSet {
 	return r
 }
 
+func (set Redis) IncludeDetails() bool {
+	return false
+}
+
 func (r Redis) GetResType() string {
 	return monitor.METRIC_RES_TYPE_REDIS
 }
@@ -269,6 +253,10 @@ func (o Oss) AddModel(i db.IModel) {
 
 func (o Oss) Copy() apihelper.IModelSet {
 	return o
+}
+
+func (set Oss) IncludeDetails() bool {
+	return false
 }
 
 func (o Oss) GetResType() string {
@@ -297,6 +285,10 @@ func (a Accounts) Copy() apihelper.IModelSet {
 	return a
 }
 
+func (set Accounts) IncludeDetails() bool {
+	return false
+}
+
 func (a Accounts) GetResType() string {
 	return monitor.METRIC_RES_TYPE_CLOUDACCOUNT
 }
@@ -320,6 +312,10 @@ func (s Storages) AddModel(i db.IModel) {
 
 func (s Storages) Copy() apihelper.IModelSet {
 	return s
+}
+
+func (set Storages) IncludeDetails() bool {
+	return false
 }
 
 func (s Storages) GetResType() string {
@@ -353,6 +349,10 @@ func (d Domains) Copy() apihelper.IModelSet {
 	return d
 }
 
+func (set Domains) IncludeDetails() bool {
+	return false
+}
+
 func (d Domains) GetResType() string {
 	return monitor.METRIC_RES_TYPE_DOMAIN
 }
@@ -376,6 +376,10 @@ func (p Projects) AddModel(i db.IModel) {
 
 func (p Projects) Copy() apihelper.IModelSet {
 	return p
+}
+
+func (set Projects) IncludeDetails() bool {
+	return false
 }
 
 func (p Projects) GetResType() string {

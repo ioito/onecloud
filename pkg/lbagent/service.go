@@ -16,6 +16,7 @@ package lbagent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"sync"
@@ -27,9 +28,11 @@ import (
 
 	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
+	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostbridge"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/ovnutils"
 	"yunion.io/x/onecloud/pkg/util/procutils"
+	"yunion.io/x/onecloud/pkg/util/sysutils"
 )
 
 func StartService() {
@@ -70,11 +73,17 @@ func StartService() {
 	}
 
 	if !opts.DisableLocalVpc {
-		err := ovnutils.InitOvn(opts.SOvnOptions)
+		err := hostbridge.OVSPrepare()
+		if err != nil {
+			log.Fatalf("ovs prepare fail: %s", err)
+		}
+		err = ovnutils.InitOvn(opts.SOvnOptions)
 		if err != nil {
 			log.Fatalf("ovn init fail: %s", err)
 		}
 	}
+
+	tuneSystem()
 
 	var haproxyHelper *HaproxyHelper
 	var apiHelper *ApiHelper
@@ -120,5 +129,22 @@ func StartService() {
 			cancelFunc()
 		}()
 		wg.Wait()
+	}
+}
+
+func tuneSystem() {
+	minMemKB := fmt.Sprintf("%d", 128*1024)
+	kv := map[string]string{
+		"/proc/sys/vm/swappiness":                             "0",
+		"/proc/sys/vm/vfs_cache_pressure":                     "350",
+		"/proc/sys/vm/min_free_kbytes":                        minMemKB,
+		"/proc/sys/net/ipv4/tcp_mtu_probing":                  "2",
+		"/proc/sys/net/ipv4/neigh/default/gc_thresh1":         "1024",
+		"/proc/sys/net/ipv4/neigh/default/gc_thresh2":         "4096",
+		"/proc/sys/net/ipv4/neigh/default/gc_thresh3":         "8192",
+		"/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal": "1",
+	}
+	for k, v := range kv {
+		sysutils.SetSysConfig(k, v)
 	}
 }

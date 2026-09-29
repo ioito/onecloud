@@ -18,14 +18,18 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/influxdata/promql/v2/pkg/labels"
+	"github.com/zexi/influxql-to-metricsql/converter/translator"
+
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/gotypes"
+	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/rbacscope"
 
 	"yunion.io/x/onecloud/pkg/apis/monitor"
@@ -34,12 +38,13 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	mod "yunion.io/x/onecloud/pkg/mcclient/modules/monitor"
+	"yunion.io/x/onecloud/pkg/monitor/datasource"
 	merrors "yunion.io/x/onecloud/pkg/monitor/errors"
 	mq "yunion.io/x/onecloud/pkg/monitor/metricquery"
 	"yunion.io/x/onecloud/pkg/monitor/options"
-	"yunion.io/x/onecloud/pkg/monitor/tsdb"
+	"yunion.io/x/onecloud/pkg/monitor/tsdb/driver/victoriametrics"
 	"yunion.io/x/onecloud/pkg/monitor/validators"
-	"yunion.io/x/onecloud/pkg/util/influxdb"
 )
 
 const (
@@ -79,25 +84,24 @@ func (self *SUnifiedMonitorManager) GetPropertyMeasurements(ctx context.Context,
 
 	filter, err := getTagFilterByRequestQuery(ctx, userCred, query)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "getTagFilterByRequestQuery")
 	}
-	return DataSourceManager.GetMeasurementsWithDescriptionInfos(query, "", filter)
+	return DataSourceManager.GetMeasurementsWithDescriptionInfos(query, filter)
 }
 
-func getTagFilterByRequestQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (filter string, err error) {
+func getTagFilterByRequestQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (*monitor.MetricQueryTag, error) {
 
 	scope, _ := query.GetString("scope")
-	filter, err = filterByScope(ctx, userCred, scope, query)
-	return
+	return filterByScope(ctx, userCred, scope, query)
 }
 
-func filterByScope(ctx context.Context, userCred mcclient.TokenCredential, scope string, data jsonutils.JSONObject) (string, error) {
+func filterByScope(ctx context.Context, userCred mcclient.TokenCredential, scope string, data jsonutils.JSONObject) (*monitor.MetricQueryTag, error) {
 	domainId := jsonutils.GetAnyString(data, db.DomainFetchKeys)
 	projectId := jsonutils.GetAnyString(data, db.ProjectFetchKeys)
 	if projectId != "" {
 		project, err := db.DefaultProjectFetcher(ctx, projectId, domainId)
 		if err != nil {
-			return "", err
+			return nil, errors.Wrap(err, "db.DefaultProjectFetcher")
 		}
 		projectId = project.GetProjectId()
 		domainId = project.GetProjectDomainId()
@@ -105,14 +109,14 @@ func filterByScope(ctx context.Context, userCred mcclient.TokenCredential, scope
 	if domainId != "" {
 		domain, err := db.DefaultDomainFetcher(ctx, domainId)
 		if err != nil {
-			return "", err
+			return nil, errors.Wrap(err, "db.DefaultDomainFetcher")
 		}
 		domainId = domain.GetProjectDomainId()
 		domain.GetProjectId()
 	}
 	switch scope {
 	case "system":
-		return "", nil
+		return nil, nil
 	case "domain":
 		if domainId == "" {
 			domainId = userCred.GetProjectDomainId()
@@ -126,9 +130,9 @@ func filterByScope(ctx context.Context, userCred mcclient.TokenCredential, scope
 	}
 }
 
-func getTenantIdStr(role string, userCred mcclient.TokenCredential) (string, error) {
+func getTenantIdStr(role string, userCred mcclient.TokenCredential) (*monitor.MetricQueryTag, error) {
 	if role == "admin" {
-		return "", nil
+		return nil, nil
 	}
 	if role == "domainadmin" {
 		domainId := userCred.GetDomainId()
@@ -138,10 +142,10 @@ func getTenantIdStr(role string, userCred mcclient.TokenCredential) (string, err
 		tenantId := userCred.GetProjectId()
 		return getProjectIdFilterByProject(tenantId)
 	}
-	return "", errors.ErrNotFound
+	return nil, errors.Wrapf(errors.ErrNotFound, "not supported role %q", role)
 }
 
-func getProjectIdsFilterByDomain(domainId string) (string, error) {
+func getProjectIdsFilterByDomain(domainId string) (*monitor.MetricQueryTag, error) {
 	//s := auth.GetAdminSession(context.Background(), "", "")
 	//params := jsonutils.Marshal(map[string]string{"domain_id": domainId})
 	//tenants, err := modules.Projects.List(s, params)
@@ -160,11 +164,21 @@ func getProjectIdsFilterByDomain(domainId string) (string, error) {
 	//}
 	//buffer.WriteString(" )")
 	//return buffer.String(), nil
-	return fmt.Sprintf(`%s =~ /%s/`, "domain_id", domainId), nil
+	return &monitor.MetricQueryTag{
+		Key:      "domain_id",
+		Operator: "=~",
+		Value:    fmt.Sprintf("/%s/", domainId),
+	}, nil
+	//return fmt.Sprintf(`%s =~ /%s/`, "domain_id", domainId), nil
 }
 
-func getProjectIdFilterByProject(projectId string) (string, error) {
-	return fmt.Sprintf(`%s =~ /%s/`, "tenant_id", projectId), nil
+func getProjectIdFilterByProject(projectId string) (*monitor.MetricQueryTag, error) {
+	//return fmt.Sprintf(`%s =~ /%s/`, "tenant_id", projectId), nil
+	return &monitor.MetricQueryTag{
+		Key:      "tenant_id",
+		Operator: "=~",
+		Value:    fmt.Sprintf("/%s/", projectId),
+	}, nil
 }
 
 func (self *SUnifiedMonitorManager) GetPropertyMetricMeasurement(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -178,19 +192,49 @@ func (self *SUnifiedMonitorManager) GetPropertyMetricMeasurement(ctx context.Con
 	if err != nil {
 		return nil, errors.Wrapf(err, "getTagFilterByRequestQuery %s", query.String())
 	}
-	rtn, err := DataSourceManager.GetMetricMeasurement(userCred, query, filter)
+	ret, err := DataSourceManager.GetMetricMeasurement(userCred, query, filter)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetMetricMeasurement by query %s, filter %s", query.String(), filter)
 	}
-	rtn.(*jsonutils.JSONDict).Add(jsonutils.Marshal(&metricFunc), "func")
-	return rtn, nil
+	tagNameIdMap := monitor.GetMeasurementTagNameIdMapByResType(ret.ResType)
+	if tagNameIdMap == nil && len(ret.TagNameIdValueMap) > 0 {
+		for nameTag := range ret.TagNameIdValueMap {
+			for resType, keyword := range monitor.MEASUREMENT_TAG_KEYWORD {
+				if keyword == nameTag {
+					if idTag := monitor.MEASUREMENT_TAG_ID[resType]; idTag != "" {
+						tagNameIdMap = map[string]string{nameTag: idTag}
+						break
+					}
+				}
+			}
+			break
+		}
+	}
+	ret.TagNameIdMap = tagNameIdMap
+	output := &monitor.MetricMeasurementOutput{
+		InfluxMeasurement: *ret,
+		Func:              &metricFunc,
+	}
+	return jsonutils.Marshal(output), nil
 }
 
 func (self *SUnifiedMonitorManager) SetHandlerProcessTimeout(info *appsrv.SHandlerInfo, r *http.Request) time.Duration {
 	return 5 * time.Minute
 }
 
-func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+// +onecloud:swagger-gen-route-method=POST
+// +onecloud:swagger-gen-route-path=/unifiedmonitors/query
+// +onecloud:swagger-gen-route-tag=unifiedmonitor
+// +onecloud:swagger-gen-param-body-index=0
+// +onecloud:swagger-gen-resp-index=0
+// +onecloud:swagger-gen-resp-body-key=unifiedmonitor
+
+// 查询监控数据接口
+func PerformQuery(input monitor.MetricQueryInput) *monitor.MetricsQueryResult {
+	return nil
+}
+
+func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (*monitor.MetricsQueryResult, error) {
 	tmp := jsonutils.DeepCopy(data)
 	self.handleDataPreSignature(ctx, tmp)
 	if !options.Options.DisableQuerySignatureCheck {
@@ -198,10 +242,10 @@ func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred m
 			return nil, errors.Wrap(err, "ValidateQuerySignature")
 		}
 	}
-	inputQuery := new(monitor.MetricInputQuery)
+	inputQuery := new(monitor.MetricQueryInput)
 	err := data.Unmarshal(inputQuery)
 	if err != nil {
-		return jsonutils.NewDict(), err
+		return nil, err
 	}
 	if len(inputQuery.MetricQuery) == 0 {
 		return nil, merrors.NewArgIsEmptyErr("metric_query")
@@ -212,9 +256,9 @@ func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred m
 		if ownId == nil {
 			ownId = userCred
 		}
-		setDefaultValue(q, inputQuery, scope, ownId)
-		if err := self.ValidateInputQuery(q); err != nil {
-			return jsonutils.NewDict(), errors.Wrapf(err, "ValidateInputQuery")
+		setDefaultValue(q, inputQuery, scope, ownId, false)
+		if err := self.ValidateInputQuery(q, inputQuery); err != nil {
+			return nil, errors.Wrapf(err, "ValidateInputQuery")
 		}
 	}
 
@@ -227,9 +271,13 @@ func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred m
 		}
 	}
 
+	return self.performQuery(ctx, userCred, inputQuery)
+}
+
+func (self *SUnifiedMonitorManager) performQuery(ctx context.Context, userCred mcclient.TokenCredential, inputQuery *monitor.MetricQueryInput) (*monitor.MetricsQueryResult, error) {
 	rtn, err := doQuery(userCred, *inputQuery)
 	if err != nil {
-		return jsonutils.NewDict(), errors.Wrapf(err, "doQuery with input %s", data)
+		return nil, errors.Wrapf(err, "doQuery with input %s", jsonutils.Marshal(inputQuery))
 	}
 
 	if len(inputQuery.Soffset) != 0 && len(inputQuery.Slimit) != 0 {
@@ -257,16 +305,15 @@ func (self *SUnifiedMonitorManager) PerformQuery(ctx context.Context, userCred m
 		}
 	}
 
-	setSerieRowName(&rtn.Series, groupByTag)
 	fillSerieTags(&rtn.Series)
-	return jsonutils.Marshal(rtn), nil
+	return rtn, nil
 }
 
 func (self *SUnifiedMonitorManager) fillSearchSeriesTotalQuery(userCred mcclient.TokenCredential, fork monitor.AlertQuery) int64 {
 	newGroupByPart := make([]monitor.MetricQueryPart, 0)
 	newGroupByPart = append(newGroupByPart, fork.Model.GroupBy[0])
 	fork.Model.GroupBy = newGroupByPart
-	forkInputQury := new(monitor.MetricInputQuery)
+	forkInputQury := new(monitor.MetricQueryInput)
 	forkInputQury.MetricQuery = []*monitor.AlertQuery{&fork}
 	rtn, err := doQuery(userCred, *forkInputQury)
 	if err != nil {
@@ -305,23 +352,36 @@ func (self *SUnifiedMonitorManager) handleDataPreSignature(ctx context.Context, 
 	}
 }
 
-func doQuery(userCred mcclient.TokenCredential, query monitor.MetricInputQuery) (*mq.Metrics, error) {
-	conditions := make([]*monitor.AlertCondition, 0)
+func doQuery(userCred mcclient.TokenCredential, query monitor.MetricQueryInput) (*monitor.MetricsQueryResult, error) {
+	conds := make([]*monitor.AlertCondition, 0)
 	for _, q := range query.MetricQuery {
+		if q.To == "" {
+			q.To = query.To
+		}
+		if q.From == "" {
+			q.From = query.From
+		}
+		if q.Model.Interval == "" {
+			q.Model.Interval = query.Interval
+		}
 		condition := monitor.AlertCondition{
-			Type:  "metricquery",
+			Type:  monitor.ConditionTypeMetricQuery,
 			Query: *q,
 		}
-		conditions = append(conditions, &condition)
+		if q.ResultReducer != nil {
+			condition.Reducer = *q.ResultReducer
+			condition.ReducerOrder = q.ResultReducerOrder
+		}
+		conds = append(conds, &condition)
 	}
-	factory := mq.GetQueryFactories()["metricquery"]
-	metricQ, err := factory(conditions)
+	factory := mq.GetQueryFactories()[monitor.ConditionTypeMetricQuery]
+	metricQ, err := factory(conds)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "factory")
 	}
-	metrics, err := metricQ.ExecuteQuery(userCred, query.SkipCheckSeries)
+	metrics, err := metricQ.ExecuteQuery(userCred, query.Scope, query.SkipCheckSeries)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "ExecuteQuery")
 	}
 	// drop metas contains raw_query
 	if !query.ShowMeta {
@@ -331,15 +391,30 @@ func doQuery(userCred mcclient.TokenCredential, query monitor.MetricInputQuery) 
 	return metrics, nil
 }
 
-func (self *SUnifiedMonitorManager) ValidateInputQuery(query *monitor.AlertQuery) error {
+func (self *SUnifiedMonitorManager) ValidateInputQuery(query *monitor.AlertQuery, input *monitor.MetricQueryInput) error {
+	if input.From == "" {
+		input.From = "1h"
+	}
+	if input.To == "" {
+		input.To = "now"
+	}
+	if input.Interval == "" {
+		input.Interval = "5m"
+		if input.To == "now" {
+			if input.From == "10m" {
+				input.Interval = "1m"
+			}
+		}
+	}
+
 	if query.From == "" {
-		query.From = "1h"
+		query.From = input.From
 	}
 	if query.Model.Interval == "" {
-		query.Model.Interval = "5m"
+		query.Model.Interval = input.Interval
 	}
 	if query.To == "" {
-		query.To = "now"
+		query.To = input.To
 	}
 	if _, err := time.ParseDuration(query.Model.Interval); err != nil {
 		return httperrors.NewInputParameterError("Invalid interval format: %s", query.Model.Interval)
@@ -347,16 +422,24 @@ func (self *SUnifiedMonitorManager) ValidateInputQuery(query *monitor.AlertQuery
 	return validators.ValidateSelectOfMetricQuery(*query)
 }
 
-func setDefaultValue(query *monitor.AlertQuery, inputQuery *monitor.MetricInputQuery,
-	scope string, ownerId mcclient.IIdentityProvider) {
-	setDataSourceId(query)
-	query.From = inputQuery.From
-	query.To = inputQuery.To
-	query.Model.Interval = inputQuery.Interval
+func setDefaultValue(
+	query *monitor.AlertQuery,
+	inputQuery *monitor.MetricQueryInput,
+	scope string, ownerId mcclient.IIdentityProvider,
+	isAlert bool) {
+	if query.From == "" {
+		query.From = inputQuery.From
+	}
+	if query.To == "" {
+		query.To = inputQuery.To
+	}
+	if query.Model.Interval == "" {
+		query.Model.Interval = inputQuery.Interval
+	}
 
 	metricMeasurement, _ := MetricMeasurementManager.GetCache().Get(query.Model.Measurement)
 
-	checkQueryGroupBy(query, inputQuery)
+	checkQueryGroupBy(query, inputQuery, isAlert)
 
 	if len(inputQuery.Interval) != 0 {
 		query.Model.GroupBy = append(query.Model.GroupBy,
@@ -392,16 +475,9 @@ func setDefaultValue(query *monitor.AlertQuery, inputQuery *monitor.MetricInputQ
 		query.Model.Database = database
 	}
 
-	for i, sel := range query.Model.Selects {
-		if len(sel) > 1 {
-			continue
-		}
-		sel = append(sel, monitor.MetricQueryPart{
-			Type:   "mean",
-			Params: []string{},
-		})
-		query.Model.Selects[i] = sel
-	}
+	drv, _ := DataSourceManager.GetTSDBDriver()
+	query = drv.FillSelect(query, isAlert)
+
 	var projectId, domainId string
 	switch rbacscope.TRbacScope(scope) {
 	case rbacscope.ScopeProject:
@@ -447,14 +523,32 @@ func setDefaultValue(query *monitor.AlertQuery, inputQuery *monitor.MetricInputQ
 			Condition: "and",
 		})
 	}
+	AppendCloudAccountDefaultQueryTags(&query.Model, isAlert)
 }
 
-func setDataSourceId(query *monitor.AlertQuery) {
-	datasource, _ := DataSourceManager.GetDefaultSource()
-	query.DataSourceId = datasource.Id
+// AppendCloudAccountDefaultQueryTags appends default tag filters for cloud account metrics.
+func AppendCloudAccountDefaultQueryTags(model *monitor.MetricQuery, isAlert bool) {
+	if !isAlert || model == nil {
+		return
+	}
+	metricMeasurement, _ := MetricMeasurementManager.GetCache().Get(model.Measurement)
+	if metricMeasurement == nil || metricMeasurement.ResType != monitor.METRIC_RES_TYPE_CLOUDACCOUNT {
+		return
+	}
+	for _, tagFilter := range model.Tags {
+		if tagFilter.Key == "enabled" {
+			return
+		}
+	}
+	model.Tags = append(model.Tags, monitor.MetricQueryTag{
+		Key:       "enabled",
+		Operator:  "=",
+		Value:     "true",
+		Condition: "and",
+	})
 }
 
-func checkQueryGroupBy(query *monitor.AlertQuery, inputQuery *monitor.MetricInputQuery) {
+func checkQueryGroupBy(query *monitor.AlertQuery, inputQuery *monitor.MetricQueryInput, isAlert bool) {
 	if len(query.Model.GroupBy) != 0 {
 		return
 	}
@@ -464,63 +558,13 @@ func checkQueryGroupBy(query *monitor.AlertQuery, inputQuery *monitor.MetricInpu
 	}
 	tagId := ""
 	if metricMeasurement != nil {
-		tagId = monitor.MEASUREMENT_TAG_ID[metricMeasurement.ResType]
+		tagId = monitor.GetMeasurementTagIdKeyByResType(metricMeasurement.ResType)
 	}
-	if len(tagId) == 0 || (len(inputQuery.Slimit) != 0 && len(inputQuery.Soffset) != 0) {
-		tagId = "*"
-	}
-	query.Model.GroupBy = append(query.Model.GroupBy,
-		monitor.MetricQueryPart{
-			Type:   "field",
-			Params: []string{tagId},
-		})
+	drv, _ := DataSourceManager.GetTSDBDriver()
+	query = drv.FillGroupBy(query, inputQuery, tagId, isAlert)
 }
 
-func setSerieRowName(series *tsdb.TimeSeriesSlice, groupTag []string) {
-	// Add rowname，The front end displays the curve according to rowname
-	var index, unknownIndex = 1, 1
-	for i, serie := range *series {
-		// setRowName by groupTag
-		if len(groupTag) != 0 {
-			for key, val := range serie.Tags {
-				if strings.Contains(strings.Join(groupTag, ","), key) {
-					serie.RawName = fmt.Sprintf("%s", val)
-					(*series)[i] = serie
-					break
-				}
-			}
-			continue
-		}
-		measurement := strings.Split(serie.Name, ".")[0]
-		// sep measurement set RowName by spe param
-		measurements, _ := MetricMeasurementManager.getMeasurementByName(measurement)
-		if len(measurements) != 0 {
-			if key, ok := monitor.MEASUREMENT_TAG_KEYWORD[measurements[0].ResType]; ok {
-				serie.RawName = fmt.Sprintf("%d: %s", index, serie.Tags[key])
-				(*series)[i] = serie
-				index++
-				continue
-			}
-		}
-		// other condition set RowName
-		for key, val := range serie.Tags {
-			if strings.Contains(key, "id") {
-				serie.RawName = fmt.Sprintf("%d: %s", index, val)
-				(*series)[i] = serie
-				index++
-				break
-			}
-		}
-		if serie.RawName == "" {
-			serie.RawName = fmt.Sprintf("unknown-%d", unknownIndex)
-			(*series)[i] = serie
-			unknownIndex++
-		}
-	}
-
-}
-
-func fillSerieTags(series *tsdb.TimeSeriesSlice) {
+func fillSerieTags(series *monitor.TimeSeriesSlice) {
 	for i, serie := range *series {
 		for _, tag := range []string{"brand", "platform", "hypervisor"} {
 			if val, ok := serie.Tags[tag]; ok {
@@ -528,18 +572,26 @@ func fillSerieTags(series *tsdb.TimeSeriesSlice) {
 				break
 			}
 		}
-		for _, tag := range []string{"source", "status", hostconsts.TELEGRAF_TAG_KEY_HOST_TYPE,
-			hostconsts.TELEGRAF_TAG_KEY_RES_TYPE, "cpu", "is_vm", "os_type", "domain_name", "region"} {
+		for _, tag := range []string{
+			"source", "status", hostconsts.TELEGRAF_TAG_KEY_HOST_TYPE,
+			hostconsts.TELEGRAF_TAG_KEY_RES_TYPE,
+			"is_vm", "os_type", "domain_name", "region",
+			labels.MetricName, translator.UNION_RESULT_NAME,
+		} {
 			if _, ok := serie.Tags[tag]; ok {
 				delete(serie.Tags, tag)
+			}
+		}
+		if val, ok := serie.Tags[VICTORIA_METRICS_DB_TAG_KEY]; ok {
+			if val == VICTORIA_METRICS_DB_TAG_VAL_TELEGRAF {
+				delete(serie.Tags, VICTORIA_METRICS_DB_TAG_KEY)
 			}
 		}
 		(*series)[i] = serie
 	}
 }
 
-func (self *SUnifiedMonitorManager) GetPropertySimpleQuery(ctx context.Context, userCred mcclient.TokenCredential,
-	input *monitor.SimpleQueryInput) (jsonutils.JSONObject, error) {
+func (self *SUnifiedMonitorManager) GetPropertySimpleQuery(ctx context.Context, userCred mcclient.TokenCredential, input *monitor.SimpleQueryInput) (jsonutils.JSONObject, error) {
 	if len(input.Database) == 0 {
 		input.Database = "telegraf"
 	}
@@ -551,12 +603,13 @@ func (self *SUnifiedMonitorManager) GetPropertySimpleQuery(ctx context.Context, 
 		return nil, httperrors.NewInputParameterError("invalid metric_name %s", input.MetricName)
 	}
 	measurement, field := metric[0], metric[1]
-	sqlstr := "select id, " + field + " from " + measurement + " where "
-	if input.Tags == nil {
-		input.Tags = map[string]string{}
-	}
+
+	data := mod.NewMetricQueryInputWithDB(input.Database, measurement).SkipCheckSeries(true)
+	data.Selects().Select(field)
+
+	where := data.Where()
 	if len(input.Id) > 0 {
-		input.Tags["id"] = input.Id
+		where.Equal("id", input.Id)
 	}
 	if input.EndTime.IsZero() {
 		input.EndTime = time.Now()
@@ -567,58 +620,288 @@ func (self *SUnifiedMonitorManager) GetPropertySimpleQuery(ctx context.Context, 
 	if input.EndTime.Sub(input.StartTime).Hours() > 1 {
 		return nil, httperrors.NewInputParameterError("The query interval is greater than one hour")
 	}
-	st := input.StartTime.Format(time.RFC3339)
-	et := input.EndTime.Format(time.RFC3339)
-	conditions := []string{}
 	for k, v := range input.Tags {
-		conditions = append(conditions, fmt.Sprintf("%s = '%s'", k, v))
+		where.Equal(k, v)
 	}
-	conditions = append(conditions, fmt.Sprintf("time >= '%s'", st))
-	conditions = append(conditions, fmt.Sprintf("time <= '%s'", et))
-	sqlstr += strings.Join(conditions, " and ")
-	sqlstr += " limit 2000"
-	dataSource, err := DataSourceManager.GetDefaultSource()
-	if err != nil {
-		return nil, errors.Wrap(err, "s.GetDefaultSource")
+	if len(input.Interval) == 0 {
+		input.Interval = options.Options.ResourceMetricsDefaultInterval
 	}
-	db := influxdb.NewInfluxdb(dataSource.Url)
-	err = db.SetDatabase(input.Database)
+	_, err := time.ParseDuration(input.Interval)
 	if err != nil {
-		return nil, httperrors.NewInputParameterError("not support database %s", input.Database)
+		return nil, httperrors.NewInputParameterError("invalid interval %s", input.Interval)
 	}
-	dbRtn, err := db.Query(sqlstr)
+	data.From(input.StartTime).To(input.EndTime).Interval(input.Interval)
+
+	queryData := data.ToQueryData()
+	dbRtn, err := self.performQuery(ctx, userCred, queryData)
 	if err != nil {
-		return nil, errors.Wrap(err, "sql selected error")
+		return nil, errors.Wrapf(err, "performQuery with data: %s", jsonutils.Marshal(queryData))
 	}
 	ret := []monitor.SimpleQueryOutput{}
-	for _, dbResults := range dbRtn {
-		for _, dbResult := range dbResults {
-			for _, value := range dbResult.Values {
-				if len(value) != 3 ||
-					gotypes.IsNil(value[0]) ||
-					gotypes.IsNil(value[1]) ||
-					gotypes.IsNil(value[2]) {
-					continue
-				}
-				timestamp, err := value[0].Int()
-				if err != nil {
-					continue
-				}
-				id, err := value[1].GetString()
-				if err != nil {
-					continue
-				}
-				v, err := value[2].Float()
-				if err != nil {
-					continue
-				}
-				ret = append(ret, monitor.SimpleQueryOutput{
-					Id:    id,
-					Time:  time.UnixMilli(timestamp),
-					Value: v,
-				})
+
+	for _, s := range dbRtn.Series {
+		id, ok := s.Tags["id"]
+		if !ok {
+			log.Warningf("Not found id from series: %s", jsonutils.Marshal(s))
+			continue
+		}
+		for _, point := range s.Points {
+			if len(point) != 2 {
+				log.Warningf("invalid series: %s", jsonutils.Marshal(s))
+				break
 			}
+			timestamp := point[len(point)-1]
+			valPtr, ok := point[0].(*float64)
+			if !ok || valPtr == nil {
+				log.Warningf("invalid series point: %#v", point)
+				break
+			}
+			ret = append(ret, monitor.SimpleQueryOutput{
+				Id:    id,
+				Time:  time.UnixMilli(int64(timestamp.(float64))),
+				Value: *valPtr,
+			})
 		}
 	}
 	return jsonutils.Marshal(map[string]interface{}{"values": ret}), nil
+}
+
+func (self *SUnifiedMonitorManager) GetPropertyCdfQuery(ctx context.Context, userCred mcclient.TokenCredential, input *monitor.CdfQueryInput) (*monitor.CdfQueryOutput, error) {
+	if len(input.Database) == 0 {
+		input.Database = "telegraf"
+	}
+	if len(input.MetricName) == 0 {
+		return nil, httperrors.NewMissingParameterError("metric_name")
+	}
+	input.MetricName = strings.Replace(input.MetricName, ".", "_", 1)
+	ds, err := datasource.GetDefaultSource(input.Database)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetDefaultSource")
+	}
+	client, err := victoriametrics.NewClient(ds.Url)
+	if err != nil {
+		return nil, errors.Wrapf(err, "NewClient")
+	}
+	if len(input.Period) == 0 {
+		input.Period = "1h"
+	}
+	sql := fmt.Sprintf("sum(histogram_over_time(avg_over_time(%s[%s]))) by (vmrange)", input.MetricName, input.Period)
+	if len(input.Tags) > 0 {
+		tags := []string{}
+		for k, v := range input.Tags {
+			tags = append(tags, fmt.Sprintf(`%s="%s"`, k, v))
+		}
+		sql = fmt.Sprintf("sum(histogram_over_time(avg_over_time(%s{%s}[%s]))) by (vmrange)", input.MetricName, strings.Join(tags, ","), input.Period)
+	}
+	resp, err := client.RawQuery(ctx, httputils.GetAdaptiveTimeoutClient(), sql, true)
+	if err != nil {
+		return nil, err
+	}
+	ret, total := monitor.CdfQueryDataSet{}, 0
+	for _, r := range resp.Data.Result {
+		if len(r.Metric) == 0 {
+			continue
+		}
+		vmrange, _ := r.Metric["vmrange"]
+		if len(vmrange) == 0 {
+			continue
+		}
+		if len(r.Value) != 2 {
+			continue
+		}
+		v, _ := strconv.Atoi(r.Value[1].(string))
+		ret = append(ret, monitor.CdfQueryData{
+			Vmrange: vmrange,
+			Value:   v,
+		})
+		total += v
+	}
+	sort.Sort(ret)
+	for i := range ret {
+		ret[i].Total = total
+		if i == 0 {
+			ret[i].ValueAsc = ret[i].Value
+		} else {
+			ret[i].ValueAsc = ret[i-1].ValueAsc + ret[i].Value
+		}
+	}
+	for i := len(ret) - 1; i >= 0; i-- {
+		if i == len(ret)-1 {
+			ret[i].ValueDesc = ret[i].Value
+		} else {
+			ret[i].ValueDesc = ret[i+1].ValueDesc + ret[i].Value
+		}
+	}
+	result := &monitor.CdfQueryOutput{
+		Data: monitor.CdfQueryDataSet{},
+	}
+	for i := range ret {
+		v1 := ret[i]
+		v1.Metric = v1.Start()
+		v2 := v1.Copy()
+		v2.Metric = v2.End()
+		result.Data = append(result.Data, v1, v2)
+	}
+	return result, nil
+}
+
+func (self *SUnifiedMonitorManager) PerformResourceMetrics(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	data jsonutils.JSONObject,
+) (jsonutils.JSONObject, error) {
+	input := new(monitor.ResourceMetricsQueryInput)
+	if err := data.Unmarshal(input); err != nil {
+		return nil, httperrors.NewInputParameterError("unmarshal input: %v", err)
+	}
+	return self.getResourceMetrics(ctx, userCred, input)
+}
+
+func (self *SUnifiedMonitorManager) GetPropertyResourceMetrics(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	input *monitor.ResourceMetricsQueryInput,
+) (jsonutils.JSONObject, error) {
+	return self.getResourceMetrics(ctx, userCred, input)
+}
+
+func (self *SUnifiedMonitorManager) getResourceMetrics(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	input *monitor.ResourceMetricsQueryInput,
+) (jsonutils.JSONObject, error) {
+	drv := GetResourceMetricDriver(input.ResType)
+	if drv == nil {
+		return nil, httperrors.NewInputParameterError("unsupported res_type %q", input.ResType)
+	}
+	if len(input.ResIds) == 0 {
+		return nil, httperrors.NewMissingParameterError("res_ids")
+	}
+
+	if input.EndTime.IsZero() {
+		input.EndTime = time.Now()
+	}
+	if input.StartTime.IsZero() {
+		input.StartTime = input.EndTime.Add(-1 * time.Hour)
+	}
+	if len(input.Interval) == 0 {
+		input.Interval = options.Options.ResourceMetricsDefaultInterval
+	}
+
+	tagKey := drv.GetTagKey()
+	specs := drv.GetMetricSpecs()
+
+	result := make(map[string]*monitor.ResourceMetricValues, len(input.ResIds))
+	for _, id := range input.ResIds {
+		result[id] = &monitor.ResourceMetricValues{}
+	}
+
+	for _, spec := range specs {
+		qInput := mod.NewMetricQueryInputWithDB(TELEGRAF_DATABASE, spec.Measurement).SkipCheckSeries(true)
+		sel := qInput.Selects()
+		for _, f := range spec.Fields {
+			sel.Select(f).MEAN()
+		}
+		where := qInput.Where()
+		where.IN(tagKey, input.ResIds)
+		qInput.GroupBy().TAG(tagKey)
+		qInput.From(input.StartTime).To(input.EndTime).Interval(input.Interval)
+
+		queryData := qInput.ToQueryData()
+		dbRtn, err := self.performQuery(ctx, userCred, queryData)
+		if err != nil {
+			log.Warningf("query %s metrics error: %v", spec.Measurement, err)
+			continue
+		}
+
+		for _, series := range dbRtn.Series {
+			resId := series.Tags[tagKey]
+			if resId == "" {
+				continue
+			}
+			rv, ok := result[resId]
+			if !ok {
+				continue
+			}
+			// 取最后一个有效数据点
+			for pi := len(series.Points) - 1; pi >= 0; pi-- {
+				point := series.Points[pi]
+				if len(point) < 2 {
+					continue
+				}
+				allValid := true
+				for fi := 0; fi < len(spec.Fields) && fi < len(point)-1; fi++ {
+					if point[fi] == nil {
+						allValid = false
+						break
+					}
+					if fval, ok := point[fi].(*float64); !ok || fval == nil {
+						allValid = false
+						break
+					}
+				}
+				if !allValid {
+					continue
+				}
+				for fi, outputKey := range spec.OutputKeys {
+					if fi < len(point)-1 {
+						val := 0.0
+						if fval, ok := point[fi].(*float64); ok && fval != nil {
+							val = *fval
+						} else if fval, ok := point[fi].(float64); ok {
+							val = fval
+						}
+						SetResourceMetricValue(rv, outputKey, val)
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// 查询告警状态
+	monResources, err := MonitorResourceManager.GetMonitorResources(monitor.MonitorResourceListInput{
+		ResId: input.ResIds,
+	})
+	if err != nil {
+		log.Warningf("GetMonitorResources error: %v", err)
+	} else {
+		alertingResIds := map[string]struct{}{}
+		alertJoints := make([]SMonitorResourceAlert, 0)
+		q := MonitorResourceAlertManager.Query().
+			In("monitor_resource_id", input.ResIds).
+			Equals("alert_state", monitor.MONITOR_RESOURCE_ALERT_STATUS_ALERTING)
+		alertSq := AlertManager.Query("id").SubQuery()
+		q = q.In("alert_id", alertSq)
+		if err := db.FetchModelObjects(MonitorResourceAlertManager, q, &alertJoints); err != nil {
+			log.Warningf("query MonitorResourceAlert error: %v", err)
+		} else {
+			for _, joint := range alertJoints {
+				alertingResIds[joint.MonitorResourceId] = struct{}{}
+			}
+		}
+		for _, mr := range monResources {
+			if rv, ok := result[mr.ResId]; ok {
+				state := mr.AlertState
+				if state == monitor.MONITOR_RESOURCE_ALERT_STATUS_ALERTING {
+					if _, ok := alertingResIds[mr.ResId]; !ok {
+						state = monitor.MONITOR_RESOURCE_ALERT_STATUS_ATTACH
+					}
+				}
+				if state == monitor.MONITOR_RESOURCE_ALERT_STATUS_ATTACH || state == monitor.MONITOR_RESOURCE_ALERT_STATUS_INIT {
+					state = monitor.MONITOR_RESOURCE_ALERT_STATUS_INIT
+				}
+				rv.AlertState = state
+			}
+		}
+	}
+
+	output := monitor.ResourceMetricsQueryOutput{
+		ResourceMetrics: make(map[string]monitor.ResourceMetricValues, len(result)),
+	}
+	for id, rv := range result {
+		output.ResourceMetrics[id] = *rv
+	}
+	return jsonutils.Marshal(output), nil
 }

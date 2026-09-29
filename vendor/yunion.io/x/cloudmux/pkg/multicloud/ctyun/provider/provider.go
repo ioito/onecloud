@@ -111,12 +111,12 @@ func (self *SCtyunProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SCtyunProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SCtyunProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
 func (self *SCtyunProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	return info, nil
@@ -162,4 +162,8 @@ func (self *SCtyunProvider) GetCloudRegionExternalIdPrefix() string {
 
 func (self *SCtyunProvider) GetCapabilities() []string {
 	return self.client.GetCapabilities()
+}
+
+func (self *SCtyunProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
+	return self.client.GetMetrics(opts)
 }

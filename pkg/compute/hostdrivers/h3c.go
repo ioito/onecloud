@@ -41,6 +41,10 @@ func (self *SH3CHostDriver) GetHypervisor() string {
 	return api.HYPERVISOR_H3C
 }
 
+func (self *SH3CHostDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_H3C
+}
+
 // 系统盘必须至少40G
 func (self *SH3CHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb int) error {
 	if sizeGb < 1 || sizeGb > 65536 {
@@ -54,7 +58,7 @@ func (self *SH3CHostDriver) ValidateResetDisk(ctx context.Context, userCred mccl
 		if disk.DiskType == api.DISK_TYPE_SYS {
 			for _, g := range guests {
 				if g.Status != api.VM_READY {
-					return nil, httperrors.NewBadRequestError("Server %s must in status ready", g.GetName())
+					return nil, httperrors.NewBadRequestError("Server %s must be in ready status", g.GetName())
 				}
 			}
 		} else {

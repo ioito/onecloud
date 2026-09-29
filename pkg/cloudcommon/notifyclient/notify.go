@@ -17,6 +17,7 @@ package notifyclient
 import (
 	"context"
 	"fmt"
+	"html/template"
 	"sync"
 	"time"
 
@@ -42,7 +43,7 @@ var (
 )
 
 func init() {
-	notifyClientWorkerMan = appsrv.NewWorkerManager("NotifyClientWorkerManager", 1, 50, false)
+	notifyClientWorkerMan = appsrv.NewWorkerManager("NotifyClientWorkerManager", 1, 1024, false)
 
 	// set db notify hook
 	db.SetUpdateNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, obj db.IModel) {
@@ -56,25 +57,34 @@ func init() {
 		})
 	})
 
-	db.SetCreateNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, obj db.IModel) {
+	db.SetCustomizeNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, action string, obj db.IModel, moreDetails jsonutils.JSONObject) {
 		_, ok := notifyDBHookResources.Load(obj.KeywordPlural())
 		if !ok {
 			return
 		}
 		EventNotify(ctx, userCred, SEventNotifyParam{
 			Obj:    obj,
-			Action: ActionCreate,
+			Action: api.SAction(action),
+			ObjDetailsDecorator: func(ctx context.Context, details *jsonutils.JSONDict) {
+				if moreDetails != nil {
+					details.Set("customize_details", moreDetails)
+				}
+			},
 		})
 	})
 
-	db.SetDeleteNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, obj db.IModel) {
+	db.SetStatusChangedNotifyHook(func(ctx context.Context, userCred mcclient.TokenCredential, oldStatus, newStatus string, obj db.IModel) {
 		_, ok := notifyDBHookResources.Load(obj.KeywordPlural())
 		if !ok {
 			return
 		}
 		EventNotify(ctx, userCred, SEventNotifyParam{
 			Obj:    obj,
-			Action: ActionDelete,
+			Action: api.ActionStatusChanged,
+			ObjDetailsDecorator: func(ctx context.Context, details *jsonutils.JSONDict) {
+				details.Set("old_status", jsonutils.NewString(oldStatus))
+				details.Set("new_status", jsonutils.NewString(newStatus))
+			},
 		})
 	})
 }
@@ -94,16 +104,13 @@ func Notify(recipientId []string, isGroup bool, priority npk.TNotifyPriority, ev
 }
 
 func NotifyWithTag(ctx context.Context, params SNotifyParams) {
-	p := sNotifyParams{
-		recipientId:               params.RecipientId,
-		isGroup:                   params.IsGroup,
-		event:                     params.Event,
-		data:                      params.Data,
-		priority:                  params.Priority,
-		tag:                       params.Tag,
-		metadata:                  params.Metadata,
-		ignoreNonexistentReceiver: params.IgnoreNonexistentReceiver,
-	}
+	p := newSNotifyParams(params.Event, params.Data).
+		withRecipientId(params.RecipientId).
+		withIsGroup(params.IsGroup).
+		withPriority(params.Priority).
+		withTag(params.Tag).
+		withMetadata(params.Metadata).
+		withIgnoreNonexistentReceiver(params.IgnoreNonexistentReceiver)
 	notifyWithChannel(ctx, p,
 		npk.NotifyByEmail,
 		npk.NotifyByMobile,
@@ -126,13 +133,8 @@ type SNotifyParams struct {
 }
 
 func NotifyWithContact(ctx context.Context, contacts []string, channel npk.TNotifyChannel, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) {
-	p := sNotifyParams{
-		contacts: contacts,
-		priority: priority,
-		channel:  channel,
-		event:    event,
-		data:     data,
-	}
+	p := newSNotifyParams(event, data).
+		withContactChannelAndPriority(contacts, channel, priority)
 	rawNotify(ctx, p)
 }
 
@@ -167,7 +169,12 @@ func NotifyAllWithoutRobot(recipientId []string, isGroup bool, priority npk.TNot
 
 // NotifyAllWithoutRobot will send messages via all contacnt type from exclude robot contact type such as dingtalk-robot.
 func NotifyAllWithoutRobotWithCtx(ctx context.Context, recipientId []string, isGroup bool, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) error {
-	return notifyAll(ctx, recipientId, isGroup, priority, event, data)
+	return NotifyAllWithoutRobotWithCtxAndTemplateFuncs(ctx, recipientId, isGroup, priority, event, data, nil)
+}
+
+// NotifyAllWithoutRobotWithCtxAndTemplateFuncs 发送通知给所有用户（不包括机器人），支持自定义模板函数
+func NotifyAllWithoutRobotWithCtxAndTemplateFuncs(ctx context.Context, recipientId []string, isGroup bool, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject, templateFuncs template.FuncMap) error {
+	return notifyAllWithTemplateFuncs(ctx, recipientId, isGroup, priority, event, data, templateFuncs)
 }
 
 // NotifyRobot will send messages via all robot contact type such as dingtalk-robot.
@@ -177,13 +184,14 @@ func NotifyRobot(robotIds []string, priority npk.TNotifyPriority, event string, 
 
 // NotifyRobot will send messages via all robot contact type such as dingtalk-robot.
 func NotifyRobotWithCtx(ctx context.Context, robotIds []string, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) error {
-	rawNotify(ctx, sNotifyParams{
-		robots:   robotIds,
-		channel:  npk.NotifyByRobot,
-		priority: priority,
-		event:    event,
-		data:     data,
-	})
+	return NotifyRobotWithCtxAndTemplateFuncs(ctx, robotIds, priority, event, data, nil)
+}
+
+// NotifyRobotWithCtxAndTemplateFuncs 发送通知给机器人，支持自定义模板函数
+func NotifyRobotWithCtxAndTemplateFuncs(ctx context.Context, robotIds []string, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject, templateFuncs template.FuncMap) error {
+	p := newSNotifyParams(event, data).
+		withRobotChannelAndPriority(robotIds, npk.NotifyByRobot, priority, templateFuncs)
+	rawNotify(ctx, p)
 	return nil
 }
 
@@ -192,7 +200,12 @@ func SystemNotify(priority npk.TNotifyPriority, event string, data jsonutils.JSO
 }
 
 func SystemNotifyWithCtx(ctx context.Context, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) {
-	systemNotify(ctx, priority, event, data)
+	SystemNotifyWithCtxAndTemplateFuncs(ctx, priority, event, data, nil)
+}
+
+// SystemNotifyWithCtxAndTemplateFuncs 发送系统通知，支持自定义模板函数
+func SystemNotifyWithCtxAndTemplateFuncs(ctx context.Context, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject, templateFuncs template.FuncMap) {
+	systemNotifyWithTemplateFuncs(ctx, priority, event, data, templateFuncs)
 }
 
 func NotifyGeneralSystemError(data jsonutils.JSONObject) {
@@ -338,6 +351,10 @@ func EventNotify(ctx context.Context, userCred mcclient.TokenCredential, ep SEve
 		ResourceType:    ep.ResourceType,
 		Action:          ep.Action,
 	}
+	EventNotify2(params)
+}
+
+func EventNotify2(params api.NotificationManagerEventNotifyInput) {
 	t := eventTask{
 		params: params,
 	}
@@ -363,10 +380,7 @@ func EventNotifyServiceAbnormal(ctx context.Context, userCred mcclient.TokenCred
 		ResourceType:    api.TOPIC_RESOURCE_SERVICE,
 		Action:          api.ActionServiceAbnormal,
 	}
-	t := eventTask{
-		params: params,
-	}
-	notifyClientWorkerMan.Run(&t, nil, nil)
+	EventNotify2(params)
 }
 
 func systemEventNotify(ctx context.Context, action api.SAction, resType string, result api.SResult, priority string, obj *jsonutils.JSONDict) {
@@ -377,10 +391,7 @@ func systemEventNotify(ctx context.Context, action api.SAction, resType string, 
 		Event:           event.String(),
 		Priority:        priority,
 	}
-	t := eventTask{
-		params: params,
-	}
-	notifyClientWorkerMan.Run(&t, nil, nil)
+	EventNotify2(params)
 }
 
 func SystemEventNotify(ctx context.Context, action api.SAction, resType string, obj *jsonutils.JSONDict) {
@@ -396,38 +407,28 @@ func SystemExceptionNotifyWithResult(ctx context.Context, action api.SAction, re
 }
 
 func RawNotifyWithCtx(ctx context.Context, recipientId []string, isGroup bool, channel npk.TNotifyChannel, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) {
-	rawNotify(ctx, sNotifyParams{
-		recipientId: recipientId,
-		isGroup:     isGroup,
-		channel:     channel,
-		priority:    priority,
-		event:       event,
-		data:        data,
-	})
+	RawNotifyWithCtxAndTemplateFuncs(ctx, recipientId, isGroup, channel, priority, event, data, nil)
+}
+
+// RawNotifyWithCtxAndTemplateFuncs 发送通知，支持自定义模板函数
+func RawNotifyWithCtxAndTemplateFuncs(ctx context.Context, recipientId []string, isGroup bool, channel npk.TNotifyChannel, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject, templateFuncs template.FuncMap) {
+	p := newSNotifyParams(event, data).
+		withRecipientChannelAndPriority(recipientId, isGroup, channel, priority, templateFuncs)
+	rawNotify(ctx, p)
 }
 
 func RawNotify(recipientId []string, isGroup bool, channel npk.TNotifyChannel, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject) {
-	rawNotify(context.Background(), sNotifyParams{
-		recipientId: recipientId,
-		isGroup:     isGroup,
-		channel:     channel,
-		priority:    priority,
-		event:       event,
-		data:        data,
-	})
+	p := newSNotifyParams(event, data).
+		withRecipientChannelAndPriority(recipientId, isGroup, channel, priority, nil)
+	rawNotify(context.Background(), p)
 }
 
 // IntelliNotify try to create receiver nonexistent if createReceiver is set to true
 func IntelliNotify(ctx context.Context, recipientId []string, isGroup bool, channel npk.TNotifyChannel, priority npk.TNotifyPriority, event string, data jsonutils.JSONObject, createReceiver bool) {
-	intelliNotify(ctx, sNotifyParams{
-		recipientId:    recipientId,
-		isGroup:        isGroup,
-		channel:        channel,
-		priority:       priority,
-		event:          event,
-		data:           data,
-		createReceiver: createReceiver,
-	})
+	p := newSNotifyParams(event, data).
+		withRecipientChannelAndPriority(recipientId, isGroup, channel, priority, nil).
+		withCreateReceiver(createReceiver)
+	intelliNotify(ctx, p)
 }
 
 func FetchNotifyAdminRecipients(ctx context.Context, region string, users []string, groups []string) {

@@ -30,6 +30,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SCloudpolicyResourceBaseManager struct {
 }
 
@@ -40,7 +41,7 @@ type SCloudpolicyResourceBase struct {
 
 func (manager *SCloudpolicyResourceBaseManager) ListItemFilter(ctx context.Context, q *sqlchemy.SQuery, policyCred mcclient.TokenCredential, query api.CloudpolicyResourceListInput) (*sqlchemy.SQuery, error) {
 	if len(query.Cloudpolicy) > 0 {
-		policy, err := CloudpolicyManager.FetchByIdOrName(nil, query.Cloudpolicy)
+		policy, err := CloudpolicyManager.FetchByIdOrName(ctx, nil, query.Cloudpolicy)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("cloudpolicy", query.Cloudpolicy)

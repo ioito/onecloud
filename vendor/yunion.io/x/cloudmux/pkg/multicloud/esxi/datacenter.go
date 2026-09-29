@@ -17,6 +17,7 @@ package esxi
 import (
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
@@ -41,6 +42,8 @@ type SDatacenter struct {
 	inetworks    map[string]IVMNetwork
 	iresoucePool []cloudprovider.ICloudProject
 	clusters     []*SCluster
+
+	netLock sync.Mutex
 
 	Name string
 }
@@ -115,18 +118,12 @@ func (dc *SDatacenter) GetResourcePools() ([]cloudprovider.ICloudProject, error)
 }
 
 func (dc *SDatacenter) listResourcePools() ([]mo.ResourcePool, error) {
-	var pools, result []mo.ResourcePool
+	var pools []mo.ResourcePool
 	err := dc.manager.scanMObjects(dc.object.Entity().Self, RESOURCEPOOL_PROPS, &pools)
 	if err != nil {
 		return nil, errors.Wrap(err, "scanMObjects")
 	}
-	for i := range pools {
-		if pools[i].Parent.Type == "ClusterComputeResource" {
-			continue
-		}
-		result = append(result, pools[i])
-	}
-	return result, nil
+	return pools, nil
 }
 
 func (dc *SDatacenter) ListClusters() ([]*SCluster, error) {
@@ -242,7 +239,7 @@ func (dc *SDatacenter) getDcObj() *object.Datacenter {
 	return object.NewDatacenter(dc.manager.client.Client, dc.object.Reference())
 }
 
-func (dc *SDatacenter) fetchMoVms(filter property.Filter, props []string) ([]mo.VirtualMachine, error) {
+func (dc *SDatacenter) fetchMoVms(filter property.Match, props []string) ([]mo.VirtualMachine, error) {
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	var movms []mo.VirtualMachine
@@ -353,17 +350,17 @@ func (dc *SDatacenter) fetchHostsInternal(vmRefs []types.ManagedObjectReference,
 }
 
 func (dc *SDatacenter) FetchVMs() ([]*SVirtualMachine, error) {
-	return dc.fetchVMsWithFilter(property.Filter{})
+	return dc.fetchVMsWithFilter(property.Match{})
 }
 
 func (dc *SDatacenter) FetchNoTemplateVMs() ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = false
 	return dc.fetchVMsWithFilter(filter)
 }
 
 func (dc *SDatacenter) FetchFakeTempateVMs(regex string) ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.runtime.powerState"] = types.VirtualMachinePowerStatePoweredOff
 	movms, err := dc.fetchMoVms(filter, []string{"name"})
 	if err != nil {
@@ -372,7 +369,7 @@ func (dc *SDatacenter) FetchFakeTempateVMs(regex string) ([]*SVirtualMachine, er
 	return dc.fetchFakeTemplateVMs(movms, regex)
 }
 
-func (dc *SDatacenter) fetchVMsWithFilter(filter property.Filter) ([]*SVirtualMachine, error) {
+func (dc *SDatacenter) fetchVMsWithFilter(filter property.Match) ([]*SVirtualMachine, error) {
 	movms, err := dc.fetchMoVms(filter, VIRTUAL_MACHINE_PROPS)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to fetch mo.VirtualMachines")
@@ -385,7 +382,7 @@ func (dc *SDatacenter) fetchVMsWithFilter(filter property.Filter) ([]*SVirtualMa
 }
 
 func (dc *SDatacenter) FetchNoTemplateVMEntityReferens() ([]types.ManagedObjectReference, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = false
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
@@ -405,7 +402,7 @@ func (dc *SDatacenter) FetchNoTemplateVMEntityReferens() ([]types.ManagedObjectR
 }
 
 func (dc *SDatacenter) FetchNoTemplateHostEntityReferens() ([]types.ManagedObjectReference, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	m := view.NewManager(dc.manager.client.Client)
@@ -423,7 +420,7 @@ func (dc *SDatacenter) FetchNoTemplateHostEntityReferens() ([]types.ManagedObjec
 	return objs, nil
 }
 
-func (dc *SDatacenter) fetchHosts(filter property.Filter) ([]*SHost, error) {
+func (dc *SDatacenter) fetchHosts(filter property.Match) ([]*SHost, error) {
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	m := view.NewManager(dc.manager.client.Client)
@@ -443,13 +440,13 @@ func (dc *SDatacenter) fetchHosts(filter property.Filter) ([]*SHost, error) {
 }
 
 func (dc *SDatacenter) FetchTemplateVMs() ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = true
 	return dc.fetchVMsWithFilter(filter)
 }
 
 func (dc *SDatacenter) FetchTemplateVMById(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = true
 	filter["summary.config.uuid"] = id
 	vms, err := dc.fetchVMsWithFilter(filter)
@@ -463,16 +460,31 @@ func (dc *SDatacenter) FetchTemplateVMById(id string) (*SVirtualMachine, error) 
 }
 
 func (dc *SDatacenter) FetchVMById(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.config.uuid"] = id
 	vms, err := dc.fetchVMsWithFilter(filter)
 	if err != nil {
 		return nil, err
 	}
-	if len(vms) == 0 {
-		return nil, errors.ErrNotFound
+	for i := range vms {
+		return vms[i], nil
 	}
-	return vms[0], nil
+	return dc.FetchVMByName(id)
+}
+
+func (dc *SDatacenter) FetchVMByName(name string) (*SVirtualMachine, error) {
+	filter := property.Match{}
+	filter["name"] = name
+	vms, err := dc.fetchVMsWithFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	for i := range vms {
+		if vms[i].GetName() == name {
+			return vms[i], nil
+		}
+	}
+	return nil, errors.Wrapf(errors.ErrNotFound, "FetchVMByName %s", name)
 }
 
 func (dc *SDatacenter) fetchDatastores(datastoreRefs []types.ManagedObjectReference) ([]cloudprovider.ICloudStorage, error) {
@@ -522,6 +534,8 @@ func (dc *SDatacenter) scanAllDvPortgroups() error {
 	if err != nil {
 		return errors.Wrap(err, "dc.manager.scanAllMObjects mo.DistributedVirtualPortgroup")
 	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
 	for i := range dvports {
 		net := NewDistributedVirtualPortgroup(dc.manager, &dvports[i], dc)
 		dc.inetworks[net.GetName()] = net
@@ -536,6 +550,8 @@ func (dc *SDatacenter) scanAllNetworks() error {
 	if err != nil {
 		return errors.Wrap(err, "dc.manager.scanAllMObjects mo.Network")
 	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
 	for i := range nets {
 		net := NewNetwork(dc.manager, &nets[i], dc)
 		dc.inetworks[net.GetName()] = net
@@ -548,6 +564,8 @@ func (dc *SDatacenter) scanDcNetworks() error {
 	if err != nil {
 		return errors.Wrap(err, "resolveNetworks")
 	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
 	for i := range nets {
 		net := nets[i]
 		dc.inetworks[net.GetName()] = net

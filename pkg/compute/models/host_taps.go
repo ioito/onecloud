@@ -26,6 +26,10 @@ import (
 )
 
 func (h *SHost) GetDetailsTapConfig(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (api.SHostTapConfig, error) {
+	return h.getTapConfig()
+}
+
+func (h *SHost) getTapConfig() (api.SHostTapConfig, error) {
 	conf := api.SHostTapConfig{}
 
 	srvs, err := NetTapServiceManager.getEnabledTapServiceOnHost(h.Id)
@@ -68,7 +72,7 @@ func (g *SGuest) getTapNicJsonDesc(ctx context.Context, p *api.GuestnetworkJsonD
 		return nil
 	}
 	var driver string
-	var index int8
+	var index int
 	if p == nil {
 		driver = "virtio"
 		index = 0

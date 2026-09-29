@@ -20,14 +20,12 @@ import (
 	"fmt"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
-	"yunion.io/x/sqlchemy"
 
-	"yunion.io/x/onecloud/pkg/apis/compute"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/compute/models"
-	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 )
@@ -54,17 +52,7 @@ func (self *SBaseStorageDriver) DoStorageUpdateTask(ctx context.Context, userCre
 
 func (self *SBaseStorageDriver) ValidateSnapshotDelete(ctx context.Context, snapshot *models.SSnapshot) error {
 	if snapshot.RefCount > 0 {
-		return httperrors.NewBadRequestError("Snapshot reference(by disk) count > 0, can not delete")
-	}
-
-	if !snapshot.OutOfChain && snapshot.FakeDeleted {
-		disk, _ := snapshot.GetDisk()
-		if disk != nil {
-			_, err := models.SnapshotManager.GetConvertSnapshot(snapshot)
-			if err != nil {
-				return httperrors.NewBadRequestError("disk need at least one of snapshot as backing file")
-			}
-		}
+		return httperrors.NewBadRequestError("Snapshot reference(by disk) count > 0, cannot delete")
 	}
 	return nil
 }
@@ -72,25 +60,15 @@ func (self *SBaseStorageDriver) ValidateSnapshotDelete(ctx context.Context, snap
 func (self *SBaseStorageDriver) ValidateCreateSnapshotData(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, input *api.SnapshotCreateInput) error {
 	guests := disk.GetGuests()
 	if len(guests) != 1 {
-		return httperrors.NewBadRequestError("Disk %s dosen't attach guest ?", disk.Id)
+		return httperrors.NewBadRequestError("Disk %s is not attached to a guest", disk.Id)
 	}
 	guest := guests[0]
-	if len(guest.BackupHostId) > 0 {
+	if len(guest.BackupHostId) > 0 || guest.GetMetadata(ctx, api.QUORUM_CHILD_INDEX, userCred) != "" {
 		return httperrors.NewBadRequestError(
 			"Disk attached Guest has backup, Can't create snapshot")
 	}
 	if !utils.IsInStringArray(guest.Status, []string{api.VM_RUNNING, api.VM_READY}) {
 		return httperrors.NewInvalidStatusError("Cannot do snapshot when VM in status %s", guest.Status)
-	}
-	q := models.SnapshotManager.Query()
-	cnt, err := q.Filter(sqlchemy.AND(sqlchemy.Equals(q.Field("disk_id"), disk.Id),
-		sqlchemy.Equals(q.Field("created_by"), api.SNAPSHOT_MANUAL),
-		sqlchemy.IsFalse(q.Field("fake_deleted")))).CountWithError()
-	if err != nil {
-		return httperrors.NewInternalServerError("check disk snapshot count fail %s", err)
-	}
-	if cnt >= options.Options.DefaultMaxManualSnapshotCount {
-		return httperrors.NewBadRequestError("Disk %s snapshot full, cannot take any more", disk.Id)
 	}
 	return nil
 }
@@ -112,46 +90,101 @@ func (self *SBaseStorageDriver) RequestCreateSnapshot(ctx context.Context, snaps
 }
 
 func (self *SBaseStorageDriver) RequestDeleteSnapshot(ctx context.Context, snapshot *models.SSnapshot, task taskman.ITask) error {
+	setSnapshotChain := func(params *jsonutils.JSONDict) {
+		ids := jsonutils.NewArray()
+		for _, candidate := range models.SnapshotManager.GetDiskSnapshots(snapshot.DiskId) {
+			ids.Add(jsonutils.NewString(candidate.Id))
+		}
+		params.Set("snapshot_ids", ids)
+	}
 	guest, err := snapshot.GetGuest()
 	if err != nil {
 		if err != sql.ErrNoRows {
 			return err
 		}
 	}
-
-	if jsonutils.QueryBoolean(task.GetParams(), "reload_disk", false) && snapshot.OutOfChain {
-		guest.SetStatus(task.GetUserCred(), api.VM_SNAPSHOT, "Start Reload Snapshot")
-		params := jsonutils.NewDict()
-		params.Set("disk_id", jsonutils.NewString(snapshot.DiskId))
-		return guest.GetDriver().RequestReloadDiskSnapshot(ctx, guest, task, params)
-	} else {
-		if !snapshot.FakeDeleted {
-			snapshot.SetStatus(task.GetUserCred(), compute.SNAPSHOT_READY, "snapshot fake_delete")
-			task.SetStageComplete(ctx, nil)
-			return snapshot.FakeDelete(task.GetUserCred())
+	if guest == nil {
+		var host *models.SHost
+		disk, err := models.DiskManager.FetchById(snapshot.DiskId)
+		if err != nil && err != sql.ErrNoRows {
+			return errors.Wrap(err, "get disk by snapshot")
+		}
+		if disk != nil {
+			sDisk := disk.(*models.SDisk)
+			if hostId := sDisk.GetLastAttachedHost(ctx, task.GetUserCred()); hostId != "" {
+				host = models.HostManager.FetchHostById(hostId)
+			}
+		} else {
+			if hostId := snapshot.GetMetadata(ctx, api.DISK_META_LAST_ATTACHED_HOST, task.GetUserCred()); hostId != "" {
+				host = models.HostManager.FetchHostById(hostId)
+			}
+		}
+		if host == nil {
+			storage := snapshot.GetStorage()
+			host, err = storage.GetMasterHost()
+			if err != nil {
+				return err
+			}
 		}
 
-		convertSnapshot, _ := models.SnapshotManager.GetConvertSnapshot(snapshot)
-		if convertSnapshot == nil {
-			return fmt.Errorf("snapshot dose not have convert snapshot")
-		}
-		snapshot.SetStatus(task.GetUserCred(), api.SNAPSHOT_DELETING, "On SnapshotDeleteTask StartDeleteSnapshot")
 		params := jsonutils.NewDict()
 		params.Set("delete_snapshot", jsonutils.NewString(snapshot.Id))
 		params.Set("disk_id", jsonutils.NewString(snapshot.DiskId))
-		if !snapshot.OutOfChain {
-			params.Set("convert_snapshot", jsonutils.NewString(convertSnapshot.Id))
-			var FakeDelete = jsonutils.JSONFalse
-			if snapshot.CreatedBy == api.SNAPSHOT_MANUAL && snapshot.FakeDeleted == false {
-				FakeDelete = jsonutils.JSONTrue
+		setSnapshotChain(params)
+
+		if disk != nil {
+			sDisk, _ := disk.(*models.SDisk)
+			if sDisk.IsEncrypted() {
+				if encryptInfo, err := sDisk.GetEncryptInfo(ctx, task.GetUserCred()); err != nil {
+					return errors.Wrap(err, "faild get encryptInfo")
+				} else {
+					params.Set("encrypt_info", jsonutils.Marshal(encryptInfo))
+				}
 			}
-			params.Set("pending_delete", FakeDelete)
-		} else {
-			params.Set("auto_deleted", jsonutils.JSONTrue)
 		}
-		guest.SetStatus(task.GetUserCred(), api.VM_SNAPSHOT_DELETE, "Start Delete Snapshot")
-		return guest.GetDriver().RequestDeleteSnapshot(ctx, guest, task, params)
+
+		drv, err := host.GetHostDriver()
+		if err != nil {
+			return err
+		}
+
+		return drv.RequestDeleteSnapshotWithoutGuest(ctx, host, snapshot, params, task)
 	}
+
+	drv, err := guest.GetDriver()
+	if err != nil {
+		return err
+	}
+
+	snapshot.SetStatus(ctx, task.GetUserCred(), api.SNAPSHOT_DELETING, "On SnapshotDeleteTask StartDeleteSnapshot")
+	params := jsonutils.NewDict()
+	params.Set("delete_snapshot", jsonutils.NewString(snapshot.Id))
+	params.Set("disk_id", jsonutils.NewString(snapshot.DiskId))
+	setSnapshotChain(params)
+
+	disk, err := models.DiskManager.FetchById(snapshot.DiskId)
+	if err != nil && err != sql.ErrNoRows {
+		return errors.Wrap(err, "get disk by snapshot")
+	}
+	sDisk, _ := disk.(*models.SDisk)
+	if sDisk.IsEncrypted() {
+		if encryptInfo, err := sDisk.GetEncryptInfo(ctx, task.GetUserCred()); err != nil {
+			return errors.Wrap(err, "faild get encryptInfo")
+		} else {
+			params.Set("encrypt_info", jsonutils.Marshal(encryptInfo))
+		}
+	}
+
+	taskParams := task.GetParams()
+	if taskParams.Contains("snapshot_total_count") {
+		totalCnt, _ := taskParams.Get("snapshot_total_count")
+		params.Set("snapshot_total_count", totalCnt)
+		deletedCnt, _ := taskParams.Get("deleted_snapshot_count")
+		params.Set("deleted_snapshot_count", deletedCnt)
+	}
+
+	guest.SetStatus(ctx, task.GetUserCred(), api.VM_SNAPSHOT_DELETE, "Start Delete Snapshot")
+	return drv.RequestDeleteSnapshot(ctx, guest, task, params)
 }
 
 func (self *SBaseStorageDriver) SnapshotIsOutOfChain(disk *models.SDisk) bool {
@@ -159,5 +192,7 @@ func (self *SBaseStorageDriver) SnapshotIsOutOfChain(disk *models.SDisk) bool {
 }
 
 func (self *SBaseStorageDriver) OnDiskReset(ctx context.Context, userCred mcclient.TokenCredential, disk *models.SDisk, snapshot *models.SSnapshot, data jsonutils.JSONObject) error {
-	return disk.CleanUpDiskSnapshots(ctx, userCred, snapshot)
+	return nil
+	// no need cleanup snapshots
+	//return disk.CleanUpDiskSnapshots(ctx, userCred, snapshot)
 }

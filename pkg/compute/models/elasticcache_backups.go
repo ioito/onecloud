@@ -37,7 +37,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
-// SElasticcache.Backup
+// +onecloud:swagger-gen-model-singular=elasticcachebackup
+// +onecloud:swagger-gen-model-plural=elasticcachebackups
 type SElasticcacheBackupManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -212,8 +213,8 @@ func (manager *SElasticcacheBackupManager) FetchOwnerId(ctx context.Context, dat
 	return elasticcacheSubResourceFetchOwnerId(ctx, data)
 }
 
-func (manager *SElasticcacheBackupManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
-	return elasticcacheSubResourceFetchOwner(q, ownerId, scope)
+func (manager *SElasticcacheBackupManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return elasticcacheSubResourceFetchOwner(ctx, q, ownerId, scope)
 }
 
 func (manager *SElasticcacheBackupManager) FilterByUniqValues(q *sqlchemy.SQuery, values jsonutils.JSONObject) *sqlchemy.SQuery {
@@ -228,7 +229,7 @@ func (manager *SElasticcacheBackupManager) ValidateCreateData(ctx context.Contex
 	var region *SCloudregion
 	var ec *SElasticcache
 	if id, _ := data.GetString("elasticcache"); len(id) > 0 {
-		_ec, err := db.FetchByIdOrName(ElasticcacheManager, userCred, id)
+		_ec, err := db.FetchByIdOrName(ctx, ElasticcacheManager, userCred, id)
 		if err != nil {
 			return nil, fmt.Errorf("getting elastic cache instance failed")
 		}
@@ -248,7 +249,7 @@ func (manager *SElasticcacheBackupManager) ValidateCreateData(ctx context.Contex
 	var err error
 	err = data.Unmarshal(&input)
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput fail %s", err)
+		return nil, httperrors.NewInternalServerError("unmarshal StandaloneResourceCreateInput failed %s", err)
 	}
 	input, err = manager.SStandaloneResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input)
 	if err != nil {
@@ -265,7 +266,7 @@ func (self *SElasticcacheBackup) GetOwnerId() mcclient.IIdentityProvider {
 
 func (self *SElasticcacheBackup) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	self.SStandaloneResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
-	self.SetStatus(userCred, api.ELASTIC_CACHE_BACKUP_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_BACKUP_STATUS_CREATING, "")
 	if err := self.StartElasticcacheBackupCreateTask(ctx, userCred, data.(*jsonutils.JSONDict), ""); err != nil {
 		log.Errorf("Failed to create elastic cache backup error: %v", err)
 	}
@@ -281,7 +282,7 @@ func (self *SElasticcacheBackup) StartElasticcacheBackupCreateTask(ctx context.C
 }
 
 func (self *SElasticcacheBackup) ValidatorRestoreInstanceData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	ec, err := db.FetchByIdOrName(ElasticcacheManager, userCred, self.ElasticcacheId)
+	ec, err := db.FetchByIdOrName(ctx, ElasticcacheManager, userCred, self.ElasticcacheId)
 	if err != nil {
 		return nil, fmt.Errorf("getting elastic cache instance failed")
 	}
@@ -299,7 +300,7 @@ func (self *SElasticcacheBackup) PerformRestoreInstance(ctx context.Context, use
 		return nil, err
 	}
 
-	self.SetStatus(userCred, api.ELASTIC_CACHE_STATUS_BACKUPRECOVERING, "")
+	self.SetStatus(ctx, userCred, api.ELASTIC_CACHE_STATUS_BACKUPRECOVERING, "")
 	return nil, self.StartRestoreInstanceTask(ctx, userCred, data.(*jsonutils.JSONDict), "")
 }
 
@@ -330,14 +331,10 @@ func (self *SElasticcacheBackup) ValidateDeleteCondition(ctx context.Context, in
 	}
 
 	if icache.(*SElasticcache).GetProviderName() == api.CLOUD_PROVIDER_ALIYUN && len(self.ExternalId) == 0 {
-		return httperrors.NewUnsupportOperationError("unsupport delete %s backups", api.CLOUD_PROVIDER_ALIYUN)
+		return httperrors.NewUnsupportOperationError("deleting backups for %s is not supported", api.CLOUD_PROVIDER_ALIYUN)
 	}
 
-	return self.ValidatePurgeCondition(ctx)
-}
-
-func (self *SElasticcacheBackup) ValidatePurgeCondition(ctx context.Context) error {
-	return nil
+	return self.SStatusStandaloneResourceBase.ValidateDeleteCondition(ctx, info)
 }
 
 // 弹性缓存备份列表

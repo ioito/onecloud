@@ -18,6 +18,7 @@ import (
 	"yunion.io/x/jsonutils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/apis/host"
 )
 
 type SGuestCpu struct {
@@ -37,14 +38,9 @@ type SGuestCpu struct {
 	// CpuCacheMode string
 }
 
-type CpuPin struct {
+type SCpuPin struct {
 	Vcpus string
 	Pcpus string
-}
-
-type SMemObject struct {
-	*Object
-	SizeMB int64
 }
 
 type SMemDevice struct {
@@ -55,8 +51,36 @@ type SMemDevice struct {
 type SMemSlot struct {
 	SizeMB int64
 
-	MemObj *Object
+	MemObj *SMemDesc
 	MemDev *SMemDevice
+}
+
+type SCpuNumaPin struct {
+	SizeMB    int64
+	Unregular bool
+	NodeId    *uint16 `json:",omitempty"`
+
+	VcpuPin       []SVCpuPin `json:",omitempty"`
+	ExtraCpuCount int        `json:"extra_cpu_count"`
+}
+
+type SVCpuPin struct {
+	Vcpu int
+	Pcpu int
+}
+
+type SMemDesc struct {
+	*Object
+
+	NodeId *uint16 `json:",omitempty"`
+	// vcpus
+	Cpus *string `json:",omitempty"`
+}
+
+type SMemsDesc struct {
+	SMemDesc
+
+	Mems []SMemDesc `json:",omitempty"`
 }
 
 type SGuestMem struct {
@@ -64,19 +88,23 @@ type SGuestMem struct {
 	MaxMem uint
 
 	SizeMB int64
-	Mem    *Object `json:",omitempty"`
 
+	Mem *SMemsDesc `json:",omitempty"`
+
+	// hotplug mem devices
 	MemSlots []*SMemSlot `json:",omitempty"`
 }
 
 type SGuestHardwareDesc struct {
 	Cpu     int64
 	CpuDesc *SGuestCpu `json:",omitempty"`
-	VcpuPin []CpuPin   `json:",omitempty"`
+	VcpuPin []SCpuPin  `json:",omitempty"`
 	// Clock   *SGuestClock `json:",omitempty"`
 
-	Mem     int64
-	MemDesc *SGuestMem `json:",omitempty"`
+	// memory size in MB
+	Mem        int64
+	MemDesc    *SGuestMem     `json:",omitempty"`
+	CpuNumaPin []*SCpuNumaPin `json:",omitempty"`
 
 	Bios      string
 	BootOrder string
@@ -88,6 +116,8 @@ type SGuestHardwareDesc struct {
 
 	VirtioSerial *SGuestVirtioSerial
 
+	Tpm *SGuestTpm
+
 	// std virtio cirrus vmware qlx none
 	Vga       string
 	VgaDevice *SGuestVga `json:",omitempty"`
@@ -98,6 +128,7 @@ type SGuestHardwareDesc struct {
 
 	VirtioScsi      *SGuestVirtioScsi       `json:",omitempty"`
 	PvScsi          *SGuestPvScsi           `json:",omitempty"`
+	SataController  *SGuestAhciDevice       `json:",omitempty"`
 	Cdroms          []*SGuestCdrom          `json:"cdroms,omitempty"`
 	Floppys         []*SGuestFloppy         `json:",omitempty"`
 	Disks           []*SGuestDisk           `json:",omitempty"`
@@ -114,6 +145,12 @@ type SGuestHardwareDesc struct {
 	PCIControllers []*PCIController `json:",omitempty"`
 
 	AnonymousPCIDevs []*PCIDevice `json:",omitempty"`
+
+	RescueInitdPath      string `json:",omitempty"` // rescue initramfs path
+	RescueKernelPath     string `json:",omitempty"` // rescue kernel path
+	RescueDiskPath       string `json:",omitempty"` // rescue disk path
+	RescueDiskDeviceBus  uint   `json:",omitempty"` // rescue disk device bus
+	RescueDiskDeviceSlot uint   `json:",omitempty"` // rescue disk device slot
 }
 
 type SGuestIsaSerial struct {
@@ -136,6 +173,13 @@ type VirtSerialPort struct {
 type SGuestPvpanic struct {
 	Ioport uint // default ioport 1285(0x505)
 	Id     string
+}
+
+type SGuestTpm struct {
+	TpmSock *CharDev
+
+	// default emulator tpm
+	Id string
 }
 
 // -device pcie-pci-bridge,id=pci.1,bus=pcie.0 \
@@ -222,12 +266,19 @@ type SGuestRng struct {
 type SoundCard struct {
 	*PCIDevice `json:",omitempty"`
 	Codec      *Codec
+	Audio      *AudioDev
+}
+
+type AudioDev struct {
+	Id   string
+	Type string
 }
 
 type Codec struct {
-	Id   string
-	Type string
-	Cad  int
+	Id       string
+	Type     string
+	Cad      int
+	AudioDev string
 }
 
 type SSpiceDesc struct {
@@ -307,6 +358,10 @@ type SGuestPvScsi struct {
 	*PCIDevice
 }
 
+type SGuestAhciDevice struct {
+	*PCIDevice
+}
+
 type SGuestProjectDesc struct {
 	Tenant        string
 	TenantId      string
@@ -315,10 +370,12 @@ type SGuestProjectDesc struct {
 }
 
 type SGuestRegionDesc struct {
-	Zone     string
-	Domain   string
-	HostId   string
-	Hostname string
+	Zone         string `json:"zone"`
+	Domain       string `json:"domain"`
+	HostId       string `json:"host_id"`
+	Hostname     string `json:"hostname"`
+	HostAccessIp string `json:"host_access_ip"`
+	HostEIP      string `json:"host_eip"`
 }
 
 type SGuestControlDesc struct {
@@ -329,13 +386,25 @@ type SGuestControlDesc struct {
 	// is volatile host meaning guest not running on this host right now
 	IsVolatileHost bool
 
-	ScalingGroupId     string
+	ScalingGroupId string
+	SrcIpCheck     bool
+	SrcMacCheck    bool
+
 	SecurityRules      string
 	AdminSecurityRules string
-	SrcIpCheck         bool
-	SrcMacCheck        bool
+	NicSecgroups       []*api.GuestnetworkSecgroupDesc `json:"nic_secgroups,omitempty"`
 
 	EncryptKeyId string
+
+	LightMode  bool // light mode
+	Hypervisor string
+}
+
+func (desc SGuestControlDesc) GetHypervisor() string {
+	if desc.Hypervisor != "" {
+		return desc.Hypervisor
+	}
+	return api.HYPERVISOR_KVM
 }
 
 type SGuestMetaDesc struct {
@@ -351,10 +420,15 @@ type SGuestMetaDesc struct {
 	ExtraOptions map[string]jsonutils.JSONObject
 }
 
+type SGuestContainerDesc struct {
+	Containers []*host.ContainerDesc
+}
+
 type SGuestDesc struct {
 	SGuestProjectDesc
 	SGuestRegionDesc
 	SGuestControlDesc
 	SGuestHardwareDesc
 	SGuestMetaDesc
+	SGuestContainerDesc
 }

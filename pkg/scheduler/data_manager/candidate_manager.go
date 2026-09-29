@@ -18,12 +18,14 @@ import (
 	"fmt"
 	"time"
 
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
 	"yunion.io/x/onecloud/pkg/scheduler/cache"
 	candidatecache "yunion.io/x/onecloud/pkg/scheduler/cache/candidate"
 	"yunion.io/x/onecloud/pkg/scheduler/core"
+	schedmodels "yunion.io/x/onecloud/pkg/scheduler/models"
 )
 
 type CandidateGetArgs struct {
@@ -31,6 +33,7 @@ type CandidateGetArgs struct {
 	ResType   string
 	RegionID  string
 	ZoneID    string
+	ZoneIDs   []string
 	ManagerID string
 	HostTypes []string
 }
@@ -206,12 +209,12 @@ func (cm *CandidateManager) GetCandidates(args CandidateGetArgs) ([]core.Candida
 
 	result := []core.Candidater{}
 
-	matchZone := func(r core.Candidater, zoneId string) bool {
+	matchZone := func(r core.Candidater, zoneId string, zoneIds []string) bool {
+		if len(zoneIds) > 0 {
+			return utils.IsInStringArray(r.Getter().Zone().GetId(), zoneIds)
+		}
 		if zoneId != "" {
-			if r.Getter().Zone().GetId() == zoneId {
-				return true
-			}
-			return false
+			return r.Getter().Zone().GetId() == zoneId
 		}
 		return true
 	}
@@ -256,7 +259,7 @@ func (cm *CandidateManager) GetCandidates(args CandidateGetArgs) ([]core.Candida
 			continue
 		}
 
-		if !matchZone(r, args.ZoneID) {
+		if !matchZone(r, args.ZoneID, args.ZoneIDs) {
 			continue
 		}
 
@@ -322,6 +325,11 @@ func (cm *CandidateManager) AddImpl(name string, impl *CandidateManagerImpl) {
 	cm.impls[name] = impl
 }
 
+const (
+	CANDIDATE_MANAGER_IMPL_HOST      = "host"
+	CANDIDATE_MANAGER_IMPL_BAREMETAL = "baremetal"
+)
+
 func NewCandidateManager(dataManager *DataManager, stopCh <-chan struct{}) *CandidateManager {
 
 	candidateManager := &CandidateManager{
@@ -331,10 +339,10 @@ func NewCandidateManager(dataManager *DataManager, stopCh <-chan struct{}) *Cand
 		//dirtyPool:   ttlpool.NewCountPool(),
 	}
 
-	candidateManager.AddImpl("host", NewCandidateManagerImpl(
+	candidateManager.AddImpl(CANDIDATE_MANAGER_IMPL_HOST, NewCandidateManagerImpl(
 		&HostCandidateManagerImplProvider{dataManager: dataManager}, stopCh))
 
-	candidateManager.AddImpl("baremetal", NewCandidateManagerImpl(
+	candidateManager.AddImpl(CANDIDATE_MANAGER_IMPL_BAREMETAL, NewCandidateManagerImpl(
 		&BaremetalCandidateManagerImplProvider{dataManager: dataManager}, stopCh))
 
 	return candidateManager
@@ -347,8 +355,11 @@ func (cm *CandidateManager) Run() {
 	}
 }
 
-func (cm *CandidateManager) Reload(resType string, candidateIds []string) (
-	[]interface{}, error) {
+func (cm *CandidateManager) ReloadHosts(ids []string) ([]interface{}, error) {
+	return cm.Reload(CANDIDATE_MANAGER_IMPL_HOST, ids)
+}
+
+func (cm *CandidateManager) Reload(resType string, candidateIds []string) ([]interface{}, error) {
 
 	if len(candidateIds) == 0 {
 		return []interface{}{}, nil
@@ -363,12 +374,24 @@ func (cm *CandidateManager) Reload(resType string, candidateIds []string) (
 }
 
 func (cm *CandidateManager) ReloadAll(resType string) ([]interface{}, error) {
+	// Mark the start of ReloadAll to protect pending usage added during reload
+	schedmodels.HostPendingUsageManager.SetReloadAllStartTime()
+
 	impl, err := cm.getImpl(resType)
 	if err != nil {
 		return nil, err
 	}
 
-	return impl.ReloadAll()
+	result, err := impl.ReloadAll()
+	if err == nil {
+		// Clear pending usage created before ReloadAll started
+		// This ensures pending usage doesn't leak when cache is fully rebuilt
+		// but protects pending usage added during reload
+		schedmodels.HostPendingUsageManager.ClearAllPendingUsage()
+	} else {
+		log.Errorf("[CandidateManager] Failed to reload all %q candidates: %v", resType, err)
+	}
+	return result, err
 }
 
 //type IDirtyPoolItem interface {

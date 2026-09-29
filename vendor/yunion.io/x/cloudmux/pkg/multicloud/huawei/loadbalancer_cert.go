@@ -23,7 +23,7 @@ import (
 
 	"yunion.io/x/jsonutils"
 
-	api "yunion.io/x/cloudmux/pkg/apis/compute"
+	"yunion.io/x/cloudmux/pkg/apis"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
@@ -68,7 +68,7 @@ func (self *SElbCert) GetGlobalId() string {
 }
 
 func (self *SElbCert) GetStatus() string {
-	return api.LB_STATUS_ENABLED
+	return apis.STATUS_AVAILABLE
 }
 
 func (self *SElbCert) Refresh() error {
@@ -79,26 +79,12 @@ func (self *SElbCert) Refresh() error {
 	return jsonutils.Update(self, cert)
 }
 
-func (self *SElbCert) IsEmulated() bool {
-	return false
-}
-
 func (self *SElbCert) GetProjectId() string {
 	return ""
 }
 
-func (self *SElbCert) Sync(name, privateKey, publickKey string) error {
-	params := map[string]interface{}{
-		"name":        name,
-		"private_key": privateKey,
-		"certificate": publickKey,
-	}
-	_, err := self.region.lbUpdate("elb/certificates/"+self.GetId(), params)
-	return err
-}
-
 func (self *SElbCert) Delete() error {
-	_, err := self.region.lbDelete("elb/certificates/" + self.GetId())
+	_, err := self.region.delete(SERVICE_ELB, "elb/certificates/"+self.GetId())
 	return err
 }
 
@@ -121,12 +107,12 @@ func (self *SElbCert) GetExpireTime() time.Time {
 }
 
 func (self *SRegion) GetLoadBalancerCertificate(id string) (*SElbCert, error) {
-	resp, err := self.lbGet("elb/certificates/" + id)
+	resp, err := self.list(SERVICE_ELB, "elb/certificates/"+id, nil)
 	if err != nil {
 		return nil, err
 	}
 	ret := &SElbCert{region: self}
-	return ret, resp.Unmarshal(ret)
+	return ret, resp.Unmarshal(ret, "certificate")
 }
 
 // https://support.huaweicloud.com/api-elb/elb_qy_zs_0001.html
@@ -136,7 +122,7 @@ func (self *SRegion) CreateLoadBalancerCertificate(cert *cloudprovider.SLoadbala
 		"private_key": cert.PrivateKey,
 		"certificate": cert.Certificate,
 	}
-	resp, err := self.lbCreate("elb/certificates", params)
+	resp, err := self.post(SERVICE_ELB, "elb/certificates", params)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +131,7 @@ func (self *SRegion) CreateLoadBalancerCertificate(cert *cloudprovider.SLoadbala
 }
 
 func (self *SRegion) GetLoadBalancerCertificates() ([]SElbCert, error) {
-	resp, err := self.lbList("elb/certificates", url.Values{})
+	resp, err := self.list(SERVICE_ELB, "elb/certificates", url.Values{})
 	if err != nil {
 		return nil, err
 	}

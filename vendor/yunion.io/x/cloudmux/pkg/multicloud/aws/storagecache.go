@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -62,7 +62,7 @@ func (self *SStoragecache) IsEmulated() bool {
 }
 
 func (self *SStoragecache) GetICustomizedCloudImages() ([]cloudprovider.ICloudImage, error) {
-	images, err := self.region.GetImages("", ImageOwnerSelf, nil, "", "hvm", nil, "", true)
+	images, err := self.region.GetImages("", ImageOwnerSelf, nil, "", "hvm", nil, "", false)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetImages")
 	}
@@ -167,14 +167,13 @@ func (self *SStoragecache) uploadImage(ctx context.Context, image *cloudprovider
 	}
 
 	task, err := self.region.ImportImage(imageName, image.OsArch, image.OsType, image.OsDistribution, string(qemuimgfmt.VMDK), bucketName, image.ImageId)
-
 	if err != nil {
-		log.Errorf("ImportImage error %s %s %s", image.ImageId, bucketName, err)
-		return "", err
+		return "", errors.Wrapf(err, "ImportImage")
 	}
 
 	err = cloudprovider.Wait(2*time.Minute, 4*time.Hour, func() (bool, error) {
 		status := task.GetStatus()
+		log.Debugf("task %s status: %s", task.TaskId, status)
 		if status == ImageImportStatusDeleted {
 			return false, errors.Wrap(errors.ErrInvalidStatus, "SStoragecache.ImageImportStatusDeleted")
 		}
@@ -189,8 +188,6 @@ func (self *SStoragecache) uploadImage(ctx context.Context, image *cloudprovider
 		return "", errors.Wrap(err, "SStoragecache.Wait")
 	}
 
-	// add name tag
-	//self.region.addTags(task.ImageId, "Name", image.ImageId)
 	if callback != nil {
 		callback(100)
 	}
@@ -252,7 +249,7 @@ func (self *SRegion) DescribeExportTasks(id string) (*SExportTask, error) {
 			return &ret.ExportTaskSet[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) CheckBucket(bucketName string) error {
@@ -278,7 +275,7 @@ func (self *SRegion) IsBucketExist(bucketName string) (bool, error) {
 	}
 
 	params := &s3.ListBucketsInput{}
-	ret, err := s3Client.ListBuckets(params)
+	ret, err := s3Client.ListBuckets(context.Background(), params)
 	if err != nil {
 		return false, errors.Wrap(err, "ListBuckets")
 	}
@@ -299,12 +296,12 @@ func (self *SRegion) GetBucketRegionId(bucketName string) (string, error) {
 	}
 
 	params := &s3.GetBucketLocationInput{Bucket: &bucketName}
-	ret, err := s3Client.GetBucketLocation(params)
+	ret, err := s3Client.GetBucketLocation(context.Background(), params)
 	if err != nil {
 		return "", err
 	}
 
-	return StrVal(ret.LocationConstraint), nil
+	return string(ret.LocationConstraint), nil
 }
 
 func (self *SRegion) GetARNPartition() string {
@@ -354,7 +351,11 @@ func (self *SRegion) initVmimportRole() error {
 			"AssumeRolePolicyDocument": roleDoc,
 		}
 		ret := struct{}{}
-		return self.client.iamRequest("CreateRole", params, &ret)
+		err := self.client.iamRequest("CreateRole", params, &ret)
+		if e, ok := err.(*sAwsError); ok && e.Errors.Code == "EntityAlreadyExists" {
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -413,11 +414,11 @@ func (self *SRegion) initVmimportRolePolicy() error {
 
 func (self *SRegion) InitVmimport() error {
 	if err := self.initVmimportRole(); err != nil {
-		return err
+		return errors.Wrapf(err, "initVmimportRole")
 	}
 
 	if err := self.initVmimportRolePolicy(); err != nil {
-		return err
+		return errors.Wrapf(err, "initVmimportRolePolicy")
 	}
 
 	return nil

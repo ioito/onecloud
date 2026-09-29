@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/cloudmux/pkg/apis/compute"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 )
 
 const (
@@ -44,7 +45,7 @@ const (
 )
 
 type FileSystemListInput struct {
-	apis.StatusInfrasResourceBaseListInput
+	apis.SharableVirtualResourceListInput
 	apis.ExternalizedResourceBaseListInput
 	ManagedResourceListInput
 
@@ -52,9 +53,9 @@ type FileSystemListInput struct {
 }
 
 type FileSystemCreateInput struct {
-	apis.StatusInfrasResourceBaseCreateInput
+	apis.SharableVirtualResourceCreateInput
 	// 协议类型
-	// enum: NFS, SMB, CPFS
+	// enum: ["NFS", "SMB", "CPFS"]
 	Protocol string `json:"protocol"`
 
 	// 文件系统类型
@@ -87,12 +88,12 @@ type FileSystemCreateInput struct {
 	// default: false
 	AutoRenew bool `json:"auto_renew"`
 
-	// 到期释放时间，仅后付费支持
-	ExpiredAt time.Time `json:"expired_at"`
+	// 到期释放时间
+	ReleaseAt time.Time `json:"release_at"`
 
 	// 计费方式
-	// enum: postpaid, prepaid
-	BillingType string `json:"billing_type"`
+	// enum: ["postpaid", "prepaid"]
+	BillingType billing_api.TBillingType `json:"billing_type"`
 	// swagger:ignore
 	BillingCycle string `json:"billing_cycle"`
 }
@@ -101,16 +102,21 @@ type FileSystemSyncstatusInput struct {
 }
 
 type FileSystemDetails struct {
-	apis.StatusInfrasResourceBaseDetails
+	apis.SharableVirtualResourceDetails
 	ManagedResourceInfo
 	CloudregionResourceInfo
 
-	Vpc     string
-	Network string
-	Zone    string
+	Vpc     string `json:"vpc"`
+	Network string `json:"network"`
+	Zone    string `json:"zone"`
 }
 
 type FileSystemRemoteUpdateInput struct {
 	// 是否覆盖替换所有标签
 	ReplaceTags *bool `json:"replace_tags" help:"replace all remote tags"`
+}
+
+type FileSystemSetQuotaInput struct {
+	MaxGb    *int64
+	MaxFiles *int64
 }

@@ -62,10 +62,6 @@ func (self *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICl
 	return nil, cloudprovider.ErrNotSupported
 }
 
-func (self *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	return nil, cloudprovider.ErrNotSupported
-}
-
 func (self *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
 	return nil, cloudprovider.ErrNotSupported
 }
@@ -148,7 +144,7 @@ func (self *SRegion) GetIZoneById(id string) (cloudprovider.ICloudZone, error) {
 			return zones[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetIHosts() ([]cloudprovider.ICloudHost, error) {
@@ -219,4 +215,16 @@ func (self *SRegion) upload(res string, id string, header http.Header, body io.R
 func (self *SRegion) getTask(id string) (*STask, error) {
 	task := &STask{}
 	return task, self.get("tasks", id, nil, task)
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	vms, err := region.GetInstances()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetInstances")
+	}
+	ret := []cloudprovider.ICloudVM{}
+	for i := range vms {
+		ret = append(ret, &vms[i])
+	}
+	return ret, nil
 }

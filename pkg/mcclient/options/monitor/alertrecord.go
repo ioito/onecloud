@@ -25,14 +25,18 @@ import (
 )
 
 type AlertRecordListOptions struct {
+	_ struct{} `mcp-desc:"列出告警记录。可用 res-types/alerting/level 过滤；告警总数饼图用 climc_monitor_alertrecord_total_alert"`
+
 	options.BaseListOptions
 
-	AlertId  string   `help:"id of alert"`
-	Level    string   `help:"alert level"`
-	State    string   `help:"alert state"`
-	ResTypes []string `json:"res_types"`
-	ResName  string   `json:"res_name"`
-	Alerting bool     `json:"alerting"`
+	AlertId   string   `help:"id of alert" mcp:"true"`
+	Level     string   `help:"alert level" mcp:"true"`
+	State     string   `help:"alert state" mcp:"true"`
+	ResTypes  []string `json:"res_types" mcp:"true"`
+	ResId     string   `json:"res_id" mcp:"true"`
+	ResName   string   `json:"res_name" mcp:"true"`
+	Alerting  bool     `json:"alerting" mcp:"true"`
+	AlertName string   `json:"alert_name" mcp:"true"`
 }
 
 func (o *AlertRecordListOptions) Params() (jsonutils.JSONObject, error) {
@@ -52,7 +56,8 @@ func (o *AlertRecordShowOptions) GetId() string {
 }
 
 type AlertRecordTotalOptions struct {
-	ID string `help:"total-alert" json:"-"`
+	_ struct{} `mcp-desc:"告警总览饼图数据（alertrecords/total-alert）。按资源类型汇总当前告警数。项目/域用 tenant 或 scope"`
+
 	options.BaseListOptions
 }
 
@@ -60,8 +65,36 @@ func (o *AlertRecordTotalOptions) Params() (jsonutils.JSONObject, error) {
 	return options.ListStructToParams(o)
 }
 
-func (o *AlertRecordTotalOptions) GetId() string {
-	return o.ID
+func (o *AlertRecordTotalOptions) Property() string {
+	return "total-alert"
+}
+
+type AlertRecordHistoryAlertOptions struct {
+	options.BaseListOptions
+}
+
+func (o *AlertRecordHistoryAlertOptions) Params() (jsonutils.JSONObject, error) {
+	return options.ListStructToParams(o)
+}
+
+func (o *AlertRecordHistoryAlertOptions) Property() string {
+	return "history-alert"
+}
+
+type AlertRecordProjectAlertResourceCountOptions struct {
+	StartTime time.Time `help:"start time (RFC3339 format)" json:"start_time" default:"2025-01-01 00:00:00"`
+	EndTime   time.Time `help:"end time (RFC3339 format)" json:"end_time" default:"2025-01-01 00:00:00"`
+	ResType   string    `help:"resource type" json:"res_type"`
+	AlertId   string    `help:"alert id" json:"alert_id"`
+	Scope     string    `help:"scope" json:"scope" choices:"system|domain|project"`
+}
+
+func (o *AlertRecordProjectAlertResourceCountOptions) Params() (jsonutils.JSONObject, error) {
+	return options.StructToParams(o)
+}
+
+func (o *AlertRecordProjectAlertResourceCountOptions) Property() string {
+	return "project-alert-resource-count"
 }
 
 type AlertRecordShieldListOptions struct {

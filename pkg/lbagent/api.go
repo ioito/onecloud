@@ -308,7 +308,7 @@ func (h *ApiHelper) agentUpdateSeen(ctx context.Context) *computemodels.SLoadbal
 }
 
 func (h *ApiHelper) newAgentHbParams(ctx context.Context) (*jsonutils.JSONDict, error) {
-	ip, err := netutils2.MyIP()
+	ip, err := netutils2.MyIPSmart()
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +390,7 @@ func (h *ApiHelper) doSyncAgentParams(ctx context.Context) bool {
 	agentParams.SetVrrpParams("notify_script", h.haStateProvider.StateScript())
 	if useUnicast {
 		agentParams.SetVrrpParams("unicast_peer", unicastPeer)
+		agentParams.SetVrrpParams("unicast_src_ip", agent.IP)
 	}
 	if !agentParams.Equals(h.agentParams) {
 		if useUnicast {

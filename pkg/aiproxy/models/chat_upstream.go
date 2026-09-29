@@ -1,0 +1,452 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package models
+
+import (
+	"context"
+	"database/sql"
+	stderrors "errors"
+	"strings"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
+
+	api "yunion.io/x/onecloud/pkg/apis/aiproxy"
+	"yunion.io/x/onecloud/pkg/httperrors"
+	"yunion.io/x/onecloud/pkg/mcclient"
+)
+
+// clientModelRef holds parsed client request model id (flat or routingKey/catalogPart).
+type clientModelRef struct {
+	raw          string
+	routeKey     string
+	catalogPart  string
+	hierarchical bool
+}
+
+// parseClientModelRef splits a client model id at the first '/'.
+// "my-route/gpt-4" → routeKey=my-route, catalogPart=gpt-4, hierarchical=true.
+// "flat-alias"     → catalogPart=flat-alias, hierarchical=false.
+func parseClientModelRef(reqModel string) clientModelRef {
+	raw := strings.TrimSpace(reqModel)
+	if raw == "" {
+		return clientModelRef{raw: raw}
+	}
+	before, after, found := strings.Cut(raw, "/")
+	if !found {
+		return clientModelRef{raw: raw, catalogPart: raw}
+	}
+	routeKey := strings.TrimSpace(before)
+	if routeKey == "" {
+		return clientModelRef{raw: raw, catalogPart: raw}
+	}
+	return clientModelRef{
+		raw:          raw,
+		routeKey:     routeKey,
+		catalogPart:  strings.TrimSpace(after),
+		hierarchical: true,
+	}
+}
+
+// ChatUpstream holds resolved upstream and the model id to send.
+type ChatUpstream struct {
+	BaseURL       string
+	APIKey        string
+	UpstreamModel string
+	ProviderKey   string
+	AiProviderId  string
+	AiModelId     string
+	AiKeyId       string
+	APIMode       string
+	ModelConfig   *api.SAiModelConfig
+	// VisualProviderId / VisualModelKey come from the resolved text ai_model row.
+	VisualProviderId string
+	VisualModelKey   string
+
+	// VirtualKeyId and usage/rate snapshots come from the matched ai_virtual_key row.
+	VirtualKeyId        string
+	ProjectId           string
+	DomainId            string
+	MaxTokensPerRequest int
+	RequestsPerMinute   int
+	RoutingLog          *AiRoutingLog
+}
+
+type AiRoutingLog struct {
+	Enabled       bool
+	Candidates    []string
+	SelectedModel string
+	Method        string
+	Scores        map[string]interface{}
+	Confidence    *float64
+	Reason        string
+	LatencyMs     int64
+	Error         string
+}
+
+func modelKeyMatches(key, requestedModel string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	return strings.EqualFold(key, strings.TrimSpace(requestedModel))
+}
+
+func modelPatternMatches(pattern, requestedModel string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return true
+	}
+	rm := strings.TrimSpace(requestedModel)
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(rm, strings.TrimSuffix(pattern, "*"))
+	}
+	return strings.EqualFold(pattern, rm)
+}
+
+func virtualKeyAllowsProvider(vk *SAiVirtualKey, prov *SAiProvider) bool {
+	if vk == nil || prov == nil {
+		return false
+	}
+	if vk.Limits == nil || len(vk.Limits.AllowedAiProviderIds) == 0 {
+		return true
+	}
+	for _, idOrName := range vk.Limits.AllowedAiProviderIds {
+		idOrName = strings.TrimSpace(idOrName)
+		if idOrName == "" {
+			continue
+		}
+		if idOrName == prov.Id || strings.EqualFold(idOrName, prov.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadEnabledVirtualKey(virtualKey string) (*SAiVirtualKey, error) {
+	virtualKey = strings.TrimSpace(virtualKey)
+	if virtualKey == "" {
+		return nil, errors.Wrap(httperrors.ErrInputParameter, "missing virtual key (Authorization: Bearer <vk> or X-Ai-Virtual-Key)")
+	}
+	vk := SAiVirtualKey{}
+	qvk := AiVirtualKeyManager.Query().Equals("virtual_key_hash", virtualKeyDigest(virtualKey)).Equals("enabled", true)
+	err := qvk.First(&vk)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.Wrap(httperrors.ErrInvalidStatus, "virtual key not found or disabled")
+		}
+		return nil, errors.Wrap(err, "query ai_virtual_key")
+	}
+	if strings.TrimSpace(vk.ProjectId) == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "virtual key has no project")
+	}
+	return &vk, nil
+}
+
+// LoadEnabledVirtualKeyById loads an enabled virtual key by database id.
+func LoadEnabledVirtualKeyById(id string) (*SAiVirtualKey, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errors.Wrap(httperrors.ErrInputParameter, "empty virtual key id")
+	}
+	vk := SAiVirtualKey{}
+	qvk := AiVirtualKeyManager.Query().Equals("id", id).Equals("enabled", true)
+	err := qvk.First(&vk)
+	if err != nil {
+		if stderrors.Is(err, sql.ErrNoRows) {
+			return nil, errors.Wrap(httperrors.ErrInvalidStatus, "virtual key not found or disabled")
+		}
+		return nil, errors.Wrap(err, "query ai_virtual_key by id")
+	}
+	return &vk, nil
+}
+
+// listProjectRoutingsForVirtualKey returns enabled ai_routing rows owned by or shared with the virtual key's project.
+func listProjectRoutingsForVirtualKey(ctx context.Context, userCred mcclient.TokenCredential, vk *SAiVirtualKey) ([]SAiRouting, error) {
+	if vk == nil {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "nil virtual key")
+	}
+	routings := make([]SAiRouting, 0, 16)
+	qr := AiRoutingManager.Query().Equals("enabled", true)
+	qr = AiRoutingManager.FilterByOwner(ctx, qr, AiRoutingManager, userCred, vk.GetOwnerId(), rbacscope.ScopeProject)
+	qr = qr.Asc("priority")
+	if err := qr.All(&routings); err != nil {
+		return nil, errors.Wrap(err, "list ai_routings for virtual key project")
+	}
+	return routings, nil
+}
+
+// pickRoutingForRequest chooses the best matching ai_routing on the current aiproxy instance.
+// Hierarchical refs (routingKey/catalogPart) match only ai_routing.model_key on routeKey.
+// Flat refs: Phase 1 exact ai_routing.model_key match, Phase 2 non-empty ai_routing.model_pattern match.
+// Empty model_pattern is not a wildcard; unmatched models return nil (ResolveChatUpstream maps that to ErrNotFound).
+func pickRoutingForRequest(routings []SAiRouting, reqModel, currentNodeId string) (*SAiRouting, error) {
+	ref := parseClientModelRef(reqModel)
+	if ref.hierarchical {
+		return pickRoutingByMatch(routings, ref.routeKey, currentNodeId, func(r *SAiRouting, key string) bool {
+			return modelKeyMatches(r.ModelKey, key)
+		})
+	}
+	if picked, err := pickRoutingByMatch(routings, reqModel, currentNodeId, func(r *SAiRouting, reqModel string) bool {
+		return modelKeyMatches(r.ModelKey, reqModel)
+	}); picked != nil || err != nil {
+		return picked, err
+	}
+	return pickRoutingByMatch(routings, reqModel, currentNodeId, func(r *SAiRouting, reqModel string) bool {
+		if strings.TrimSpace(r.ModelPattern) == "" {
+			return false
+		}
+		return modelPatternMatches(r.ModelPattern, reqModel)
+	})
+}
+
+func pickRoutingByMatch(routings []SAiRouting, reqModel, currentNodeId string, match func(*SAiRouting, string) bool) (*SAiRouting, error) {
+	var boundElsewhere *SAiRouting
+	var best *SAiRouting
+	for i := range routings {
+		r := &routings[i]
+		if !match(r, reqModel) {
+			continue
+		}
+		if !proxyNodeScopeMatches(r.AiProxyNodeId, currentNodeId) {
+			if boundElsewhere == nil && strings.TrimSpace(r.AiProxyNodeId) != "" {
+				boundElsewhere = r
+			}
+			continue
+		}
+		if best == nil || r.Priority < best.Priority {
+			best = r
+		}
+	}
+	if best != nil {
+		return best, nil
+	}
+	if boundElsewhere != nil {
+		return nil, errors.Wrapf(httperrors.ErrForbidden,
+			"ai_routing %q is bound to ai_proxy_node %q; use that instance endpoint",
+			boundElsewhere.Name, boundElsewhere.AiProxyNodeId)
+	}
+	return nil, nil
+}
+
+func pickRoutingById(routings []SAiRouting, routingId, currentNodeId string) (*SAiRouting, error) {
+	routingId = strings.TrimSpace(routingId)
+	if routingId == "" {
+		return nil, nil
+	}
+	var boundElsewhere *SAiRouting
+	for i := range routings {
+		r := &routings[i]
+		if r.Id != routingId {
+			continue
+		}
+		if !proxyNodeScopeMatches(r.AiProxyNodeId, currentNodeId) {
+			if strings.TrimSpace(r.AiProxyNodeId) != "" {
+				boundElsewhere = r
+			}
+			continue
+		}
+		return r, nil
+	}
+	if boundElsewhere != nil {
+		return nil, errors.Wrapf(httperrors.ErrForbidden,
+			"ai_routing %q is bound to ai_proxy_node %q; use that instance endpoint",
+			boundElsewhere.Name, boundElsewhere.AiProxyNodeId)
+	}
+	return nil, nil
+}
+
+type resolvedCatalogModel struct {
+	provider   *SAiProvider
+	model      *SAiModel
+	routingLog *AiRoutingLog
+}
+
+// resolveCatalogModelFromRouting picks ai_routing_models for the routing and loads catalog provider/model rows.
+func resolveCatalogModelFromRouting(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	vk *SAiVirtualKey,
+	routing *SAiRouting,
+	reqModel string,
+	body *jsonutils.JSONDict,
+) (*resolvedCatalogModel, error) {
+	if routing == nil {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "nil ai_routing")
+	}
+	ref := parseClientModelRef(reqModel)
+	matchedByModelKey := !ref.hierarchical && modelKeyMatches(routing.ModelKey, ref.raw)
+	providerId, modelId, routingLog, err := pickAiRoutingModel(ctx, userCred, routing, ref, matchedByModelKey, body)
+	if err != nil {
+		return nil, err
+	}
+
+	pObj, err := AiProviderManager.FetchByIdOrName(ctx, userCred, providerId)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch ai_provider")
+	}
+	prov := pObj.(*SAiProvider)
+	if !prov.GetEnabled() {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_provider disabled")
+	}
+	if !virtualKeyAllowsProvider(vk, prov) {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_provider not allowed for this virtual key")
+	}
+
+	mObj, err := AiModelManager.FetchByIdOrName(ctx, userCred, modelId)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch ai_model")
+	}
+	mdl := mObj.(*SAiModel)
+	if !mdl.GetEnabled() {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_model disabled")
+	}
+	if strings.TrimSpace(mdl.AiProviderId) != "" && mdl.AiProviderId != prov.Id {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_model does not belong to resolved ai_provider")
+	}
+	return &resolvedCatalogModel{provider: prov, model: mdl, routingLog: routingLog}, nil
+}
+
+// ResolveChatUpstream resolves upstream URL, API key, and catalog model_key for a chat request:
+//  1. ai_virtual_key (auth + project scope)
+//  2. optional preferredRoutingId (X-Ai-Routing-Id) pins the ai_routing; otherwise model_key then non-empty model_pattern
+//  3. ai_routing_model -> ai_provider + ai_model
+//  4. ai_key rows for that provider matching the catalog model_key (weight)
+func ResolveChatUpstream(ctx context.Context, userCred mcclient.TokenCredential, virtualKey string, body *jsonutils.JSONDict, preferredRoutingId string) (*ChatUpstream, error) {
+	vk, err := loadEnabledVirtualKey(virtualKey)
+	if err != nil {
+		return nil, err
+	}
+
+	reqModel, _ := body.GetString("model")
+	if strings.TrimSpace(reqModel) == "" {
+		return nil, errors.Wrap(httperrors.ErrInputParameter, "missing model in JSON body")
+	}
+
+	routings, err := listProjectRoutingsForVirtualKey(ctx, userCred, vk)
+	if err != nil {
+		return nil, err
+	}
+	var routing *SAiRouting
+	if strings.TrimSpace(preferredRoutingId) != "" {
+		routing, err = pickRoutingById(routings, preferredRoutingId, CurrentProxyNodeId())
+	} else {
+		routing, err = pickRoutingForRequest(routings, reqModel, CurrentProxyNodeId())
+	}
+	if err != nil {
+		return nil, err
+	}
+	if routing == nil {
+		return nil, errors.Wrap(httperrors.ErrNotFound, "no ai_routing matched for virtual key project on this aiproxy node")
+	}
+
+	resolved, err := resolveCatalogModelFromRouting(ctx, userCred, vk, routing, reqModel, body)
+	if err != nil {
+		return nil, err
+	}
+	prov := resolved.provider
+	mdl := resolved.model
+
+	if prov.Config == nil {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_provider.config is empty")
+	}
+	baseURL := prov.Config.EffectiveBaseURL(prov.ProviderKey)
+	if baseURL == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_provider.config must include base_url")
+	}
+
+	upstreamModel := strings.TrimSpace(mdl.ModelKey)
+	if upstreamModel == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "ai_model.model_key is empty")
+	}
+
+	apiMode := prov.Config.ResolvedAPIMode()
+
+	// Keys are scoped to ai_provider; routing on each ai_key matches the resolved catalog model_key.
+	keyRes, err := resolveUpstreamAPIKey(prov, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	if keyRes == nil || keyRes.Secret == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "add an enabled ai_key with secret for this provider")
+	}
+
+	up := &ChatUpstream{
+		BaseURL:          baseURL,
+		APIKey:           keyRes.Secret,
+		UpstreamModel:    upstreamModel,
+		ProviderKey:      prov.ProviderKey,
+		AiProviderId:     prov.Id,
+		AiModelId:        mdl.Id,
+		AiKeyId:          keyRes.AiKeyId,
+		VirtualKeyId:     vk.Id,
+		APIMode:          apiMode,
+		ModelConfig:      mdl.Config,
+		VisualProviderId: mdl.VisualProviderId,
+		VisualModelKey:   mdl.VisualModelKey,
+		ProjectId:        vk.ProjectId,
+		DomainId:         vk.DomainId,
+		RoutingLog:       resolved.routingLog,
+	}
+	if vk.Limits != nil {
+		up.MaxTokensPerRequest = vk.Limits.MaxTokensPerRequest
+		up.RequestsPerMinute = vk.Limits.RequestsPerMinute
+	}
+	return up, nil
+}
+
+// ResolveVisualUpstream resolves the visual provider upstream for tool-delegated image analysis.
+func ResolveVisualUpstream(ctx context.Context, userCred mcclient.TokenCredential, vk *SAiVirtualKey, visualProviderId, visualModelKey string) (*ChatUpstream, error) {
+	providerID := strings.TrimSpace(visualProviderId)
+	modelKey := strings.TrimSpace(visualModelKey)
+	if providerID == "" || modelKey == "" {
+		return nil, errors.Wrap(httperrors.ErrInputParameter, "visual_provider_id and visual_model_key are required")
+	}
+	pObj, err := AiProviderManager.FetchByIdOrName(ctx, userCred, providerID)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch visual ai_provider")
+	}
+	prov := pObj.(*SAiProvider)
+	if !prov.GetEnabled() {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "visual ai_provider disabled")
+	}
+	if !virtualKeyAllowsProvider(vk, prov) {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "visual ai_provider not allowed for this virtual key")
+	}
+	if prov.Config == nil {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "visual ai_provider.config is empty")
+	}
+	baseURL := prov.Config.EffectiveBaseURL(prov.ProviderKey)
+	if baseURL == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "visual ai_provider.config must include base_url")
+	}
+	keyRes, err := resolveUpstreamAPIKey(prov, modelKey)
+	if err != nil {
+		return nil, err
+	}
+	if keyRes == nil || keyRes.Secret == "" {
+		return nil, errors.Wrap(httperrors.ErrInvalidStatus, "add an enabled ai_key with secret for visual provider")
+	}
+	return &ChatUpstream{
+		BaseURL:       baseURL,
+		APIKey:        keyRes.Secret,
+		UpstreamModel: modelKey,
+		ProviderKey:   prov.ProviderKey,
+		AiProviderId:  prov.Id,
+		AiKeyId:       keyRes.AiKeyId,
+		APIMode:       prov.Config.ResolvedAPIMode(),
+	}, nil
+}

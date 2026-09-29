@@ -25,12 +25,22 @@ type WebConsoleOptions struct {
 
 	common_options.DBOptions
 
-	KubectlPath              string `help:"kubectl binary path used to connect k8s cluster" default:"/usr/bin/kubectl"`
-	IpmitoolPath             string `help:"ipmitool binary path used to connect baremetal sol" default:"/usr/bin/ipmitool"`
-	EnableAutoLogin          bool   `help:"allow webconsole to log in directly with the cloudroot public key" default:"false"`
-	ApsaraConsoleAddr        string `help:"Apsara console addr" default:"https://xxxx.com.cn/module/ecs/vnc/index.html"`
-	AliyunConsoleAddr        string `help:"Aliyun vnc addr" default:"https://ecs.console.aliyun.com/vnc/index.htm"`
-	SshSessionTimeoutMinutes int    `help:"ssh timeout session" default:"-1"`
+	KubectlPath       string `help:"kubectl binary path used to connect k8s cluster" default:"/usr/bin/kubectl"`
+	AdbPath           string `help:"adb binary path" default:"/usr/bin/adb"`
+	IpmitoolPath      string `help:"ipmitool binary path used to connect baremetal sol" default:"/usr/bin/ipmitool"`
+	EnableAutoLogin   bool   `help:"allow webconsole to log in directly with the cloudroot public key" default:"false"`
+	ApsaraConsoleAddr string `help:"Apsara console addr" default:"https://xxxx.com.cn/module/ecs/vnc/index.html"`
+	AliyunConsoleAddr string `help:"Aliyun vnc addr" default:"https://g.alicdn.com/aliyun/ecs-console-vnc2/0.0.8/index.html"`
+
+	SshSessionTimeoutMinutes int `help:"ssh timeout session" default:"-1"`
+	RdpSessionTimeoutMinutes int `help:"rdp timeout session" default:"-1"`
+
+	EnableWatermark        bool `help:"enable water mark" default:"false"`
+	EnableCommandRecording bool `help:"enable command recording" default:"false"`
+
+	KeepWebsocketSession bool `help:"keep websocket session" default:"false"`
+
+	RefererWhitelist []string `help:"referer whitelist" default:"skip_check"`
 }
 
 func OnOptionsChange(oldO, newO interface{}) bool {

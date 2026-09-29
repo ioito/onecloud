@@ -52,6 +52,7 @@ func initKubeCluster() {
 	cmd.Perform("delete-machines", new(o.KubeClusterDeleteMachinesOptions))
 	cmd.Perform("add-machines", new(o.KubeClusterAddMachinesOptions))
 	cmd.PerformClass("gc", new(o.ClusterGCOpts))
+	cmd.PerformClass("history-data-clean", new(o.ClusterHistoryDataCleanOpts))
 	cmd.Perform("set-extra-config", new(o.ClusterSetExtraConfigOpt))
 	cmd.Get("extra-config", new(o.IdentOptions))
 
@@ -311,6 +312,9 @@ func initKubeCluster() {
 
 		// 2. edit yaml
 		yaml, err := shellutils.Edit(setting.YAMLString())
+		if err != nil {
+			return errors.Wrap(err, "edit component setting")
+		}
 		if len(yaml) == 0 {
 			if !args.Force {
 				log.Infof("Nothing to update")

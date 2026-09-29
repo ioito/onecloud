@@ -136,7 +136,7 @@ func (self *sCtyunError) ParseErrorFromJsonResponse(statusCode int, status strin
 		body.Unmarshal(self)
 	}
 	if strings.Contains(self.Message, "signature verification failed") {
-		return errors.Wrapf(cloudprovider.ErrInvalidAccessKey, jsonutils.Marshal(self).String())
+		return errors.Wrapf(cloudprovider.ErrInvalidAccessKey, "%s", jsonutils.Marshal(self).String())
 	}
 	return self
 }
@@ -151,7 +151,7 @@ func (cli *SCtyunClient) getDefaultClient() *http.Client {
 	httputils.SetClientProxyFunc(cli.client, cli.cpcfg.ProxyFunc)
 	ts, _ := cli.client.Transport.(*http.Transport)
 	ts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if req.Method == "GET" {
 			return nil, nil
 		}
@@ -314,24 +314,28 @@ func (self *SCtyunClient) request(method httputils.THttpMethod, service, resourc
 		return resp, nil
 	}
 	if strings.HasSuffix(ret.ErrorCode, "NotFound") || ret.ErrorCode == "ebs.ebsInfo.get volume resourceId failed" {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, resp.String())
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", resp.String())
 	}
 	log.Errorf("request %s with params %s error: %s", uri, jsonutils.Marshal(body).String(), resp.String())
-	return nil, fmt.Errorf(resp.String())
+	return nil, fmt.Errorf("%s", resp.String())
 }
 
-func (self *SCtyunClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SCtyunClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	ret := []cloudprovider.ICloudRegion{}
 	for i := range self.regions {
+		if !self.regions[i].OpenapiAvailable {
+			continue
+		}
 		self.regions[i].client = self
 		ret = append(ret, &self.regions[i])
 	}
-	return ret
+	return ret, nil
 }
 
 func (self *SCtyunClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccounts := make([]cloudprovider.SSubAccount, 0)
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = self.GetAccountId()
 	subAccount.Name = self.cpcfg.Name
 	subAccount.Account = self.accessKey
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
@@ -366,7 +370,7 @@ func (self *SCtyunClient) GetRegion(id string) (*SRegion, error) {
 			return &self.regions[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SCtyunClient) GetCloudRegionExternalIdPrefix() string {
@@ -377,6 +381,7 @@ func (self *SCtyunClient) GetCapabilities() []string {
 	caps := []string{
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 	}
 	return caps

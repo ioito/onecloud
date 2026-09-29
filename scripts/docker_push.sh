@@ -36,9 +36,14 @@ get_current_arch() {
     aarch64)
         current_arch=arm64
         ;;
+    riscv64)
+        current_arch=riscv64
+        ;;
     esac
     echo $current_arch
 }
+
+ALLARCH=("amd64" "arm64" "riscv64")
 
 pushd $(
     cd "$(dirname "$0")"
@@ -66,21 +71,9 @@ build_bin() {
     local BUILD_ARCH=$2
     local BUILD_CGO=$3
     case "$1" in
-    host-image)
-        rm -vf _output/bin/$1
-        rm -rvf _output/bin/bundles/$1
-        if [ -z "$LIBQEMUIO_PATH" ]; then
-            echo "Need set \$LIBQEMUIO_PATH env to build host-image"
-            exit 1
-        fi
-        GOOS=linux make cmd/$1
-        ;;
     climc)
         rm -vf _output/bin/*cli
         env $BUILD_ARCH $BUILD_CGO make -C "$SRC_DIR" docker-alpine-build F="cmd/$1 cmd/*cli"
-        ;;
-    host-deployer | telegraf-raid-plugin)
-        env $BUILD_ARCH $BUILD_CGO make -C "$SRC_DIR" docker-centos-build F="cmd/$1"
         ;;
     *)
         env $BUILD_ARCH $BUILD_CGO make -C "$SRC_DIR" docker-alpine-build F="cmd/$1"
@@ -88,14 +81,14 @@ build_bin() {
     esac
 }
 
-build_bundle_libraries() {
-    for bundle_component in 'host-image'; do
-        if [ $1 == $bundle_component ]; then
-            $CUR_DIR/bundle_libraries.sh _output/bin/bundles/$1 _output/bin/$1
-            break
-        fi
-    done
-}
+# build_bundle_libraries() {
+#     for bundle_component in 'host-image'; do
+#         if [ $1 == $bundle_component ]; then
+#             $CUR_DIR/bundle_libraries.sh _output/bin/bundles/$1 _output/bin/$1
+#             break
+#         fi
+#     done
+# }
 
 build_image() {
     local tag=$1
@@ -111,6 +104,9 @@ build_image() {
         aarch64)
             docker buildx build -t "$tag" -f "$2" "$3" --output type=docker --platform linux/arm64
             ;;
+        riscv64)
+            docker buildx build -t "$tag" -f "$2" "$3" --output type=docker --platform linux/riscv64
+            ;;
         *)
             echo wrong arch
             exit 1
@@ -121,6 +117,8 @@ build_image() {
             docker buildx build -t "$tag" -f "$file" "$path" --push --platform linux/amd64
         elif [[ "$tag" == *"arm64" || "$ARCH" == "arm64" ]]; then
             docker buildx build -t "$tag" -f "$file" "$path" --push --platform linux/arm64
+        elif [[ "$tag" == *"riscv64" || "$ARCH" == "riscv64" ]]; then
+            docker buildx build -t "$tag" -f "$file" "$path" --push --platform linux/riscv64
         else
             docker buildx build -t "$tag" -f "$file" "$path" --push
         fi
@@ -141,12 +139,13 @@ buildx_and_push() {
     docker pull --platform "linux/$arch" "$tag"
 }
 
+
 get_image_name() {
     local component=$1
     local arch=$2
     local is_all_arch=$3
     local img_name="$REGISTRY/$component:$TAG"
-    if [[ "$is_all_arch" == "true" || "$arch" == arm64 || "$component" == host-image ]]; then
+    if [[ -n "$arch" && "$is_all_arch" == "true" ]]; then
         img_name="${img_name}-$arch"
     fi
     echo $img_name
@@ -157,13 +156,23 @@ build_process() {
     local arch=$2
     local is_all_arch=$3
     local img_name=$(get_image_name $component $arch $is_all_arch)
+    local build_env=""
+
+    case "$component" in
+    host)
+        build_env="$build_env CGO_ENABLED=1"
+        ;;
+    *)
+        build_env="$build_env CGO_ENABLED=0"
+        ;;
+    esac
 
     build_bin $component
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[$(readlink -f ${BASH_SOURCE}):${LINENO} ${FUNCNAME[0]}] return for DRY_RUN"
         return
     fi
-    build_bundle_libraries $component
+    # build_bundle_libraries $component
 
     build_image $img_name $DOCKER_DIR/Dockerfile.$component $SRC_DIR
 }
@@ -175,12 +184,14 @@ build_process_with_buildx() {
     local img_name=$(get_image_name $component $arch $is_all_arch)
 
     build_env="GOARCH=$arch"
-    if [[ "$arch" == arm64 ]]; then
-        build_env="$build_env"
-        if [[ $component == host ]]; then
-            build_env="$build_env CGO_ENABLED=1"
-        fi
-    fi
+    case "$component" in
+    host)
+        build_env="$build_env CGO_ENABLED=1"
+        ;;
+    *)
+        build_env="$build_env CGO_ENABLED=0"
+        ;;
+    esac
 
     case "$component" in
     host | torrent)
@@ -208,22 +219,20 @@ general_build() {
 
 make_manifest_image() {
     local component=$1
+    local arch=$2
     local img_name=$(get_image_name $component "" "false")
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "[$(readlink -f ${BASH_SOURCE}):${LINENO} ${FUNCNAME[0]}] return for DRY_RUN"
         return
     fi
-
-    if [[ "$img_name" == *:5000/* ]]; then
-        docker push $img_name-amd64
-        docker push $img_name-arm64
-    fi
-
-    docker buildx imagetools create -t $img_name \
-        $img_name-amd64 \
-        $img_name-arm64
-    docker manifest inspect ${img_name} | grep -wq amd64
-    docker manifest inspect ${img_name} | grep -wq arm64
+    CMD="docker buildx imagetools create -t ${img_name} "
+    for ac in "${ALLARCH[@]}"; do
+        if [[ "${arch}" == "all" || "${arch}" == *"$ac"* ]]; then
+            CMD="${CMD} ${img_name}-${ac}"
+        fi
+    done
+    echo "$CMD"
+    $CMD
 }
 
 ALL_COMPONENTS=$(ls cmd | grep -v '.*cli$' | xargs)
@@ -243,6 +252,52 @@ fi
 cd $SRC_DIR
 mkdir -p $SRC_DIR/_output
 
+show_update_cmd() {
+    local component=$1
+    local spec=$1
+    local name=$1
+    local tag=$TAG
+
+    case "$component" in
+    'apigateway')
+        spec='apiGateway'
+        ;;
+    'baremetal-agent')
+        spec='baremetalagent'
+        name='baremetal-agent'
+        ;;
+    'host')
+        spec='hostagent'
+        ;;
+    'host-deployer')
+        spec='hostdeployer'
+        ;;
+    'host-health')
+        spec='hostagent/HostHealth'
+        ;;
+    'host-image')
+        spec='hostimage'
+        ;;
+    'region')
+        spec='regionServer'
+        ;;
+    'region-dns')
+        spec='regionDNS'
+        ;;
+    'vpcagent')
+        spec='vpcAgent'
+        ;;
+    'esxi-agent')
+        spec='esxiagent'
+        ;;
+    'mcp-server')
+        spec='mcpServer'
+        ;;
+    esac
+
+    echo "kubectl patch oc -n onecloud default --type='json' -p='[{op: replace, path: /spec/${spec}/imageName, value: ${name}},{"op": "replace", "path": "/spec/${spec}/repository", "value": "${REGISTRY}"},{"op": "add", "path": "/spec/${spec}/tag", "value": "${tag}"}]'"
+}
+
 for component in $COMPONENTS; do
     if [[ $component == *cli ]]; then
         echo "Please build image for climc"
@@ -250,22 +305,28 @@ for component in $COMPONENTS; do
     fi
 
     echo "Start to build component: $component"
-    if [[ $component == host-image ]]; then
-        build_process $component $ARCH "false"
+
+    multiarch=""
+    for ac in "${ALLARCH[@]}"; do
+        if [[ "$ARCH" == "$ac" ]]; then
+            # single arch
+            if [ -e "$DOCKER_DIR/Dockerfile.$component" ]; then
+                general_build $component $ARCH "false"
+            fi
+        elif [[ "$ARCH" == "all" || "$ARCH" == *"$ac"* ]]; then
+            multiarch="true"
+            general_build $component $ac "true"
+        fi
+    done
+    if [[ "$multiarch" == "true" ]]; then
+        make_manifest_image $component $ARCH
+    fi
+done
+
+echo ""
+for component in $COMPONENTS; do
+    if [[ $component == *cli ]]; then
         continue
     fi
-
-    case "$ARCH" in
-    all)
-        for arch in "arm64" "amd64"; do
-            general_build $component $arch "true"
-        done
-        make_manifest_image $component
-        ;;
-    *)
-        if [ -e "$DOCKER_DIR/Dockerfile.$component" ]; then
-            general_build $component $ARCH "false"
-        fi
-        ;;
-    esac
+    show_update_cmd $component
 done

@@ -15,11 +15,32 @@
 package monitor
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"yunion.io/x/log"
 )
+
+func TestDeviceAddArgsPreservesQmpTypes(t *testing.T) {
+	cmd := Command{Execute: "device_add", Args: deviceAddArgs("usb-host", map[string]interface{}{
+		"hostbus":  uint64(1),
+		"hostaddr": uint64(9),
+		"hostport": "1.2",
+	})}
+
+	raw, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, want := range []string{`"hostbus":1`, `"hostaddr":9`, `"hostport":"1.2"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("QMP command %s does not contain %s", got, want)
+		}
+	}
+}
 
 func TestQmpMonitor_Connect(t *testing.T) {
 	onConnected := func() { log.Infof("Monitor Connected") }
@@ -42,4 +63,21 @@ func TestQmpMonitor_Connect(t *testing.T) {
 	m.QueryStatus(statusCallBack)
 	m.Disconnect()
 	time.Sleep(3 * time.Second)
+}
+
+func TestFilterQcow2NamedBlockNodes(t *testing.T) {
+	qcow2 := QemuNamedBlockNode{NodeName: "node-snap", Driver: "qcow2", File: "/snapshots/s1"}
+	file := QemuNamedBlockNode{NodeName: "file-snap", Driver: "file", File: "/snapshots/s1"}
+	unnamed := QemuNamedBlockNode{Driver: "qcow2", File: "/snapshots/s2"}
+	nodes := filterQcow2NamedBlockNodes([]QemuNamedBlockNode{file, unnamed, qcow2})
+	if len(nodes) != 1 || nodes[0].NodeName != qcow2.NodeName {
+		t.Fatalf("unexpected qcow2 nodes: %#v", nodes)
+	}
+}
+
+func TestBlockJobsReturnsQMPError(t *testing.T) {
+	m := NewQmpMonitor("test", "", nil, nil, nil, nil)
+	if _, err := m.blockJobs(&Response{ErrorVal: &Error{Class: "GenericError", Desc: "failed"}}); err == nil {
+		t.Fatal("expected query-block-jobs error")
+	}
 }

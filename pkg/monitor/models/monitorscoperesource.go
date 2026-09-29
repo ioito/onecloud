@@ -33,16 +33,26 @@ type SMonitorScopedResource struct {
 	db.SScopedResourceBase
 }
 
-func (m *SMonitorScopedResourceManager) FilterByOwner(q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (m *SMonitorScopedResourceManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if ownerId == nil {
 		return q
 	}
 	switch scope {
 	case rbacscope.ScopeDomain:
-		q = q.Equals("domain_id", ownerId.GetProjectDomainId())
+		q = q.Filter(
+			sqlchemy.OR(
+				sqlchemy.Equals(q.Field("domain_id"), ownerId.GetProjectDomainId()),
+				sqlchemy.IsNullOrEmpty(q.Field("domain_id")),
+			),
+		)
 	case rbacscope.ScopeProject:
-
-		q = q.Equals("tenant_id", ownerId.GetProjectId())
+		q = q.Filter(
+			sqlchemy.OR(
+				sqlchemy.Equals(q.Field("tenant_id"), ownerId.GetProjectId()),
+				sqlchemy.IsNullOrEmpty(q.Field("domain_id")),
+				sqlchemy.Equals(q.Field("domain_id"), ownerId.GetProjectDomainId()),
+			),
+		)
 	}
 	return q
 }

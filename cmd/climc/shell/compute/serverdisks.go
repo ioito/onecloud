@@ -77,22 +77,10 @@ func init() {
 	type ServerDiskUpdateOptions struct {
 		SERVER string `help:"ID or Name of server"`
 		DISK   string `help:"ID or Name of Disk"`
-		Driver string `help:"Driver of vDisk" choices:"virtio|ide|scsi|pvscsi"`
-		Cache  string `help:"Cache mode of vDisk" choices:"writethrough|none|writeback|directsync"`
-		Aio    string `help:"Asynchronous IO mode of vDisk" choices:"native|threads"`
 		Index  int64  `help:"Index of vDisk" default:"-1"`
 	}
 	R(&ServerDiskUpdateOptions{}, "server-disk-update", "Update details of a virtual disk of a virtual server", func(s *mcclient.ClientSession, args *ServerDiskUpdateOptions) error {
 		params := jsonutils.NewDict()
-		if len(args.Driver) > 0 {
-			params.Add(jsonutils.NewString(args.Driver), "driver")
-		}
-		if len(args.Cache) > 0 {
-			params.Add(jsonutils.NewString(args.Cache), "cache_mode")
-		}
-		if len(args.Aio) > 0 {
-			params.Add(jsonutils.NewString(args.Aio), "aio_mode")
-		}
 		if args.Index >= 0 {
 			params.Add(jsonutils.NewInt(args.Index), "index")
 		}
@@ -125,10 +113,12 @@ func init() {
 	})
 
 	type ServerAttachDiskOptions struct {
+		_ struct{} `mcp-desc:"将已有硬盘挂载到虚机。SERVER/DISK 为 id/name；可选 driver。先 climc_server_list + climc_disk_list"`
+
 		SERVER string `help:"ID or name of server"`
-		DISK   string `help:"ID of name of disk to attach"`
-		Driver string `help:"Driver" choices:"virtio|ide|scsi"`
-		Cache  string `help:"Cache mode" choices:"writeback|none|writethrought"`
+		DISK   string `help:"ID or name of disk to attach"`
+		Driver string `help:"Disk driver" choices:"virtio|ide|scsi" mcp:"true"`
+		Cache  string `help:"Cache mode" choices:"writeback|none|writethrough" mcp:"true"`
 	}
 	R(&ServerAttachDiskOptions{}, "server-attach-disk", "Attach an existing virtual disks to a virtual server", func(s *mcclient.ClientSession, args *ServerAttachDiskOptions) error {
 		params := jsonutils.NewDict()
@@ -148,9 +138,11 @@ func init() {
 	})
 
 	type ServerDetachDiskOptions struct {
+		_ struct{} `mcp-desc:"从虚机卸载硬盘。SERVER/DISK 为 id/name；可选 delete-disk。先 climc_server_list / climc_disk_list"`
+
 		SERVER     string `help:"ID or name of server"`
 		DISK       string `help:"ID or name of disk to detach"`
-		DeleteDisk bool   `help:"Delete disk if the disk not has flag of auto_delete when detached"`
+		DeleteDisk bool   `help:"Delete the disk after detach (ignored if disk has auto_delete)" mcp:"true"`
 	}
 	R(&ServerDetachDiskOptions{}, "server-detach-disk", "Detach a disk from a virtual server", func(s *mcclient.ClientSession, args *ServerDetachDiskOptions) error {
 		params := jsonutils.NewDict()

@@ -48,7 +48,15 @@ func (self *SESXiHostDriver) GetHypervisor() string {
 	return api.HYPERVISOR_ESXI
 }
 
+func (self *SESXiHostDriver) GetProvider() string {
+	return api.CLOUD_PROVIDER_ONECLOUD
+}
+
 func (self *SESXiHostDriver) ValidateDiskSize(storage *models.SStorage, sizeGb int) error {
+	return nil
+}
+
+func (self *SESXiHostDriver) RequestRemoteUpdateDisk(ctx context.Context, userCred mcclient.TokenCredential, storage *models.SStorage, disk *models.SDisk, replaceTags bool) error {
 	return nil
 }
 
@@ -71,30 +79,14 @@ func (self *SESXiHostDriver) CheckAndSetCacheImage(ctx context.Context, userCred
 	hostCacheImage := models.StoragecachedimageManager.GetStoragecachedimage(storageCache.GetId(), cacheImage.GetId())
 	if hostCacheImage == nil {
 		zone, _ := host.GetZone()
-		srcHostCacheImage, err = cacheImage.ChooseSourceStoragecacheInRange(api.HOST_TYPE_ESXI, []string{host.Id},
+		srcHostCacheImage, err = cacheImage.ChooseSourceStoragecacheInRange([]string{api.HOST_TYPE_ESXI}, []string{host.Id},
 			[]interface{}{zone, host.GetCloudprovider()})
 		if err != nil {
 			return err
 		}
 	}
 
-	type contentStruct struct {
-		ImageId            string
-		HostId             string
-		HostIp             string
-		SrcHostIp          string
-		SrcPath            string
-		SrcDatastore       vcenter.SVCenterAccessInfo
-		Datastore          vcenter.SVCenterAccessInfo
-		Format             string
-		IsForce            bool
-		StoragecacheId     string
-		ImageType          string
-		ImageExternalId    string
-		StorageCacheHostIp string
-	}
-
-	content := contentStruct{}
+	content := vcenter.ImageCacheInput{}
 	content.ImageId = imageId
 	content.HostId = host.Id
 	content.HostIp = host.AccessIp
@@ -111,7 +103,7 @@ func (self *SESXiHostDriver) CheckAndSetCacheImage(ctx context.Context, userCred
 	storage := host.GetStorageByFilePath(storageCache.Path)
 	if storage == nil {
 		msg := fmt.Sprintf("fail to find storage for storageCache %s", storageCache.Path)
-		log.Errorf(msg)
+		log.Errorf("%s", msg)
 		return errors.Error(msg)
 	}
 
@@ -129,7 +121,7 @@ func (self *SESXiHostDriver) CheckAndSetCacheImage(ctx context.Context, userCred
 				return errors.Wrap(err, "srcHostCacheImage.GetHost")
 			}
 		} else {
-			host, err = storageCache.GetHost()
+			host, err = storageCache.GetMasterHost()
 			if err != nil {
 				return errors.Wrap(err, "StorageCache.GetHost")
 			}
@@ -268,6 +260,30 @@ func (self *SESXiHostDriver) RequestResizeDiskOnHost(ctx context.Context, host *
 	guest := disk.GetGuest()
 	if guest == nil {
 		return fmt.Errorf("unable to find guest has disk %s", disk.GetId())
+	}
+
+	iVm, err := guest.GetIVM(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "GetIVM")
+	}
+	if iVm.GetStatus() == api.VM_RUNNING {
+		taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+			disks, err := iVm.GetIDisks()
+			if err != nil {
+				return nil, errors.Wrapf(err, "GetIDisk")
+			}
+			for i := range disks {
+				if disks[i].GetGlobalId() == disk.ExternalId {
+					err = disks[i].Resize(ctx, sizeMb)
+					if err != nil {
+						return nil, errors.Wrapf(err, "Resize")
+					}
+					return jsonutils.Marshal(map[string]int64{"disk_size": sizeMb}), nil
+				}
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrNotFound, "disk %s", disk.Name)
+		})
+		return nil
 	}
 	spec := struct {
 		HostInfo vcenter.SVCenterAccessInfo

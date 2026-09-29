@@ -24,6 +24,7 @@ import (
 	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	merrors "yunion.io/x/onecloud/pkg/monitor/errors"
+	"yunion.io/x/onecloud/pkg/monitor/tsdb"
 )
 
 const (
@@ -35,8 +36,8 @@ const (
 )
 
 var (
-	EvaluatorDefaultTypes = []string{"gt", "lt", "eq"}
-	EvaluatorRangedTypes  = []string{"within_range", "outside_range"}
+	EvaluatorDefaultTypes = []string{string(monitor.EvaluatorTypeGT), string(monitor.EvaluatorTypeLT), string(monitor.EvaluatorTypeEQ)}
+	EvaluatorRangedTypes  = []string{string(monitor.EvaluatorTypeWithinRange), string(monitor.EvaluatorTypeOutsideRange)}
 
 	CommonAlertType = []string{
 		monitor.CommonAlertNomalAlertType,
@@ -46,7 +47,7 @@ var (
 	CommonAlertReducerFieldOpts = []string{"/"}
 	CommonAlertNotifyTypes      = []string{"email", "mobile", "dingtalk", "webconsole", "feishu"}
 
-	ConditionTypes = []string{"query", "nodata_query"}
+	ConditionTypes = []string{"query", monitor.METRIC_QUERY_TYPE_NO_DATA}
 )
 
 func ValidateAlertCreateInput(input monitor.AlertCreateInput) error {
@@ -112,11 +113,11 @@ func ValidateAlertQueryModel(input monitor.MetricQuery) error {
 
 func ValidateSelectOfMetricQuery(input monitor.AlertQuery) error {
 	if err := ValidateFromAndToValue(input); err != nil {
-		return err
+		return errors.Wrap(err, "ValidateFromAndToValue")
 	}
 
 	if err := ValidateAlertQueryModel(input.Model); err != nil {
-		return err
+		return errors.Wrap(err, "ValidateAlertQueryModel")
 	}
 
 	for _, sel := range input.Model.Selects {
@@ -124,32 +125,22 @@ func ValidateSelectOfMetricQuery(input monitor.AlertQuery) error {
 			return httperrors.NewInputParameterError("select for nothing in query")
 		}
 	}
+	if input.ResultReducer != nil {
+		if !monitor.ValidateReducerTypes.Has(input.ResultReducer.Type) {
+			return httperrors.NewInputParameterError("invalid result reducer type %s", input.ResultReducer.Type)
+		}
+	}
 	return nil
 }
 
 func ValidateFromAndToValue(input monitor.AlertQuery) error {
-	fromRaw := strings.Replace(input.From, "now-", "", 1)
-
-	fromDur, err := time.ParseDuration("-" + fromRaw)
-	if err != nil {
-		return err
+	if err := ValidateFromValue(input.From); err != nil {
+		return errors.Wrap(err, "ValidateFromValue")
 	}
-
-	if input.To == "now" {
-		return nil
-	} else if strings.HasPrefix(input.To, "now-") {
-		withoutNow := strings.Replace(input.To, "now-", "", 1)
-
-		toDur, err := time.ParseDuration("-" + withoutNow)
-		if err == nil {
-			if toDur >= fromDur {
-				return nil
-			}
-			return httperrors.NewInputParameterError("query duration err: from: %s, to:%s", input.From, input.To)
-		}
-		return err
+	if err := ValidateToValue(input.To); err != nil {
+		return errors.Wrap(err, "ValidateToValue")
 	}
-	return httperrors.NewInputParameterError("query duration `to` err: %s", input.To)
+	return nil
 }
 
 func ValidateAlertConditionReducer(input monitor.Condition) error {
@@ -161,10 +152,10 @@ func ValidateAlertConditionEvaluator(input monitor.Condition) error {
 	if typ == "" {
 		return ErrMissingParameterType
 	}
-	if utils.IsInStringArray(typ, EvaluatorDefaultTypes) {
+	if utils.IsInStringArray(string(typ), EvaluatorDefaultTypes) {
 		return ValidateAlertConditionThresholdEvaluator(input)
 	}
-	if utils.IsInStringArray(typ, EvaluatorRangedTypes) {
+	if utils.IsInStringArray(string(typ), EvaluatorRangedTypes) {
 		return ValidateAlertConditionRangedEvaluator(input)
 	}
 	if typ != "no_value" {
@@ -185,14 +176,14 @@ func ValidateAlertConditionType(typ string) error {
 
 func ValidateAlertConditionThresholdEvaluator(input monitor.Condition) error {
 	if len(input.Params) == 0 {
-		return errors.Wrapf(ErrMissingParameterThreshold, "Evaluator %s", HumanThresholdType(input.Type))
+		return errors.Wrapf(ErrMissingParameterThreshold, "Evaluator %s", HumanThresholdType(monitor.EvaluatorType(input.Type)))
 	}
 	return nil
 }
 
 func ValidateAlertConditionRangedEvaluator(input monitor.Condition) error {
 	if len(input.Params) == 0 {
-		return errors.Wrapf(ErrMissingParameterThreshold, "Evaluator %s", HumanThresholdType(input.Type))
+		return errors.Wrapf(ErrMissingParameterThreshold, "Evaluator %s", HumanThresholdType(monitor.EvaluatorType(input.Type)))
 	}
 	if len(input.Params) == 1 {
 		return errors.Wrap(ErrMissingParameterThreshold, "RangedEvaluator parameter second parameter is missing")
@@ -202,25 +193,35 @@ func ValidateAlertConditionRangedEvaluator(input monitor.Condition) error {
 
 // HumanThresholdType converts a threshold "type" string to a string that matches the UI
 // so errors are less confusing.
-func HumanThresholdType(typ string) string {
+func HumanThresholdType(typ monitor.EvaluatorType) string {
 	switch typ {
-	case "gt":
+	case monitor.EvaluatorTypeGT:
 		return "IS ABOVE"
-	case "lt":
+	case monitor.EvaluatorTypeLT:
 		return "IS BELOW"
-	case "within_range":
+	case monitor.EvaluatorTypeWithinRange:
 		return "IS WITHIN RANGE"
-	case "outside_range":
+	case monitor.EvaluatorTypeOutsideRange:
 		return "IS OUTSIDE RANGE"
+	case monitor.EvaluatorTypeEQ:
+		return "IS EQUAL TO"
 	}
 	return ""
 }
 
 func ValidateFromValue(from string) error {
-	fromRaw := strings.Replace(from, "now-", "", 1)
+	_, ok := tsdb.TryParseUnixMsEpoch(from)
+	if ok {
+		return nil
+	}
 
-	_, err := time.ParseDuration("-" + fromRaw)
-	return err
+	fromRaw := strings.Replace(from, "now-", "", 1)
+	fromRawStr := "-" + fromRaw
+	_, err := time.ParseDuration(fromRawStr)
+	if err != nil {
+		return errors.Wrapf(err, "parse duration: %s", fromRawStr)
+	}
+	return nil
 }
 
 func ValidateToValue(to string) error {
@@ -228,13 +229,16 @@ func ValidateToValue(to string) error {
 		return nil
 	} else if strings.HasPrefix(to, "now-") {
 		withoutNow := strings.Replace(to, "now-", "", 1)
-
 		_, err := time.ParseDuration("-" + withoutNow)
 		if err == nil {
 			return nil
 		}
 	}
 
+	_, ok := tsdb.TryParseUnixMsEpoch(to)
+	if ok {
+		return nil
+	}
 	_, err := time.ParseDuration(to)
-	return err
+	return errors.Wrapf(err, "parse to: %s", to)
 }

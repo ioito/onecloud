@@ -17,6 +17,7 @@ package cloudcommon
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
@@ -25,6 +26,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/sqlchemy"
+	_ "yunion.io/x/sqlchemy/backends"
 
 	noapi "yunion.io/x/onecloud/pkg/apis/notify"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
@@ -34,13 +36,85 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/informer"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
+	"yunion.io/x/onecloud/pkg/util/dbutils"
 )
+
+func InitDBConn(options *common_options.DBOptions) {
+	dialect, sqlStr, err := options.GetDBConnection()
+	if err != nil {
+		log.Fatalf("Invalid SqlConnection string: %s error: %v", options.SqlConnection, err)
+	}
+	backend := sqlchemy.MySQLBackend
+	switch dialect {
+	case "dm":
+		backend = sqlchemy.DamengBackend
+		dialect = "dm"
+		sqlStr = "dm://" + sqlStr
+	case "sqlite3":
+		backend = sqlchemy.SQLiteBackend
+		dialect = "sqlite3_with_extensions"
+		sql.Register(dialect,
+			&sqlite3.SQLiteDriver{
+				Extensions: []string{
+					"/opt/yunion/share/sqlite/inet",
+				},
+			},
+		)
+	case "clickhouse":
+		log.Fatalf("cannot use clickhouse as primary database")
+	}
+	log.Infof("database dialect: %s sqlStr: %s", dialect, sqlStr)
+	// save configuration to consts
+	consts.SetDefaultDB(dialect, sqlStr)
+	dbConn, err := sql.Open(dialect, sqlStr)
+	if err != nil {
+		panic(err)
+	}
+	sqlchemy.SetDBWithNameBackend(dbConn, sqlchemy.DefaultDB, backend)
+
+	if options.DbMaxWaitTimeoutSeconds <= 300 {
+		options.DbMaxWaitTimeoutSeconds = 3600
+	}
+	// ConnMaxLifetime is the maximum amount of time a connection may be reused.
+	// mysql default max_waitimeout is 28800 seconds, 1 hour should be enough
+	// but if user set a customized mysql max_waittimeout, the value should be adjusted accordingly
+	dbConn.SetConnMaxLifetime(time.Duration(options.DbMaxWaitTimeoutSeconds) * time.Second)
+	// ConnMaxIdleTime should be half of ConnMaxLifetime
+	dbConn.SetConnMaxIdleTime(time.Duration(options.DbMaxWaitTimeoutSeconds/2) * time.Second)
+}
+
+func InitClickhouseConn(options *common_options.DBOptions) {
+	dialect, sqlStr, err := options.GetClickhouseConnStr()
+	if err == nil {
+		// connect to clickcloud
+		// force convert sqlstr from clickhouse v2 to v1
+		sqlStr, err = dbutils.ClickhouseSqlStrV2ToV1(sqlStr)
+		if err != nil {
+			log.Fatalf("fail to convert clickhouse sqlstr from v2 to v1: %s", err)
+		}
+		err = dbutils.ValidateClickhouseV1Str(sqlStr)
+		if err != nil {
+			log.Fatalf("invalid clickhouse sqlstr: %s", err)
+		}
+		click, err := sql.Open(dialect, sqlStr)
+		if err != nil {
+			panic(err)
+		}
+		sqlchemy.SetDBWithNameBackend(click, db.ClickhouseDB, sqlchemy.ClickhouseBackend)
+
+		if options.OpsLogWithClickhouse {
+			consts.OpsLogWithClickhouse = true
+		}
+	}
+}
 
 func InitDB(options *common_options.DBOptions) {
 	if options.DebugSqlchemy {
 		log.Warningf("debug Sqlchemy is turned on")
 		sqlchemy.DEBUG_SQLCHEMY = true
 	}
+
+	log.Infof("Registered SQL drivers: %s", strings.Join(sql.Drivers(), ", "))
 
 	consts.QueryOffsetOptimization = options.QueryOffsetOptimization
 
@@ -57,54 +131,8 @@ func InitDB(options *common_options.DBOptions) {
 		consts.SetSplitableMaxDurationHours(options.SplitableMaxDurationHours)
 	}
 
-	dialect, sqlStr, err := options.GetDBConnection()
-	if err != nil {
-		log.Fatalf("Invalid SqlConnection string: %s error: %v", options.SqlConnection, err)
-	}
-	backend := sqlchemy.MySQLBackend
-	switch dialect {
-	case "sqlite3":
-		backend = sqlchemy.SQLiteBackend
-		dialect = "sqlite3_with_extensions"
-		sql.Register(dialect,
-			&sqlite3.SQLiteDriver{
-				Extensions: []string{
-					"/opt/yunion/share/sqlite/inet",
-				},
-			},
-		)
-	case "clickhouse":
-		log.Fatalf("cannot use clickhouse as primary database")
-	}
-	log.Infof("database dialect: %s sqlStr: %s", dialect, sqlStr)
-	dbConn, err := sql.Open(dialect, sqlStr)
-	if err != nil {
-		panic(err)
-	}
-	sqlchemy.SetDBWithNameBackend(dbConn, sqlchemy.DefaultDB, backend)
-
-	dialect, sqlStr, err = options.GetClickhouseConnStr()
-	if err == nil {
-		// connect to clickcloud
-		// force convert sqlstr from clickhouse v2 to v1
-		sqlStr, err = clickhouseSqlStrV2ToV1(sqlStr)
-		if err != nil {
-			log.Fatalf("fail to convert clickhouse sqlstr from v2 to v1: %s", err)
-		}
-		err = validateClickhouseV1Str(sqlStr)
-		if err != nil {
-			log.Fatalf("invalid clickhouse sqlstr: %s", err)
-		}
-		click, err := sql.Open(dialect, sqlStr)
-		if err != nil {
-			panic(err)
-		}
-		sqlchemy.SetDBWithNameBackend(click, db.ClickhouseDB, sqlchemy.ClickhouseBackend)
-
-		if options.OpsLogWithClickhouse {
-			consts.OpsLogWithClickhouse = true
-		}
-	}
+	InitDBConn(options)
+	InitClickhouseConn(options)
 
 	switch options.LockmanMethod {
 	case common_options.LockMethodInMemory, "":
@@ -131,6 +159,10 @@ func InitDB(options *common_options.DBOptions) {
 		lockman.Init(lm)
 	}
 	// lm := lockman.NewNoopLockManager()
+
+	if options.EnableDBChecksumTables && len(options.DBChecksumHashAlgorithm) > 0 {
+		consts.SetDefaultDBChecksumHashAlgorithm(options.DBChecksumHashAlgorithm)
+	}
 
 	initDBNotifier()
 	startInitInformer(options)

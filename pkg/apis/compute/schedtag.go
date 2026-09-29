@@ -26,11 +26,11 @@ type SchedtagCreateInput struct {
 	apis.ScopedResourceCreateInput
 
 	// 动态标签策略
-	// enum: exclude, prefer, avoid
+	// enum: ["exclude", "prefer", "avoid"]
 	DefaultStrategy string `json:"default_strategy"`
 
 	// 资源类型
-	// enum: servers, hosts, .....
+	// enum: ["servers", "hosts", "...."]
 	// default: hosts
 	ResourceType string `json:"resource_type"`
 }
@@ -69,6 +69,9 @@ type SchedtagListInput struct {
 	Type string `json:"type" yunion-deprecated-by:"resource_type"`
 
 	DefaultStrategy []string `json:"default_strategy"`
+
+	// filter by zone_id
+	ZoneId []string `json:"zone_id"`
 }
 
 type SchedtagDetails struct {

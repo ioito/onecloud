@@ -16,6 +16,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -70,6 +71,7 @@ func (manager *SVirtualResourceBaseManager) GetIVirtualModelManager() IVirtualMo
 	return manager.GetVirtualObject().(IVirtualModelManager)
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SVirtualResourceBaseManager) GetPropertyStatistics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (*apis.StatusStatistic, error) {
 	im, ok := manager.GetVirtualObject().(IModelManager)
 	if !ok {
@@ -112,6 +114,28 @@ func (manager *SVirtualResourceBaseManager) GetPropertyStatistics(ctx context.Co
 	return result, nil
 }
 
+func (manager *SVirtualResourceBaseManager) CustomizedTotalCount(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, totalQ *sqlchemy.SQuery) (int, jsonutils.JSONObject, error) {
+	results := struct {
+		apis.TotalCountBase
+		StatusInfo []apis.StatusStatisticStatusInfo
+	}{}
+
+	err := totalQ.First(&results.TotalCountBase)
+	if err != nil && errors.Cause(err) != sql.ErrNoRows {
+		return -1, nil, errors.Wrapf(err, "First")
+	}
+
+	totalSQ := totalQ.ResetFields().SubQuery()
+	statQ := totalSQ.Query(totalSQ.Field("status"), sqlchemy.COUNT("total_count", totalSQ.Field("id")), sqlchemy.SUM("pending_deleted_count", totalSQ.Field("pending_deleted")))
+	statQ = statQ.GroupBy(totalSQ.Field("status"))
+	err = statQ.All(&results.StatusInfo)
+	if err != nil {
+		return -1, nil, errors.Wrapf(err, "status query")
+	}
+	return results.Count, jsonutils.Marshal(results), nil
+}
+
+// +onecloud:swagger-gen-ignore
 func (manager *SVirtualResourceBaseManager) GetPropertyProjectStatistics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) ([]apis.ProjectStatistic, error) {
 	im, ok := manager.GetVirtualObject().(IModelManager)
 	if !ok {
@@ -141,6 +165,7 @@ func (manager *SVirtualResourceBaseManager) GetPropertyProjectStatistics(ctx con
 	return result, q.All(&result)
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SVirtualResourceBaseManager) GetPropertyDomainStatistics(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) ([]apis.ProjectStatistic, error) {
 	im, ok := manager.GetVirtualObject().(IModelManager)
 	if !ok {
@@ -213,12 +238,12 @@ func (manager *SVirtualResourceBaseManager) FilterBySystemAttributes(q *sqlchemy
 	return q
 }
 
-func (manager *SVirtualResourceBaseManager) FetchByName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByName(manager, userCred, idStr)
+func (manager *SVirtualResourceBaseManager) FetchByName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByName(ctx, manager, userCred, idStr)
 }
 
-func (manager *SVirtualResourceBaseManager) FetchByIdOrName(userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
-	return FetchByIdOrName(manager, userCred, idStr)
+func (manager *SVirtualResourceBaseManager) FetchByIdOrName(ctx context.Context, userCred mcclient.IIdentityProvider, idStr string) (IModel, error) {
+	return FetchByIdOrName(ctx, manager, userCred, idStr)
 }
 
 func (manager *SVirtualResourceBaseManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, input apis.VirtualResourceCreateInput) (apis.VirtualResourceCreateInput, error) {
@@ -297,6 +322,7 @@ func (model *SVirtualResourceBase) GetTenantCache(ctx context.Context) (*STenant
 	return TenantCacheManager.FetchTenantById(ctx, model.ProjectId)
 }
 
+// +onecloud:swagger-gen-ignore
 // freezed update and perform action operation except for unfreeze
 func (model *SVirtualResourceBase) PerformFreeze(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformFreezeInput) (jsonutils.JSONObject, error) {
 	if model.Freezed {
@@ -315,6 +341,7 @@ func (model *SVirtualResourceBase) PerformFreeze(ctx context.Context, userCred m
 	return nil, nil
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SVirtualResourceBase) PerformUnfreeze(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformUnfreezeInput) (jsonutils.JSONObject, error) {
 	if !model.Freezed {
 		return nil, httperrors.NewBadRequestError("virtual resource not freezed")
@@ -332,6 +359,7 @@ func (model *SVirtualResourceBase) PerformUnfreeze(ctx context.Context, userCred
 	return nil, nil
 }
 
+// 更改项目
 func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformChangeProjectOwnerInput) (jsonutils.JSONObject, error) {
 	if model.GetIStandaloneModel().IsShared() {
 		return nil, errors.Wrap(httperrors.ErrForbidden, "cannot change owner of shared resource")
@@ -379,16 +407,18 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 		return nil, errors.Wrap(err, "objectConfirmPolicyTags")
 	}
 
-	q := manager.Query().Equals("name", model.GetName())
-	q = manager.FilterByOwner(q, manager, userCred, ownerId, manager.NamespaceScope())
-	q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
-	q = q.NotEquals("id", model.GetId())
-	cnt, err := q.CountWithError()
-	if err != nil {
-		return nil, httperrors.NewInternalServerError("check name duplication error: %s", err)
-	}
-	if cnt > 0 {
-		return nil, httperrors.NewDuplicateNameError("name", model.GetName())
+	if !consts.GetChangeOwnerAutoRename() {
+		q := manager.Query().Equals("name", model.GetName())
+		q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, manager.NamespaceScope())
+		q = manager.FilterBySystemAttributes(q, nil, nil, manager.ResourceScope())
+		q = q.NotEquals("id", model.GetId())
+		cnt, err := q.CountWithError()
+		if err != nil {
+			return nil, httperrors.NewInternalServerError("check name duplication error: %s", err)
+		}
+		if cnt > 0 {
+			return nil, httperrors.NewDuplicateNameError("name", model.GetName())
+		}
 	}
 	former, _ := TenantCacheManager.FetchTenantById(ctx, model.ProjectId)
 	if former == nil {
@@ -428,7 +458,15 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 	// cancel usage
 	model.cleanModelUsages(ctx, userCred)
 
+	oldName := model.Name
+	newName, err := GenerateName2(ctx, manager, ownerId, oldName, model, 1)
+	if err != nil {
+		return nil, errors.Wrap(err, "GenerateName2")
+	}
 	_, err = Update(model, func() error {
+		if newName != oldName {
+			model.Name = newName
+		}
 		model.DomainId = ownerId.GetProjectDomainId()
 		model.ProjectId = ownerId.GetProjectId()
 		model.ProjectSrc = string(apis.OWNER_SOURCE_LOCAL)
@@ -436,6 +474,10 @@ func (model *SVirtualResourceBase) PerformChangeOwner(ctx context.Context, userC
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "Update")
+	}
+
+	if oldName != model.Name {
+		model.SetMetadata(ctx, "old_name", oldName, userCred)
 	}
 
 	// add usage
@@ -487,6 +529,7 @@ func (model *SVirtualResourceBase) Delete(ctx context.Context, userCred mcclient
 	return DeleteModel(ctx, userCred, model.GetIVirtualModel())
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SVirtualResourceBase) PerformCancelDelete(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	if model.PendingDeleted && !model.Deleted {
 		err := model.DoCancelPendingDelete(ctx, userCred)
@@ -606,6 +649,7 @@ func (model *SVirtualResourceBase) ValidateUpdateData(
 	return input, nil
 }
 
+// +onecloud:swagger-gen-ignore
 func (model *SVirtualResourceBase) GetDetailsChangeOwnerCandidateDomains(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (apis.ChangeOwnerCandidateDomainsOutput, error) {
 	return IOwnerResourceBaseModelGetChangeOwnerCandidateDomains(model.GetIVirtualModel())
 }
@@ -631,6 +675,7 @@ func (manager *SVirtualResourceBaseManager) GetExportExtraKeys(ctx context.Conte
 	return res
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SVirtualResourceBaseManager) GetPropertyProjectTagValuePairs(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -646,6 +691,7 @@ func (manager *SVirtualResourceBaseManager) GetPropertyProjectTagValuePairs(
 	)
 }
 
+// +onecloud:swagger-gen-ignore
 func (manager *SVirtualResourceBaseManager) GetPropertyProjectTagValueTree(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -655,6 +701,7 @@ func (manager *SVirtualResourceBaseManager) GetPropertyProjectTagValueTree(
 		manager.GetIVirtualModelManager(),
 		"project",
 		"tenant_id",
+		"",
 		ctx,
 		userCred,
 		query,

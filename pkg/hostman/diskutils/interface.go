@@ -22,12 +22,18 @@ import (
 )
 
 type IDisk interface {
-	Connect() error
+	Connect(desc *apis.GuestDesc) error
+	ConnectWithDiskId(desc *apis.GuestDesc, diskId string) error
 	Disconnect() error
 	MountRootfs() (fsdriver.IRootFsDriver, error)
 	UmountRootfs(driver fsdriver.IRootFsDriver) error
-	ResizePartition() error
 	Cleanup()
+
+	DeployGuestfs(req *apis.DeployParams) (res *apis.DeployGuestFsResponse, err error)
+	ResizeFs(req *apis.ResizeFsParams) (res *apis.Empty, err error)
+	FormatFs(req *apis.FormatFsParams) (*apis.Empty, error)
+	SaveToGlance(req *apis.SaveToGlanceParams) (*apis.SaveToGlanceResponse, error)
+	ProbeImageInfo(req *apis.ProbeImageInfoPramas) (*apis.ImageInfo, error)
 }
 
 type DiskParams struct {
@@ -44,19 +50,9 @@ func GetIDisk(params DiskParams, driver string, readOnly bool) (IDisk, error) {
 	case comapi.HYPERVISOR_ESXI:
 		// ESXI does not support encrypted disk
 		return NewVDDKDisk(params.VddkInfo, params.DiskInfo.Path, driver, readOnly)
+	case comapi.HYPERVISOR_PROXMOX:
+		return NewNbdkitDisk(params.VddkInfo, params.DiskInfo.Path, driver, readOnly)
 	default:
 		return NewKVMGuestDisk(params.DiskInfo, driver, readOnly)
 	}
-}
-
-type IDeployer interface {
-	Connect() error
-	Disconnect() error
-
-	GetPartitions() []fsdriver.IDiskPartition
-	IsLVMPartition() bool
-	Zerofree()
-	ResizePartition() error
-	FormatPartition(fs, uuid string) error
-	MakePartition(fs string) error
 }

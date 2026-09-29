@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/sqlchemy"
@@ -36,7 +37,8 @@ import (
 )
 
 const (
-	AlertMetadataTitle = "alert_title"
+	AlertMetadataTitle   = "alert_title"
+	AlertMetadataChannel = "alert_channel"
 )
 
 var (
@@ -116,11 +118,13 @@ type SAlert struct {
 	//db.SStatusResourceBase
 
 	// Frequency is evaluate period
-	Frequency int64                `nullable:"false" list:"user" create:"required" update:"user"`
-	Settings  jsonutils.JSONObject `nullable:"false" list:"user" create:"required" update:"user" length:"medium"`
-	Level     string               `charset:"ascii" width:"36" nullable:"false" default:"normal" list:"user" update:"user"`
-	Message   string               `charset:"utf8" list:"user" create:"optional" update:"user"`
-	UsedBy    string               `charset:"ascii" create:"optional" list:"user"`
+	Frequency int64                 `nullable:"false" list:"user" create:"required" update:"user"`
+	Settings  *monitor.AlertSetting `nullable:"false" list:"user" create:"required" update:"user" length:"medium"`
+	Level     string                `charset:"ascii" width:"36" nullable:"false" default:"normal" list:"user" update:"user"`
+	Message   string                `charset:"utf8" list:"user" create:"optional" update:"user"`
+	UsedBy    string                `charset:"ascii" create:"optional" list:"user"`
+
+	DisableNotifyRecovery bool `nullable:"false" default:"false" list:"user" create:"optional" update:"user"`
 
 	// Silenced       bool
 	ExecutionError string `charset:"utf8" list:"user"`
@@ -139,6 +143,8 @@ type SAlert struct {
 	StateChanges        int                  `default:"0" nullable:"false" list:"user"`
 	CustomizeConfig     jsonutils.JSONObject `list:"user" create:"optional" update:"user" length:"medium"`
 	ResType             string               `width:"32" list:"user" update:"user"`
+	// 报警原因
+	Reason string `length:"0" charset:"utf8" get:"user" list:"user" update:"user" create:"optional" json:"reason"`
 }
 
 func (alert *SAlert) IsEnable() bool {
@@ -179,19 +185,28 @@ func (alert *SAlert) GetTitle() string {
 	return alert.GetMetadata(context.Background(), AlertMetadataTitle, nil)
 }
 
+func (alert *SAlert) SetChannel(ctx context.Context, channel []string) error {
+	return alert.SetMetadata(ctx, AlertMetadataChannel, jsonutils.Marshal(channel), nil)
+}
+
+func (alert *SAlert) GetChannel() []string {
+	channelJson := alert.GetMetadataJson(context.Background(), AlertMetadataChannel, nil)
+	if channelJson == nil {
+		return []string{}
+	}
+	channel := []string{}
+	if err := channelJson.Unmarshal(&channel); err != nil {
+		log.Warningf("get channel failed when unmarshal: %v", err)
+	}
+	return channel
+}
+
 func (alert *SAlert) ShouldUpdateState(newState monitor.AlertStateType) bool {
 	return monitor.AlertStateType(alert.State) != newState
 }
 
 func (alert *SAlert) GetSettings() (*monitor.AlertSetting, error) {
-	setting := new(monitor.AlertSetting)
-	if alert.Settings == nil {
-		return setting, nil
-	}
-	if err := alert.Settings.Unmarshal(setting); err != nil {
-		return nil, errors.Wrapf(err, "alert %s unmarshal", alert.GetId())
-	}
-	return setting, nil
+	return alert.Settings, nil
 }
 
 type AlertRuleTags map[string]AlertRuleTag
@@ -201,16 +216,16 @@ type AlertRuleTag struct {
 	Value string
 }
 
-func setAlertDefaultSetting(setting *monitor.AlertSetting, dsId string) *monitor.AlertSetting {
+func setAlertDefaultSetting(setting *monitor.AlertSetting) *monitor.AlertSetting {
 	for idx, cond := range setting.Conditions {
-		cond = setAlertDefaultCondition(cond, dsId)
+		cond = setAlertDefaultCondition(cond)
 		setting.Conditions[idx] = cond
 	}
 	return setting
 }
 
-func setAlertDefaultCreateData(data monitor.AlertCreateInput, dsId string) monitor.AlertCreateInput {
-	setting := setAlertDefaultSetting(&data.Settings, dsId)
+func setAlertDefaultCreateData(data monitor.AlertCreateInput) monitor.AlertCreateInput {
+	setting := setAlertDefaultSetting(&data.Settings)
 	data.Settings = *setting
 	enable := true
 	if data.Enabled == nil {
@@ -219,7 +234,7 @@ func setAlertDefaultCreateData(data monitor.AlertCreateInput, dsId string) monit
 	return data
 }
 
-func setAlertDefaultCondition(cond monitor.AlertCondition, dsId string) monitor.AlertCondition {
+func setAlertDefaultCondition(cond monitor.AlertCondition) monitor.AlertCondition {
 	if cond.Type == "" {
 		cond.Type = "query"
 	}
@@ -229,18 +244,11 @@ func setAlertDefaultCondition(cond monitor.AlertCondition, dsId string) monitor.
 	if cond.Operator == "" {
 		cond.Operator = "and"
 	}
-	if cond.Query.DataSourceId == "" {
-		cond.Query.DataSourceId = dsId
-	}
 	return cond
 }
 
 func (man *SAlertManager) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, _ jsonutils.JSONObject, data monitor.AlertCreateInput) (monitor.AlertCreateInput, error) {
-	ds, err := DataSourceManager.GetDefaultSource()
-	if err != nil {
-		return data, errors.Wrap(err, "get default data source")
-	}
-	data = setAlertDefaultCreateData(data, ds.GetId())
+	data = setAlertDefaultCreateData(data)
 	if err := validators.ValidateAlertCreateInput(data); err != nil {
 		return data, err
 	}
@@ -298,6 +306,10 @@ func (man *SAlertManager) ListItemFilter(
 	q, err = man.SEnabledResourceBaseManager.ListItemFilter(ctx, q, userCred, input.EnabledResourceBaseListInput)
 	if err != nil {
 		return nil, errors.Wrap(err, "SEnabledResourceBaseManager.ListItemFilter")
+	}
+	if len(input.MonitorResourceId) != 0 {
+		sq := MonitorResourceAlertManager.Query("alert_id").In("monitor_resource_id", input.MonitorResourceId).SubQuery()
+		q = q.In("id", sq)
 	}
 	return q, nil
 }
@@ -402,7 +414,7 @@ func (alert *SAlert) CustomizeCreate(ctx context.Context, userCred mcclient.Toke
 }
 
 func (alert *SAlert) PostCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) {
-	alert.SetStatus(userCred, monitor.ALERT_STATUS_READY, "")
+	alert.SetStatus(ctx, userCred, monitor.ALERT_STATUS_READY, "")
 }
 
 func (alert *SAlert) PerformEnable(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformEnableInput) (jsonutils.JSONObject, error) {
@@ -462,15 +474,6 @@ func (alert *SAlert) SetState(input AlertSetStateInput) error {
 }
 
 func (alert *SAlert) ValidateUpdateData(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input monitor.AlertUpdateInput) (monitor.AlertUpdateInput, error) {
-	if input.Settings != nil {
-		updateSettings := jsonutils.NewDict()
-		updateSettings.Update(alert.Settings)
-		updateSettings.Update(jsonutils.Marshal(input.Settings))
-		input.Settings = new(monitor.AlertSetting)
-		if err := updateSettings.Unmarshal(input.Settings); err != nil {
-			return input, err
-		}
-	}
 	var err error
 	input.StandaloneResourceBaseUpdateInput, err = alert.SStandaloneResourceBase.ValidateUpdateData(ctx, userCred, query, input.StandaloneResourceBaseUpdateInput)
 	if err != nil {

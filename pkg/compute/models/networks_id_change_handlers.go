@@ -66,8 +66,20 @@ func (manager *SHostnetworkManager) handleNetworkIdChange(ctx context.Context, a
 		return err
 	}
 	for _, hn := range hns {
-		addr, _ := netutils.NewIPV4Addr(hn.IpAddr)
-		if args.newNet.IsAddressInRange(addr) {
+		inNet := false
+		if len(hn.IpAddr) > 0 {
+			addr, _ := netutils.NewIPV4Addr(hn.IpAddr)
+			if args.newNet.IsAddressInRange(addr) {
+				inNet = true
+			}
+		}
+		if len(hn.Ip6Addr) > 0 {
+			addr, _ := netutils.NewIPV6Addr(hn.Ip6Addr)
+			if args.newNet.IsAddress6InRange(addr) {
+				inNet = true
+			}
+		}
+		if inNet {
 			_, err = db.Update(&hn, func() error {
 				hn.NetworkId = args.newNet.Id
 				return nil
@@ -88,6 +100,9 @@ func (manager *SReservedipManager) handleNetworkIdChange(ctx context.Context, ar
 		return err
 	}
 	for _, ri := range ris {
+		if len(ri.IpAddr) == 0 {
+			continue
+		}
 		addr, _ := netutils.NewIPV4Addr(ri.IpAddr)
 		if args.newNet.IsAddressInRange(addr) {
 			_, err = db.Update(&ri, func() error {
@@ -110,6 +125,9 @@ func (manager *SGroupnetworkManager) handleNetworkIdChange(ctx context.Context, 
 		return err
 	}
 	for _, gn := range gns {
+		if len(gn.IpAddr) == 0 {
+			continue
+		}
 		addr, _ := netutils.NewIPV4Addr(gn.IpAddr)
 		if args.newNet.IsAddressInRange(addr) {
 			_, err = db.Update(&gn, func() error {

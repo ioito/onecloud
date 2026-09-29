@@ -305,10 +305,6 @@ func (in *SInstance) GetVmemSizeMB() int {
 	return in.instanceType.GetMemoryMB()
 }
 
-func (in *SInstance) AssignSecurityGroup(id string) error {
-	return cloudprovider.ErrNotImplemented
-}
-
 func (in *SInstance) SetSecurityGroups(ids []string) error {
 	return cloudprovider.ErrNotImplemented
 }
@@ -341,7 +337,7 @@ func (self *SInstance) RebuildRoot(ctx context.Context, config *cloudprovider.SM
 	return "", cloudprovider.ErrNotImplemented
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	return cloudprovider.ErrNotImplemented
 }
 
@@ -406,7 +402,7 @@ func (r *SRegion) GetInstances(zoneId string, ids []string, pangeNumber, pageSiz
 		return nil, 0, err
 	}
 	if resp.Error.Code >= 400 {
-		return nil, 0, fmt.Errorf(resp.Error.Message)
+		return nil, 0, fmt.Errorf("%s", resp.Error.Message)
 	}
 	ins := make([]SInstance, len(resp.Result.Instances))
 	for i := range ins {

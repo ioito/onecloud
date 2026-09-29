@@ -44,11 +44,17 @@ const (
 )
 
 type TopicUpdateInput struct {
-	TitleCn     string
-	TitleEn     string
-	ContentCn   string
-	ContentEn   string
-	AdvanceDays []int `json:"advance_days"`
+	apis.EnabledStatusStandaloneResourceBaseUpdateInput
+	TitleCn           string   `json:"title_cn"`
+	TitleEn           string   `json:"title_en"`
+	ContentCn         string   `json:"content_cn"`
+	ContentEn         string   `json:"content_en"`
+	AdvanceDays       []int    `json:"advance_days"`
+	WebconsoleDisable *bool    `json:"webconsole_disable"`
+	EnableSms         *bool    `json:"enable_sms"`
+	SmsTemplate       *string  `json:"sms_template"`
+	Actions           []string `json:"actions"`
+	Resources         []string `json:"resources"`
 }
 
 type TopicListInput struct {
@@ -63,6 +69,7 @@ type TopicDetails struct {
 	// description: resources managed
 	// example: ["server", "eip", "disk"]
 	Resources   []string `json:"resource_types"`
+	Actions     []string `json:"actions"`
 	AdvanceDays []int    `json:"advance_days"`
 }
 
@@ -74,3 +81,28 @@ type PerformDisableInput struct {
 
 type STopicGroupKeys []string
 type TopicAdvanceDays []int
+
+type STopicCreateInput struct {
+	apis.EnabledStatusStandaloneResourceCreateInput
+	Type              string           `json:"type"`
+	Results           bool             `json:"results"`
+	TitleCn           string           `json:"title_cn"`
+	TitleEn           string           `json:"title_en"`
+	ContentCn         string           `json:"content_cn"`
+	ContentEn         string           `json:"content_en"`
+	GroupKeys         *STopicGroupKeys `json:"group_keys"`
+	AdvanceDays       []int            `json:"advance_days"`
+	Resources         []string         `json:"resources"`
+	Actions           []string         `json:"actions"`
+	WebconsoleDisable bool             `json:"webconsole_disable"`
+	EnableSms         bool             `json:"enable_sms"`
+	SmsTemplate       string           `json:"sms_template"`
+}
+
+type TopicAddActionInput struct {
+	Actions []string `json:"actions"`
+}
+
+type TopicAddResourcesInput struct {
+	Resources []string `json:"resources"`
+}

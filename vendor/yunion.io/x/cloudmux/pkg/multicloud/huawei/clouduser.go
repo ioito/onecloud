@@ -15,13 +15,16 @@
 package huawei
 
 import (
+	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
+	api "yunion.io/x/cloudmux/pkg/apis/cloudid"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
-	"yunion.io/x/cloudmux/pkg/multicloud/huawei/client/modules"
+	"yunion.io/x/cloudmux/pkg/multicloud"
 )
 
 type SLink struct {
@@ -32,6 +35,7 @@ type SLink struct {
 
 type SClouduser struct {
 	client *SHuaweiClient
+	multicloud.SBaseClouduser
 
 	Description       string
 	DomainId          string
@@ -43,6 +47,7 @@ type SClouduser struct {
 	Name              string
 	PasswordExpiresAt string
 	PwdStatus         bool
+	AccessMode        string
 }
 
 func (user *SClouduser) GetGlobalId() string {
@@ -61,27 +66,15 @@ func (user *SClouduser) GetInviteUrl() string {
 	return ""
 }
 
-func (user *SClouduser) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (user *SClouduser) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	return []cloudprovider.ICloudpolicy{}, nil
 }
 
-func (user *SClouduser) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return []cloudprovider.ICloudpolicy{}, nil
-}
-
-func (user *SClouduser) AttachSystemPolicy(policyType string) error {
+func (user *SClouduser) AttachPolicy(policyName string, policyType api.TPolicyType) error {
 	return cloudprovider.ErrNotSupported
 }
 
-func (user *SClouduser) AttachCustomPolicy(policyType string) error {
-	return cloudprovider.ErrNotSupported
-}
-
-func (user *SClouduser) DetachSystemPolicy(policyId string) error {
-	return cloudprovider.ErrNotSupported
-}
-
-func (user *SClouduser) DetachCustomPolicy(policyId string) error {
+func (user *SClouduser) DetachPolicy(policyName string, policyType api.TPolicyType) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -103,52 +96,75 @@ func (user *SClouduser) Delete() error {
 }
 
 func (user *SClouduser) IsConsoleLogin() bool {
-	return user.Enabled == true
+	return user.AccessMode != "programmatic"
 }
 
-func (user *SClouduser) ResetPassword(password string) error {
-	return user.client.ResetClouduserPassword(user.Id, password)
+func (user *SClouduser) SetDisable() error {
+	enable := false
+	return user.client.UpdateUser(user.Id, "", &enable)
 }
 
-func (self *SHuaweiClient) DeleteClouduser(id string) error {
-	client, err := self.newGeneralAPIClient()
+func (user *SClouduser) SetEnable(opts *cloudprovider.SClouduserEnableOptions) error {
+	enable := true
+	err := user.client.UpdateUser(user.Id, opts.Password, &enable)
 	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
+		return err
 	}
-	_, err = client.Users.Delete(id)
+	if opts.EnableMfa {
+		return user.client.EnableUserMfa(user.Id)
+	}
+	return nil
+}
+
+func (self *SHuaweiClient) EnableUserMfa(id string) error {
+	params := map[string]interface{}{
+		"login_protect": map[string]interface{}{
+			"enabled":             "true",
+			"verification_method": "vmfa",
+		},
+	}
+	_, err := self.put(SERVICE_IAM, "", fmt.Sprintf("OS-USER/users/%s/login-protect", id), params)
 	return err
 }
 
+func (user *SClouduser) ResetPassword(password string) error {
+	return user.client.UpdateUser(user.Id, password, nil)
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneDeleteUser
+func (self *SHuaweiClient) DeleteClouduser(id string) error {
+	_, err := self.delete(SERVICE_IAM_V3, "", "users/"+id)
+	return err
+}
+
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneListGroupsForUser
 func (self *SHuaweiClient) ListUserGroups(userId string) ([]SCloudgroup, error) {
-	client, err := self.newGeneralAPIClient()
+	resp, err := self.list(SERVICE_IAM_V3, "", fmt.Sprintf("users/%s/groups", userId), nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
-	result, err := client.Users.ListGroups(userId)
-	if err != nil {
-		return nil, errors.Wrap(err, "Users.ListGroups")
+		return nil, err
 	}
 	groups := []SCloudgroup{}
-	err = jsonutils.Update(&groups, result.Data)
+	err = resp.Unmarshal(&groups, "groups")
 	if err != nil {
-		return nil, errors.Wrap(err, "jsonutils.Update")
+		return nil, err
 	}
 	return groups, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneListUsers
 func (self *SHuaweiClient) GetCloudusers(name string) ([]SClouduser, error) {
-	params := map[string]string{}
+	params := url.Values{}
 	if len(name) > 0 {
-		params["name"] = name
+		params.Set("name", name)
+	}
+	resp, err := self.list(SERVICE_IAM_V3, "", "users", params)
+	if err != nil {
+		return nil, err
 	}
 	users := []SClouduser{}
-	client, err := self.newGeneralAPIClient()
+	err = resp.Unmarshal(&users, "users")
 	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
-	err = doListAllWithOffset(client.Users.List, params, &users)
-	if err != nil {
-		return nil, errors.Wrap(err, "doListAllWithOffset")
+		return nil, err
 	}
 	return users, nil
 }
@@ -187,8 +203,9 @@ func (self *SHuaweiClient) CreateIClouduser(conf *cloudprovider.SClouduserCreate
 	return self.CreateClouduser(conf.Name, conf.Password, conf.Desc)
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=CreateUser
 func (self *SHuaweiClient) CreateClouduser(name, password, desc string) (*SClouduser, error) {
-	params := map[string]string{
+	params := map[string]interface{}{
 		"name":      name,
 		"domain_id": self.ownerId,
 	}
@@ -198,28 +215,39 @@ func (self *SHuaweiClient) CreateClouduser(name, password, desc string) (*SCloud
 	if len(desc) > 0 {
 		params["description"] = desc
 	}
-	client, err := self.newGeneralAPIClient()
+	resp, err := self.post(SERVICE_IAM, "", "OS-USER/users", map[string]interface{}{"user": params})
 	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
-	user := SClouduser{client: self}
-	err = DoCreate(client.Users.Create, jsonutils.Marshal(map[string]interface{}{"user": params}), &user)
-	if err != nil {
-		ce, ok := err.(*modules.HuaweiClientError)
-		if ok && len(ce.Errorcode) > 0 && ce.Errorcode[0] == "1101" {
+		if strings.Contains(err.Error(), "1101") {
 			return nil, errors.Wrap(err, `IAM user name. The length is between 5 and 32. The first digit is not a number. Special characters can only contain the '_' '-' or ' '`) //https://support.huaweicloud.com/api-iam/iam_08_0015.html
 		}
-		return nil, errors.Wrap(err, "DoCreate")
+		return nil, err
 	}
-	return &user, nil
+	user := &SClouduser{client: self}
+	err = resp.Unmarshal(user, "user")
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
 }
 
-func (self *SHuaweiClient) ResetClouduserPassword(id, password string) error {
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return errors.Wrap(err, "newGeneralAPIClient")
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=UpdateUser
+func (self *SHuaweiClient) UpdateUser(id, password string, enable *bool) error {
+	params := map[string]interface{}{
+		"enabled": true,
 	}
-	return client.Users.ResetPassword(id, password)
+	if len(password) > 0 {
+		params["password"] = password
+	}
+	if enable != nil {
+		params["access_mode"] = "programmatic"
+		if *enable {
+			params["access_mode"] = "default"
+		}
+	}
+	_, err := self.put(SERVICE_IAM, "", "OS-USER/users/"+id, map[string]interface{}{
+		"user": params,
+	})
+	return err
 }
 
 type SAccessKey struct {
@@ -232,10 +260,13 @@ type SAccessKey struct {
 	CreatedAt   time.Time `json:"create_time"`
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=ListPermanentAccessKeys
 func (self *SHuaweiClient) GetAKSK(id string) ([]cloudprovider.SAccessKey, error) {
-	obj, err := self.getAKSKList(id)
+	query := url.Values{}
+	query.Set("user_id", id)
+	obj, err := self.list(SERVICE_IAM, "", "OS-CREDENTIAL/credentials", query)
 	if err != nil {
-		return nil, errors.Wrap(err, "SHuaweiClient.getAKSKList")
+		return nil, errors.Wrap(err, "list credential")
 	}
 	aks := make([]SAccessKey, 0)
 	obj.Unmarshal(&aks, "credentials")
@@ -250,6 +281,7 @@ func (self *SHuaweiClient) GetAKSK(id string) ([]cloudprovider.SAccessKey, error
 	return res, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=CreatePermanentAccessKey
 func (self *SHuaweiClient) CreateAKSK(id, name string) (*cloudprovider.SAccessKey, error) {
 	params := map[string]interface{}{
 		"credential": map[string]interface{}{
@@ -257,12 +289,15 @@ func (self *SHuaweiClient) CreateAKSK(id, name string) (*cloudprovider.SAccessKe
 			"description": name,
 		},
 	}
-	obj, err := self.createAKSK(params)
+	obj, err := self.post(SERVICE_IAM, "", "OS-CREDENTIAL/credentials", params)
 	if err != nil {
 		return nil, errors.Wrap(err, "SHuaweiClient.createAKSK")
 	}
 	ak := SAccessKey{}
-	obj.Unmarshal(&ak, "credential")
+	err = obj.Unmarshal(&ak, "credential")
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
+	}
 	res := cloudprovider.SAccessKey{
 		Name:      ak.Description,
 		AccessKey: ak.AccessKey,
@@ -271,8 +306,9 @@ func (self *SHuaweiClient) CreateAKSK(id, name string) (*cloudprovider.SAccessKe
 	return &res, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=DeletePermanentAccessKey
 func (self *SHuaweiClient) DeleteAKSK(accessKey string) error {
-	_, err := self.deleteAKSK(accessKey)
+	_, err := self.delete(SERVICE_IAM, "", "OS-CREDENTIAL/credentials/"+accessKey)
 	return err
 }
 

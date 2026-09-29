@@ -18,9 +18,11 @@ import (
 	"context"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/cloudmux/pkg/multicloud"
 )
 
 type SLoadbalancer struct {
+	multicloud.SLoadbalancerBase
 	SResourceBase
 
 	region       *SRegion
@@ -77,7 +79,7 @@ func (self *SLoadbalancer) GetEgressMbps() int {
 	return self.Bandwidth
 }
 
-func (self *SLoadbalancer) GetIEIP() (cloudprovider.ICloudEIP, error) {
+func (self *SLoadbalancer) GetIEIPs() ([]cloudprovider.ICloudEIP, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 

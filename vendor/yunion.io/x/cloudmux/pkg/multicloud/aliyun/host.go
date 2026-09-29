@@ -41,43 +41,30 @@ func (self *SHost) GetIStorageById(id string) (cloudprovider.ICloudStorage, erro
 }
 
 func (self *SHost) GetIVMs() ([]cloudprovider.ICloudVM, error) {
-	vms := make([]SInstance, 0)
-	for {
-		parts, total, err := self.zone.region.GetInstances(self.zone.ZoneId, nil, len(vms), 50)
-		if err != nil {
-			return nil, err
-		}
-		vms = append(vms, parts...)
-		if len(vms) >= total {
-			break
-		}
-	}
-	ivms := make([]cloudprovider.ICloudVM, len(vms))
-	for i := 0; i < len(vms); i += 1 {
-		vms[i].host = self
-		ivms[i] = &vms[i]
-	}
-	return ivms, nil
-}
-
-func (self *SHost) VMGlobalId2Id(gid string) string {
-	return gid
-}
-
-func (self *SHost) GetIVMById(gid string) (cloudprovider.ICloudVM, error) {
-	id := self.VMGlobalId2Id(gid)
-	parts, _, err := self.zone.region.GetInstances(self.zone.ZoneId, []string{id}, 0, 1)
+	vms, err := self.zone.region.GetInstances(self.zone.ZoneId, nil)
 	if err != nil {
 		return nil, err
 	}
-	if len(parts) == 0 {
-		return nil, cloudprovider.ErrNotFound
+	ret := make([]cloudprovider.ICloudVM, len(vms))
+	for i := 0; i < len(vms); i += 1 {
+		vms[i].host = self
+		ret[i] = &vms[i]
 	}
-	if len(parts) > 1 {
-		return nil, cloudprovider.ErrDuplicateId
+	return ret, nil
+}
+
+func (self *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
+	vms, err := self.zone.region.GetInstances(self.zone.ZoneId, []string{id})
+	if err != nil {
+		return nil, err
 	}
-	parts[0].host = self
-	return &parts[0], nil
+	for i := range vms {
+		if vms[i].InstanceId == id {
+			vms[i].host = self
+			return &vms[i], nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SHost) GetId() string {
@@ -150,7 +137,7 @@ func (self *SHost) GetMemSizeMB() int {
 	return 0
 }
 
-func (self *SHost) GetStorageSizeMB() int {
+func (self *SHost) GetStorageSizeMB() int64 {
 	return 0
 }
 
@@ -174,7 +161,7 @@ func (self *SHost) GetInstanceById(instanceId string) (*SInstance, error) {
 func (self *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudprovider.ICloudVM, error) {
 	vmId, err := self._createVM(desc.Name, desc.Hostname, desc.ExternalImageId, desc.SysDisk, desc.Cpu, desc.MemoryMB,
 		desc.InstanceType, desc.ExternalNetworkId, desc.IpAddr, desc.Description, desc.Password,
-		desc.DataDisks, desc.PublicKey, desc.ExternalSecgroupId, desc.UserData, desc.BillingCycle,
+		desc.DataDisks, desc.PublicKey, desc.ExternalSecgroupIds, desc.UserData, desc.BillingCycle,
 		desc.ProjectId, desc.OsType, desc.Tags, desc.SPublicIpInfo)
 	if err != nil {
 		return nil, err
@@ -189,7 +176,7 @@ func (self *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudpr
 func (self *SHost) _createVM(name, hostname string, imgId string,
 	sysDisk cloudprovider.SDiskInfo, cpu int, memMB int, instanceType string,
 	vswitchId string, ipAddr string, desc string, passwd string,
-	dataDisks []cloudprovider.SDiskInfo, publicKey string, secgroupId string,
+	dataDisks []cloudprovider.SDiskInfo, publicKey string, secgroupIds []string,
 	userData string, bc *billing.SBillingCycle, projectId, osType string,
 	tags map[string]string, publicIp cloudprovider.SPublicIpInfo,
 ) (string, error) {
@@ -247,7 +234,7 @@ func (self *SHost) _createVM(name, hostname string, imgId string,
 
 	if len(instanceType) > 0 {
 		log.Debugf("Try instancetype : %s", instanceType)
-		vmId, err := self.zone.region.CreateInstance(name, hostname, imgId, instanceType, secgroupId, self.zone.ZoneId, desc, passwd, disks, vswitchId, ipAddr, keypair, userData, bc, projectId, osType, tags, publicIp)
+		vmId, err := self.zone.region.CreateInstance(name, hostname, imgId, instanceType, secgroupIds, self.zone.ZoneId, desc, passwd, disks, vswitchId, ipAddr, keypair, userData, bc, projectId, osType, tags, publicIp)
 		if err != nil {
 			log.Errorf("Failed for %s: %s", instanceType, err)
 			return "", fmt.Errorf("Failed to create specification %s.%s", instanceType, err.Error())
@@ -267,7 +254,7 @@ func (self *SHost) _createVM(name, hostname string, imgId string,
 	for _, instType := range instanceTypes {
 		instanceTypeId := instType.InstanceTypeId
 		log.Debugf("Try instancetype : %s", instanceTypeId)
-		vmId, err = self.zone.region.CreateInstance(name, hostname, imgId, instanceTypeId, secgroupId, self.zone.ZoneId, desc, passwd, disks, vswitchId, ipAddr, keypair, userData, bc, projectId, osType, tags, publicIp)
+		vmId, err = self.zone.region.CreateInstance(name, hostname, imgId, instanceTypeId, secgroupIds, self.zone.ZoneId, desc, passwd, disks, vswitchId, ipAddr, keypair, userData, bc, projectId, osType, tags, publicIp)
 		if err != nil {
 			log.Errorf("Failed for %s: %s", instanceTypeId, err)
 		} else {

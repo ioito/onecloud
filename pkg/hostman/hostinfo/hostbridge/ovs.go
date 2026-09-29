@@ -17,6 +17,7 @@ package hostbridge
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -99,6 +100,9 @@ func (o *SOVSBridgeDriver) SetupBridgeDev() error {
 }
 
 func (d *SOVSBridgeDriver) PersistentConfig() error {
+	if d.inter == nil {
+		return nil
+	}
 	args := []string{
 		"ovs-vsctl", "set", "Bridge", d.bridge.String(),
 		"other-config:hwaddr=" + d.inter.GetMac(),
@@ -196,6 +200,9 @@ func (o *SOVSBridgeDriver) getUpScripts(nic *desc.SGuestNetwork, isVolatileHost 
 		s += "    ovs-vsctl set Interface $IF ingress_policing_rate=$LIMIT\n"
 		s += "    ovs-vsctl set Interface $IF ingress_policing_burst=$BURST\n"
 		s += "fi\n"
+		if vpcProvider != compute.VPC_PROVIDER_OVN && len(options.HostOptions.SRIOVNics) > 0 {
+			s += fmt.Sprintf("bridge fdb add %s dev %s\n", nic.Mac, o.inter.String())
+		}
 	}
 
 	s += "if [ $LIMIT_DOWNLOAD != \"0mbit\" ]; then\n"
@@ -232,6 +239,11 @@ func (o *SOVSBridgeDriver) getDownScripts(nic *desc.SGuestNetwork, isVolatileHos
 	s += "PORT=$(echo $PORT | awk 'BEGIN{FS=\"(\"}{print $1}')\n"
 	s += "ip link set dev $IF down\n"
 	s += "ovs-vsctl -- --if-exists del-port $SWITCH $IF\n"
+	if nic.Driver != compute.NETWORK_DRIVER_VFIO {
+		if nic.Vpc.Provider != compute.VPC_PROVIDER_OVN && len(options.HostOptions.SRIOVNics) > 0 {
+			s += fmt.Sprintf("bridge fdb del %s dev %s\n", nic.Mac, o.inter.String())
+		}
+	}
 	return s, nil
 }
 
@@ -273,8 +285,31 @@ func (o *SOVSBridgeDriver) WarmupConfig() error {
 
 func OVSPrepare() error {
 	ovs := system_service.GetService("openvswitch")
-	if !ovs.IsInstalled() {
-		return fmt.Errorf("Service openvswitch not installed!")
+	if !ovs.IsInstalled() || !ovs.IsActive() {
+		// no openvswitch service found, first try load openvswitch kernel modules, then try ovs-vsctl command, if success, return nil
+		if !utils.IsInStringArray("openvswitch", options.HostOptions.SkipCheckKernelMods) {
+			err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", "openvswitch").Run()
+			if err != nil {
+				return errors.Wrap(err, "Failed to load openvswitch kernel modules")
+			}
+		}
+		// wait for the ovs-vswitchd to start
+		startProbe := time.Now()
+		const waitSeconds = 60 * 2 // wait ovs-vswitch running for 2 minutes
+		for time.Since(startProbe) < time.Duration(waitSeconds)*time.Second {
+			err := procutils.NewCommand("ovs-vsctl", "show").Run()
+			if err != nil {
+				time.Sleep(2 * time.Second)
+			} else {
+				return nil
+			}
+		}
+		// ovs service start timeout
+		if !ovs.IsInstalled() {
+			// ovs service not installed, return error
+			return fmt.Errorf("service openvswitch not installed and wait ovs service timeout, please check ovs service status")
+		}
+		// ovs service installed but not running, continue to start the service
 	}
 	if ovs.IsEnabled() {
 		err := ovs.Disable()
@@ -292,8 +327,8 @@ func cleanOvsBridge() {
 	//ovsutils.CleanAllHiddenPorts()
 }
 
-func NewOVSBridgeDriver(bridge, inter, ip string) (*SOVSBridgeDriver, error) {
-	base, err := NewBaseBridgeDriver(bridge, inter, ip)
+func NewOVSBridgeDriver(bridge, inter, ip string, maskLen int, ip6 string, mask6Len int) (*SOVSBridgeDriver, error) {
+	base, err := NewBaseBridgeDriver(bridge, inter, ip, maskLen, ip6, mask6Len)
 	if err != nil {
 		return nil, err
 	}
@@ -303,5 +338,5 @@ func NewOVSBridgeDriver(bridge, inter, ip string) (*SOVSBridgeDriver, error) {
 }
 
 func NewOVSBridgeDriverByName(bridge string) (*SOVSBridgeDriver, error) {
-	return NewOVSBridgeDriver(bridge, "", "")
+	return NewOVSBridgeDriver(bridge, "", "", 0, "", 0)
 }

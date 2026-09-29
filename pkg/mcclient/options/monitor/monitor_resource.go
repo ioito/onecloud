@@ -15,8 +15,12 @@
 package monitor
 
 import (
-	"yunion.io/x/jsonutils"
+	"time"
 
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+
+	"yunion.io/x/onecloud/pkg/apis/monitor"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
 )
 
@@ -32,12 +36,44 @@ func (o *MonitorResourceJointAlertOptions) Property() string {
 }
 
 type MonitorResourceListOptions struct {
+	_ struct{} `mcp-desc:"监控资源列表/告警资源 TopN。res-type=guest|host|cloudaccount|oss|storage|rds|redis；top 默认 5。报表「监控指标关联资源」可用本工具"`
+
 	options.BaseListOptions
-	ResType string   `help:"filter by resource type" json:"res_type"`
-	ResId   []string `help:"filter by resource id" json:"res_id"`
-	ResName string   `help:"filter by resource name" json:"res_name"`
+	ResType     string    `help:"filter by resource type" json:"res_type" mcp:"true"`
+	ResId       []string  `help:"filter by resource id" json:"res_id" mcp:"true"`
+	ResName     string    `help:"filter by resource name" json:"res_name" mcp:"true"`
+	AlertStates []string  `help:"filter by alert state" json:"alert_states" mcp:"true"`
+	StartTime   time.Time `help:"start time for top query, format: 2025-01-01 00:00:00" json:"start_time" mcp:"true"`
+	EndTime     time.Time `help:"end time for top query, format: 2025-01-01 00:00:00" json:"end_time" mcp:"true"`
+	Top         int       `help:"return top N resources by alert count (default: 5)" json:"top" mcp:"true"`
 }
 
 func (o *MonitorResourceListOptions) Params() (jsonutils.JSONObject, error) {
 	return options.ListStructToParams(o)
+}
+
+type MonitorResourceDoActionOptions struct {
+	ID     string `help:"ID of the resource"`
+	ACTION string `help:"Action name"`
+	Data   string `json:"json string data"`
+}
+
+func (o *MonitorResourceDoActionOptions) GetId() string {
+	return o.ID
+}
+
+func (o *MonitorResourceDoActionOptions) Params() (jsonutils.JSONObject, error) {
+	var data jsonutils.JSONObject = jsonutils.NewDict()
+	if len(o.Data) != 0 {
+		d, err := jsonutils.ParseString(o.Data)
+		if err != nil {
+			return nil, errors.Wrapf(err, "parse string to data: %s", o.Data)
+		}
+		data = d
+	}
+	input := monitor.MonitorResourceDoActionInput{
+		Action: o.ACTION,
+		Data:   data,
+	}
+	return jsonutils.Marshal(input), nil
 }

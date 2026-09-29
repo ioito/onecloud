@@ -31,22 +31,29 @@ package service
 import (
 	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/appsrv/dispatcher"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/proxy"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudid/models"
+	"yunion.io/x/onecloud/pkg/cloudid/options"
 )
 
-func InitHandlers(app *appsrv.Application) {
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
 
-	taskman.AddTaskHandler("v1", app)
+	app_common.ExportOptionsHandler(app, &options.Options)
+
+	taskman.AddTaskHandler("v1", app, isSlave)
+
 	db.AddScopeResourceCountHandler("", app)
 
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
+
 		db.UserCacheManager,
 		db.TenantCacheManager,
 		db.SharedResourceManager,
@@ -62,16 +69,14 @@ func InitHandlers(app *appsrv.Application) {
 		proxy.ProxySettingManager,
 		models.ClouduserManager,
 		models.CloudgroupManager,
-		models.CloudgroupcacheManager,
 		models.CloudpolicyManager,
-		models.CloudpolicycacheManager,
 		models.SAMLProviderManager,
 		models.CloudroleManager,
 		models.SamluserManager,
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher("", app, handler)
+		dispatcher.AddModelDispatcher("", app, handler, isSlave)
 	}
 
 	for _, manager := range []db.IJointModelManager{
@@ -81,7 +86,7 @@ func InitHandlers(app *appsrv.Application) {
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewJointModelHandler(manager)
-		dispatcher.AddJointModelDispatcher("", app, handler)
+		dispatcher.AddJointModelDispatcher("", app, handler, isSlave)
 	}
 
 }

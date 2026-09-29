@@ -22,6 +22,7 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	o "yunion.io/x/onecloud/pkg/baremetal/options"
@@ -49,7 +50,7 @@ type sBaremetalRegisterTask struct {
 	IpmiIpAddr   string
 	IpmiMac      net.HardwareAddr
 
-	IpmiLanChannel int
+	IpmiLanChannel uint8
 
 	AdminWire string
 	IpmiWire  string
@@ -60,7 +61,7 @@ type sBaremetalRegisterTask struct {
 func NewBaremetalRegisterTask(
 	userCred mcclient.TokenCredential, bmManager IBmManager, sshCli *ssh.Client,
 	hostname, remoteIp, ipmiUsername, ipmiPassword, ipmiIpAddr string,
-	ipmiMac net.HardwareAddr, ipmiLanChannel int, adminWire, ipmiWire string) *sBaremetalRegisterTask {
+	ipmiMac net.HardwareAddr, ipmiLanChannel uint8, adminWire, ipmiWire string) *sBaremetalRegisterTask {
 	return &sBaremetalRegisterTask{
 		sBaremetalPrepareTask: sBaremetalPrepareTask{userCred: userCred},
 		BmManager:             bmManager,
@@ -82,12 +83,20 @@ func (s *sBaremetalRegisterTask) getSession() *mcclient.ClientSession {
 }
 
 func (s *sBaremetalRegisterTask) getAccessDevMacAddr(ip string) (string, error) {
-	nicsRet, err := s.SshCli.Run("/sbin/ip -o -4 addr show")
-	if err != nil {
-		return "", fmt.Errorf("Failed get access nic %s", err)
-	}
-
 	var dev string
+	var nicsRet []string
+	var err error
+	if strings.Contains(ip, ":") { // ipv6
+		nicsRet, err = s.SshCli.Run("/sbin/ip -o -6 addr show")
+		if err != nil {
+			return "", fmt.Errorf("Failed get access nic %s", err)
+		}
+	} else { // ipv4
+		nicsRet, err = s.SshCli.Run("/sbin/ip -o -4 addr show")
+		if err != nil {
+			return "", fmt.Errorf("Failed get access nic %s", err)
+		}
+	}
 	for i := 0; i < len(nicsRet); i++ {
 		if strings.Contains(nicsRet[i], ip+"/") {
 			segs := strings.Split(nicsRet[i], " ")
@@ -100,6 +109,7 @@ func (s *sBaremetalRegisterTask) getAccessDevMacAddr(ip string) (string, error) 
 	if len(dev) == 0 {
 		return "", fmt.Errorf("Can't get access dev")
 	}
+
 	log.Infof("Access dev is %s", dev)
 	macRet, err := s.SshCli.Run("/sbin/ip a show " + dev)
 	if err != nil || len(macRet) < 2 {
@@ -112,7 +122,7 @@ func (s *sBaremetalRegisterTask) getAccessDevMacAddr(ip string) (string, error) 
 	return segs[1], nil
 }
 
-func (s *sBaremetalRegisterTask) CreateBaremetal() (string, error) {
+func (s *sBaremetalRegisterTask) CreateBaremetal(ctx context.Context) (string, error) {
 	zoneId := s.BmManager.GetZoneId()
 	ret, err := s.SshCli.Run("/lib/mos/lsnic")
 	if err != nil {
@@ -148,24 +158,24 @@ func (s *sBaremetalRegisterTask) CreateBaremetal() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Create baremetal failed: %s", err)
 	}
-	pxeBm, err := s.BmManager.AddBaremetal(res)
+	pxeBm, err := s.BmManager.AddBaremetal(ctx, res)
 	if err != nil {
 		return "", fmt.Errorf("BmManager add baremetal failed: %s", err)
 	}
 
-	err = pxeBm.InitAdminNetif(
+	err = pxeBm.InitAdminNetif(ctx,
 		s.accessNic.Mac, s.AdminWire, api.NIC_TYPE_ADMIN, api.NETWORK_TYPE_PXE, true, s.RemoteIp)
 	if err != nil {
 		return "", fmt.Errorf("BmManager add admin netif failed: %s", err)
 	}
-	err = pxeBm.InitAdminNetif(
+	err = pxeBm.InitAdminNetif(ctx,
 		s.IpmiMac, s.IpmiWire, api.NIC_TYPE_IPMI, api.NETWORK_TYPE_IPMI, true, s.IpmiIpAddr)
 	if err != nil {
 		return "", fmt.Errorf("BmManager add ipmi netif failed: %s", err)
 	}
 	for _, nic := range nicinfo {
 		if nic.Dev != s.accessNic.Dev {
-			pxeBm.RegisterNetif(nic.Mac, s.AdminWire)
+			pxeBm.RegisterNetif(ctx, nic.Mac, s.AdminWire)
 		}
 	}
 	s.baremetal = pxeBm.(IBaremetal)
@@ -173,14 +183,14 @@ func (s *sBaremetalRegisterTask) CreateBaremetal() (string, error) {
 	return bmInstanceId, nil
 }
 
-func (s *sBaremetalRegisterTask) UpdateBaremetal() (string, error) {
+func (s *sBaremetalRegisterTask) UpdateBaremetal(ctx context.Context) (string, error) {
 	accessMac, err := s.getAccessDevMacAddr(s.RemoteIp)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "getAccessDevMacAddr")
 	}
 	accessMacAddr, err := net.ParseMAC(accessMac)
 	if err != nil {
-		return "", fmt.Errorf("Failed parse access mac %s", accessMac)
+		return "", errors.Wrapf(err, "Failed parse access mac %s", accessMac)
 	}
 
 	params := jsonutils.NewDict()
@@ -188,14 +198,14 @@ func (s *sBaremetalRegisterTask) UpdateBaremetal() (string, error) {
 	params.Set("scope", jsonutils.NewString("system"))
 	res, err := modules.Hosts.List(s.BmManager.GetClientSession(), params)
 	if err != nil {
-		return "", fmt.Errorf("Fetch baremetal failed %s", err)
+		return "", errors.Wrap(err, "Fetch baremetal failed")
 	}
 	if len(res.Data) == 0 {
-		return "", fmt.Errorf("Cann't find baremetal by access mac %s", accessMacAddr)
+		return "", errors.Wrapf(errors.ErrNotFound, "Cann't find baremetal by access mac %s", accessMacAddr)
 	}
-	pxeBm, err := s.BmManager.AddBaremetal(res.Data[0])
+	pxeBm, err := s.BmManager.AddBaremetal(ctx, res.Data[0])
 	if err != nil {
-		return "", fmt.Errorf("BmManager add baremetal failed: %s", err)
+		return "", errors.Wrap(err, "BmManager add baremetal failed")
 	}
 
 	s.baremetal = pxeBm.(IBaremetal)
@@ -203,7 +213,11 @@ func (s *sBaremetalRegisterTask) UpdateBaremetal() (string, error) {
 }
 
 func (s *sBaremetalRegisterTask) doRedfishProbe(ctx context.Context) (redfishSupport bool, cdromBoot bool) {
-	redfishCli := redfish.NewRedfishDriver(ctx, "https://"+s.IpmiIpAddr, s.IpmiUsername, s.IpmiPassword, false)
+	var endpoint = "https://" + s.IpmiIpAddr
+	if strings.Contains(s.IpmiIpAddr, ":") {
+		endpoint = fmt.Sprintf("https://[%s]", s.IpmiIpAddr)
+	}
+	redfishCli := redfish.NewRedfishDriver(ctx, endpoint, s.IpmiUsername, s.IpmiPassword, false)
 	if redfishCli != nil {
 		_, cdInfo, _ := redfishCli.GetVirtualCdromInfo(ctx)
 		redfishSupport = true
@@ -229,12 +243,12 @@ func (s *sBaremetalRegisterTask) DoPrepare(ctx context.Context, cli *ssh.Client,
 	infos.ipmiInfo.RedfishApi = redfishSupport
 	infos.ipmiInfo.CdromBoot = cdromSupport
 
-	s.updateIpmiInfo(cli)
+	s.updateIpmiInfo(ctx, cli)
 
-	return s.updateBmInfo(cli, infos, registered)
+	return s.updateBmInfo(ctx, cli, infos, registered)
 }
 
-func (s *sBaremetalRegisterTask) updateIpmiInfo(cli *ssh.Client) {
+func (s *sBaremetalRegisterTask) updateIpmiInfo(ctx context.Context, cli *ssh.Client) {
 	ipmiTool := ipmitool.NewSSHIPMI(cli)
 	sysInfo, err := ipmitool.GetSysInfo(ipmiTool)
 	if err == nil && o.Options.IpmiLanPortShared {
@@ -245,76 +259,58 @@ func (s *sBaremetalRegisterTask) updateIpmiInfo(cli *ssh.Client) {
 			ipmitool.SetDellIPMILanPortShared(ipmiTool)
 		}
 	}
+	conf, err := ipmitool.GetLanConfig(ipmiTool, s.IpmiLanChannel)
+	if err != nil {
+		log.Errorf("Failed to get IPMI lan config on channel %d: %v", s.IpmiLanChannel, err)
+		return
+	}
+	if conf == nil {
+		log.Errorf("IPMI lan channel %d returned no configuration", s.IpmiLanChannel)
+		return
+	}
+	if len(conf.Mac) == 0 {
+		log.Errorf("IPMI lan channel %d returned an empty MAC address", s.IpmiLanChannel)
+		return
+	}
 	up := true
-	var nic = &types.SNicDevInfo{
+	nic := &types.SNicDevInfo{
+		Mac:   conf.Mac,
 		Up:    &up,
 		Speed: 100,
 		Mtu:   1500,
 	}
-
-	var conf *types.SIPMILanConfig
-	for _, lanChannel := range ipmitool.GetLanChannels(sysInfo) {
-		conf, _ = ipmitool.GetLanConfig(ipmiTool, lanChannel)
-		if conf == nil || len(conf.Mac) == 0 {
-			continue
-		}
+	if err := s.sendNicInfo(ctx, nic, -1, api.NIC_TYPE_IPMI, false, "", false); err != nil {
+		log.Errorf("Failed to send IPMI NIC info for channel %d: %v", s.IpmiLanChannel, err)
 	}
-	if conf == nil || len(conf.Mac) == 0 {
-		log.Errorln("Fail to get IPMI lan config !!!")
-	} else {
-		nic.Mac = conf.Mac
-	}
-	s.sendNicInfo(nic, -1, api.NIC_TYPE_IPMI, false, "", false)
 }
 
-func (s *sBaremetalRegisterTask) updateBmInfo(cli *ssh.Client, i *baremetalPrepareInfo, registered bool) error {
-	updateInfo := make(map[string]interface{})
-	updateInfo["access_ip"] = s.RemoteIp
-	updateInfo["cpu_count"] = i.cpuInfo.Count
-	updateInfo["node_count"] = i.dmiCpuInfo.Nodes
-	updateInfo["cpu_desc"] = i.cpuInfo.Model
-	updateInfo["cpu_mhz"] = i.cpuInfo.Freq
-	updateInfo["cpu_cache"] = i.cpuInfo.Cache
-	updateInfo["mem_size"] = i.memInfo.Total
-	updateInfo["storage_driver"] = i.storageDriver
-	updateInfo["storage_info"] = i.diskInfo
-	updateInfo["sys_info"] = i.sysInfo
-	updateInfo["sn"] = i.sysInfo.SN
-	size, diskType := s.collectDiskInfo(i.diskInfo)
-	updateInfo["storage_size"] = size
-	updateInfo["storage_type"] = diskType
-	updateData := jsonutils.Marshal(updateInfo)
-	updateData.(*jsonutils.JSONDict).Update(i.ipmiInfo.ToPrepareParams())
-	_, err := modules.Hosts.Update(s.getClientSession(), s.baremetal.GetId(), updateData)
+func (s *sBaremetalRegisterTask) updateBmInfo(ctx context.Context, cli *ssh.Client, i *baremetalPrepareInfo, registered bool) error {
+	accessMac := ""
+	if s.accessNic != nil {
+		accessMac = s.accessNic.Mac.String()
+	}
+	err := s.doUpdateBmInfo(ctx, cli, i, "", s.RemoteIp, accessMac)
 	if err != nil {
-		log.Errorf("Update baremetal info error: %v", err)
+		log.Errorf("failed do update bminfo %s", err)
 	}
-	if err := s.sendStorageInfo(size); err != nil {
-		log.Errorf("sendStorageInfo error: %v", err)
-	}
-	for idx := range i.nicsInfo {
-		err = s.sendNicInfo(i.nicsInfo[idx], idx, "", false, "", false)
-		if err != nil {
-			log.Errorf("Send nicinfo idx: %d, %#v error: %v", idx, i.nicsInfo[idx], err)
-		}
-	}
+
 	if registered {
 		return nil
 	}
-	return s.initBaremetalServer()
+	return s.initBaremetalServer(ctx)
 }
 
-func (s *sBaremetalRegisterTask) initBaremetalServer() error {
+func (s *sBaremetalRegisterTask) initBaremetalServer(ctx context.Context) error {
 	if err := s.baremetal.InitializeServer(s.getSession(), s.Hostname); err != nil {
 		return fmt.Errorf("Baremteal Create Server Failed %s", err)
 	}
 	// if err := s.baremetal.SaveSSHConfig("", ""); err != nil {
 	// 	log.Errorf("Save ssh config failed %s", err)
 	// }
-	if err := s.baremetal.ServerLoadDesc(); err != nil {
+	if err := s.baremetal.ServerLoadDesc(ctx); err != nil {
 		log.Errorf("Server load desc failed %s", err)
 	}
-	s.baremetal.SyncStatus("running", "Register success")
+	s.baremetal.SyncStatus(ctx, "running", "Register success")
 	log.Infof("%s Load baremetal info success ...", s.baremetal.GetId())
 	return nil
 }

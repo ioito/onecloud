@@ -98,13 +98,14 @@ func NewRemoteFileClient(cfg *RemoteFileClientConfig) (*SRemoteFileClient, error
 }
 
 func (cli *SRemoteFileClient) GetCloudRegionExternalIdPrefix() string {
-	return fmt.Sprintf("%s/%s/", CLOUD_PROVIDER_REMOTEFILE, cli.cpcfg.Id)
+	return fmt.Sprintf("%s/%s", CLOUD_PROVIDER_REMOTEFILE, cli.cpcfg.Id)
 }
 
 func (cli *SRemoteFileClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{
 		Account: cli.cpcfg.Id,
 		Name:    cli.cpcfg.Name,
+		Id:      cli.cpcfg.Id,
 
 		HealthStatus: api.CLOUD_PROVIDER_HEALTH_NORMAL,
 	}
@@ -231,17 +232,20 @@ func (self *SRemoteFileClient) GetLoadbalancers() ([]SLoadbalancer, error) {
 	return self.lbs, resp.Unmarshal(&self.lbs)
 }
 
-func (self *SRemoteFileClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SRemoteFileClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	ret := []cloudprovider.ICloudRegion{}
 	for i := range self.regions {
 		self.regions[i].client = self
 		ret = append(ret, &self.regions[i])
 	}
-	return ret
+	return ret, nil
 }
 
 func (self *SRemoteFileClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	regions := self.GetIRegions()
+	regions, err := self.GetIRegions()
+	if err != nil {
+		return nil, err
+	}
 	for i := range regions {
 		if regions[i].GetGlobalId() == id {
 			return regions[i], nil
@@ -377,16 +381,17 @@ func (self *SRemoteFileClient) GetIProjects() ([]cloudprovider.ICloudProject, er
 
 func (self *SRemoteFileClient) GetCapabilities() []string {
 	caps := []string{
-		cloudprovider.CLOUD_CAPABILITY_PROJECT,
-		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
-		cloudprovider.CLOUD_CAPABILITY_NETWORK,
-		cloudprovider.CLOUD_CAPABILITY_EIP,
-		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
+		cloudprovider.CLOUD_CAPABILITY_PROJECT + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_COMPUTE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_NETWORK + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_EIP + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,
-		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
-		cloudprovider.CLOUD_CAPABILITY_RDS,
-		cloudprovider.CLOUD_CAPABILITY_CACHE,
-		cloudprovider.CLOUD_CAPABILITY_MISC,
+		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_RDS + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_CACHE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_MISC + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

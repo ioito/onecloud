@@ -29,8 +29,6 @@ type SVpc struct {
 
 	region *SRegion
 
-	secgroups []cloudprovider.ICloudSecurityGroup
-
 	VpcId          string
 	Name           string
 	Description    string
@@ -88,13 +86,7 @@ func (self *SVpc) GetIWires() ([]cloudprovider.ICloudWire, error) {
 }
 
 func (self *SVpc) GetISecurityGroups() ([]cloudprovider.ICloudSecurityGroup, error) {
-	if self.secgroups == nil {
-		err := self.fetchSecurityGroups()
-		if err != nil {
-			return nil, err
-		}
-	}
-	return self.secgroups, nil
+	return []cloudprovider.ICloudSecurityGroup{}, nil
 }
 
 func (self *SVpc) GetIRouteTables() ([]cloudprovider.ICloudRouteTable, error) {
@@ -120,21 +112,7 @@ func (self *SVpc) GetIWireById(id string) (cloudprovider.ICloudWire, error) {
 			return wires[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
-}
-
-func (self *SVpc) fetchSecurityGroups() error {
-	secgroups, err := self.region.GetSecurityGroups("")
-	if err != nil {
-		return err
-	}
-
-	self.secgroups = make([]cloudprovider.ICloudSecurityGroup, len(secgroups))
-	for i := 0; i < len(secgroups); i++ {
-		self.secgroups[i] = &secgroups[i]
-	}
-
-	return nil
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SRegion) GetVpc(vpcId string) (*SVpc, error) {

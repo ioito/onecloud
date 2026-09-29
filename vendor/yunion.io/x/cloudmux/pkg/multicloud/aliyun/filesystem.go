@@ -71,6 +71,7 @@ type SFileSystem struct {
 	FileSystemType       string
 	FileSystemId         string
 	RegionId             string
+	ResourceGroupId      string
 }
 
 func (self *SFileSystem) GetId() string {
@@ -234,9 +235,9 @@ func (self *SRegion) GetFileSystem(id string) (*SFileSystem, error) {
 		return &nas[0], nil
 	}
 	if total == 0 {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, id)
+	return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%s", id)
 }
 
 func (self *SRegion) GetICloudFileSystemById(id string) (cloudprovider.ICloudFileSystem, error) {
@@ -359,4 +360,8 @@ func (self *SRegion) CreateFileSystem(opts *cloudprovider.FileSystemCraeteOption
 
 func (self *SFileSystem) SetTags(tags map[string]string, replace bool) error {
 	return self.region.SetResourceTags(ALIYUN_SERVICE_NAS, "filesystem", self.FileSystemId, tags, replace)
+}
+
+func (self *SFileSystem) GetProjectId() string {
+	return self.ResourceGroupId
 }

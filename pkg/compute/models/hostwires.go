@@ -29,6 +29,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SHostwireManagerDeprecated struct {
 	SHostJointsManager
 	SWireResourceBaseManager
@@ -52,12 +53,13 @@ func init() {
 	})
 }
 
+// +onecloud:model-api-gen
 type SHostwireDeprecated struct {
 	SHostJointsBase
 
 	Bridge string `width:"64" charset:"ascii" nullable:"false" list:"domain" update:"domain" create:"domain_required"`
 	// 接口名称
-	Interface string `width:"16" charset:"ascii" nullable:"false" list:"domain" update:"domain" create:"domain_required"`
+	Interface string `width:"64" charset:"ascii" nullable:"false" list:"domain" update:"domain" create:"domain_required"`
 	// 是否是主地址
 	IsMaster bool `nullable:"true" default:"false" list:"domain" update:"domain" create:"domain_optional"`
 	// MAC地址
@@ -149,7 +151,7 @@ func (self *SHostwireDeprecated) GetGuestnicsCount() (int, error) {
 func (self *SHostwireDeprecated) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
 	cnt, err := self.GetGuestnicsCount()
 	if err != nil {
-		return httperrors.NewInternalServerError("GetGuestnicsCount fail %s", err)
+		return httperrors.NewInternalServerError("GetGuestnicsCount failed %s", err)
 	}
 	if cnt > 0 {
 		// check if this is the last one

@@ -23,10 +23,12 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/cloudmux/pkg/multicloud"
 )
 
 // 全球负载均衡 https://cloud.google.com/compute/docs/reference/rest/v1/globalAddresses/list
@@ -38,6 +40,7 @@ import (
 // https://cloud.google.com/compute/docs/reference/rest/v1/targetTcpProxies/get
 
 type SLoadbalancer struct {
+	multicloud.SLoadbalancerBase
 	SResourceBase
 	region          *SRegion
 	urlMap          *SUrlMap           // http & https LB
@@ -89,7 +92,7 @@ func (self *SLoadbalancer) GetSysTags() map[string]string {
 
 	ips := []string{}
 	for i := range frs {
-		if len(frs[i].IPAddress) > 0 {
+		if len(frs[i].IPAddress) > 0 && !utils.IsInStringArray(frs[i].IPAddress, ips) {
 			ips = append(ips, frs[i].IPAddress)
 		}
 	}
@@ -135,7 +138,6 @@ func (self *SLoadbalancer) GetAddress() string {
 			return frs[i].IPAddress
 		}
 	}
-
 	return ""
 }
 
@@ -241,26 +243,29 @@ func (self *SLoadbalancer) GetEgressMbps() int {
 	return 0
 }
 
-func (self *SLoadbalancer) GetIEIP() (cloudprovider.ICloudEIP, error) {
+func (self *SLoadbalancer) GetIEIPs() ([]cloudprovider.ICloudEIP, error) {
 	frs, err := self.GetForwardingRules()
 	if err != nil {
 		log.Errorf("GetAddress.GetForwardingRules %s", err)
 	}
 
+	ret, addrs := []cloudprovider.ICloudEIP{}, []string{}
 	for i := range frs {
-		if strings.ToLower(frs[i].LoadBalancingScheme) == "external" {
+		ipAddr, _ := netutils.NewIPV4Addr(frs[i].IPAddress)
+		if netutils.IsExitAddress(ipAddr) && !utils.IsInStringArray(frs[i].IPAddress, addrs) {
+			addrs = append(addrs, frs[i].IPAddress)
 			eips, err := self.region.GetEips(frs[i].IPAddress, 0, "")
 			if err != nil {
 				log.Errorf("GetEips %s", err)
 			}
-
-			if len(eips) > 0 {
-				return &eips[0], nil
+			for j := range eips {
+				eips[j].region = self.region
+				ret = append(ret, &eips[j])
 			}
 		}
 	}
 
-	return nil, nil
+	return ret, nil
 }
 
 func (self *SLoadbalancer) Delete(ctx context.Context) error {
@@ -342,7 +347,8 @@ func (self *SLoadbalancer) GetILoadBalancerListenerById(listenerId string) (clou
 }
 
 // GET https://compute.googleapis.com/compute/v1/projects/{project}/aggregated/targetHttpProxies 前端监听
-//  tcp lb backend type: backend service
+//
+//	tcp lb backend type: backend service
 func (self *SRegion) GetRegionalTcpLoadbalancers() ([]SLoadbalancer, error) {
 	bss, err := self.GetRegionalBackendServices("protocol eq TCP")
 	if err != nil {
@@ -366,7 +372,7 @@ func (self *SRegion) GetRegionalTcpLoadbalancers() ([]SLoadbalancer, error) {
 	return lbs, nil
 }
 
-//  udp lb backend type: backend service
+// udp lb backend type: backend service
 func (self *SRegion) GetRegionalUdpLoadbalancers() ([]SLoadbalancer, error) {
 	bss, err := self.GetRegionalBackendServices("protocol eq UDP")
 	if err != nil {
@@ -390,7 +396,7 @@ func (self *SRegion) GetRegionalUdpLoadbalancers() ([]SLoadbalancer, error) {
 	return lbs, nil
 }
 
-//  http&https lb: urlmaps
+// http&https lb: urlmaps
 func (self *SRegion) GetRegionalHTTPLoadbalancers() ([]SLoadbalancer, error) {
 	ums, err := self.GetRegionalUrlMaps("")
 	if err != nil {

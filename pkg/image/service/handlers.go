@@ -21,6 +21,7 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	_ "yunion.io/x/onecloud/pkg/image/drivers/container_registries"
 	"yunion.io/x/onecloud/pkg/image/models"
 	"yunion.io/x/onecloud/pkg/image/options"
 	"yunion.io/x/onecloud/pkg/image/usages"
@@ -30,7 +31,7 @@ const (
 	API_VERSION = "v1"
 )
 
-func InitHandlers(app *appsrv.Application) {
+func InitHandlers(app *appsrv.Application, isSlave bool) {
 	db.InitAllManagers()
 
 	// add version handler with API_VERSION prefix
@@ -40,16 +41,18 @@ func InitHandlers(app *appsrv.Application) {
 
 	db.AddScopeResourceCountHandler(API_VERSION, app)
 
-	quotas.AddQuotaHandler(&models.QuotaManager.SQuotaBaseManager, API_VERSION, app)
+	quotas.AddQuotaHandler(&models.QuotaManager.SQuotaBaseManager, API_VERSION, app, isSlave)
 	usages.AddUsageHandler(API_VERSION, app)
-	taskman.AddTaskHandler(API_VERSION, app)
 
-	app_common.ExportOptionsHandler(app, &options.Options)
+	taskman.AddTaskHandler(API_VERSION, app, isSlave)
+
+	app_common.ExportOptionsHandlerWithPrefix(app, API_VERSION, &options.Options)
 
 	for _, manager := range []db.IModelManager{
 		taskman.TaskManager,
 		taskman.SubTaskManager,
 		taskman.TaskObjectManager,
+		taskman.ArchivedTaskManager,
 
 		db.UserCacheManager,
 		db.TenantCacheManager,
@@ -75,9 +78,11 @@ func InitHandlers(app *appsrv.Application) {
 		models.ImageManager,
 
 		models.GuestImageManager,
+		models.GetContainerRegistryManager(),
+		models.GetContainerImageManager(),
 	} {
 		db.RegisterModelManager(manager)
 		handler := db.NewModelHandler(manager)
-		dispatcher.AddModelDispatcher(API_VERSION, app, handler)
+		dispatcher.AddModelDispatcher(API_VERSION, app, handler, isSlave)
 	}
 }

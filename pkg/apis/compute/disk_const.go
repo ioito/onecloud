@@ -19,6 +19,7 @@ import "yunion.io/x/cloudmux/pkg/apis/compute"
 const (
 	DISK_INIT                = compute.DISK_INIT
 	DISK_REBUILD             = compute.DISK_REBUILD
+	DISK_REBUILD_FAILED      = "rebuild_failed"
 	DISK_ALLOC_FAILED        = compute.DISK_ALLOC_FAILED
 	DISK_STARTALLOC          = "start_alloc"
 	DISK_BACKUP_STARTALLOC   = compute.DISK_BACKUP_STARTALLOC
@@ -44,6 +45,8 @@ const (
 	DISK_START_MIGRATE = "start_migrate"
 	DISK_POST_MIGRATE  = "post_migrate"
 	DISK_MIGRATING     = "migrating"
+	DISK_MIGRATE_FAIL  = "migrate_failed"
+	DISK_IMAGE_CACHING = "image_caching" // 缓存镜像中
 
 	DISK_CLONE      = "clone"
 	DISK_CLONE_FAIL = "clone_failed"
@@ -64,9 +67,27 @@ const (
 
 	DISK_NOT_EXIST = "not_exist"
 	DISK_EXIST     = "exist"
+
+	DISK_PREALLOCATION_OFF = "off"
+	// 精简置备
+	DISK_PREALLOCATION_METADATA = "metadata"
+	// 厚置备延迟归零
+	DISK_PREALLOCATION_FALLOC = "falloc"
+	// 厚置备快速归零
+	DISK_PREALLOCATION_FULL = "full"
 )
 
-const DISK_META_EXISTING_PATH = "disk_existing_path"
+var DISK_PREALLOCATIONS = []string{
+	DISK_PREALLOCATION_OFF,
+	DISK_PREALLOCATION_METADATA,
+	DISK_PREALLOCATION_FALLOC,
+	DISK_PREALLOCATION_FULL,
+}
+
+const (
+	DISK_META_EXISTING_PATH      = "disk_existing_path"
+	DISK_META_LAST_ATTACHED_HOST = "__disk_last_attached_host"
+)
 
 const (
 	DISK_DRIVER_VIRTIO = "virtio"
@@ -75,4 +96,16 @@ const (
 	DISK_DRIVER_IDE    = "ide"
 	DISK_DRIVER_SATA   = "sata"
 	DISK_DRIVER_VFIO   = "vfio-pci"
+)
+
+const (
+	DISK_CACHE_MODE_WRITETHROGH = "writethrough"
+	DISK_CACHE_MODE_NONE        = "none"
+	DISK_CACHE_MODE_WRITEBACK   = "writeback"
+	DISK_CACHE_MODE_DIRECTSYNC  = "directsync"
+)
+
+const (
+	DISK_AIO_MODE_NATIVE = "native"
+	DISK_AIO_MOD_THREADS = "threads"
 )

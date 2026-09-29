@@ -34,6 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SLoadbalancernetworkManager struct {
 	db.SVirtualJointResourceBaseManager
 	SLoadbalancerResourceBaseManager
@@ -58,6 +59,7 @@ func init() {
 	})
 }
 
+// +onecloud:model-api-gen
 type SLoadbalancerNetwork struct {
 	db.SVirtualJointResourceBase
 
@@ -122,10 +124,10 @@ func (m *SLoadbalancernetworkManager) NewLoadbalancerNetwork(ctx context.Context
 		ln.MacAddr = macAddr
 	}
 
-	usedMap := network.GetUsedAddresses()
+	usedMap := network.GetUsedAddresses(ctx)
 	var recentReclaimed map[string]bool
 	ipAddr, err := network.GetFreeIP(ctx, userCred,
-		usedMap, recentReclaimed, req.Address, req.strategy, req.reserved)
+		usedMap, recentReclaimed, req.Address, req.strategy, req.reserved, api.AddressTypeIPv4)
 	if err != nil {
 		return nil, errors.Wrap(err, "find a free ip")
 	}
@@ -156,7 +158,7 @@ func (m *SLoadbalancernetworkManager) DeleteLoadbalancerNetwork(ctx context.Cont
 				req.loadbalancer.Id)
 			reservedIpMan := db.GetModelManager("reservedip").(*SReservedipManager)
 			network := ln.Network()
-			err := reservedIpMan.ReserveIP(userCred, network, ln.IpAddr, note)
+			err := reservedIpMan.ReserveIP(ctx, userCred, network, ln.IpAddr, note, api.AddressTypeIPv4)
 			if err != nil {
 				return err
 			}
@@ -188,6 +190,7 @@ func (m *SLoadbalancernetworkManager) syncLoadbalancerNetwork(ctx context.Contex
 	}
 	if len(lns) == 0 {
 		ln := &SLoadbalancerNetwork{LoadbalancerId: req.Loadbalancer.Id, NetworkId: req.NetworkId, IpAddr: req.Address}
+		ln.SetModelManager(LoadbalancernetworkManager, ln)
 		return m.TableSpec().Insert(ctx, ln)
 	}
 	for i := 0; i < len(lns); i++ {

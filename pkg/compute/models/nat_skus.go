@@ -293,7 +293,7 @@ func (self *SCloudregion) newFromCloudNatSku(ctx context.Context, userCred mccli
 	sku := &SNatSku{}
 	sku.SetModelManager(NatSkuManager, sku)
 
-	skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.NatBase, self.ExternalId, isku.GetGlobalId())
+	skuUrl := self.getMetaUrl(meta.NatBase, isku.GetGlobalId())
 	err = meta.Get(skuUrl, sku)
 	if err != nil {
 		return errors.Wrapf(err, "Get")
@@ -350,6 +350,9 @@ func SyncRegionNatSkus(ctx context.Context, userCred mcclient.TokenCredential, r
 	if err != nil {
 		return errors.Wrapf(err, "db.FetchModelObjects")
 	}
+	if len(regions) == 0 {
+		return nil
+	}
 
 	meta, err := yunionmeta.FetchYunionmeta(ctx)
 	if err != nil {
@@ -382,9 +385,8 @@ func SyncRegionNatSkus(ctx context.Context, userCred mcclient.TokenCredential, r
 		db.Metadata.SetValue(ctx, skuMeta, db.SKU_METADAT_KEY, newMd5, userCred)
 
 		result := regions[i].SyncNatSkus(ctx, userCred, xor)
-		msg := result.Result()
-		notes := fmt.Sprintf("SyncNatSkus for region %s result: %s", regions[i].Name, msg)
-		log.Infof(notes)
+		notes := fmt.Sprintf("SyncNatSkus for region %s result: %v", regions[i].Name, result.Result())
+		log.Infof("%s", notes)
 	}
 	return nil
 }

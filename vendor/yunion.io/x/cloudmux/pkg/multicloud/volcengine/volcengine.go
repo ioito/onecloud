@@ -15,20 +15,25 @@
 package volcengine
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fatih/color"
 	tos "github.com/volcengine/ve-tos-golang-sdk/v2/tos"
 	sdk "github.com/volcengine/volc-sdk-golang/base"
+	"moul.io/http2curl/v2"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/httputils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
@@ -40,12 +45,15 @@ const (
 	CLOUD_PROVIDER_VOLCENGINE_CN = "火山云"
 	CLOUD_PROVIDER_VOLCENGINE_EN = "VolcEngine"
 
-	VOLCENGINE_API_VERSION     = "2020-04-01"
-	VOLCENGINE_IAM_API_VERSION = "2021-08-01"
+	VOLCENGINE_API_VERSION         = "2020-04-01"
+	VOLCENGINE_IAM_API_VERSION     = "2018-01-01"
+	VOLCENGINE_MONITOR_API_VERSION = "2018-01-01"
+	VOLCENGINE_BILLING_API_VERSION = "2022-01-01"
 
-	VOLCENGINE_API     = "open.volcengineapi.com"
-	VOLCENGINE_IAM_API = "iam.volcengineapi.com"
-	VOLCENGINE_TOS_API = "tos-cn-beijing.volces.com"
+	VOLCENGINE_API         = "open.volcengineapi.com"
+	VOLCENGINE_IAM_API     = "iam.volcengineapi.com"
+	VOLCENGINE_TOS_API     = "tos-cn-beijing.volces.com"
+	VOLCENGINE_BILLING_API = "billing.volcengineapi.com"
 
 	VOLCENGINE_SERVICE_ECS     = "ecs"
 	VOLCENGINE_SERVICE_VPC     = "vpc"
@@ -53,7 +61,10 @@ const (
 	VOLCENGINE_SERVICE_STORAGE = "storage_ebs"
 	VOLCENGINE_SERVICE_IAM     = "iam"
 	VOLCENGINE_SERVICE_TOS     = "tos"
-	VOLCENGINE_DEFAULT_REGION  = "cn-beijing"
+	VOLCENGINE_SERVICE_MONITOR = "cloudmonitor"
+	VOLCENGINE_SERVICE_BILLING = "billing"
+
+	VOLCENGINE_DEFAULT_REGION = "cn-beijing"
 )
 
 type VolcEngineClientConfig struct {
@@ -63,6 +74,9 @@ type VolcEngineClientConfig struct {
 	secretKey string
 	accountId string
 	debug     bool
+
+	client *http.Client
+	lock   sync.Mutex
 }
 
 func NewVolcEngineClientConfig(accessKey, secretKey string) *VolcEngineClientConfig {
@@ -85,10 +99,6 @@ func (cfg *VolcEngineClientConfig) AccountId(id string) *VolcEngineClientConfig 
 
 func (cfg *VolcEngineClientConfig) Debug(debug bool) *VolcEngineClientConfig {
 	cfg.debug = debug
-	return cfg
-}
-
-func (cfg VolcEngineClientConfig) Copy() VolcEngineClientConfig {
 	return cfg
 }
 
@@ -120,7 +130,7 @@ func (client *SVolcEngineClient) fetchRegions() error {
 		return errors.Wrapf(err, "DescribeRegions")
 	}
 	regions := make([]SRegion, 0)
-	err = body.Unmarshal(&regions, "Result", "Regions")
+	err = body.Unmarshal(&regions, "Regions")
 	if err != nil {
 		return errors.Wrapf(err, "resp.Unmarshal")
 	}
@@ -153,8 +163,8 @@ func (client *SVolcEngineClient) GetRegion(regionId string) *SRegion {
 	return nil
 }
 
-func (client *SVolcEngineClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return client.iregions
+func (client *SVolcEngineClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return client.iregions, nil
 }
 
 func (client *SVolcEngineClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
@@ -170,11 +180,11 @@ func (client *SVolcEngineClient) GetAccountId() string {
 	if len(client.ownerId) > 0 {
 		return client.ownerId
 	}
-	caller, err := client.GetCallerIdentity()
+	balance, err := client.QueryBalance()
 	if err != nil {
 		return ""
 	}
-	client.ownerId = caller.AccountId
+	client.ownerId = balance.AccountId
 	return client.ownerId
 }
 
@@ -184,6 +194,7 @@ func (client *SVolcEngineClient) GetSubAccounts() ([]cloudprovider.SSubAccount, 
 		return nil, err
 	}
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = client.GetAccountId()
 	subAccount.Name = client.cpcfg.Name
 	subAccount.Account = client.accessKey
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL
@@ -218,27 +229,64 @@ func (client *SVolcEngineClient) GetProjects() ([]SProject, error) {
 		if len(client.projects) >= total {
 			break
 		}
-		offset += total
+		offset = len(client.projects)
 	}
 	return client.projects, nil
 }
 
-func (client *SVolcEngineClient) jsonRequest(cred sdk.Credentials, domain string, apiVersion string, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+func (cli *SVolcEngineClient) getDefaultClient() *http.Client {
+	cli.lock.Lock()
+	defer cli.lock.Unlock()
+	if !gotypes.IsNil(cli.client) {
+		return cli.client
+	}
+	cli.client = httputils.GetAdaptiveTimeoutClient()
+	httputils.SetClientProxyFunc(cli.client, cli.cpcfg.ProxyFunc)
+	ts, _ := cli.client.Transport.(*http.Transport)
+	ts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	cli.client.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
+		if cli.cpcfg.ReadOnly {
+			action := req.URL.Query().Get("Action")
+			if len(action) > 0 {
+				for _, prefix := range []string{"Get", "Describe", "List"} {
+					if strings.HasPrefix(action, prefix) {
+						return nil, nil
+					}
+				}
+			}
+			return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s %s", req.Method, req.URL.Path)
+		}
+		return nil, nil
+	})
+	return cli.client
+}
+
+type sCred struct {
+	client *SVolcEngineClient
+
+	cred sdk.Credentials
+}
+
+func (self *sCred) Do(req *http.Request) (*http.Response, error) {
+	cli := self.client.getDefaultClient()
+
+	req = self.cred.Sign(req)
+
+	return cli.Do(req)
+}
+
+func (client *SVolcEngineClient) monitorRequest(regionId, apiName string, params map[string]interface{}) (jsonutils.JSONObject, error) {
+	cred := client.getSdkCredential(regionId, VOLCENGINE_SERVICE_MONITOR, "")
+	return client.jsonRequest(cred, VOLCENGINE_API, VOLCENGINE_MONITOR_API_VERSION, apiName, params)
+}
+
+func (client *SVolcEngineClient) jsonRequest(cred sdk.Credentials, domain string, apiVersion string, apiName string, params interface{}) (jsonutils.JSONObject, error) {
 
 	query := url.Values{
 		"Action":  []string{apiName},
 		"Version": []string{apiVersion},
 	}
-	for k, v := range params {
-		query.Set(k, v)
-	}
 
-	u := url.URL{
-		Scheme:   "http",
-		Host:     domain,
-		Path:     "/",
-		RawQuery: query.Encode(),
-	}
 	method := httputils.GET
 	for prefix, _method := range map[string]httputils.THttpMethod{
 		"Get":      httputils.GET,
@@ -246,6 +294,7 @@ func (client *SVolcEngineClient) jsonRequest(cred sdk.Credentials, domain string
 		"List":     httputils.GET,
 		"Delete":   httputils.GET,
 		"Put":      httputils.PUT,
+		"Create":   httputils.POST,
 	} {
 		if strings.HasPrefix(apiName, prefix) {
 			method = _method
@@ -257,24 +306,89 @@ func (client *SVolcEngineClient) jsonRequest(cred sdk.Credentials, domain string
 			method = httputils.DELETE
 		}
 	}
+	if cred.Service == VOLCENGINE_SERVICE_MONITOR {
+		method = httputils.POST
+	}
+	// 私网接口仅支持GET请求
+	if cred.Service == VOLCENGINE_SERVICE_VPC {
+		method = httputils.GET
+	}
 
-	req, err := http.NewRequest(string(method), u.String(), nil)
-	if err != nil {
-		fmt.Println("Failed to build request:", err)
-		return nil, err
+	var reqBody io.Reader = nil
+	switch method {
+	case httputils.POST:
+		reqBody = strings.NewReader(jsonutils.Marshal(params).String())
+	default:
+		_params, _ := params.(map[string]string)
+		for k, v := range _params {
+			query.Set(k, v)
+		}
 	}
-	req = cred.Sign(req)
-	resp, err := http.DefaultClient.Do(req)
-	rbody, _ := io.ReadAll(resp.Body)
-	resp.Body = io.NopCloser(bytes.NewBuffer(rbody))
-	_, result, err := httputils.ParseJSONResponse("", resp, err, client.debug)
+
+	u, err := url.Parse(fmt.Sprintf("http://%s?%s", domain, query.Encode()))
 	if err != nil {
-		jrbody, _ := jsonutils.Parse(rbody)
-		errorCode, _ := jrbody.GetString("ResponseMetadata", "Error", "Code")
-		errorMessage, _ := jrbody.GetString("ResponseMetadata", "Error", "Message")
-		return nil, errors.Wrapf(err, errorCode, errorMessage)
+		return nil, errors.Wrapf(err, "url.Parse")
 	}
-	return result, nil
+
+	req, err := http.NewRequest(string(method), u.String(), reqBody)
+	if err != nil {
+		return nil, errors.Wrapf(err, "NewRequest")
+	}
+
+	cli := &sCred{
+		client: client,
+		cred:   cred,
+	}
+
+	resp, err := cli.Do(req)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Do request")
+	}
+	defer resp.Body.Close()
+
+	red := color.New(color.FgRed, color.Bold).PrintlnFunc()
+	green := color.New(color.FgGreen, color.Bold).PrintlnFunc()
+	yellow := color.New(color.FgYellow, color.Bold).PrintlnFunc()
+	cyan := color.New(color.FgHiCyan, color.Bold).PrintlnFunc()
+
+	if client.debug {
+		dump, _ := httputil.DumpRequestOut(req, true)
+		yellow(string(dump))
+		if req.Header.Get("Content-Type") != "application/octet-stream" {
+			curlCmd, _ := http2curl.GetCurlCommand(req)
+			cyan("CURL:", curlCmd, "\n")
+		}
+
+		dump, _ = httputil.DumpResponse(resp, true)
+		if resp.StatusCode < 300 {
+			green(string(dump))
+		} else if resp.StatusCode < 400 {
+			yellow(string(dump))
+		} else {
+			red(string(dump))
+		}
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Read body")
+	}
+
+	obj, err := jsonutils.Parse(body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Parse body %s", string(body))
+	}
+
+	// {"ResponseMetadata":{"RequestId":"202404021200176E2994C9222303CC731B","Action":"CreateUser","Version":"2018-01-01","Service":"iam","Region":"cn-beijing","Error":{"Code":"ParameterNotFound","Message":"The parameter 'UserName' is required."}}}
+	if obj.Contains("ResponseMetadata", "Error") {
+		ve := &sVolcError{StatusCode: resp.StatusCode}
+		obj.Unmarshal(ve, "ResponseMetadata")
+		return nil, ve
+	}
+
+	if obj.Contains("Result") {
+		return obj.Get("Result")
+	}
+	return obj, nil
 }
 
 func (client *SVolcEngineClient) getSdkCredential(region string, service string, token string) sdk.Credentials {
@@ -302,9 +416,31 @@ func (client *SVolcEngineClient) getDefaultCredential(region string, service str
 	return cred
 }
 
+type sVolcError struct {
+	StatusCode   int
+	RequestId    string
+	Action       string
+	Version      string
+	Service      string
+	Region       string
+	ErrorMessage struct {
+		Code    string
+		Message string
+	} `json:"Error"`
+}
+
+func (self *sVolcError) Error() string {
+	return jsonutils.Marshal(self).String()
+}
+
 func (client *SVolcEngineClient) ecsRequest(region string, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
 	cred := client.getDefaultCredential(region, VOLCENGINE_SERVICE_ECS)
 	return client.jsonRequest(cred, VOLCENGINE_API, VOLCENGINE_API_VERSION, apiName, params)
+}
+
+func (client *SVolcEngineClient) iam20210801Request(region string, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cred := client.getDefaultCredential(region, VOLCENGINE_SERVICE_IAM)
+	return client.jsonRequest(cred, VOLCENGINE_IAM_API, "2021-08-01", apiName, params)
 }
 
 func (client *SVolcEngineClient) iamRequest(region string, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
@@ -315,6 +451,15 @@ func (client *SVolcEngineClient) iamRequest(region string, apiName string, param
 func (client *SVolcEngineClient) getTosClient(regionId string) (*tos.ClientV2, error) {
 	tosClient, err := tos.NewClientV2(VOLCENGINE_TOS_API, tos.WithRegion(regionId), tos.WithCredentials(tos.NewStaticCredentials(client.accessKey, client.secretKey)))
 	return tosClient, err
+}
+
+func (client *SVolcEngineClient) billRequest(region string, apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	cred := client.getDefaultCredential(region, VOLCENGINE_SERVICE_BILLING)
+	domain := VOLCENGINE_API
+	if apiName == "QueryBalanceAcct" {
+		domain = VOLCENGINE_BILLING_API + "/open-apis/trade_balance"
+	}
+	return client.jsonRequest(cred, domain, VOLCENGINE_BILLING_API_VERSION, apiName, params)
 }
 
 // Buckets
@@ -379,7 +524,10 @@ func (region *SVolcEngineClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
+		cloudprovider.CLOUD_CAPABILITY_CLOUDID,
+		cloudprovider.CLOUD_CAPABILITY_SAML_AUTH,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
 	}
 	return caps
@@ -387,4 +535,26 @@ func (region *SVolcEngineClient) GetCapabilities() []string {
 
 func (client *SVolcEngineClient) GetAccessEnv() string {
 	return api.CLOUD_ACCESS_ENV_VOLCENGINE_CHINA
+}
+
+type SBalance struct {
+	AccountId        string
+	ArrearsBalance   float64
+	AvailableBalance float64
+	CashBalance      float64
+	CreditLimit      float64
+	FreezeAmount     float64
+}
+
+func (client *SVolcEngineClient) QueryBalance() (*SBalance, error) {
+	resp, err := client.billRequest("", "QueryBalanceAcct", nil)
+	if err != nil {
+		return nil, err
+	}
+	ret := &SBalance{}
+	err = resp.Unmarshal(ret)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal")
+	}
+	return ret, nil
 }

@@ -33,6 +33,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=servicecatalog
+// +onecloud:swagger-gen-model-plural=servicecatalogs
 type SServiceCatalogManager struct {
 	db.SSharableVirtualResourceBaseManager
 }
@@ -64,7 +66,7 @@ func (scm *SServiceCatalog) ValidateUpdateData(ctx context.Context, userCred mcc
 	data := jsonutils.NewDict()
 	if len(input.GuestTemplate) > 0 {
 		// check
-		model, err := GuestTemplateManager.FetchByIdOrName(userCred, input.GuestTemplate)
+		model, err := GuestTemplateManager.FetchByIdOrName(ctx, userCred, input.GuestTemplate)
 		if errors.Cause(err) == sql.ErrNoRows {
 			return nil, httperrors.NewResourceNotFoundError("no such guest template")
 		}
@@ -97,7 +99,7 @@ func (scm *SServiceCatalogManager) ValidateCreateData(ctx context.Context, userC
 		return nil, httperrors.NewMissingParameterError("guest_template")
 	}
 
-	model, err := GuestTemplateManager.FetchByIdOrName(userCred, input.GuestTemplate)
+	model, err := GuestTemplateManager.FetchByIdOrName(ctx, userCred, input.GuestTemplate)
 	if errors.Cause(err) == sql.ErrNoRows {
 		return nil, httperrors.NewResourceNotFoundError("no such guest template")
 	}
@@ -176,7 +178,7 @@ func (manager *SServiceCatalogManager) ListItemFilter(
 		return nil, errors.Wrap(err, "SSharableVirtualResourceBaseManager.ListItemFilter")
 	}
 	if len(input.GuestTemplateId) > 0 {
-		gtObj, err := GuestTemplateManager.FetchByIdOrName(userCred, input.GuestTemplateId)
+		gtObj, err := GuestTemplateManager.FetchByIdOrName(ctx, userCred, input.GuestTemplateId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(GuestTemplateManager.Keyword(), input.GuestTemplateId)

@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,6 +34,7 @@ import (
 	"yunion.io/x/pkg/util/version"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	hostapi "yunion.io/x/onecloud/pkg/apis/host"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
@@ -40,9 +43,11 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/isolated_device"
 	"yunion.io/x/onecloud/pkg/hostman/monitor"
+	"yunion.io/x/onecloud/pkg/hostman/monitor/qga"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
-	"yunion.io/x/onecloud/pkg/util/fileutils2"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/util/cgrouputils/cpuset"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/timeutils2"
@@ -60,40 +65,91 @@ type SGuestStopTask struct {
 	*SKVMGuestInstance
 	ctx            context.Context
 	timeout        int64
+	isFroce        bool
 	startPowerdown time.Time
+	c              chan context.Context
+
+	qgaStopping bool
+	qgaTiemout  int64
 }
 
-func NewGuestStopTask(guest *SKVMGuestInstance, ctx context.Context, timeout int64) *SGuestStopTask {
+func NewGuestStopTask(guest *SKVMGuestInstance, ctx context.Context, timeout int64, isForce bool) *SGuestStopTask {
 	return &SGuestStopTask{
 		SKVMGuestInstance: guest,
 		ctx:               ctx,
 		timeout:           timeout,
+		isFroce:           isForce,
 		startPowerdown:    time.Time{},
+		c:                 make(chan context.Context),
 	}
 }
 
 func (s *SGuestStopTask) Start() {
 	s.stopping = true
+	s.startPowerdown = time.Now()
 	if s.IsRunning() && s.IsMonitorAlive() {
-		s.Monitor.SimpleCommand("system_powerdown", s.onPowerdownGuest)
-	} else {
-		s.checkGuestRunning()
+		if s.guestAgent.GuestPing(1) == nil {
+			// qga stop first
+			if err := s.guestAgent.GuestStop(2); err != nil && err != qga.QgaReadTimeOutErr {
+				log.Errorf("failed qga guest stop %s", err)
+			} else {
+				s.qgaStopping = true
+				s.qgaTiemout = s.timeout / 2
+				if s.qgaTiemout > options.HostOptions.QgaStopTimeout {
+					s.qgaTiemout = options.HostOptions.QgaStopTimeout
+				}
+			}
+		}
+		if !s.qgaStopping {
+			s.Monitor.SimpleCommand("system_powerdown", s.onPowerdownGuest)
+		}
 	}
+	s.checkGuestRunning()
+}
+
+func (s *SGuestStopTask) StopNow(ctx context.Context) {
+	s.c <- ctx
 }
 
 func (s *SGuestStopTask) onPowerdownGuest(results string) {
 	//s.ExitCleanup(true)
-	s.startPowerdown = time.Now()
-	s.checkGuestRunning()
+	log.Debugf("system_powerdown callback successfully")
+	// s.checkGuestRunning()
 }
 
 func (s *SGuestStopTask) checkGuestRunning() {
-	if !s.IsRunning() || time.Now().Sub(s.startPowerdown) > time.Duration(s.timeout)*time.Second {
+	select {
+	case ctx := <-s.c:
 		s.Stop() // force stop
 		s.stopping = false
+		s.qgaStopping = false
+		if ctx != nil {
+			hostutils.TaskComplete(ctx, nil)
+		}
 		hostutils.TaskComplete(s.ctx, nil)
-	} else {
-		s.CheckGuestRunningLater()
+	case <-time.After(time.Second * 1):
+		if !s.IsRunning() {
+			s.Stop() // force stop
+			s.stopping = false
+			s.qgaStopping = false
+			hostutils.TaskComplete(s.ctx, nil)
+		} else if s.qgaStopping && time.Now().Sub(s.startPowerdown) > time.Duration(s.qgaTiemout)*time.Second {
+			// rollback acpi guest shutdown
+			s.qgaStopping = false
+			s.Monitor.SimpleCommand("system_powerdown", s.onPowerdownGuest)
+			go s.checkGuestRunning()
+		} else if time.Now().Sub(s.startPowerdown) > time.Duration(s.timeout)*time.Second {
+			// timeout
+			if s.isFroce {
+				s.Stop() // force stop
+				s.stopping = false
+				hostutils.TaskComplete(s.ctx, nil)
+			} else {
+				hostutils.TaskFailed(s.ctx, fmt.Sprintf("guest stop timeout after %d seconds", s.timeout))
+			}
+		} else {
+			go s.checkGuestRunning()
+		}
 	}
 }
 
@@ -152,7 +208,7 @@ func (s *SGuestSuspendTask) onSaveMemStateWait(results string) {
 
 func (s *SGuestSuspendTask) onSaveMemStateCheck(status string) {
 	if status == "failed" {
-		hostutils.TaskFailed(s.ctx, fmt.Sprintf("Save memory state failed"))
+		hostutils.TaskFailed(s.ctx, "Save memory state failed")
 		// TODO: send cont command
 		return
 	} else if status != "completed" {
@@ -167,7 +223,11 @@ func (s *SGuestSuspendTask) onSaveMemStateCheck(status string) {
 
 func (s *SGuestSuspendTask) onSaveMemStateComplete(_ *SGuestSuspendTask, _ string) {
 	log.Infof("Server %s memory state saved, stopping server", s.GetName())
-	s.ExecStopTask(s.ctx, int64(3))
+	params := &SGuestStopParams{
+		IsForce: true,
+		Timeout: 3,
+	}
+	s.ExecStopTask(s.ctx, params)
 }
 
 /**
@@ -267,7 +327,7 @@ func (d *SGuestDiskSyncTask) syncDisksConf() {
 	}
 	if idxs := d.guest.GetNeedMergeBackingFileDiskIndexs(); len(idxs) > 0 {
 		d.guest.StreamDisks(context.Background(),
-			func() { d.guest.streamDisksComplete(context.Background()) }, idxs,
+			func() { d.guest.streamDisksComplete(context.Background()) }, idxs, -1, -1,
 		)
 	}
 	d.callback(d.errors...)
@@ -291,7 +351,7 @@ func (d *SGuestDiskSyncTask) changeCdrom(cdrom *desc.SGuestCdrom) {
 				}
 				cb := func(res string) {
 					cdrom.Scsi.Options["drive"] = cdrom.Id
-					d.guest.Monitor.DeviceAdd(cdrom.Scsi.DevType, cdrom.Scsi.Options, cb2)
+					d.guest.Monitor.DeviceAdd(cdrom.Scsi.DevType, monitor.StringParams(cdrom.Scsi.Options), cb2)
 				}
 				params := map[string]string{}
 				for k, v := range cdrom.DriveOptions {
@@ -455,17 +515,58 @@ func (d *SGuestDiskSyncTask) checkDiskDriver(disk *desc.SGuestDisk) {
 		d.guest.Desc.VirtioScsi = &desc.SGuestVirtioScsi{
 			PCIDevice: desc.NewPCIDevice(*cType, "virtio-scsi-pci", "scsi"),
 		}
+		if err := d.guest.ensureDevicePciAddress(d.guest.Desc.VirtioScsi.PCIDevice, -1, nil); err != nil {
+			d.guest.Desc.VirtioScsi = nil
+
+			err = errors.Wrap(err, "ensureDevicePciAddress for virtio scsi device")
+			d.errors = append(d.errors, err)
+			d.syncDisksConf()
+			return
+		}
 		cb := func(ret string) {
 			log.Infof("Add scsi controller %s", ret)
 			d.checkDrivers = append(d.checkDrivers, DISK_DRIVER_SCSI)
 			d.startAddDisk(disk)
 		}
-		params := map[string]string{
+		params := map[string]interface{}{
 			"id":   d.guest.Desc.VirtioScsi.Id,
 			"bus":  d.guest.Desc.VirtioScsi.BusStr(),
 			"addr": d.guest.Desc.VirtioScsi.SlotFunc(),
 		}
 		d.guest.Monitor.DeviceAdd(d.guest.Desc.VirtioScsi.DevType, params, cb)
+	} else if disk.Driver == DISK_DRIVER_SATA && d.guest.Desc.SataController == nil {
+		// insert sata ahci controller
+		var cType = d.guest.getHotPlugPciControllerType()
+		if cType == nil {
+			err := errors.Errorf("failed get hotplugable pci controller")
+			d.errors = append(d.errors, err)
+			d.syncDisksConf()
+			return
+		}
+
+		d.guest.Desc.SataController = &desc.SGuestAhciDevice{
+			PCIDevice: desc.NewPCIDevice(*cType, "ahci", "ahci0"),
+		}
+
+		err := d.guest.ensureDevicePciAddress(d.guest.Desc.SataController.PCIDevice, -1, nil)
+		if err != nil {
+			d.guest.Desc.SataController = nil
+			err = errors.Wrap(err, "ensureDevicePciAddress sata controller")
+			d.errors = append(d.errors, err)
+			d.syncDisksConf()
+			return
+		}
+		cb := func(ret string) {
+			log.Infof("Add sata ahci controller %s", ret)
+			d.checkDrivers = append(d.checkDrivers, DISK_DRIVER_SATA)
+			d.startAddDisk(disk)
+		}
+		params := map[string]interface{}{
+			"id":   d.guest.Desc.SataController.Id,
+			"bus":  d.guest.Desc.SataController.BusStr(),
+			"addr": d.guest.Desc.SataController.SlotFunc(),
+		}
+		d.guest.Monitor.DeviceAdd(d.guest.Desc.SataController.DevType, params, cb)
 	} else {
 		d.startAddDisk(disk)
 	}
@@ -520,9 +621,13 @@ func (d *SGuestDiskSyncTask) startAddDisk(disk *desc.SGuestDisk) {
 		}
 		bus = d.guest.GetPciBus()
 	case DISK_DRIVER_IDE:
-		bus = fmt.Sprintf("ide.%d", diskIndex/2)
+		var busNum = diskIndex / 2
+		if d.guest.Desc.Machine == api.VM_MACHINE_TYPE_Q35 {
+			busNum = diskIndex
+		}
+		bus = fmt.Sprintf("ide.%d", busNum)
 	case DISK_DRIVER_SATA:
-		bus = fmt.Sprintf("ide.%d", diskIndex)
+		bus = fmt.Sprintf("ahci0.%d", diskIndex)
 	}
 	// drive_add bus is a placeholder
 	d.guest.Monitor.DriveAdd(bus, "", params, func(result string) { d.onAddDiskSucc(disk, result, cType) })
@@ -560,7 +665,7 @@ func (d *SGuestDiskSyncTask) onAddDiskSucc(disk *desc.SGuestDisk, results string
 	}
 
 	d.guest.Desc.Disks = append(d.guest.Desc.Disks, disk)
-	var params = map[string]string{
+	var params = map[string]interface{}{
 		"drive": fmt.Sprintf("drive_%d", diskIndex),
 		"id":    fmt.Sprintf("drive_%d", diskIndex),
 	}
@@ -589,11 +694,41 @@ type SGuestNetworkSyncTask struct {
 	addNics []*desc.SGuestNetwork
 	errors  []error
 
+	delNicCnt   int
+	addNicMacs  []string
+	addNicConfs []*monitor.NetworkModify
+
 	callback func(...error)
 }
 
 func (n *SGuestNetworkSyncTask) Start(callback func(...error)) {
 	n.callback = callback
+	if len(n.addNics) > 0 {
+		addNicMacs := make([]string, 0)
+		addNicConfs := make([]*monitor.NetworkModify, 0)
+		for i := range n.addNics {
+			addNicMacs = append(addNicMacs, n.addNics[i].Mac)
+			netMod := &monitor.NetworkModify{}
+			if len(n.addNics[i].Ip) > 0 {
+				netMod.Ipmask = fmt.Sprintf("%s/%d", n.addNics[i].Ip, n.addNics[i].Masklen)
+				netMod.Gateway = n.addNics[i].Gateway
+			}
+			if len(n.addNics[i].Ip6) > 0 {
+				netMod.Ip6mask = fmt.Sprintf("%s/%d", n.addNics[i].Ip6, n.addNics[i].Masklen6)
+			}
+			addNicConfs = append(addNicConfs, netMod)
+		}
+		n.addNicMacs = addNicMacs
+		n.addNicConfs = addNicConfs
+
+		// deploy nics configure before do add nics
+		allNics := append(n.guest.Desc.Nics, n.addNics...)
+		if err := n.guest.QgaDeployNicsConfigure(allNics); err != nil {
+			log.Errorf("failed do QgaDeployNicsConfigure %s", err)
+		}
+	}
+
+	n.delNicCnt = len(n.delNics)
 	n.syncNetworkConf()
 }
 
@@ -607,11 +742,75 @@ func (n *SGuestNetworkSyncTask) syncNetworkConf() {
 		n.addNics = n.addNics[:len(n.addNics)-1]
 		n.addNic(nic)
 	} else {
+		func() {
+			if len(n.addNicMacs) > 0 || n.delNicCnt > 0 {
+				// redeploy nics config after add/del nics
+				if err := n.guest.QgaDeployNicsConfigure(n.guest.Desc.Nics); err != nil {
+					log.Errorf("failed do QgaDeployNicsConfigure %s", err)
+					return
+				}
+			}
+			if len(n.addNicMacs) > 0 {
+				// try restart added nics, wait for added nic ready
+				time.Sleep(6 * time.Second)
+				if err := n.qgaRestartAddedNics(); err != nil {
+					log.Errorf("failed qgaRestartAddedNics %s", err)
+					return
+				}
+			}
+		}()
+
 		n.callback(n.errors...)
 	}
 }
 
+func (n *SGuestNetworkSyncTask) qgaRestartAddedNics() error {
+	err := n.qgaGetAddedNicDevs()
+	if err != nil {
+		return err
+	}
+	for i := range n.addNicConfs {
+		if n.addNicConfs[i].Device != "" {
+			err = n.guest.guestAgent.QgaRestartNetwork(n.addNicConfs[i])
+			if err != nil {
+				log.Errorf("Failed QgaRestartNetwork %s %s", n.addNicConfs[i].Device, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (n *SGuestNetworkSyncTask) qgaGetAddedNicDevs() error {
+	data, err := n.guest.guestAgent.QgaGetNetwork()
+	if err != nil {
+		return errors.Wrap(err, "QgaGetNetwork")
+	}
+	var parsedData []api.IfnameDetail
+	ifnames, err := jsonutils.Parse(data)
+	if err != nil {
+		return errors.Wrapf(err, "parse qga network output %s", data)
+	}
+	err = ifnames.Unmarshal(&parsedData)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal ifnames")
+	}
+	for i := range n.addNicMacs {
+		for j := range parsedData {
+			if n.addNicMacs[i] == parsedData[j].HardwareAddress {
+				n.addNicConfs[i].Device = parsedData[j].Name
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (n *SGuestNetworkSyncTask) removeNic(nic *desc.SGuestNetwork) {
+	if nic.Driver == "vfio-pci" {
+		n.onDeviceDel(nic)
+		return
+	}
+
 	callback := func(res string) {
 		if len(res) > 0 && !strings.Contains(res, "not found") {
 			log.Errorf("netdev del failed %s", res)
@@ -634,46 +833,50 @@ func (n *SGuestNetworkSyncTask) onNetdevDel(nic *desc.SGuestNetwork) {
 	n.delNicDevice(nic)
 }
 
+func (n *SGuestNetworkSyncTask) onDeviceDel(nic *desc.SGuestNetwork) {
+	var i = 0
+	for ; i < len(n.guest.Desc.Nics); i++ {
+		if n.guest.Desc.Nics[i].Index == nic.Index {
+			if nic.Pci != nil {
+				err := n.guest.pciAddrs.ReleasePCIAddress(nic.Pci.PCIAddr)
+				if err != nil {
+					log.Errorf("failed release nic pci addr %s", nic.Pci.PCIAddr)
+				}
+			}
+			break
+		}
+	}
+
+	if i < len(n.guest.Desc.Nics) {
+		n.guest.Desc.Nics = append(n.guest.Desc.Nics[:i], n.guest.Desc.Nics[i+1:]...)
+	}
+
+	n.syncNetworkConf()
+}
+
 func (n *SGuestNetworkSyncTask) delNicDevice(nic *desc.SGuestNetwork) {
 	callback := func(res string) {
 		if len(res) > 0 {
 			log.Errorf("network device del failed %s", res)
 			n.errors = append(n.errors, fmt.Errorf("network device del failed %s", res))
 		} else {
-			var i = 0
-			for ; i < len(n.guest.Desc.Nics); i++ {
-				if n.guest.Desc.Nics[i].Index == nic.Index {
-					if nic.Pci != nil {
-						err := n.guest.pciAddrs.ReleasePCIAddress(nic.Pci.PCIAddr)
-						if err != nil {
-							log.Errorf("failed release nic pci addr %s", nic.Pci.PCIAddr)
-						}
-					}
-					break
-				}
-			}
-
-			if i < len(n.guest.Desc.Nics) {
-				n.guest.Desc.Nics = append(n.guest.Desc.Nics[:i], n.guest.Desc.Nics[i+1:]...)
-			}
-
-			n.syncNetworkConf()
+			n.onDeviceDel(nic)
 		}
 	}
 	n.guest.Monitor.DeviceDel(fmt.Sprintf("netdev-%s", nic.Ifname), callback)
 }
 
 func (n *SGuestNetworkSyncTask) addNic(nic *desc.SGuestNetwork) {
-	if nic.Driver == "vfio-pci" {
-		// vfio device will add on isolated devices sync task
-		n.onDeviceAdd(nic)
-		return
-	}
-
 	if err := n.guest.generateNicScripts(nic); err != nil {
 		log.Errorln(err)
 		n.errors = append(n.errors, err)
 		n.syncNetworkConf()
+		return
+	}
+
+	if nic.Driver == "vfio-pci" {
+		// vfio device will add on isolated devices sync task
+		n.onDeviceAdd(nic)
 		return
 	}
 	var (
@@ -740,7 +943,7 @@ func (n *SGuestNetworkSyncTask) onNetdevAdd(nic *desc.SGuestNetwork, cType *desc
 		return
 	}
 
-	params := map[string]string{
+	params := map[string]interface{}{
 		"id":     fmt.Sprintf("netdev-%s", nic.Ifname),
 		"netdev": nic.Ifname,
 		"mac":    nic.Mac,
@@ -768,7 +971,7 @@ func (n *SGuestNetworkSyncTask) onDeviceAdd(nic *desc.SGuestNetwork) {
 func NewGuestNetworkSyncTask(
 	guest *SKVMGuestInstance, delNics, addNics []*desc.SGuestNetwork,
 ) *SGuestNetworkSyncTask {
-	return &SGuestNetworkSyncTask{guest, delNics, addNics, make([]error, 0), nil}
+	return &SGuestNetworkSyncTask{guest, delNics, addNics, make([]error, 0), 0, nil, nil, nil}
 }
 
 /**
@@ -901,7 +1104,7 @@ func (t *SGuestIsolatedDeviceSyncTask) addDevice(dev *desc.SGuestIsolatedDevice)
 		id := devObj.GetQemuId()
 		dev.VfioDevs = make([]*desc.VFIODevice, 0)
 		vfioDev := desc.NewVfioDevice(
-			*cType, "vfio-pci", id, devObj.GetAddr(), devObj.GetDeviceType() == api.GPU_VGA_TYPE,
+			*cType, "vfio-pci", id, devObj.GetAddr(), dev.GpuType == api.GPU_VGA,
 		)
 		dev.VfioDevs = append(dev.VfioDevs, vfioDev)
 
@@ -947,7 +1150,7 @@ func (t *SGuestIsolatedDeviceSyncTask) addDevice(dev *desc.SGuestIsolatedDevice)
 		}
 	}
 
-	opts, err := devObj.GetHotPlugOptions(dev)
+	opts, err := devObj.GetHotPlugOptions(dev, t.guest.Desc)
 	if err != nil {
 		cb(errors.Wrap(err, "GetHotPlugOptions").Error())
 		return
@@ -1049,11 +1252,26 @@ func (s *SGuestLiveMigrateTask) onSetAutoConverge(res string) {
 		return
 	}
 
-	// https://wiki.qemu.org/Features/AutoconvergeLiveMigration
+	s.Monitor.MigrateSetParameter("cpu-throttle-initial", options.HostOptions.LiveMigrateCpuThrottleInitial, s.onSetCpuThrottleInitial)
+}
+
+func (s *SGuestLiveMigrateTask) onSetCpuThrottleInitial(res string) {
+	if strings.Contains(strings.ToLower(res), "error") {
+		s.migrateFailed(fmt.Sprintf("Migrate set params cpu-throttle-initial error: %s", res))
+		return
+	}
+	s.Monitor.MigrateSetParameter("cpu-throttle-increment", options.HostOptions.LiveMigrateCpuThrottleIncrement, s.onSetCpuThrottleIncrement)
+}
+
+func (s *SGuestLiveMigrateTask) onSetCpuThrottleIncrement(res string) {
+	if strings.Contains(strings.ToLower(res), "error") {
+		s.migrateFailed(fmt.Sprintf("Migrate set params cpu-throttle-increment error: %s", res))
+		return
+	}
 	s.Monitor.MigrateSetCapability("events", "on", s.onMigrateEnableEvents)
 }
 
-func (s SGuestLiveMigrateTask) onMigrateEnableEvents(res string) {
+func (s *SGuestLiveMigrateTask) onMigrateEnableEvents(res string) {
 	if strings.Contains(strings.ToLower(res), "error") {
 		s.migrateFailed(fmt.Sprintf("Migrate set capability events error: %s", res))
 		return
@@ -1159,7 +1377,7 @@ func (s *SGuestLiveMigrateTask) waitMirrorJobsReady() {
 			s.waitMirrorJobsReady()
 			return
 		}
-		s.Monitor.Migrate(fmt.Sprintf("tcp:%s:%d", s.params.DestIp, s.params.DestPort),
+		s.Monitor.Migrate(fmt.Sprintf("tcp:%s", net.JoinHostPort(s.params.DestIp, strconv.Itoa(s.params.DestPort))),
 			false, false, s.setMaxBandwidth)
 	}
 	s.Monitor.GetBlockJobs(cb)
@@ -1178,7 +1396,13 @@ func (s *SGuestLiveMigrateTask) mirrorDisks(res string) {
 
 	i := s.diskDriverMirrorIndex
 	s.diskDriverMirrorIndex += 1
-	if utils.IsInStringArray(s.Desc.Disks[i].StorageType, api.STORAGE_LOCAL_TYPES) {
+
+	storageType := s.Desc.Disks[i].StorageType
+	if storageType == "" {
+		storageType = storageman.GetManager().GetStorage(s.Desc.Disks[i].StorageId).StorageType()
+	}
+
+	if utils.IsInStringArray(storageType, api.STORAGE_LOCAL_TYPES) {
 		var drive = fmt.Sprintf("drive_%d", s.Desc.Disks[i].Index)
 		var target = fmt.Sprintf("nbd:%s:%d:exportname=drive_%d", s.params.DestIp, s.params.NbdServerPort, s.Desc.Disks[i].Index)
 		var speed int64 = 0
@@ -1204,7 +1428,7 @@ func (s *SGuestLiveMigrateTask) doMigrate() {
 			// copy disk data
 			copyIncremental = true
 		}
-		s.Monitor.Migrate(fmt.Sprintf("tcp:%s:%d", s.params.DestIp, s.params.DestPort),
+		s.Monitor.Migrate(fmt.Sprintf("tcp:%s", net.JoinHostPort(s.params.DestIp, strconv.Itoa(s.params.DestPort))),
 			copyIncremental, false, s.setMaxBandwidth)
 	}
 }
@@ -1229,6 +1453,7 @@ func (s *SGuestLiveMigrateTask) startMigrateStatusCheck(res string) {
 		s.migrateFailed(fmt.Sprintf("Migrate error: %s", res))
 		return
 	}
+	s.startRamMigrateTimeout()
 
 	s.c = make(chan struct{})
 	for s.c != nil {
@@ -1275,6 +1500,14 @@ func (s *SGuestLiveMigrateTask) onGetMigrateStatus(stats *monitor.MigrationInfo)
 	} else if status == "cancelled" {
 		s.migrateFailed(status)
 	} else if status == "active" {
+		if !s.doTimeoutMigrate && s.timeoutAt.Before(time.Now()) {
+			s.Monitor.SimpleCommand("stop", s.onMigrateStartPostcopy)
+			s.doTimeoutMigrate = true
+		}
+		if s.doTimeoutMigrate {
+			return
+		}
+
 		var (
 			ramRemain int64
 			mbps      float64
@@ -1565,7 +1798,7 @@ func (s *SGuestResumeTask) resumeGuest() {
 			return
 		}
 		s.Desc.IsVolatileHost = false
-		s.SaveLiveDesc(s.Desc)
+		SaveLiveDesc(s, s.Desc)
 	}
 
 	s.startTime = time.Now()
@@ -1584,7 +1817,7 @@ func (s *SGuestResumeTask) SetGetTaskData(f func() (jsonutils.JSONObject, error)
 func (s *SGuestResumeTask) onStartRunning() {
 	if s.Desc.IsVolatileHost {
 		s.Desc.IsVolatileHost = false
-		s.SaveLiveDesc(s.Desc)
+		SaveLiveDesc(s, s.Desc)
 	}
 
 	s.setCgroupPid()
@@ -1609,10 +1842,8 @@ func (s *SGuestResumeTask) onStartRunning() {
 
 	disksIdx := s.GetNeedMergeBackingFileDiskIndexs()
 	if len(disksIdx) > 0 {
-		s.SyncStatus("")
-		timeutils2.AddTimeout(
-			time.Second*time.Duration(options.HostOptions.AutoMergeDelaySeconds),
-			func() { s.startStreamDisks(disksIdx) })
+		s.startStreamDisks(disksIdx)
+		//s.SyncStatus("")
 	} else if options.HostOptions.AutoMergeBackingTemplate {
 		s.SyncStatus("")
 		timeutils2.AddTimeout(
@@ -1628,7 +1859,7 @@ func (s *SGuestResumeTask) startStreamDisks(disksIdx []int) {
 	s.startTime = time.Time{}
 	s.detachStartupTask()
 	if s.IsMonitorAlive() {
-		s.StreamDisks(s.ctx, func() { s.onStreamComplete(disksIdx) }, disksIdx)
+		s.StreamDisks(s.ctx, func() { s.onStreamComplete(disksIdx) }, disksIdx, -1, -1)
 	}
 }
 
@@ -1723,8 +1954,10 @@ func (s *SGuestBlockProgressBaseTask) onGetBlockJobs(jobs []monitor.BlockJob) {
 	}
 
 	diskCount := s.task.StreamingDiskCount()
+	streamedDiskCount := s.task.StreamingDiskCompletedCount()
 	if diskCount > 0 {
-		progress = float64(s.task.StreamingDiskCompletedCount())/float64(diskCount)*100.0 + 1.0/float64(diskCount)*progress
+		progress = float64(streamedDiskCount)/float64(diskCount)*100.0 + 1.0/float64(diskCount)*progress
+		log.Debugf("stream disk progress %v, streamedDiskCount %v, diskCount %v ", progress, streamedDiskCount, diskCount)
 	}
 	hostutils.UpdateServerProgress(context.Background(), s.GetId(), progress, mbps)
 	s.task.OnGetBlockJobs(jobs)
@@ -1749,12 +1982,18 @@ type SGuestStreamDisksTask struct {
 
 	c          chan struct{}
 	streamDevs []string
+	lvmBacking []string
+
+	progressTotalDiskCnt     int
+	progressCompletedDiskCnt int
 }
 
-func NewGuestStreamDisksTask(ctx context.Context, guest *SKVMGuestInstance, callback func(), disksIdx []int) *SGuestStreamDisksTask {
+func NewGuestStreamDisksTask(ctx context.Context, guest *SKVMGuestInstance, callback func(), disksIdx []int, totalCnt, completedCnt int) *SGuestStreamDisksTask {
 	task := &SGuestStreamDisksTask{
-		callback: callback,
-		disksIdx: disksIdx,
+		callback:                 callback,
+		disksIdx:                 disksIdx,
+		progressTotalDiskCnt:     totalCnt,
+		progressCompletedDiskCnt: completedCnt,
 	}
 	task.SGuestBlockProgressBaseTask = NewGuestBlockProgressBaseTask(ctx, guest, task)
 	return task
@@ -1783,25 +2022,43 @@ func (s *SGuestStreamDisksTask) checkBlockDrives() {
 
 func (s *SGuestStreamDisksTask) onBlockDrivesSucc(blocks []monitor.QemuBlock) {
 	s.streamDevs = []string{}
+	s.lvmBacking = []string{}
 	for _, block := range blocks {
 		if len(block.Inserted.File) > 0 && len(block.Inserted.BackingFile) > 0 {
-			var stream = false
-			idx := block.Device[len(block.Device)-1] - '0'
-			for i := 0; i < len(s.disksIdx); i++ {
-				if int(idx) == s.disksIdx[i] {
-					stream = true
+			if len(s.disksIdx) > 0 {
+				var stream = false
+				idx := block.Device[len(block.Device)-1] - '0'
+				for i := 0; i < len(s.disksIdx); i++ {
+					if int(idx) == s.disksIdx[i] {
+						stream = true
+					}
+				}
+				if !stream {
+					continue
 				}
 			}
-			if !stream {
-				continue
-			}
+
 			s.streamDevs = append(s.streamDevs, block.Device)
+			disk, err := storageman.GetManager().GetDiskByPath(block.Inserted.File)
+			if err == nil && disk.GetType() == api.STORAGE_SLVM {
+				s.lvmBacking = append(s.lvmBacking, block.Inserted.BackingFile)
+			} else {
+				log.Errorf("failed get disk by path %s: %s", block.Inserted.File, err)
+			}
 		}
 	}
-	log.Infof("Stream devices %s: %v", s.GetName(), s.streamDevs)
+	log.Infof("Stream devices %s: %v , backingfiles %v", s.GetName(), s.streamDevs, s.lvmBacking)
 	if len(s.streamDevs) == 0 {
 		s.taskComplete()
 	} else {
+		if len(s.disksIdx) == 0 {
+			for i := range s.streamDevs {
+				dev := s.streamDevs[i]
+				idx := dev[len(dev)-1] - '0'
+				s.disksIdx = append(s.disksIdx, int(idx))
+			}
+		}
+
 		s.startDoBlockStream()
 		s.SyncStatus("")
 	}
@@ -1818,10 +2075,18 @@ func (s *SGuestStreamDisksTask) startDoBlockStream() {
 }
 
 func (s *SGuestStreamDisksTask) StreamingDiskCompletedCount() int {
-	return len(s.disksIdx) - len(s.streamDevs) - 1
+	completedCnt := len(s.disksIdx) - len(s.streamDevs) - 1
+	if s.progressCompletedDiskCnt > 0 {
+		completedCnt += s.progressCompletedDiskCnt
+	}
+	return completedCnt
 }
 
 func (s *SGuestStreamDisksTask) StreamingDiskCount() int {
+	if s.progressTotalDiskCnt > 0 {
+		return s.progressTotalDiskCnt
+	}
+
 	return len(s.disksIdx)
 }
 
@@ -1836,9 +2101,16 @@ func (s *SGuestStreamDisksTask) OnGetBlockJobs(jobs []monitor.BlockJob) {
 	}
 }
 
+func (s *SGuestStreamDisksTask) deactivateLvmBackingFile() {
+	for _, lvPath := range s.lvmBacking {
+		storageman.TryDeactivateBackingLvs(lvPath)
+	}
+}
+
 func (s *SGuestStreamDisksTask) taskComplete() {
+	s.deactivateLvmBackingFile()
 	hostutils.UpdateServerProgress(context.Background(), s.Id, 100.0, 0.0)
-	s.SyncStatus("")
+	s.SyncStatus("Guest Disks Block Stream Complete")
 
 	if s.callback != nil {
 		s.callback()
@@ -1994,12 +2266,11 @@ func (s *SGuestDiskSnapshotTask) onReloadBlkdevSucc(res string) {
 }
 
 func (s *SGuestDiskSnapshotTask) onSnapshotBlkdevFail(reason string) {
-	snapshotDir := s.disk.GetSnapshotDir()
-	snapshotPath := path.Join(snapshotDir, s.snapshotId)
-	output, err := procutils.NewCommand("mv", "-f", snapshotPath, s.disk.GetPath()).Output()
-	if err != nil {
-		log.Errorf("mv %s to %s failed: %s, %s", snapshotPath, s.disk.GetPath(), err, output)
+	// rollback snapshot to disk file
+	if err := s.disk.RollbackDiskOnSnapshotFail(s.snapshotId); err != nil {
+		log.Errorf("failed do rollback %s", err)
 	}
+
 	hostutils.TaskFailed(s.ctx, fmt.Sprintf("Reload blkdev error: %s", reason))
 }
 
@@ -2017,99 +2288,269 @@ func (s *SGuestDiskSnapshotTask) onResumeSucc(res string) {
 
 type SGuestSnapshotDeleteTask struct {
 	*SGuestReloadDiskTask
-	deleteSnapshot  string
-	convertSnapshot string
-	pendingDelete   bool
+	deleteSnapshot string
+	snapshotIds    []string
+	encryptInfo    apis.SEncryptInfo
 
-	tmpPath string
+	onBlockJobComplete func() error
+	blockProgressTask  *SGuestBlockProgressBaseTask
+}
+
+func snapshotIdsForDelete(snapshotIds []string, storageType string) []string {
+	if !utils.IsInStringArray(storageType, []string{api.STORAGE_LVM, api.STORAGE_SLVM}) {
+		return snapshotIds
+	}
+	ret := make([]string, 0, len(snapshotIds))
+	for _, snapshotId := range snapshotIds {
+		ret = append(ret, "snap_"+snapshotId)
+	}
+	return ret
 }
 
 func NewGuestSnapshotDeleteTask(
 	ctx context.Context, s *SKVMGuestInstance, disk storageman.IDisk,
-	deleteSnapshot, convertSnapshot string, pendingDelete bool,
+	deleteSnapshot string, snapshotIds []string, encryptInfo apis.SEncryptInfo,
 ) *SGuestSnapshotDeleteTask {
 	return &SGuestSnapshotDeleteTask{
 		SGuestReloadDiskTask: NewGuestReloadDiskTask(ctx, s, disk),
 		deleteSnapshot:       deleteSnapshot,
-		convertSnapshot:      convertSnapshot,
-		pendingDelete:        pendingDelete,
+		snapshotIds:          snapshotIds,
+		encryptInfo:          encryptInfo,
 	}
 }
 
-func (s *SGuestSnapshotDeleteTask) Start() {
-	if err := s.doDiskConvert(); err != nil {
-		s.taskFailed(err.Error())
-	}
-	s.fetchDisksInfo(s.doReloadDisk)
+func (s *SGuestSnapshotDeleteTask) Start(totalDeleteSnapshotCount, deletedSnapshotCount int) {
+	s.startResolveBackingChain(totalDeleteSnapshotCount, deletedSnapshotCount)
 }
 
-func (s *SGuestSnapshotDeleteTask) doDiskConvert() error {
-	snapshotDir := s.disk.GetSnapshotDir()
-	snapshotPath := path.Join(snapshotDir, s.convertSnapshot)
-	img, err := qemuimg.NewQemuImage(snapshotPath)
+func (s *SGuestSnapshotDeleteTask) startResolveBackingChain(totalDeleteSnapshotCount, deletedSnapshotCount int) {
+	cleanupGraph, err := storageman.PrepareLocalSnapshotGraph(s.disk, s.snapshotIds)
 	if err != nil {
-		log.Errorln(err)
-		return err
+		s.taskFailed(err.Error())
+		return
 	}
-	convertedDisk := snapshotPath + ".tmp"
-	if err = img.Convert2Qcow2To(convertedDisk, true, "", "", ""); err != nil {
-		log.Errorln(err)
-		if fileutils2.Exists(convertedDisk) {
-			os.Remove(convertedDisk)
-		}
-		return err
+	snapshotDir := s.disk.GetSnapshotDir()
+	deleteSnapshot := s.deleteSnapshot
+	if utils.IsInStringArray(s.disk.GetType(), []string{api.STORAGE_LVM, api.STORAGE_SLVM}) {
+		snapshotDir = path.Dir(snapshotDir)
+		deleteSnapshot = "snap_" + deleteSnapshot
 	}
+	plan, err := storageman.ResolveLocalSnapshotDeletePlan(snapshotDir, deleteSnapshot, snapshotIdsForDelete(s.snapshotIds, s.disk.GetType()), s.disk.GetPath(), nil)
+	cleanupGraph()
+	if err != nil {
+		s.taskFailed(err.Error())
+		return
+	}
+	log.Infof("ResolveLocalSnapshotDeletePlan %#v", plan)
 
-	s.tmpPath = snapshotPath + ".swap"
-	if output, err := procutils.NewCommand("mv", "-f", snapshotPath, s.tmpPath).Output(); err != nil {
-		log.Errorf("mv %s to %s failed: %s, %s", snapshotPath, s.tmpPath, err, output)
-		if fileutils2.Exists(s.tmpPath) {
-			procutils.NewCommand("mv", "-f", s.tmpPath, snapshotPath).Output()
-		}
-		return err
+	if plan.Action == storageman.LocalSnapshotRemove {
+		s.deleteInactiveSnapshot()
+		return
 	}
-	if output, err := procutils.NewCommand("mv", "-f", convertedDisk, snapshotPath).Output(); err != nil {
-		log.Errorf("mv %s to %s failed: %s, %s", convertedDisk, snapshotPath, err, output)
-		if fileutils2.Exists(s.tmpPath) {
-			procutils.NewCommand("mv", "-f", s.tmpPath, snapshotPath).Output()
-		}
-		return err
-	}
-	return nil
-}
-
-func (s *SGuestSnapshotDeleteTask) doReloadDisk(device string) {
-	s.SGuestReloadDiskTask.doReloadDisk(device, s.onReloadBlkdevSucc)
-}
-
-func (s *SGuestSnapshotDeleteTask) onReloadBlkdevSucc(err string) {
-	var callback = s.onResumeSucc
-	if len(err) > 0 {
-		callback = func(string) {
-			s.onSnapshotBlkdevFail(fmt.Sprintf("onReloadBlkdevFail %s", err))
-		}
-	}
-	s.Monitor.SimpleCommand("cont", callback)
-}
-
-func (s *SGuestSnapshotDeleteTask) onSnapshotBlkdevFail(res string) {
-	snapshotPath := path.Join(s.disk.GetSnapshotDir(), s.convertSnapshot)
-	if output, err := procutils.NewCommand("mv", "-f", s.tmpPath, snapshotPath).Output(); err != nil {
-		log.Errorf("mv %s to %s failed: %s, %s", s.tmpPath, snapshotPath, err, output)
-	}
-	s.taskFailed(fmt.Sprintf("Reload blkdev failed %s", res))
-}
-
-func (s *SGuestSnapshotDeleteTask) onResumeSucc(res string) {
-	log.Infof("guest do new snapshot task resume succ %s", res)
-	if len(s.tmpPath) > 0 {
-		output, err := procutils.NewCommand("rm", "-f", s.tmpPath).Output()
+	s.onBlockJobComplete = nil
+	s.Monitor.GetNamedBlockNodes(func(nodes []monitor.QemuNamedBlockNode, err error) {
 		if err != nil {
-			log.Errorf("rm %s failed: %s, %s", s.tmpPath, err, output)
+			s.taskFailed(err.Error())
+			return
+		}
+		nodeForPath := func(filePath string) string {
+			for i := range nodes {
+				if filepath.Clean(nodes[i].Filename()) == filepath.Clean(filePath) {
+					return nodes[i].NodeName
+				}
+			}
+			return ""
+		}
+		var childNode string
+		var onlineChild string
+		for _, child := range plan.Children {
+			childNode = nodeForPath(child)
+			if childNode != "" {
+				onlineChild = child
+				break
+			}
+		}
+		parentNode := nodeForPath(plan.Parent)
+		targetNode := nodeForPath(plan.Target)
+		if plan.Action == storageman.LocalSnapshotConvert && childNode == "" {
+			if err := s.disk.ConvertSnapshots(plan.Children, s.encryptInfo); err != nil {
+				s.taskFailed(fmt.Sprintf("ConvertSnapshots %v failed: %s", plan.Children, err))
+				return
+			}
+			s.onStreamDiskComplete()
+			return
+		}
+		if childNode == "" && targetNode == "" {
+			s.deleteInactiveSnapshot()
+			return
+		}
+		if childNode == "" || targetNode == "" || (plan.Action != storageman.LocalSnapshotPromote && plan.Action != storageman.LocalSnapshotConvert && parentNode == "") {
+			s.taskFailed(fmt.Sprintf("cannot map qcow2 nodes child=%q parent=%q target=%q", childNode, parentNode, targetNode))
+			return
+		}
+		// deviceNode is disk path
+		deviceNode := nodeForPath(s.disk.GetPath())
+		if plan.Action == storageman.LocalSnapshotCommit {
+			log.Infof("delete snapshot block-commit target=%s parent=%s device=%s children=%v online-child=%s", plan.Target, plan.Parent, deviceNode, plan.Children, onlineChild)
+			s.onBlockJobComplete = func() error {
+				children := make([]string, 0)
+				for i := range plan.Children {
+					if plan.Children[i] == onlineChild {
+						continue
+					}
+					children = append(children, plan.Children[i])
+				}
+				// force rebase other child
+				if err := s.disk.RebaseDiskSnapshots(plan.Parent, children, s.encryptInfo, true); err != nil {
+					log.Errorf("RebaseDiskSnapshots %v to %s failed: %s", children, plan.Parent, err)
+					return errors.Wrap(err, "RebaseDiskSnapshots")
+				}
+				return nil
+			}
+			s.Monitor.BlockCommit(deviceNode, targetNode, parentNode, s.startWatchBlockJobs)
+
+		} else if plan.Action == storageman.LocalSnapshotPromote {
+			log.Infof("delete snapshot mv promote target=%s base=%s", plan.Target, plan.Base)
+
+			if err := s.disk.RenameImage(plan.Target, plan.Base); err != nil {
+				s.taskFailed(fmt.Sprintf("promote snapshot base failed %s", err))
+				return
+			}
+			s.onBlockJobComplete = func() error {
+				// force rebase other child
+				if err := s.disk.RebaseDiskSnapshots(plan.Base, plan.Children, s.encryptInfo, true); err != nil {
+					return errors.Wrapf(err, "RebaseDiskSnapshots %s to %v failed", plan.Base, plan.Children)
+				}
+				return nil
+			}
+			s.promoteReloadDisk()
+		} else if plan.Action == storageman.LocalSnapshotConvert {
+			// convert children not in disk chain
+			children := make([]string, 0)
+			for i := range plan.Children {
+				if plan.Children[i] == onlineChild {
+					continue
+				}
+				children = append(children, plan.Children[i])
+			}
+			if err := s.disk.ConvertSnapshots(children, s.encryptInfo); err != nil {
+				log.Errorf("ConvertSnapshots %v failed: %s", children, err)
+				s.taskFailed(fmt.Sprintf("ConvertSnapshots %v failed: %s", children, err))
+				return
+			}
+			s.onStreamDiskComplete()
+		} else {
+			children := make([]string, 0)
+			for i := range plan.Children {
+				if plan.Children[i] == onlineChild {
+					continue
+				}
+				children = append(children, plan.Children[i])
+			}
+			// force rebase other child
+			if err := s.disk.RebaseDiskSnapshots(plan.Parent, children, s.encryptInfo, false); err != nil {
+				log.Errorf("RebaseDiskSnapshots %v to %s failed: %s", children, plan.Parent, err)
+				s.taskFailed(fmt.Sprintf("RebaseDiskSnapshots %v to %s failed: %s", children, plan.Parent, err))
+				return
+			}
+			log.Infof("delete snapshot block-stream rebase target=%s parent=%s device=%s children=%v online-child=%s", plan.Target, plan.Parent, deviceNode, plan.Children, onlineChild)
+			s.Monitor.BlockStreamToBase(childNode, parentNode, "snap_delete", s.startWatchBlockJobs)
+		}
+	})
+}
+
+func (s *SGuestSnapshotDeleteTask) startWatchBlockJobs(res string) {
+	if len(res) > 0 {
+		log.Errorf("block job start failed: %s", res)
+		s.taskFailed(fmt.Sprintf("block job start failed: %s", res))
+		return
+	}
+
+	s.blockProgressTask = NewGuestBlockProgressBaseTask(s.ctx, s.SKVMGuestInstance, s)
+	s.blockProgressTask.startWaitBlockJob("")
+}
+
+func (s *SGuestSnapshotDeleteTask) OnGetBlockJobs(jobs []monitor.BlockJob) {
+	if len(jobs) == 0 {
+		s.blockProgressTask.cancelWaitBlockJobs()
+		s.onStreamDiskComplete()
+	}
+}
+
+func (s *SGuestSnapshotDeleteTask) StreamingDiskCompletedCount() int {
+	return 0
+}
+
+func (s *SGuestSnapshotDeleteTask) StreamingDiskCount() int {
+	return 1
+}
+
+func (s *SGuestSnapshotDeleteTask) promoteReloadDisk() {
+	onResumeSucc := func(res string) {
+		log.Infof("onResumeSucc %s", res)
+		body := jsonutils.NewDict()
+		body.Set("deleted", jsonutils.JSONTrue)
+		hostutils.TaskComplete(s.ctx, body)
+	}
+
+	onReloadGuest := func(err string) {
+		if len(err) > 0 {
+			log.Errorf("monitor new snapshot blkdev error: %s", err)
+		}
+		s.Monitor.SimpleCommand("cont", onResumeSucc)
+	}
+
+	onFetchDisksInfo := func(device string) {
+		s.Monitor.SimpleCommand("stop", func(string) {
+			path := s.disk.GetPath()
+			if s.isEncrypted() {
+				path = qemuimg.GetQemuFilepath(path, "sec0", qemuimg.EncryptFormatLuks)
+			}
+			if err := s.onBlockJobComplete(); err != nil {
+				s.taskFailed(err.Error())
+				return
+			}
+
+			s.Monitor.ReloadDiskBlkdev(device, path, onReloadGuest)
+		})
+	}
+
+	s.fetchDisksInfo(onFetchDisksInfo)
+}
+
+func (s *SGuestSnapshotDeleteTask) deleteInactiveSnapshot() {
+	if err := s.disk.DeleteSnapshot(s.deleteSnapshot, s.snapshotIds, s.encryptInfo); err != nil {
+		s.taskFailed(err.Error())
+		return
+	}
+	body := jsonutils.NewDict()
+	body.Set("deleted", jsonutils.JSONTrue)
+	hostutils.TaskComplete(s.ctx, body)
+}
+
+func (s *SGuestSnapshotDeleteTask) startBlockStream(totalDeleteSnapshotCount, deletedSnapshotCount int) {
+	diskIdx := []int{}
+	for i := range s.Desc.Disks {
+		if s.Desc.Disks[i].DiskId == s.disk.GetId() {
+			diskIdx = append(diskIdx, int(s.Desc.Disks[i].Index))
+			break
 		}
 	}
-	if !s.pendingDelete {
-		s.disk.DoDeleteSnapshot(s.deleteSnapshot)
+	s.StreamDisks(s.ctx, s.onStreamDiskComplete, diskIdx, totalDeleteSnapshotCount, deletedSnapshotCount)
+}
+
+func (s *SGuestSnapshotDeleteTask) onStreamDiskComplete() {
+	if s.onBlockJobComplete != nil {
+		if err := s.onBlockJobComplete(); err != nil {
+			hostutils.TaskFailed(s.ctx, err.Error())
+			return
+		}
+	}
+
+	// remove snapshot file
+	if err := s.disk.DoDeleteSnapshot(s.deleteSnapshot); err != nil {
+		hostutils.TaskFailed(s.ctx, err.Error())
+		return
 	}
 	body := jsonutils.NewDict()
 	body.Set("deleted", jsonutils.JSONTrue)
@@ -2317,17 +2758,17 @@ type SGuestOnlineResizeDiskTask struct {
 	*SKVMGuestInstance
 
 	ctx    context.Context
-	diskId string
+	disk   storageman.IDisk
 	sizeMB int64
 }
 
 func NewGuestOnlineResizeDiskTask(
-	ctx context.Context, s *SKVMGuestInstance, diskId string, sizeMB int64,
+	ctx context.Context, s *SKVMGuestInstance, disk storageman.IDisk, sizeMB int64,
 ) *SGuestOnlineResizeDiskTask {
 	return &SGuestOnlineResizeDiskTask{
 		SKVMGuestInstance: s,
 		ctx:               ctx,
-		diskId:            diskId,
+		disk:              disk,
 		sizeMB:            sizeMB,
 	}
 }
@@ -2349,22 +2790,32 @@ func (task *SGuestOnlineResizeDiskTask) OnGetBlocksSucc(blocks []monitor.QemuBlo
 			}
 			image, _ = fileJson.GetString("file", "image")
 		}
-		if len(blocks[i].Inserted.File) > 0 && strings.HasSuffix(blocks[i].Inserted.File, task.diskId) || image == task.diskId {
+		if len(blocks[i].Inserted.File) > 0 && strings.HasSuffix(blocks[i].Inserted.File, task.disk.GetId()) || image == task.disk.GetId() {
+			if err := task.disk.PreResize(task.ctx, task.sizeMB); err != nil {
+				hostutils.TaskFailed(task.ctx, fmt.Sprintf("disk %s preResize failed %s", task.disk.GetId(), err))
+				return
+			}
 			task.Monitor.ResizeDisk(blocks[i].Device, task.sizeMB, task.OnResizeSucc)
 			return
 		}
 	}
-	hostutils.TaskFailed(task.ctx, fmt.Sprintf("disk %s not found on this guest", task.diskId))
+	hostutils.TaskFailed(task.ctx, fmt.Sprintf("disk %s not found on this guest", task.disk.GetId()))
 }
 
 func (task *SGuestOnlineResizeDiskTask) OnResizeSucc(err string) {
 	if len(err) == 0 {
+		if e := task.guestAgent.GuestPing(1); e == nil {
+			if e := task.guestAgent.QgaResizeDisk(task.disk.GetId()); e != nil {
+				log.Errorf("failed qga resize disk %s: %s", task.disk.GetId(), e)
+			}
+		}
+
 		params := jsonutils.NewDict()
 		params.Add(jsonutils.NewInt(task.sizeMB), "disk_size")
 		hostutils.TaskComplete(task.ctx, params)
 		return
 	}
-	hostutils.TaskFailed(task.ctx, fmt.Sprintf("resize disk %s %dMb error: %v", task.diskId, task.sizeMB, err))
+	hostutils.TaskFailed(task.ctx, fmt.Sprintf("resize disk %s %dMb error: %v", task.disk.GetId(), task.sizeMB, err))
 }
 
 /**
@@ -2374,32 +2825,59 @@ func (task *SGuestOnlineResizeDiskTask) OnResizeSucc(err string) {
 type SGuestHotplugCpuMemTask struct {
 	*SKVMGuestInstance
 
-	ctx         context.Context
-	addCpuCount int
-	addMemSize  int
+	ctx             context.Context
+	addCpuCount     int
+	addMemSize      int
+	addMemNodeIndex int
 
 	originalCpuCount int
 	addedCpuCount    int
+	addedVcpuIds     []int
+	cpuNumaPin       []*desc.SCpuNumaPin
+	cpuList          []monitor.HotpluggableCPU
 
-	addedMemSize    int
-	memSlotNewIndex *int
-	memSlot         *desc.SMemSlot
+	addedMemSize     int
+	memSlotNewIndex  *int
+	memSlotNewIndexs []int
+	memSlots         []*desc.SMemSlot
 }
 
 func NewGuestHotplugCpuMemTask(
-	ctx context.Context, s *SKVMGuestInstance, addCpuCount, addMemSize int,
+	ctx context.Context, s *SKVMGuestInstance, input *SGuestHotplugCpuMem,
 ) *SGuestHotplugCpuMemTask {
-	return &SGuestHotplugCpuMemTask{
+	t := &SGuestHotplugCpuMemTask{
 		SKVMGuestInstance: s,
 		ctx:               ctx,
-		addCpuCount:       addCpuCount,
-		addMemSize:        addMemSize,
+		addCpuCount:       int(input.AddCpuCount),
+		addMemSize:        int(input.AddMemSize),
+		cpuNumaPin:        input.CpuNumaPin,
 	}
+	if input.TotalCpuCount != nil && input.AddCpuCount > 0 {
+		if s.Desc.Cpu > *input.TotalCpuCount {
+			addedCpuCount := int(s.Desc.Cpu - *input.TotalCpuCount)
+			t.addCpuCount -= addedCpuCount
+		}
+	}
+	log.Infof("guest %s add cpu count %d", s.Id, t.addCpuCount)
+	if input.TotalMemSize != nil && input.AddMemSize > 0 {
+		if s.Desc.Mem > *input.TotalMemSize {
+			addedMemSize := int(s.Desc.Mem - *input.TotalMemSize)
+			t.addMemSize -= addedMemSize
+		}
+	}
+	log.Infof("guest %s add mem size %d", s.Id, t.addMemSize)
+	return t
 }
 
 // First at all add cpu count, second add mem size
 func (task *SGuestHotplugCpuMemTask) Start() {
 	if task.addCpuCount > 0 {
+		res, err := task.getHotpluggableCPUList()
+		if err != nil {
+			task.onFail(err.Error())
+			return
+		}
+		task.cpuList = res
 		task.startAddCpu()
 	} else if task.addMemSize > 0 {
 		task.startAddMem()
@@ -2409,7 +2887,79 @@ func (task *SGuestHotplugCpuMemTask) Start() {
 }
 
 func (task *SGuestHotplugCpuMemTask) startAddCpu() {
-	task.Monitor.GetCpuCount(task.onGetCpuCount)
+	if task.Desc.MemDesc.Mem != nil && task.Desc.MemDesc.Mem.Cpus != nil && len(task.Desc.CpuNumaPin) > 0 {
+		task.buildVcpusMap()
+	} else {
+		task.Monitor.GetCpuCount(task.onGetCpuCount)
+	}
+}
+
+func (task *SGuestHotplugCpuMemTask) buildVcpusMap() {
+	vcpuSet, _ := cpuset.Parse(*task.Desc.MemDesc.Mem.Cpus)
+
+	for i := range task.Desc.MemDesc.Mem.Mems {
+		if task.Desc.MemDesc.Mem.Mems[i].Cpus != nil {
+			memVcpuSet, _ := cpuset.Parse(*task.Desc.MemDesc.Mem.Mems[i].Cpus)
+			vcpuSet = vcpuSet.Union(memVcpuSet)
+		}
+	}
+
+	allocatedVcpus := make([]int, 0)
+	for i := range task.Desc.CpuNumaPin {
+		for j := range task.Desc.CpuNumaPin[i].VcpuPin {
+			allocatedVcpus = append(allocatedVcpus, task.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu)
+		}
+	}
+	allocatedCpuset := cpuset.NewCPUSet(allocatedVcpus...)
+	vcpuSet = vcpuSet.Difference(allocatedCpuset)
+
+	task.startAddCpusWithFreeVcpuSet(vcpuSet.ToSlice())
+}
+
+func (task *SGuestHotplugCpuMemTask) startAddCpusWithFreeVcpuSet(vcpuSet []int) {
+	for i := range vcpuSet {
+		vcpuId := vcpuSet[i]
+		err := task.AddCpu(task.cpuList, vcpuSet[i])
+		if err != nil {
+			log.Errorf("failed add cpu %d: %s", vcpuSet[i], err)
+			task.onFail(err.Error())
+			return
+		}
+
+		if len(task.cpuNumaPin) > 0 {
+			for i := range task.cpuNumaPin {
+				for j := range task.cpuNumaPin[i].VcpuPin {
+					if task.cpuNumaPin[i].VcpuPin[j].Vcpu == -1 {
+						task.cpuNumaPin[i].VcpuPin[j].Vcpu = vcpuId
+					}
+				}
+			}
+		} else {
+			cpus, _ := task.manager.cpuSet.AllocCpuset(1, 0, nil, task.GetId())
+			for _, cpus := range cpus {
+				//pcpus := cpuset.NewCPUSet(cpus.Cpuset...).String()
+				//vcpus := fmt.Sprintf("%d-%d", vcpuId, vcpuId)
+				vcpuPin := make([]desc.SVCpuPin, 1)
+				vcpuPin[0].Pcpu = cpus.Cpuset[0]
+				vcpuPin[0].Vcpu = vcpuId
+				cpuPin := &desc.SCpuNumaPin{
+					SizeMB:    0,
+					VcpuPin:   vcpuPin,
+					Unregular: false,
+				}
+				task.Desc.CpuNumaPin = append(task.Desc.CpuNumaPin, cpuPin)
+			}
+		}
+		if task.addedVcpuIds == nil {
+			task.addedVcpuIds = []int{vcpuId}
+		} else {
+			task.addedVcpuIds = append(task.addedVcpuIds, vcpuId)
+		}
+
+		task.addedCpuCount += 1
+	}
+
+	task.startAddMem()
 }
 
 func (task *SGuestHotplugCpuMemTask) onGetCpuCount(count int) {
@@ -2419,7 +2969,12 @@ func (task *SGuestHotplugCpuMemTask) onGetCpuCount(count int) {
 
 func (task *SGuestHotplugCpuMemTask) doAddCpu() {
 	if task.addedCpuCount < task.addCpuCount {
-		task.Monitor.AddCpu(task.originalCpuCount+task.addedCpuCount, task.onAddCpu)
+		err := task.AddCpu(task.cpuList, task.originalCpuCount+task.addedCpuCount)
+		ret := ""
+		if err != nil {
+			ret = err.Error()
+		}
+		task.onAddCpu(ret)
 	} else {
 		task.startAddMem()
 	}
@@ -2445,11 +3000,30 @@ func (task *SGuestHotplugCpuMemTask) startAddMem() {
 
 func (task *SGuestHotplugCpuMemTask) onGetSlotIndex(index int) {
 	var newIndex = index
+	if task.Desc.MemDesc.Mem != nil {
+		newIndex += len(task.Desc.MemDesc.Mem.Mems)
+	}
+
 	task.memSlotNewIndex = &newIndex
+
+	var addMemSize = task.addMemSize
+	var numaNodeDesc *desc.SCpuNumaPin
+	for i := task.addMemNodeIndex; i < len(task.cpuNumaPin); i++ {
+		if task.cpuNumaPin[i].SizeMB > 0 {
+			task.addMemNodeIndex = i + 1
+			numaNodeDesc = task.cpuNumaPin[i]
+			addMemSize = int(task.cpuNumaPin[i].SizeMB)
+			break
+		}
+	}
+	var hostNodes *uint16
+	if numaNodeDesc != nil {
+		hostNodes = numaNodeDesc.NodeId
+	}
 
 	var objType string
 	var id = fmt.Sprintf("mem%d", *task.memSlotNewIndex)
-	var options map[string]string
+	var opts map[string]string
 
 	if task.manager.host.IsHugepagesEnabled() {
 		memPath := fmt.Sprintf("/dev/hugepages/%s-%d", task.GetId(), index)
@@ -2462,7 +3036,7 @@ func (task *SGuestHotplugCpuMemTask) onGetSlotIndex(index int) {
 			return
 		}
 		err = procutils.NewRemoteCommandAsFarAsPossible("mount", "-t", "hugetlbfs", "-o",
-			fmt.Sprintf("pagesize=%dK,size=%dM", task.manager.host.HugepageSizeKb(), task.addMemSize),
+			fmt.Sprintf("pagesize=%dK,size=%dM", task.manager.host.HugepageSizeKb(), addMemSize),
 			fmt.Sprintf("hugetlbfs-%s-%d", task.GetId(), index),
 			memPath,
 		).Run()
@@ -2474,30 +3048,34 @@ func (task *SGuestHotplugCpuMemTask) onGetSlotIndex(index int) {
 		}
 
 		objType = "memory-backend-file"
-		options = map[string]string{
-			"size":     fmt.Sprintf("%dM", task.addMemSize),
+		opts = map[string]string{
+			"size":     fmt.Sprintf("%dM", addMemSize),
 			"mem-path": memPath,
 			"share":    "on",
 			"prealloc": "on",
 		}
+
+		if hostNodes != nil {
+			opts["host-nodes"] = fmt.Sprintf("%d", *hostNodes)
+			opts["policy"] = "bind"
+		}
+
 	} else {
 		objType = "memory-backend-ram"
-		options = map[string]string{
+		opts = map[string]string{
 			"size": fmt.Sprintf("%dM", task.addMemSize),
 		}
 	}
-	options["id"] = id
+	opts["id"] = id
 	cb := func(reason string) {
-		if reason == "" {
-			memObj := desc.NewObject(objType, id)
-			memObj.Options = options
-			task.memSlot = new(desc.SMemSlot)
-			task.memSlot.MemObj = memObj
-			task.memSlot.SizeMB = int64(task.addMemSize)
-		}
-		task.onAddMemObject(reason)
+		memObj := desc.NewMemDesc(objType, id, nil, nil)
+		memObj.Options = opts
+		memSlot := new(desc.SMemSlot)
+		memSlot.MemObj = memObj
+		memSlot.SizeMB = int64(addMemSize)
+		task.onAddMemObject(reason, memSlot)
 	}
-	task.Monitor.ObjectAdd(objType, options, cb)
+	task.Monitor.ObjectAdd(objType, opts, cb)
 }
 
 func (task *SGuestHotplugCpuMemTask) onAddMemFailed(reason string) {
@@ -2507,53 +3085,82 @@ func (task *SGuestHotplugCpuMemTask) onAddMemFailed(reason string) {
 	task.onFail(reason)
 }
 
-func (task *SGuestHotplugCpuMemTask) onAddMemObject(reason string) {
+func (task *SGuestHotplugCpuMemTask) onAddMemObject(reason string, memSlot *desc.SMemSlot) {
 	if len(reason) > 0 {
 		task.onAddMemFailed(reason)
 		return
 	}
-	params := map[string]string{
+	params := map[string]interface{}{
 		"id":     fmt.Sprintf("dimm%d", *task.memSlotNewIndex),
 		"memdev": fmt.Sprintf("mem%d", *task.memSlotNewIndex),
 	}
 	cb := func(reason string) {
 		if reason == "" {
-			task.memSlot.MemDev = &desc.SMemDevice{
+			memSlot.MemDev = &desc.SMemDevice{
 				Type: "pc-dimm",
 				Id:   fmt.Sprintf("dimm%d", *task.memSlotNewIndex),
 			}
 		}
-		task.onAddMemDevice(reason)
+		task.onAddMemDevice(reason, memSlot)
 	}
 
 	task.Monitor.DeviceAdd("pc-dimm", params, cb)
 }
 
-func (task *SGuestHotplugCpuMemTask) onAddMemDevice(reason string) {
+func (task *SGuestHotplugCpuMemTask) onAddMemDevice(reason string, memSlot *desc.SMemSlot) {
 	if len(reason) > 0 {
 		task.onAddMemFailed(reason)
 		return
 	}
-	task.addedMemSize = task.addMemSize
-	task.onSucc()
+	task.addedMemSize = int(memSlot.SizeMB)
+	task.addMemSize -= int(memSlot.SizeMB)
+	if task.memSlots == nil {
+		task.memSlots = []*desc.SMemSlot{memSlot}
+		task.memSlotNewIndexs = []int{*task.memSlotNewIndex}
+	} else {
+		task.memSlots = append(task.memSlots, memSlot)
+		task.memSlotNewIndexs = append(task.memSlotNewIndexs, *task.memSlotNewIndex)
+	}
+
+	if task.addMemSize > 0 {
+		task.startAddMem()
+	} else {
+		task.onSucc()
+	}
 }
 
 func (task *SGuestHotplugCpuMemTask) updateGuestDesc() {
 	task.Desc.Cpu += int64(task.addedCpuCount)
 	task.Desc.CpuDesc.Cpus += uint(task.addedCpuCount)
 	task.Desc.Mem += int64(task.addedMemSize)
+
+	if len(task.cpuNumaPin) > 0 {
+		task.Desc.CpuNumaPin = append(task.Desc.CpuNumaPin, task.cpuNumaPin...)
+	}
+
 	if task.addedMemSize > 0 {
 		if task.Desc.MemDesc.MemSlots == nil {
 			task.Desc.MemDesc.MemSlots = make([]*desc.SMemSlot, 0)
 		}
-		task.Desc.MemDesc.MemSlots = append(task.Desc.MemDesc.MemSlots, task.memSlot)
+		task.Desc.MemDesc.MemSlots = append(task.Desc.MemDesc.MemSlots, task.memSlots...)
+
+		if task.manager.hostagentNumaAllocate {
+			for i := range task.memSlotNewIndexs {
+				hugepageId := fmt.Sprintf("%s-%d", task.getOriginId(), task.memSlotNewIndexs[i])
+				task.validateNumaAllocated(hugepageId, false, true, nil)
+			}
+		}
+	}
+
+	if len(task.addedVcpuIds) > 0 {
+		task.setCgroupCPUSet()
 	}
 	if task.addedCpuCount > 0 && len(task.Desc.VcpuPin) == 1 {
 		task.Desc.VcpuPin[0].Vcpus = fmt.Sprintf("0-%d", task.Desc.Cpu-1)
 	}
 
 	if task.addedCpuCount > 0 || task.addedMemSize > 0 {
-		task.SaveLiveDesc(task.Desc)
+		SaveLiveDesc(task, task.Desc)
 	}
 	if task.addedMemSize > 0 {
 		vncPort := task.GetVncPort()
@@ -2580,7 +3187,12 @@ func (task *SGuestHotplugCpuMemTask) onFail(reason string) {
 
 func (task *SGuestHotplugCpuMemTask) onSucc() {
 	task.updateGuestDesc()
-	hostutils.TaskComplete(task.ctx, nil)
+
+	res := jsonutils.NewDict()
+	if len(task.cpuNumaPin) > 0 {
+		res.Set("cpu_numa_pin", jsonutils.Marshal(task.Desc.CpuNumaPin))
+	}
+	hostutils.TaskComplete(task.ctx, res)
 }
 
 type SGuestBlockIoThrottleTask struct {
@@ -2741,8 +3353,15 @@ func (t *SGuestStorageCloneDiskTask) Start(guestRunning bool) {
 		return
 	}
 
-	resp, err := t.params.TargetStorage.CloneDiskFromStorage(
-		t.ctx, t.params.SourceStorage, t.params.SourceDisk, t.params.TargetDiskId, !guestRunning)
+	encryptInfo, err := t.getEncryptKey(t.ctx, auth.AdminCredential())
+	if err != nil {
+		hostutils.TaskFailed(
+			t.ctx, fmt.Sprintf("failed get guest encrypt info %s", t.params.SourceDisk.GetId()),
+		)
+		return
+	}
+
+	resp, err := t.params.TargetStorage.CloneDiskFromStorage(t.ctx, t.params.SourceStorage, t.params.SourceDisk, t.params.TargetDiskId, !guestRunning, encryptInfo)
 	if err != nil {
 		hostutils.TaskFailed(
 			t.ctx, fmt.Sprintf("Clone disk %s to storage %s failed %s",
@@ -2913,7 +3532,7 @@ func (t *SGuestLiveChangeDisk) onReopenImageSuccess(res string) {
 			if t.Desc.Disks[i].Index == int8(t.diskIndex) {
 				log.Debugf("update guest disk %s desc", t.Desc.Disks[i].DiskId)
 				t.Desc.Disks[i].GuestdiskJsonDesc = *t.params.TargetDiskDesc
-				t.SaveLiveDesc(t.Desc)
+				SaveLiveDesc(t, t.Desc)
 				break
 			}
 		}

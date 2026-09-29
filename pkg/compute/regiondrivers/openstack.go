@@ -17,11 +17,10 @@ package regiondrivers
 import (
 	"context"
 	"database/sql"
-	"strings"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
@@ -37,21 +36,6 @@ type SOpenStackRegionDriver struct {
 func init() {
 	driver := SOpenStackRegionDriver{}
 	models.RegisterRegionDriver(&driver)
-}
-
-func (self *SOpenStackRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return true
-}
-
-func (self *SOpenStackRegionDriver) GenerateSecurityGroupName(name string) string {
-	if strings.ToLower(name) == "default" {
-		return "DefaultGroup"
-	}
-	return name
-}
-
-func (self *SOpenStackRegionDriver) GetSecurityGroupPublicScope(service string) rbacscope.TRbacScope {
-	return rbacscope.ScopeProject
 }
 
 func (self *SOpenStackRegionDriver) GetProvider() string {
@@ -74,7 +58,7 @@ func (self *SOpenStackRegionDriver) ValidateCreateEipData(ctx context.Context, u
 	if len(input.NetworkId) == 0 {
 		return httperrors.NewMissingParameterError("network_id")
 	}
-	_network, err := models.NetworkManager.FetchByIdOrName(userCred, input.NetworkId)
+	_network, err := models.NetworkManager.FetchByIdOrName(ctx, userCred, input.NetworkId)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return httperrors.NewResourceNotFoundError2("network", input.NetworkId)
@@ -139,4 +123,10 @@ func (self *SOpenStackRegionDriver) RequestDeleteLoadbalancerBackend(ctx context
 		return nil, cloudprovider.ErrNotImplemented
 	})
 	return nil
+}
+
+func (self *SOpenStackRegionDriver) GetSecurityGroupFilter(vpc *models.SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error) {
+	return func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Equals("cloudregion_id", vpc.CloudregionId)
+	}, nil
 }

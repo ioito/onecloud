@@ -54,18 +54,6 @@ func (self *SAwsProviderFactory) IsSupportPrepaidResources() bool {
 	return false
 }
 
-func (self *SAwsProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SAwsProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
-func (factory *SAwsProviderFactory) IsSystemCloudpolicyUnified() bool {
-	return false
-}
-
 func (factory *SAwsProviderFactory) IsSupportSAMLAuth() bool {
 	return true
 }
@@ -251,12 +239,12 @@ func (self *SAwsProvider) GetIamLoginUrl() string {
 	return self.client.GetIamLoginUrl()
 }
 
-func (self *SAwsProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAwsProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
 func (self *SAwsProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(aws.AWS_API_VERSION), "api_version")
@@ -334,12 +322,8 @@ func (self *SAwsProvider) CreateICloudgroup(name, desc string) (cloudprovider.IC
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SAwsProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SAwsProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SAwsProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SAwsProvider) GetIClouduserByName(name string) (cloudprovider.IClouduser, error) {
@@ -396,7 +380,7 @@ func (self *SAwsProvider) GetICloudroleById(id string) (cloudprovider.ICloudrole
 			return roles[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", id)
 }
 
 func (self *SAwsProvider) GetICloudroleByName(name string) (cloudprovider.ICloudrole, error) {
@@ -417,4 +401,12 @@ func (self *SAwsProvider) CreateICloudrole(opts *cloudprovider.SRoleCreateOption
 
 func (self *SAwsProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
 	return self.client.GetMetrics(opts)
+}
+
+func (self *SAwsProvider) GetICloudCDNDomains() ([]cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomains()
+}
+
+func (self *SAwsProvider) GetICloudCDNDomainByName(name string) (cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomainByName(name)
 }

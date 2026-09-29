@@ -29,6 +29,7 @@ import (
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	imageapi "yunion.io/x/onecloud/pkg/apis/image"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemutils"
@@ -36,8 +37,24 @@ import (
 )
 
 var (
-	ErrUnsupportedFormat = errors.Error("unsupported format")
+	ErrUnsupportedFormat     = errors.Error("unsupported format")
+	ErrBackingFileNotAllowed = errors.Error("image backing file is not allowed")
+
+	convertWorkInOrder = false
+	convertCoroutines  = 16
 )
+
+func SetConvertWorkInOrder(workInOrder bool) {
+	convertWorkInOrder = workInOrder
+}
+
+func SetConvertCoroutines(coroutines int) error {
+	if coroutines < 1 || coroutines > 16 {
+		return errors.Errorf("coroutines %d out of range 1-16", coroutines)
+	}
+	convertCoroutines = coroutines
+	return nil
+}
 
 type TIONiceLevel int
 
@@ -48,6 +65,23 @@ const (
 	IONiceBestEffort = TIONiceLevel(2)
 	IONiceIdle       = TIONiceLevel(3)
 )
+
+const DefaultConvertCorutines = 8
+
+const DefaultQcow2ClusterSize = 65536
+
+var preallocation = "metadata"
+
+func SetPreallocation(prealloc string) error {
+	if !utils.IsInStringArray(prealloc, []string{"", "disable", "metadata", "falloc", "full"}) {
+		return errors.Errorf("unsupported preallocation %s", prealloc)
+	}
+	if prealloc == "disable" {
+		prealloc = ""
+	}
+	preallocation = prealloc
+	return nil
+}
 
 type SQemuImage struct {
 	Path            string
@@ -100,7 +134,7 @@ func (img *SQemuImage) parse() error {
 		fileInfo, err := procutils.RemoteStat(img.Path)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				return err
+				return errors.Wrapf(err, "remote stat of %s", img.Path)
 			} else {
 				// not created yet
 				return nil
@@ -197,7 +231,11 @@ func (img *SQemuImage) parse() error {
 	img.ClusterSize = info.ClusterSize
 	img.Compat = info.FormatSpecific.Data.Compat
 	img.Encrypted = info.Encrypted
-	img.BackFilePath, err = ParseQemuFilepath(info.FullBackingFilename)
+	backing := info.FullBackingFilename
+	if backing == "" {
+		backing = info.BackingFilename
+	}
+	img.BackFilePath, err = ParseQemuFilepath(backing)
 	if err != nil {
 		return errors.Wrap(err, "ParseQemuFilepath")
 	}
@@ -215,6 +253,9 @@ func (img *SQemuImage) parse() error {
 	if img.Format == qemuimgfmt.RAW && fileutils2.IsFile(img.Path) && fileutils2.IsIsoFile(img.Path) {
 		img.Format = qemuimgfmt.ISO
 	}
+	if img.Format == qemuimgfmt.RAW && fileutils2.IsFile(img.Path) && (fileutils2.IsTarGzipFile(img.Path) || fileutils2.IsTarFile(img.Path)) {
+		img.Format = imageapi.IMAGE_DISK_FORMAT_TGZ
+	}
 	return nil
 }
 
@@ -229,6 +270,13 @@ func (img *SQemuImage) IsValid() bool {
 
 func (img *SQemuImage) IsChained() bool {
 	return len(img.BackFilePath) > 0
+}
+
+func (img *SQemuImage) CheckNoBackingFile() error {
+	if img.IsChained() {
+		return ErrBackingFileNotAllowed
+	}
+	return nil
 }
 
 func (img *SQemuImage) GetBackingChain() ([]string, error) {
@@ -254,10 +302,11 @@ const (
 )
 
 type SImageInfo struct {
-	Path     string
-	Format   qemuimgfmt.TImageFormat
-	IoLevel  TIONiceLevel
-	Password string
+	Path        string
+	Format      qemuimgfmt.TImageFormat
+	IoLevel     TIONiceLevel
+	Password    string
+	ClusterSize int
 
 	// only luks supported
 	EncryptFormat TEncryptFormat
@@ -340,13 +389,36 @@ func convertOther(srcInfo, destInfo SImageInfo, compact bool, workerOpions []str
 	} else {
 		cmdline = append(cmdline, workerOpions...)
 	}
+
+	if !utils.IsInStringArray("-W", workerOpions) && !convertWorkInOrder {
+		cmdline = append(cmdline, "-W")
+	}
+	if !utils.IsInStringArray("-m", workerOpions) && convertCoroutines != DefaultConvertCorutines {
+		cmdline = append(cmdline, "-m", strconv.Itoa(convertCoroutines))
+	}
+
 	if compact {
 		cmdline = append(cmdline, "-c")
+		if destInfo.ClusterSize <= 0 {
+			destInfo.ClusterSize = DefaultQcow2ClusterSize
+		}
 	}
 	cmdline = append(cmdline, "-f", srcInfo.Format.String(), "-O", destInfo.Format.String())
+
+	options := []string{}
 	if destInfo.Format.String() == "vmdk" { // for esxi vmdk
-		cmdline = append(cmdline, "-o")
-		cmdline = append(cmdline, vmdkOptions(compact)...)
+		options = append(options, vmdkOptions(compact)...)
+	}
+	if destInfo.Format == qemuimgfmt.QCOW2 {
+		if destInfo.ClusterSize > 0 {
+			options = append(options, fmt.Sprintf("cluster_size=%d", destInfo.ClusterSize))
+		} else if srcInfo.ClusterSize > 0 {
+			options = append(options, fmt.Sprintf("cluster_size=%d", srcInfo.ClusterSize))
+		}
+	}
+
+	if len(options) > 0 {
+		cmdline = append(cmdline, "-o", strings.Join(options, ","))
 	}
 	cmdline = append(cmdline, srcInfo.Path, destInfo.Path)
 	log.Infof("XXXX qemu-img command: %s", cmdline)
@@ -372,10 +444,13 @@ func convertEncrypt(srcInfo, destInfo SImageInfo, compact bool, workerOpions []s
 	if err != nil {
 		return errors.Wrapf(err, "NewQemuImage dest %s", destInfo.Path)
 	}
-	err = target.CreateQcow2(source.GetSizeMB(), compact, "", destInfo.Password, destInfo.EncryptFormat, destInfo.EncryptAlg)
-	if err != nil {
-		return errors.Wrapf(err, "Create target image %s", destInfo.Path)
+	if target.Format != qemuimgfmt.QCOW2 {
+		err = target.CreateQcow2(source.GetSizeMB(), compact, "", destInfo.Password, destInfo.EncryptFormat, destInfo.EncryptAlg)
+		if err != nil {
+			return errors.Wrapf(err, "Create target image %s", destInfo.Path)
+		}
 	}
+
 	cmdline := []string{"-c", strconv.Itoa(int(srcInfo.IoLevel)), qemutils.GetQemuImg(), "convert"}
 	if compact {
 		cmdline = append(cmdline, "-c")
@@ -389,6 +464,14 @@ func convertEncrypt(srcInfo, destInfo SImageInfo, compact bool, workerOpions []s
 	} else {
 		cmdline = append(cmdline, workerOpions...)
 	}
+
+	if !utils.IsInStringArray("-W", workerOpions) && !convertWorkInOrder {
+		cmdline = append(cmdline, "-W")
+	}
+	if !utils.IsInStringArray("-m", workerOpions) && convertCoroutines != DefaultConvertCorutines {
+		cmdline = append(cmdline, "-m", strconv.Itoa(convertCoroutines))
+	}
+
 	if srcInfo.Encrypted() {
 		if srcInfo.Format != qemuimgfmt.QCOW2 {
 			return errors.Wrap(errors.ErrNotSupported, "source image not support encryption")
@@ -436,9 +519,23 @@ func convertEncrypt(srcInfo, destInfo SImageInfo, compact bool, workerOpions []s
 	return nil
 }
 
+func isValidClusterSize(size int) bool {
+	if size < 512 || size > 2*1024*1024 {
+		return false
+	}
+	return true
+}
+
 func (img *SQemuImage) doConvert(targetPath string, format qemuimgfmt.TImageFormat, compact bool, password string, encryptFormat TEncryptFormat, encryptAlg seclib2.TSymEncAlg) error {
 	if !img.IsValid() {
 		return fmt.Errorf("self is not valid")
+	}
+	destClusterSize := img.ClusterSize
+	if compact {
+		destClusterSize = DefaultQcow2ClusterSize
+	}
+	if format == qemuimgfmt.QCOW2 && !isValidClusterSize(destClusterSize) {
+		destClusterSize = DefaultQcow2ClusterSize
 	}
 	return Convert(SImageInfo{
 		Path:     img.Path,
@@ -448,6 +545,7 @@ func (img *SQemuImage) doConvert(targetPath string, format qemuimgfmt.TImageForm
 
 		EncryptFormat: img.EncryptFormat,
 		EncryptAlg:    img.EncryptAlg,
+		ClusterSize:   img.ClusterSize,
 	}, SImageInfo{
 		Path:     targetPath,
 		Format:   format,
@@ -455,6 +553,7 @@ func (img *SQemuImage) doConvert(targetPath string, format qemuimgfmt.TImageForm
 
 		EncryptFormat: encryptFormat,
 		EncryptAlg:    encryptAlg,
+		ClusterSize:   destClusterSize,
 	}, compact, nil)
 }
 
@@ -609,7 +708,7 @@ func (img *SQemuImage) CloneRaw(name string) (*SQemuImage, error) {
 }
 
 func (img *SQemuImage) create(sizeMB int, format qemuimgfmt.TImageFormat, options []string, extraArgs []string) error {
-	if img.IsValid() {
+	if img.IsValid() && img.Format != qemuimgfmt.RAW {
 		return fmt.Errorf("create: the image is valid??? %s", img.Format)
 	}
 	args := []string{"-c", strconv.Itoa(int(img.IoLevel)),
@@ -687,6 +786,10 @@ func (img *SQemuImage) CreateQcow2(sizeMB int, compact bool, backPath string, pa
 		} else {
 			extraArgs = append(extraArgs, "-b", backPath)
 		}
+		if len(string(backQemu.Format)) > 0 {
+			extraArgs = append(extraArgs, "-F", string(backQemu.Format))
+		}
+
 		if !compact {
 			options = append(options, "cluster_size=2M")
 		}
@@ -695,8 +798,10 @@ func (img *SQemuImage) CreateQcow2(sizeMB int, compact bool, backPath string, pa
 		}
 	} else if !compact {
 		sparseOpts := qcow2SparseOptions()
-		if sizeMB <= 1024*1024*4 {
-			options = append(options, "preallocation=metadata")
+		if preallocation != "" {
+			if sizeMB <= 1024*1024*4 {
+				options = append(options, fmt.Sprintf("preallocation=%s", preallocation))
+			}
 		}
 		options = append(options, sparseOpts...)
 	}
@@ -705,7 +810,7 @@ func (img *SQemuImage) CreateQcow2(sizeMB int, compact bool, backPath string, pa
 			encFormat = EncryptFormatLuks
 		}
 		options = append(options, fmt.Sprintf("encrypt.format=%s", encFormat))
-		options = append(options, fmt.Sprintf("encrypt.key-secret=sec0"))
+		options = append(options, "encrypt.key-secret=sec0")
 		if encFormat == EncryptFormatLuks {
 			options = append(options, fmt.Sprintf("encrypt.cipher-alg=%s", encAlg))
 		}
@@ -787,7 +892,11 @@ func (img *SQemuImage) Rebase(backPath string, force bool) error {
 	if force {
 		args = append(args, "-u")
 	}
-	args = append(args, "-b", backPath)
+	backImg, err := NewQemuImage(backPath)
+	if err != nil {
+		return errors.Wrapf(err, "failed parse backpath %s", backPath)
+	}
+	args = append(args, "-b", backPath, "-F", backImg.Format.String())
 	cmd := procutils.NewRemoteCommandAsFarAsPossible("ionice", args...)
 	if runtime.GOOS == "darwin" {
 		args = args[2:]
@@ -798,6 +907,39 @@ func (img *SQemuImage) Rebase(backPath string, force bool) error {
 		return errors.Wrapf(err, "rebase %s", string(output))
 	}
 	return img.parse()
+}
+
+// Commit writes this image's allocated clusters into its immediate backing
+// image. Callers must rebase the child before removing this image.
+func (img *SQemuImage) Commit() error {
+	if !img.IsValid() {
+		return fmt.Errorf("self is not valid")
+	}
+	encInfo := SImageInfo{
+		Path:    img.Path,
+		Format:  img.Format,
+		IoLevel: img.IoLevel,
+	}
+	// Keep the top intact until callers have safely detached and removed it.
+	args := []string{"-c", strconv.Itoa(int(img.IoLevel)), qemutils.GetQemuImg(), "commit", "-d"}
+	if len(img.Password) > 0 {
+		encInfo.Password = img.Password
+		encInfo.EncryptFormat = img.EncryptFormat
+		encInfo.EncryptAlg = img.EncryptAlg
+		encInfo.secId = "sec0"
+		args = append(args, "--object", encInfo.SecretOptions())
+	}
+	args = append(args, "--image-opts", encInfo.ImageOptions())
+	cmd := procutils.NewRemoteCommandAsFarAsPossible("ionice", args...)
+	if runtime.GOOS == "darwin" {
+		args = args[2:]
+		cmd = procutils.NewRemoteCommandAsFarAsPossible(args[0], args[1:]...)
+	}
+	output, err := cmd.Output()
+	if err != nil {
+		return errors.Wrapf(err, "commit %s", string(output))
+	}
+	return nil
 }
 
 func (img *SQemuImage) Delete() error {
@@ -829,6 +971,10 @@ func (img *SQemuImage) Fallocate() error {
 
 func (img *SQemuImage) String() string {
 	return fmt.Sprintf("Qemu %s %d(%d) %s", img.Format, img.GetSizeMB(), img.GetActualSizeMB(), img.Path)
+}
+
+func (img *SQemuImage) String2ImageFormat() qemuimgfmt.TImageFormat {
+	return qemuimgfmt.String2ImageFormat(string(img.Format))
 }
 
 func (img *SQemuImage) WholeChainFormatIs(format string) (bool, error) {

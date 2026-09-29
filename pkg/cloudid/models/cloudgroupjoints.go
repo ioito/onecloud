@@ -31,6 +31,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SCloudgroupJointsManager struct {
 	db.SJointResourceBaseManager
 }
@@ -48,6 +49,7 @@ func NewCloudgroupJointsManager(dt interface{}, tableName string, keyword string
 	}
 }
 
+// +onecloud:swagger-gen-ignore
 type SCloudgroupJointsBase struct {
 	db.SJointResourceBase
 
@@ -120,7 +122,7 @@ func (manager *SCloudgroupJointsManager) ListItemFilter(
 	}
 
 	if len(query.Cloudgroup) > 0 {
-		group, err := CloudgroupManager.FetchByIdOrName(nil, query.Cloudgroup)
+		group, err := CloudgroupManager.FetchByIdOrName(ctx, nil, query.Cloudgroup)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("cloudgroup", query.Cloudgroup)

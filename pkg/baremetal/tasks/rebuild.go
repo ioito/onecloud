@@ -15,6 +15,7 @@
 package tasks
 
 import (
+	"context"
 	"fmt"
 
 	"yunion.io/x/jsonutils"
@@ -23,6 +24,8 @@ import (
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/ssh"
 )
+
+var _ IServerBaseDeployTask = new(SBaremetalServerRebuildTask)
 
 type SBaremetalServerRebuildTask struct {
 	SBaremetalServerBaseDeployTask
@@ -50,16 +53,16 @@ func (self *SBaremetalServerRebuildTask) RemoveEFIOSEntry() bool {
 	return true
 }
 
-func (self *SBaremetalServerRebuildTask) DoDeploys(term *ssh.Client) (jsonutils.JSONObject, error) {
+func (self *SBaremetalServerRebuildTask) DoDeploys(ctx context.Context, term *ssh.Client) (jsonutils.JSONObject, error) {
 	tool, err := self.Baremetal.GetServer().NewConfigedSSHPartitionTool(term)
 	if err != nil {
 		return nil, errors.Wrap(err, "NewConfigedSSHPartitionTool")
 	}
-	parts, err := self.Baremetal.GetServer().DoRebuildRootDisk(tool, term, self.IsDisableImageCache())
+	rootDisk, parts, err := self.Baremetal.GetServer().DoRebuildRootDisk(tool, term, self.IsDisableImageCache())
 	if err != nil {
 		return nil, fmt.Errorf("Rebuild root disk: %v", err)
 	}
-	disks, err := self.Baremetal.GetServer().SyncPartitionSize(term, parts)
+	disks, err := self.Baremetal.GetServer().SyncPartitionSize(term, rootDisk, parts)
 	if err != nil {
 		return nil, fmt.Errorf("SyncPartitionSize: %v", err)
 	}
@@ -73,7 +76,7 @@ func (self *SBaremetalServerRebuildTask) DoDeploys(term *ssh.Client) (jsonutils.
 	return data, nil
 }
 
-func (self *SBaremetalServerRebuildTask) PostDeploys(term *ssh.Client) error {
+func (self *SBaremetalServerRebuildTask) PostDeploys(ctx context.Context, term *ssh.Client) error {
 	if self.Baremetal.HasBMC() {
 		return doPoweroff(term)
 	}

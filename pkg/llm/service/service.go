@@ -1,0 +1,79 @@
+package service
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"yunion.io/x/log"
+	_ "yunion.io/x/sqlchemy/backends"
+
+	api "yunion.io/x/onecloud/pkg/apis/llm"
+	"yunion.io/x/onecloud/pkg/cloudcommon"
+	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
+	bench "yunion.io/x/onecloud/pkg/llm/benchmark"
+	_ "yunion.io/x/onecloud/pkg/llm/drivers/llm_client"
+	_ "yunion.io/x/onecloud/pkg/llm/drivers/llm_container"
+	"yunion.io/x/onecloud/pkg/llm/models"
+	"yunion.io/x/onecloud/pkg/llm/options"
+	_ "yunion.io/x/onecloud/pkg/llm/tasks"
+	llmTask "yunion.io/x/onecloud/pkg/llm/tasks/llm"
+)
+
+// StartService the main service starts
+func StartService() {
+	opts := &options.Options
+	commonOpts := &opts.CommonOptions
+	dbOpts := &options.Options.DBOptions
+	baseOpts := &opts.BaseOptions
+	common_options.ParseOptions(opts, os.Args, "llm.conf", api.SERVICE_TYPE)
+	bench.ConfigureArtifactStore(bench.ArtifactStoreOptions{
+		Endpoint:  opts.ArtifactS3Endpoint,
+		AccessKey: opts.ArtifactS3AccessKey,
+		SecretKey: opts.ArtifactS3SecretKey,
+		Bucket:    opts.ArtifactS3Bucket,
+		Secure:    opts.ArtifactS3Secure,
+		Prefix:    opts.ArtifactS3Prefix,
+	})
+
+	llmTask.InitInstantModelSyncTaskManager()
+	app_common.InitAuth(commonOpts, func() {
+		log.Infof("Auth complete!!")
+	})
+	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
+
+	app := app_common.InitApp(&opts.BaseOptions, false)
+
+	cloudcommon.InitDB(dbOpts)
+	InitHandlers(app, opts.IsSlaveNode)
+
+	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
+	defer cloudcommon.CloseDB()
+
+	// Pull the LLM model catalog (model sets + specs) from the configured
+	// source. opts.ModelCatalogURL accepts either an http(s) URL or a local
+	// file path — the manager picks the right loader based on the prefix.
+	// Non-blocking — the initial load runs in a goroutine.
+	models.GetLLMModelSetManager().Start(
+		context.Background(),
+		opts.ModelCatalogURL,
+		time.Duration(opts.LLMCatalogRefreshIntervalMinutes)*time.Minute,
+	)
+	startBackgroundWorkers(context.Background(), opts)
+
+	models.GetLLMImagesCatalogManager().Start(
+		context.Background(),
+		opts.LLMImagesCatalogURL,
+		time.Duration(opts.LLMCatalogRefreshIntervalMinutes)*time.Minute,
+	)
+
+	// if !opts.IsSlaveNode {
+	// 	models.InitializeCronjobs(app.GetContext())
+	// }
+
+	app_common.ServeForeverWithCleanup(app, baseOpts, func() {
+		cloudcommon.CloseDB()
+	})
+}

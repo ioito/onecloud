@@ -58,6 +58,8 @@ func GetAlertResourceManager() *SAlertResourceManager {
 	return alertResourceManager
 }
 
+// +onecloud:swagger-gen-model-singular=alertresource
+// +onecloud:swagger-gen-model-plural=alertresources
 type SAlertResourceManager struct {
 	db.SStandaloneResourceBaseManager
 }
@@ -332,6 +334,9 @@ func (res *SAlertResource) attachAlert(ctx context.Context, record *SAlertRecord
 	// create resource joint alert record into db
 	jm := GetAlertResourceAlertManager()
 	jObj, err := db.NewModelObject(jm)
+	if err != nil {
+		return errors.Wrap(err, "NewModelObject")
+	}
 	input := &monitor.AlertResourceAttachInput{
 		AlertResourceId: res.GetId(),
 		AlertId:         record.AlertId,
@@ -486,7 +491,7 @@ func (manager *SAlertResourceManager) GetAdminRoleUsers(ctx context.Context, use
 	session := auth.GetAdminSession(ctx, "")
 	rid, err := identity.RolesV3.GetId(session, "admin", jsonutils.NewDict())
 	if err != nil {
-		errors.Errorf("get role id error:%v", err)
+		errors.Errorf("get role admin id error: %v", err)
 		return
 	}
 	query.Add(jsonutils.NewString(rid), "role", "id")
@@ -494,13 +499,13 @@ func (manager *SAlertResourceManager) GetAdminRoleUsers(ctx context.Context, use
 		query.Set("offset", jsonutils.NewInt(int64(offset)))
 		result, err := identity.RoleAssignments.List(session, query)
 		if err != nil {
-			errors.Errorf("get admin role list error:%v", err)
+			errors.Errorf("get admin role list by query: %s, error: %v", query, err)
 			return
 		}
 		for _, roleAssign := range result.Data {
 			userId, err := roleAssign.GetString("user", "id")
 			if err != nil {
-				log.Errorf("roleAssign:%v", roleAssign)
+				log.Errorf("get user.id from roleAssign %s: %v", roleAssign, err)
 				continue
 			}
 			//_, err = .NotifyReceiver.GetById(session, userId, jsonutils.NewDict())

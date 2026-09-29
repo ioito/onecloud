@@ -1,0 +1,159 @@
+package models
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"yunion.io/x/jsonutils"
+
+	api "yunion.io/x/onecloud/pkg/apis/aiproxy"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+)
+
+func TestRejectProviderConfigAPIKeyInJSON(t *testing.T) {
+	obj, err := jsonutils.Parse([]byte(`{"config":{"api_key":"sk-test"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	err = rejectProviderConfigAPIKeyInJSON(obj)
+	if err == nil {
+		t.Fatal("expected error for config.api_key")
+	}
+	if !strings.Contains(err.Error(), "config.api_key is not supported") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRejectProviderConfigAPIKeyInJSONAllowsValidConfig(t *testing.T) {
+	obj, err := jsonutils.Parse([]byte(`{"config":{"base_url":"https://api.openai.com"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	err = rejectProviderConfigAPIKeyInJSON(obj)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAiProviderCreateInputDefaultsEnabled(t *testing.T) {
+	input := api.AiProviderCreateInput{
+		ProviderKey: "deepseek",
+		Secret:      "sk-test",
+	}
+	if input.Enabled != nil {
+		t.Fatal("expected enabled unset before defaulting")
+	}
+	if input.Disabled != nil {
+		t.Fatal("expected disabled unset before defaulting")
+	}
+	input.SetEnabled()
+	if input.Enabled == nil || !*input.Enabled {
+		t.Fatal("expected enabled=true after SetEnabled")
+	}
+}
+
+func TestResolveUpstreamAPIKeyNilProvider(t *testing.T) {
+	_, err := resolveUpstreamAPIKey(nil, "gpt-4o")
+	if err == nil {
+		t.Fatal("expected error for nil provider")
+	}
+}
+
+func TestValidateAiProviderConfigCustomRequiresBaseURL(t *testing.T) {
+	err := validateAiProviderConfig(nil, api.ProviderKeyCustom)
+	if err == nil {
+		t.Fatal("expected error when custom has no config")
+	}
+	err = validateAiProviderConfig(&api.SAiProviderConfig{}, api.ProviderKeyCustom)
+	if err == nil {
+		t.Fatal("expected error when custom base_url empty")
+	}
+}
+
+func TestValidateAiProviderConfigCustomAnthropic(t *testing.T) {
+	cfg := &api.SAiProviderConfig{
+		BaseURL: "https://llm.example.com/anthropic",
+		APIMode: api.ProviderAPIModeAnthropic,
+	}
+	if err := validateAiProviderConfig(cfg, api.ProviderKeyCustom); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAiProviderReferrerManagers(t *testing.T) {
+	managers := aiProviderReferrerManagers()
+	if len(managers) != 1 {
+		t.Fatalf("expected 1 referrer manager, got %d", len(managers))
+	}
+	if managers[0].KeywordPlural() != "ai_routing_models" {
+		t.Fatalf("expected ai_routing_models referrer, got %q", managers[0].KeywordPlural())
+	}
+}
+
+func TestAiProviderDeleteBusyErrors(t *testing.T) {
+	prov := &SAiProvider{}
+	prov.Name = "deepseek-1"
+	refCnts := map[db.IModelManager]int{
+		AiRoutingModelManager: 3,
+	}
+	errs := aiProviderDeleteBusyErrors(prov, refCnts)
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(errs))
+	}
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "deepseek-1") {
+		t.Fatalf("error should mention provider name: %q", msg)
+	}
+	if !strings.Contains(msg, "still referred to by") {
+		t.Fatalf("error should mention referred to: %q", msg)
+	}
+	if !strings.Contains(msg, "ai_routing_models") {
+		t.Fatalf("error should mention ai_routing_models: %q", msg)
+	}
+}
+
+func TestDeleteAiKeysByProviderIdRequiresProviderId(t *testing.T) {
+	err := deleteAiKeysByProviderId(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty provider id")
+	}
+}
+
+func TestDeleteAiModelsByProviderIdRequiresProviderId(t *testing.T) {
+	err := deleteAiModelsByProviderId(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty provider id")
+	}
+}
+
+func TestResolveProviderSecretForConnectivityEmptyId(t *testing.T) {
+	_, err := resolveProviderSecretForConnectivity(&SAiProvider{})
+	if err == nil {
+		t.Fatal("expected error for empty provider id")
+	}
+}
+
+func TestPerformSetModelsRequiresModelKeys(t *testing.T) {
+	p := &SAiProvider{}
+	_, err := p.PerformSetModels(context.Background(), nil, nil, api.AiProviderSetModelsInput{})
+	if err == nil {
+		t.Fatal("expected error for empty model_keys")
+	}
+}
+
+func TestCreateSelectedProviderModelsNilProvider(t *testing.T) {
+	if err := createSelectedProviderModels(context.Background(), nil, nil, nil, []string{"gpt-4"}); err != nil {
+		t.Fatalf("nil provider should no-op: %v", err)
+	}
+}
+
+func TestNormalizeProviderModelKeys(t *testing.T) {
+	got, err := normalizeProviderModelKeys([]string{" gpt-4 ", "gpt-4", "deepseek-v4-pro"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %v, want 2 unique keys", got)
+	}
+}

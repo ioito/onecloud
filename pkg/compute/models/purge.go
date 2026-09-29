@@ -31,20 +31,7 @@ import (
 )
 
 func (self *SCloudregion) purgeAll(ctx context.Context, managerId string) error {
-	zones, err := self.GetZones()
-	if err != nil {
-		return errors.Wrapf(err, "GetZones")
-	}
-	for i := range zones {
-		lockman.LockObject(ctx, &zones[i])
-		defer lockman.ReleaseObject(ctx, &zones[i])
-
-		err = zones[i].purgeAll(ctx, managerId)
-		if err != nil {
-			return errors.Wrapf(err, "zone purgeAll %s", zones[i].Name)
-		}
-	}
-	err = self.purgeAccessGroups(ctx, managerId)
+	err := self.purgeAccessGroups(ctx, managerId)
 	if err != nil {
 		return errors.Wrapf(err, "purgeAccessGroups")
 	}
@@ -76,8 +63,27 @@ func (self *SCloudregion) purgeAll(ctx context.Context, managerId string) error 
 	if err != nil {
 		return errors.Wrapf(err, "purgeResources")
 	}
+	err = self.purgeQuotas(ctx, managerId)
+	if err != nil {
+		return errors.Wrapf(err, "purgeQuotas")
+	}
 
-	cprCount, err := CloudproviderRegionManager.Query().Equals("cloudregion_id", self.Id).CountWithError()
+	// fix #20036 避免regional子网未删除, 导致zone残留
+	zones, err := self.GetZones()
+	if err != nil {
+		return errors.Wrapf(err, "GetZones")
+	}
+	for i := range zones {
+		lockman.LockObject(ctx, &zones[i])
+		defer lockman.ReleaseObject(ctx, &zones[i])
+
+		err = zones[i].purgeAll(ctx, managerId)
+		if err != nil {
+			return errors.Wrapf(err, "zone purgeAll %s", zones[i].Name)
+		}
+	}
+
+	cprCount, err := CloudproviderRegionManager.Query().Equals("cloudregion_id", self.Id).NotEquals("cloudprovider_id", managerId).CountWithError()
 	if err != nil {
 		return errors.Wrapf(err, "cpr count")
 	}
@@ -138,6 +144,8 @@ func (self *SCloudregion) purgeVpcs(ctx context.Context, managerId string) error
 	schedtags := NetworkschedtagManager.Query("row_id").In("network_id", networks.SubQuery())
 	nats := NatGatewayManager.Query("id").In("vpc_id", vpcs.SubQuery())
 	stables := NatSEntryManager.Query("id").In("natgateway_id", nats.SubQuery())
+	secgroups := SecurityGroupManager.Query("id").In("vpc_id", vpcs.SubQuery())
+	rules := SecurityGroupRuleManager.Query("id").In("secgroup_id", secgroups.SubQuery())
 
 	dtables := NatDEntryManager.Query("id").In("natgateway_id", nats.SubQuery())
 	routes := RouteTableManager.Query("id").In("vpc_id", vpcs.SubQuery())
@@ -146,6 +154,8 @@ func (self *SCloudregion) purgeVpcs(ctx context.Context, managerId string) error
 	ipv6 := IPv6GatewayManager.Query("id").In("vpc_id", vpcs.SubQuery())
 
 	pairs := []purgePair{
+		{manager: SecurityGroupRuleManager, key: "id", q: rules},
+		{manager: SecurityGroupManager, key: "id", q: secgroups},
 		{manager: IPv6GatewayManager, key: "id", q: ipv6},
 		{manager: VpcPeeringConnectionManager, key: "id", q: peers},
 		{manager: InterVpcNetworkRouteSetManager, key: "id", q: intervpcroutes},
@@ -196,8 +206,12 @@ func (self *SVpc) purge(ctx context.Context, userCred mcclient.TokenCredential) 
 	dnszones := DnsZoneVpcManager.Query("row_id").Equals("vpc_id", self.Id)
 	intervpcroutes := InterVpcNetworkRouteSetManager.Query("id").Equals("vpc_id", self.Id)
 	ipv6 := IPv6GatewayManager.Query("id").Equals("vpc_id", self.Id)
+	secgroups := SecurityGroupManager.Query("id").Equals("vpc_id", self.Id)
+	rules := SecurityGroupRuleManager.Query("id").In("secgroup_id", secgroups.SubQuery())
 
 	pairs := []purgePair{
+		{manager: SecurityGroupRuleManager, key: "id", q: rules},
+		{manager: SecurityGroupManager, key: "id", q: secgroups},
 		{manager: IPv6GatewayManager, key: "id", q: ipv6},
 		{manager: InterVpcNetworkRouteSetManager, key: "id", q: intervpcroutes},
 		{manager: DnsZoneVpcManager, key: "row_id", q: dnszones},
@@ -258,6 +272,20 @@ func (self *SNatGateway) purge(ctx context.Context, userCred mcclient.TokenCrede
 	return self.SInfrasResourceBase.Delete(ctx, userCred)
 }
 
+func (self *SCloudregion) purgeQuotas(ctx context.Context, managerId string) error {
+	quotas := CloudproviderQuotaManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	pairs := []purgePair{
+		{manager: CloudproviderQuotaManager, key: "id", q: quotas},
+	}
+	for i := range pairs {
+		err := pairs[i].purgeAll(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (self *SCloudregion) purgeResources(ctx context.Context, managerId string) error {
 	buckets := BucketManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	ess := ElasticSearchManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
@@ -268,26 +296,30 @@ func (self *SCloudregion) purgeResources(ctx context.Context, managerId string) 
 	mongodbs := MongoDBManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	nics := NetworkInterfaceManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	nicips := NetworkinterfacenetworkManager.Query("row_id").In("networkinterface_id", nics.SubQuery())
-	seccaches := SecurityGroupCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	policycaches := SnapshotPolicyCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	secgroups := SecurityGroupManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	rules := SecurityGroupRuleManager.Query("id").In("secgroup_id", secgroups.SubQuery())
+	policies := SnapshotPolicyManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	snapshots := SnapshotManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	tables := TablestoreManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	wafs := WafInstanceManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	ipsetcaches := WafIPSetCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	regsetcaches := WafRegexSetCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	wafgroups := WafRuleGroupCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	ipsets := WafIPSetManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	addressIpsets := IpSetManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	regsets := WafRegexSetManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	wafgroups := WafRuleGroupManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	cprs := CloudproviderRegionManager.Query("row_id").Equals("cloudprovider_id", managerId).Equals("cloudregion_id", self.Id)
 
 	pairs := []purgePair{
 		{manager: CloudproviderRegionManager, key: "row_id", q: cprs},
-		{manager: WafRuleGroupCacheManager, key: "id", q: wafgroups},
-		{manager: WafRegexSetCacheManager, key: "id", q: regsetcaches},
-		{manager: WafIPSetCacheManager, key: "id", q: ipsetcaches},
+		{manager: WafRuleGroupManager, key: "id", q: wafgroups},
+		{manager: WafRegexSetManager, key: "id", q: regsets},
+		{manager: WafIPSetManager, key: "id", q: ipsets},
+		{manager: IpSetManager, key: "id", q: addressIpsets},
 		{manager: WafInstanceManager, key: "id", q: wafs},
 		{manager: TablestoreManager, key: "id", q: tables},
 		{manager: SnapshotManager, key: "id", q: snapshots},
-		{manager: SnapshotPolicyCacheManager, key: "id", q: policycaches},
-		{manager: SecurityGroupCacheManager, key: "id", q: seccaches},
+		{manager: SnapshotPolicyManager, key: "id", q: policies},
+		{manager: SecurityGroupRuleManager, key: "id", q: rules},
+		{manager: SecurityGroupManager, key: "id", q: secgroups},
 		{manager: NetworkinterfacenetworkManager, key: "row_id", q: nicips},
 		{manager: NetworkInterfaceManager, key: "id", q: nics},
 		{manager: MongoDBManager, key: "id", q: mongodbs},
@@ -409,8 +441,6 @@ func (self *SCloudregion) purgeKubeClusters(ctx context.Context, managerId strin
 }
 
 func (self *SCloudregion) purgeLoadbalancers(ctx context.Context, managerId string) error {
-	cacheAcls := CachedLoadbalancerAclManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	cacheCerts := CachedLoadbalancerCertificateManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	lbs := LoadbalancerManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	lbnetworks := LoadbalancernetworkManager.Query("row_id").In("loadbalancer_id", lbs.SubQuery())
 	lblis := LoadbalancerListenerManager.Query("id").In("loadbalancer_id", lbs.SubQuery())
@@ -424,8 +454,6 @@ func (self *SCloudregion) purgeLoadbalancers(ctx context.Context, managerId stri
 		{manager: LoadbalancerBackendGroupManager, key: "id", q: lbbgs},
 		{manager: LoadbalancerListenerManager, key: "id", q: lblis},
 		{manager: LoadbalancernetworkManager, key: "row_id", q: lbnetworks},
-		{manager: CachedLoadbalancerCertificateManager, key: "id", q: cacheCerts},
-		{manager: CachedLoadbalancerAclManager, key: "id", q: cacheAcls},
 		{manager: LoadbalancerManager, key: "id", q: lbs},
 	}
 	for i := range pairs {
@@ -456,12 +484,14 @@ func (self *SCloudregion) purgeApps(ctx context.Context, managerId string) error
 
 func (self *SCloudregion) purgeAccessGroups(ctx context.Context, managerId string) error {
 	fs := FileSystemManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
-	ags := AccessGroupCacheManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
+	ags := AccessGroupManager.Query("id").Equals("manager_id", managerId).Equals("cloudregion_id", self.Id)
 	mts := MountTargetManager.Query("id").In("file_system_id", fs.SubQuery())
+	rules := AccessGroupRuleManager.Query("id").In("access_group_id", ags.SubQuery())
 
 	pairs := []purgePair{
+		{manager: AccessGroupRuleManager, key: "id", q: rules},
 		{manager: MountTargetManager, key: "id", q: mts},
-		{manager: AccessGroupCacheManager, key: "id", q: ags},
+		{manager: AccessGroupManager, key: "id", q: ags},
 		{manager: FileSystemManager, key: "id", q: fs},
 	}
 	for i := range pairs {
@@ -561,6 +591,11 @@ func (self *purgePair) purgeAll(ctx context.Context) error {
 				"delete from %s where %s in (%s)",
 				self.manager.TableSpec().Name(), self.key, placeholder,
 			)
+		case SecurityGroupRuleManager.Keyword():
+			sql = fmt.Sprintf(
+				"delete from %s where %s in (%s)",
+				self.manager.TableSpec().Name(), self.key, placeholder,
+			)
 		case NetworkAdditionalWireManager.Keyword():
 			sql = fmt.Sprintf("delete from `%s` where `wire_id` in (%s)",
 				self.manager.TableSpec().Name(), placeholder,
@@ -602,15 +637,15 @@ func (self *purgePair) purgeAll(ctx context.Context) error {
 func (self *SZone) purgeStorages(ctx context.Context, managerId string) error {
 	storages := StorageManager.Query("id").Equals("manager_id", managerId).Equals("zone_id", self.Id)
 	schedtags := StorageschedtagManager.Query("row_id").In("storage_id", storages.SubQuery())
-	snapshots := SnapshotManager.Query("id").In("storage_id", storages.SubQuery()).IsTrue("fake_deleted")
+	snapshots := SnapshotManager.Query("id").In("storage_id", storages.SubQuery())
 	hoststorages := HoststorageManager.Query("row_id").In("storage_id", storages.SubQuery())
 	disks := DiskManager.Query("id").In("storage_id", storages.SubQuery())
 	diskbackups := DiskBackupManager.Query("id").In("disk_id", disks.SubQuery())
 	guestdisks := GuestdiskManager.Query("row_id").In("disk_id", disks.SubQuery())
-	diskpolicies := SnapshotPolicyDiskManager.Query("row_id").In("disk_id", disks.SubQuery())
+	diskpolicies := SnapshotPolicyResourceManager.Query("resource_id").In("resource_id", disks.SubQuery())
 
 	pairs := []purgePair{
-		{manager: SnapshotPolicyDiskManager, key: "row_id", q: diskpolicies},
+		{manager: SnapshotPolicyResourceManager, key: "resource_id", q: diskpolicies},
 		{manager: GuestdiskManager, key: "row_id", q: guestdisks},
 		{manager: SnapshotManager, key: "id", q: snapshots},
 		{manager: DiskBackupManager, key: "id", q: diskbackups},
@@ -630,16 +665,14 @@ func (self *SZone) purgeStorages(ctx context.Context, managerId string) error {
 
 func (self *SStorage) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
 	schedtags := StorageschedtagManager.Query("row_id").Equals("storage_id", self.Id)
-	snapshots := SnapshotManager.Query("id").Equals("storage_id", self.Id).IsTrue("fake_deleted")
+	snapshots := SnapshotManager.Query("id").Equals("storage_id", self.Id)
 	hoststorages := HoststorageManager.Query("row_id").Equals("storage_id", self.Id)
 	disks := DiskManager.Query("id").Equals("storage_id", self.Id)
 	diskbackups := DiskBackupManager.Query("id").In("disk_id", disks.SubQuery())
 	guestdisks := GuestdiskManager.Query("row_id").In("disk_id", disks.SubQuery())
-	diskpolicies := SnapshotPolicyDiskManager.Query("row_id").In("disk_id", disks.SubQuery())
 
 	pairs := []purgePair{
 		{manager: GuestdiskManager, key: "row_id", q: guestdisks},
-		{manager: SnapshotPolicyDiskManager, key: "row_id", q: diskpolicies},
 		{manager: SnapshotManager, key: "id", q: snapshots},
 		{manager: DiskBackupManager, key: "id", q: diskbackups},
 		{manager: DiskManager, key: "id", q: disks},
@@ -659,6 +692,7 @@ func (self *SZone) purgeHosts(ctx context.Context, managerId string) error {
 	hosts := HostManager.Query("id").Equals("manager_id", managerId).Equals("zone_id", self.Id)
 	isolateds := IsolatedDeviceManager.Query("id").In("host_id", hosts.SubQuery())
 	hoststorages := HoststorageManager.Query("row_id").In("host_id", hosts.SubQuery())
+	hostbackupStorages := HostBackupstorageManager.Query("row_id").In("host_id", hosts.SubQuery())
 	hostwires := HostwireManagerDeprecated.Query("row_id").In("host_id", hosts.SubQuery())
 	guests := GuestManager.Query("id").In("host_id", hosts.SubQuery())
 	guestdisks := GuestdiskManager.Query("row_id").In("guest_id", guests.SubQuery())
@@ -707,6 +741,7 @@ func (self *SZone) purgeHosts(ctx context.Context, managerId string) error {
 		{manager: InstanceBackupManager, key: "id", q: instancebackups},
 		{manager: GuestManager, key: "id", q: guests},
 		{manager: HoststorageManager, key: "row_id", q: hoststorages},
+		{manager: HostBackupstorageManager, key: "row_id", q: hostbackupStorages},
 		{manager: HostwireManagerDeprecated, key: "row_id", q: hostwires},
 		{manager: IsolatedDeviceManager, key: "id", q: isolateds},
 		{manager: HostManager, key: "id", q: hosts},
@@ -723,6 +758,7 @@ func (self *SZone) purgeHosts(ctx context.Context, managerId string) error {
 func (self *SHost) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
 	isolateds := IsolatedDeviceManager.Query("id").Equals("host_id", self.Id)
 	hoststorages := HoststorageManager.Query("row_id").Equals("host_id", self.Id)
+	hostbackupStorages := HostBackupstorageManager.Query("row_id").Equals("host_id", self.Id)
 	hostwires := HostwireManagerDeprecated.Query("row_id").Equals("host_id", self.Id)
 	guests := GuestManager.Query("id").Equals("host_id", self.Id)
 	guestdisks := GuestdiskManager.Query("row_id").In("guest_id", guests.SubQuery())
@@ -763,6 +799,7 @@ func (self *SHost) purge(ctx context.Context, userCred mcclient.TokenCredential)
 		{manager: InstanceBackupManager, key: "id", q: instancebackups},
 		{manager: GuestManager, key: "id", q: guests},
 		{manager: HoststorageManager, key: "row_id", q: hoststorages},
+		{manager: HostBackupstorageManager, key: "row_id", q: hostbackupStorages},
 		{manager: HostwireManagerDeprecated, key: "row_id", q: hostwires},
 		{manager: IsolatedDeviceManager, key: "id", q: isolateds},
 	}
@@ -781,12 +818,14 @@ func (self *SHost) purge(ctx context.Context, userCred mcclient.TokenCredential)
 func (self *SGuest) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
 	guestdisks := GuestdiskManager.Query("row_id").Equals("guest_id", self.Id)
 	guestnetworks := GuestnetworkManager.Query("row_id").Equals("guest_id", self.Id)
+	// 辅助IP
+	networkaddress := NetworkAddressManager.Query("id").In("parent_id", guestnetworks.SubQuery())
 	guestcdroms := GuestcdromManager.Query("row_id").Equals("id", self.Id)
 	guestvfd := GuestFloppyManager.Query("row_id").Equals("id", self.Id)
 	guestgroups := GroupguestManager.Query("row_id").Equals("guest_id", self.Id)
 	guestsecgroups := GuestsecgroupManager.Query("row_id").Equals("guest_id", self.Id)
-	instancesnapshots := InstanceSnapshotManager.Query("id").Equals("guest_id", self.Id)
-	instancebackups := InstanceBackupManager.Query("id").Equals("guest_id", self.Id)
+	// instancesnapshots := InstanceSnapshotManager.Query("id").Equals("guest_id", self.Id)
+	// instancebackups := InstanceBackupManager.Query("id").Equals("guest_id", self.Id)
 	publicIps := ElasticipManager.Query("id").Equals("mode", api.EIP_MODE_INSTANCE_PUBLICIP).
 		Equals("associate_type", api.EIP_ASSOCIATE_TYPE_SERVER).Equals("associate_id", self.Id)
 	tapService := NetTapServiceManager.Query("id").Equals("type", api.TapServiceGuest).Equals("target_id", self.Id)
@@ -804,16 +843,21 @@ func (self *SGuest) purge(ctx context.Context, userCred mcclient.TokenCredential
 		{manager: GroupguestManager, key: "row_id", q: guestgroups},
 		{manager: GuestcdromManager, key: "row_id", q: guestcdroms},
 		{manager: GuestFloppyManager, key: "row_id", q: guestvfd},
+		{manager: NetworkAddressManager, key: "id", q: networkaddress},
 		{manager: GuestnetworkManager, key: "row_id", q: guestnetworks},
 		{manager: GuestdiskManager, key: "row_id", q: guestdisks},
-		{manager: InstanceSnapshotManager, key: "id", q: instancesnapshots},
-		{manager: InstanceBackupManager, key: "id", q: instancebackups},
+		// {manager: InstanceSnapshotManager, key: "id", q: instancesnapshots},
+		// {manager: InstanceBackupManager, key: "id", q: instancebackups},
 	}
 	for i := range pairs {
 		err := pairs[i].purgeAll(ctx)
 		if err != nil {
 			return err
 		}
+	}
+	eip, _ := self.GetElasticIp()
+	if eip != nil {
+		eip.Dissociate(ctx, userCred)
 	}
 	return self.SVirtualResourceBase.Delete(ctx, userCred)
 }
@@ -830,6 +874,7 @@ func (self *SZone) purgeWires(ctx context.Context, managerId string) error {
 	bns := HostnetworkManager.Query("row_id").In("network_id", networks.SubQuery())
 	rdsnetworks := DBInstanceNetworkManager.Query("row_id").In("network_id", networks.SubQuery())
 	groupnetworks := GroupnetworkManager.Query("row_id").In("network_id", networks.SubQuery())
+	guestnetworks := GuestnetworkManager.Query("row_id").In("network_id", networks.SubQuery())
 	lbnetworks := LoadbalancernetworkManager.Query("row_id").In("network_id", networks.SubQuery())
 	netmacs := NetworkIpMacManager.Query("id").In("network_id", networks.SubQuery())
 	netaddrs := NetworkAddressManager.Query("id").In("network_id", networks.SubQuery())
@@ -846,6 +891,7 @@ func (self *SZone) purgeWires(ctx context.Context, managerId string) error {
 		{manager: NetworkAddressManager, key: "id", q: netaddrs},
 		{manager: NetworkIpMacManager, key: "id", q: netmacs},
 		{manager: LoadbalancernetworkManager, key: "row_id", q: lbnetworks},
+		{manager: GuestnetworkManager, key: "row_id", q: guestnetworks},
 		{manager: GroupnetworkManager, key: "row_id", q: groupnetworks},
 		{manager: DBInstanceNetworkManager, key: "row_id", q: rdsnetworks},
 		{manager: HostnetworkManager, key: "row_id", q: bns},
@@ -870,18 +916,28 @@ func (cprvd *SCloudprovider) purge(ctx context.Context, userCred mcclient.TokenC
 	capability := CloudproviderCapabilityManager.Query("cloudprovider_id").Equals("cloudprovider_id", cprvd.Id)
 	cdn := CDNDomainManager.Query("id").Equals("manager_id", cprvd.Id)
 	vpcs := GlobalVpcManager.Query("id").Equals("manager_id", cprvd.Id)
+	secgroups := SecurityGroupManager.Query("id").In("globalvpc_id", vpcs.SubQuery())
+	rules := SecurityGroupRuleManager.Query("id").In("secgroup_id", secgroups.SubQuery())
 	intervpcs := InterVpcNetworkManager.Query("id").Equals("manager_id", cprvd.Id)
 	intervpcnetworks := InterVpcNetworkVpcManager.Query("row_id").In("inter_vpc_network_id", intervpcs.SubQuery())
 	dnszones := DnsZoneManager.Query("id").Equals("manager_id", cprvd.Id)
 	records := DnsRecordManager.Query("id").In("dns_zone_id", dnszones.SubQuery())
 	dnsVpcs := DnsZoneVpcManager.Query("row_id").In("dns_zone_id", dnszones.SubQuery())
+	ssls := SSLCertificateManager.Query("id").Equals("manager_id", cprvd.Id)
+	quotas := CloudproviderQuotaManager.Query("id").Equals("manager_id", cprvd.Id)
+	projects := ExternalProjectManager.Query("id").Equals("manager_id", cprvd.Id)
 
 	pairs := []purgePair{
+		{manager: ExternalProjectManager, key: "id", q: projects},
+		{manager: CloudproviderQuotaManager, key: "id", q: quotas},
+		{manager: SSLCertificateManager, key: "id", q: ssls},
 		{manager: DnsZoneVpcManager, key: "row_id", q: dnsVpcs},
 		{manager: DnsRecordManager, key: "id", q: records},
 		{manager: DnsZoneManager, key: "id", q: dnszones},
 		{manager: InterVpcNetworkVpcManager, key: "row_id", q: intervpcnetworks},
 		{manager: InterVpcNetworkManager, key: "id", q: intervpcs},
+		{manager: SecurityGroupRuleManager, key: "id", q: rules},
+		{manager: SecurityGroupManager, key: "id", q: secgroups},
 		{manager: GlobalVpcManager, key: "id", q: vpcs},
 		{manager: CDNDomainManager, key: "id", q: cdn},
 		{manager: CloudproviderRegionManager, key: "row_id", q: cprs},
@@ -897,16 +953,5 @@ func (cprvd *SCloudprovider) purge(ctx context.Context, userCred mcclient.TokenC
 }
 
 func (caccount *SCloudaccount) purge(ctx context.Context, userCred mcclient.TokenCredential) error {
-	projects := ExternalProjectManager.Query("id").Equals("cloudaccount_id", caccount.Id)
-
-	pairs := []purgePair{
-		{manager: ExternalProjectManager, key: "id", q: projects},
-	}
-	for i := range pairs {
-		err := pairs[i].purgeAll(ctx)
-		if err != nil {
-			return err
-		}
-	}
 	return caccount.SEnabledStatusInfrasResourceBase.Delete(ctx, userCred)
 }

@@ -63,11 +63,11 @@ func (e *thresholdEvaluator) Eval(reducedValue *float64) bool {
 	val := *reducedValue
 	switch e.Type {
 	case "gt":
-		return val >= e.Threshold
+		return val > e.Threshold
 	case "eq":
 		return val == e.Threshold
 	case "lt":
-		return val <= e.Threshold
+		return val < e.Threshold
 	}
 
 	return false
@@ -134,10 +134,10 @@ func NewAlertEvaluator(cond *monitor.Condition) (AlertEvaluator, error) {
 		return nil, validators.ErrMissingParameterType
 	}
 
-	if utils.IsInStringArray(typ, validators.EvaluatorDefaultTypes) {
+	if utils.IsInStringArray(string(typ), validators.EvaluatorDefaultTypes) {
 		return newThresholdEvaluator(cond)
 	}
-	if utils.IsInStringArray(typ, validators.EvaluatorRangedTypes) {
+	if utils.IsInStringArray(string(typ), validators.EvaluatorRangedTypes) {
 		return newRangedEvaluator(cond)
 	}
 

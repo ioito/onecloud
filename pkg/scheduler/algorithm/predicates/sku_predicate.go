@@ -35,7 +35,12 @@ func (p *InstanceTypePredicate) Clone() core.FitPredicate {
 }
 
 func (p *InstanceTypePredicate) PreExecute(ctx context.Context, u *core.Unit, cs []core.Candidater) (bool, error) {
-	if u.SchedData().InstanceType == "" || !u.GetHypervisorDriver().DoScheduleSKUFilter() {
+	driver := u.GetHypervisorDriver()
+	if u.SchedData().ResetCpuNumaPin {
+		return false, nil
+	}
+
+	if u.SchedData().InstanceType == "" || (driver == nil || !driver.DoScheduleSKUFilter()) {
 		return false, nil
 	}
 	return true, nil
@@ -53,9 +58,9 @@ func (p *InstanceTypePredicate) Execute(ctx context.Context, u *core.Unit, c cor
 	instanceType := d.InstanceType
 
 	reqRegion := d.PreferRegion
-	reqZone := d.PreferZone
+	reqZones := d.GetPreferZones()
 
-	if reqRegion != "" && reqZone == "" {
+	if reqRegion != "" && len(reqZones) == 0 {
 		skus := skuman.GetByRegion(instanceType, regionId)
 		if len(skus) == 0 {
 			h.Exclude(fmt.Sprintf("Not found server sku %s at region %s", instanceType, regionName))
@@ -63,7 +68,7 @@ func (p *InstanceTypePredicate) Execute(ctx context.Context, u *core.Unit, c cor
 			zoneMatch := false
 			for idx := range skus {
 				sku := skus[idx]
-				if sku.ZoneId == zoneId {
+				if len(sku.ZoneId) == 0 || sku.ZoneId == zoneId {
 					zoneMatch = true
 					break
 				}
@@ -73,7 +78,7 @@ func (p *InstanceTypePredicate) Execute(ctx context.Context, u *core.Unit, c cor
 			}
 		}
 	} else {
-		sku := skuman.GetByZone(instanceType, zoneId)
+		sku := skuman.GetByZone(instanceType, regionId, zoneId)
 		if sku == nil {
 			h.Exclude(fmt.Sprintf("Not found server sku %s at zone %s", instanceType, zoneName))
 		}

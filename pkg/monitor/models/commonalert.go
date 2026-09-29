@@ -23,10 +23,12 @@ import (
 
 	"golang.org/x/text/language"
 
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/appctx"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/sets"
 	"yunion.io/x/pkg/utils"
@@ -86,6 +88,8 @@ type ISubscriptionManager interface {
 	DeleteAlert(alert *SCommonAlert)
 }
 
+// +onecloud:swagger-gen-model-singular=commonalert
+// +onecloud:swagger-gen-model-plural=commonalerts
 type SCommonAlertManager struct {
 	SAlertManager
 	subscriptionManager ISubscriptionManager
@@ -217,11 +221,8 @@ func (man *SCommonAlertManager) ValidateCreateData(
 		return data, merrors.NewArgIsEmptyErr("metric_query")
 	} else {
 		for _, query := range data.CommonMetricInputQuery.MetricQuery {
-			if query.ConditionType == monitor.METRIC_QUERY_TYPE_NO_DATA {
-				query.Comparator = "=="
-			}
-			if !utils.IsInStringArray(getQueryEvalType(query.Comparator), validators.EvaluatorDefaultTypes) {
-				return data, httperrors.NewInputParameterError("the Comparator is illegal: %s", query.Comparator)
+			if err := validateCommonAlertQuery(query); err != nil {
+				return data, err
 			}
 			if _, ok := monitor.AlertReduceFunc[query.Reduce]; !ok {
 				return data, httperrors.NewInputParameterError("the reduce is illegal: %s", query.Reduce)
@@ -241,7 +242,7 @@ func (man *SCommonAlertManager) ValidateCreateData(
 			return data, httperrors.NewInputParameterError("Invalid AlertType: %s", data.AlertType)
 		}
 	}
-	var err = man.ValidateMetricQuery(&data.CommonMetricInputQuery, data.Scope, ownerId)
+	var err = man.ValidateMetricQuery(&data.CommonMetricInputQuery, data.Scope, ownerId, true)
 	if err != nil {
 		return data, errors.Wrap(err, "metric query error")
 	}
@@ -268,14 +269,16 @@ func (man *SCommonAlertManager) ValidateCreateData(
 	}
 	data.Name = name
 
-	alertCreateInput := man.toAlertCreatInput(data)
+	alertCreateInput, err := man.toAlertCreatInput(data)
+	if err != nil {
+		return data, errors.Wrap(err, "to alert creation input")
+	}
 	alertCreateInput, err = AlertManager.ValidateCreateData(ctx, userCred, ownerId, query, alertCreateInput)
 	if err != nil {
 		return data, err
 	}
 	data.AlertCreateInput = alertCreateInput
 	return data, nil
-
 }
 
 func (man *SCommonAlertManager) genName(ctx context.Context, ownerId mcclient.IIdentityProvider, name string) (string,
@@ -290,15 +293,15 @@ func (man *SCommonAlertManager) genName(ctx context.Context, ownerId mcclient.II
 	return name, nil
 }
 
-func (man *SCommonAlertManager) ValidateMetricQuery(metricRequest *monitor.CommonMetricInputQuery, scope string, ownerId mcclient.IIdentityProvider) error {
+func (man *SCommonAlertManager) ValidateMetricQuery(metricRequest *monitor.CommonMetricInputQuery, scope string, ownerId mcclient.IIdentityProvider, isAlert bool) error {
 	for _, q := range metricRequest.MetricQuery {
-		metriInputQuery := monitor.MetricInputQuery{
+		metriInputQuery := monitor.MetricQueryInput{
 			From:     metricRequest.From,
 			To:       metricRequest.To,
 			Interval: metricRequest.Interval,
 		}
-		setDefaultValue(q.AlertQuery, &metriInputQuery, scope, ownerId)
-		err := UnifiedMonitorManager.ValidateInputQuery(q.AlertQuery)
+		setDefaultValue(q.AlertQuery, &metriInputQuery, scope, ownerId, isAlert)
+		err := UnifiedMonitorManager.ValidateInputQuery(q.AlertQuery, &metriInputQuery)
 		if err != nil {
 			return err
 		}
@@ -355,6 +358,9 @@ func (alert *SCommonAlert) CustomizeCreate(
 	if err := data.Unmarshal(input); err != nil {
 		return err
 	}
+	if input.DisableNotifyRecovery != nil {
+		alert.DisableNotifyRecovery = *input.DisableNotifyRecovery
+	}
 
 	return alert.customizeCreateNotis(ctx, userCred, query, data)
 }
@@ -374,6 +380,7 @@ func (alert *SCommonAlert) customizeCreateNotis(ctx context.Context, userCred mc
 		return alert.createAlertNoti(ctx, userCred, input.Name, s, input.SilentPeriod, true)
 	}
 
+	alert.SetChannel(ctx, input.Channel)
 	for _, channel := range input.Channel {
 		s := &monitor.NotificationSettingOneCloud{
 			Channel: channel,
@@ -439,7 +446,7 @@ func (alert *SCommonAlert) PostCreate(ctx context.Context,
 		return
 	}
 
-	alert.SetStatus(userCred, monitor.ALERT_STATUS_READY, "")
+	alert.SetStatus(ctx, userCred, monitor.ALERT_STATUS_READY, "")
 
 	if input.AlertType != "" {
 		if err := alert.setAlertType(ctx, userCred, input.AlertType); err != nil {
@@ -450,7 +457,7 @@ func (alert *SCommonAlert) PostCreate(ctx context.Context,
 	for i, metricQ := range input.CommonMetricInputQuery.MetricQuery {
 		if metricQ.FieldOpt != "" {
 			if i == 0 {
-				fieldOpt = metricQ.FieldOpt
+				fieldOpt = string(metricQ.FieldOpt)
 				continue
 			}
 			fieldOpt = fmt.Sprintf("%s+%s", fieldOpt, metricQ.FieldOpt)
@@ -470,7 +477,7 @@ func (alert *SCommonAlert) PostCreate(ctx context.Context,
 		log.Errorln(errors.Wrap(err, "Alert PerformSetScope"))
 	}
 	CommonAlertManager.SetSubscriptionAlert(alert)
-	alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
+	//alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
 }
 
 func (man *SCommonAlertManager) ListItemFilter(
@@ -478,6 +485,11 @@ func (man *SCommonAlertManager) ListItemFilter(
 	userCred mcclient.TokenCredential,
 	query monitor.CommonAlertListInput,
 ) (*sqlchemy.SQuery, error) {
+	// 如果指定了时间段和 top 参数，执行特殊的 top 查询
+	if query.Top != nil {
+		return man.getTopAlertsByResourceCount(ctx, q, userCred, query)
+	}
+
 	q, err := man.SAlertManager.ListItemFilter(ctx, q, userCred, query.AlertListInput)
 	if err != nil {
 		return nil, err
@@ -503,6 +515,106 @@ func (man *SCommonAlertManager) FieldListFilter(q *sqlchemy.SQuery, input monito
 	if len(input.Name) != 0 {
 		q.Contains("name", input.Name)
 	}
+}
+
+// getTopAlertsByResourceCount 查询指定时间段内报警资源最多的 top N 监控策略
+func (man *SCommonAlertManager) getTopAlertsByResourceCount(
+	ctx context.Context,
+	q *sqlchemy.SQuery,
+	userCred mcclient.TokenCredential,
+	query monitor.CommonAlertListInput,
+) (*sqlchemy.SQuery, error) {
+	// 验证时间段和 top 参数
+	startTime, endTime, top, err := validateTopQueryInput(query.TopQueryInput)
+	if err != nil {
+		return nil, err
+	}
+
+	// 查询指定时间段内的 AlertRecord
+	recordQuery := AlertRecordManager.Query("alert_id", "res_ids")
+	recordQuery = recordQuery.GE("created_at", startTime).LE("created_at", endTime)
+	recordQuery = recordQuery.IsNotNull("res_type").IsNotEmpty("res_type")
+	recordQuery = recordQuery.IsNotEmpty("res_ids")
+
+	// 应用权限过滤
+	recordQuery, err = AlertRecordManager.SScopedResourceBaseManager.ListItemFilter(
+		ctx, recordQuery, userCred, query.ScopedResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "AlertRecordManager.ListItemFilter")
+	}
+
+	// 执行查询获取所有记录
+	type RecordRow struct {
+		AlertId string
+		ResIds  string
+	}
+	rows := make([]RecordRow, 0)
+	err = recordQuery.All(&rows)
+	if err != nil {
+		return nil, errors.Wrap(err, "query alert records")
+	}
+
+	// 统计每个 alert_id 的唯一资源数量
+	alertResourceCount := make(map[string]sets.String)
+	for _, row := range rows {
+		if len(row.ResIds) == 0 {
+			continue
+		}
+		// 解析 res_ids（逗号分隔）
+		resIds := strings.Split(row.ResIds, ",")
+		if alertResourceCount[row.AlertId] == nil {
+			alertResourceCount[row.AlertId] = sets.NewString()
+		}
+		for _, resId := range resIds {
+			resId = strings.TrimSpace(resId)
+			if len(resId) > 0 {
+				alertResourceCount[row.AlertId].Insert(resId)
+			}
+		}
+	}
+
+	// 转换为切片并按资源数量排序
+	type AlertCount struct {
+		AlertId string
+		Count   int
+	}
+	alertCounts := make([]AlertCount, 0, len(alertResourceCount))
+	for alertId, resSet := range alertResourceCount {
+		alertCounts = append(alertCounts, AlertCount{
+			AlertId: alertId,
+			Count:   resSet.Len(),
+		})
+	}
+
+	// 按资源数量降序排序
+	for i := 0; i < len(alertCounts)-1; i++ {
+		for j := i + 1; j < len(alertCounts); j++ {
+			if alertCounts[i].Count < alertCounts[j].Count {
+				alertCounts[i], alertCounts[j] = alertCounts[j], alertCounts[i]
+			}
+		}
+	}
+
+	// 获取 top N 的 alert_id
+	topAlertIds := make([]string, 0, top)
+	for i := 0; i < top && i < len(alertCounts); i++ {
+		topAlertIds = append(topAlertIds, alertCounts[i].AlertId)
+	}
+
+	if len(topAlertIds) == 0 {
+		// 如果没有找到任何记录，返回空查询
+		return q.FilterByFalse(), nil
+	}
+
+	// 用 top alert_id 过滤 CommonAlert 查询
+	q, err = man.SAlertManager.ListItemFilter(ctx, q, userCred, query.AlertListInput)
+	if err != nil {
+		return nil, err
+	}
+	man.FieldListFilter(q, query)
+	q = q.In("id", topAlertIds)
+
+	return q, nil
 }
 
 func (manager *SCommonAlertManager) GetExportExtraKeys(ctx context.Context, keys stringutils2.SSortedStrings, rowMap map[string]string) *jsonutils.JSONDict {
@@ -580,10 +692,7 @@ func (man *SCommonAlertManager) CustomizeFilterList(
 			return nil, err
 		}
 		mF := func(obj *SCommonAlert) (bool, error) {
-			settings := new(monitor.AlertSetting)
-			if err := obj.Settings.Unmarshal(settings); err != nil {
-				return false, errors.Wrapf(err, "alert %s unmarshal", obj.GetId())
-			}
+			settings := obj.Settings
 			for _, s := range settings.Conditions {
 				if s.Query.Model.Measurement == meaurement && len(s.Query.Model.Selects) == 1 {
 					if IsQuerySelectHasField(s.Query.Model.Selects[0], field) {
@@ -604,10 +713,7 @@ func (man *SCommonAlertManager) CustomizeFilterList(
 
 	if len(input.ResType) != 0 {
 		mF := func(obj *SCommonAlert) (bool, error) {
-			settings := new(monitor.AlertSetting)
-			if err := obj.Settings.Unmarshal(settings); err != nil {
-				return false, errors.Wrapf(err, "alert %s unmarshal", obj.GetId())
-			}
+			settings := obj.Settings
 			for _, s := range settings.Conditions {
 				if mesurement, contain := MetricMeasurementManager.measurementsCache.Get(s.Query.Model.
 					Measurement); contain {
@@ -652,95 +758,116 @@ func (man *SCommonAlertManager) FetchCustomizeColumns(
 ) []monitor.CommonAlertDetails {
 	rows := make([]monitor.CommonAlertDetails, len(objs))
 	alertRows := man.SAlertManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	alertIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i].AlertDetails = alertRows[i]
-		var err error
-		rows[i], err = objs[i].(ICommonAlert).GetMoreDetails(ctx, rows[i])
+		alert := objs[i].(*SCommonAlert)
+		alertIds[i] = alert.Id
+	}
+	ans := []SAlertnotification{}
+	err := AlertNotificationManager.Query().In("alert_id", alertIds).Desc("index").All(&ans)
+	if err != nil {
+		log.Errorf("q.All")
+		return rows
+	}
+	alertNotificationMap := make(map[string][]SAlertnotification)
+	notificateIds := []string{}
+	for i := range ans {
+		_, ok := alertNotificationMap[ans[i].AlertId]
+		if !ok {
+			alertNotificationMap[ans[i].AlertId] = []SAlertnotification{}
+		}
+		notificateIds = append(notificateIds, ans[i].NotificationId)
+		alertNotificationMap[ans[i].AlertId] = append(alertNotificationMap[ans[i].AlertId], ans[i])
+	}
+	notis := make(map[string]SNotification)
+	err = db.FetchModelObjectsByIds(NotificationManager, "id", notificateIds, notis)
+	if err != nil {
+		log.Errorf("db.FetchModelObjectsByIds err:%v", err)
+		return rows
+	}
+	metas := []db.SMetadata{}
+	err = db.Metadata.Query().In("obj_id", alertIds).Equals("obj_type", man.Keyword()).Equals("key", CommonAlertMetadataAlertType).All(&metas)
+	if err != nil {
+		log.Errorf("db.MetadataManager.Query err:%v", err)
+		return rows
+	}
+	metaMap := make(map[string]string)
+	for i := range metas {
+		metaMap[metas[i].ObjId] = metas[i].Value
+	}
+	for i := range rows {
+		alert := objs[i].(*SCommonAlert)
+		rows[i].DisableNotifyRecovery = alert.DisableNotifyRecovery
+		if alertNotis, ok := alertNotificationMap[alertIds[i]]; ok {
+			channel := sets.String{}
+			for j, alertNoti := range alertNotis {
+				noti, ok := notis[alertNoti.NotificationId]
+				if !ok {
+					continue
+				}
+				settings := new(monitor.NotificationSettingOneCloud)
+				if err := noti.Settings.Unmarshal(settings); err != nil {
+					log.Errorf("Unmarshal to NotificationSettingOneCloud err:%v", err)
+					return rows
+				}
+				if j == 0 {
+					rows[i].Recipients = settings.UserIds
+				}
+				if !utils.IsInStringArray(settings.Channel,
+					[]string{monitor.DEFAULT_SEND_NOTIFY_CHANNEL, string(notify.NotifyByRobot)}) {
+					channel.Insert(settings.Channel)
+				}
+				if noti.Frequency != 0 {
+					rows[i].SilentPeriod = fmt.Sprintf("%dm", noti.Frequency/60)
+				}
+				if len(settings.RobotIds) != 0 {
+					rows[i].RobotIds = settings.RobotIds
+				}
+				if len(settings.RoleIds) != 0 {
+					rows[i].RoleIds = settings.RoleIds
+				}
+			}
+			rows[i].Channel = channel.List()
+		}
+		rows[i].AlertType = metaMap[alertIds[i]]
+		if alert.Frequency < 60 {
+			rows[i].Period = fmt.Sprintf("%ds", alert.Frequency)
+		} else {
+			rows[i].Period = fmt.Sprintf("%dm", alert.Frequency/60)
+		}
+		rows[i].AlertDuration = alert.For / alert.Frequency
+		if rows[i].AlertDuration == 0 {
+			rows[i].AlertDuration = 1
+		}
+
+		err := alert.getCommonAlertMetricDetails(&rows[i])
 		if err != nil {
-			log.Warningf("GetMoreDetails for alert %s: %v", rows[i].Name, err)
+			log.Errorf("getCommonAlertMetricDetails err:%v", err)
+			return rows
 		}
 	}
 	return rows
 }
 
-func (alert *SCommonAlert) validateDeleteCondition(ctx context.Context, out *monitor.CommonAlertDetails) {
-	alert_type := alert.getAlertType()
-	switch alert_type {
-	case monitor.CommonAlertSystemAlertType:
-		je := httperrors.NewInputParameterError("Cannot delete system alert")
-		out.CanDelete = false
-		out.DeleteFailReason = httperrors.NewErrorFromJCError(ctx, je)
-	default:
+func (alert *SCommonAlert) ValidateDeleteCondition(ctx context.Context, info *monitor.CommonAlertDetails) error {
+	if gotypes.IsNil(info) {
+		info = &monitor.CommonAlertDetails{}
 	}
-}
-
-func (alert *SCommonAlert) AllowDeleteItem(ctx context.Context, userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject, data jsonutils.JSONObject) bool {
-	isForce, _ := data.Bool("force")
-	if isForce {
-		return isForce
+	if info.AlertType == monitor.CommonAlertSystemAlertType {
+		return httperrors.NewInputParameterError("Cannot delete system alert")
 	}
-	alert_type := alert.getAlertType()
-	switch alert_type {
-	case monitor.CommonAlertSystemAlertType:
-		return false
-	default:
-		return true
-	}
+	return nil
 }
 
 func (alert *SCommonAlert) GetMoreDetails(ctx context.Context, out monitor.CommonAlertDetails) (monitor.CommonAlertDetails, error) {
-	alert.validateDeleteCondition(ctx, &out)
-
-	var err error
-	alertNotis, err := alert.GetNotifications()
-	if err != nil {
-		return out, errors.Wrap(err, "GetNotifications")
+	s := auth.GetAdminSession(ctx, options.Options.Region)
+	token := s.GetToken()
+	ret := CommonAlertManager.FetchCustomizeColumns(ctx, token, jsonutils.NewDict(), []interface{}{alert}, stringutils2.SSortedStrings{}, false)
+	if len(ret) != 1 {
+		return out, errors.Wrapf(cloudprovider.ErrNotFound, "FetchCustomizeColumns")
 	}
-	channel := sets.String{}
-	for i, alertNoti := range alertNotis {
-		noti, err := alertNoti.GetNotification()
-		if err != nil {
-			return out, errors.Wrap(err, "get notify")
-		}
-		settings := new(monitor.NotificationSettingOneCloud)
-		if err := noti.Settings.Unmarshal(settings); err != nil {
-			return out, errors.Wrap(err, "Unmarshal to NotificationSettingOneCloud")
-		}
-		if i == 0 {
-			out.Recipients = settings.UserIds
-		}
-		if !utils.IsInStringArray(settings.Channel,
-			[]string{monitor.DEFAULT_SEND_NOTIFY_CHANNEL, string(notify.NotifyByRobot)}) {
-			channel.Insert(settings.Channel)
-		}
-		if noti.Frequency != 0 {
-			out.SilentPeriod = fmt.Sprintf("%dm", noti.Frequency/60)
-		}
-		if len(settings.RobotIds) != 0 {
-			out.RobotIds = settings.RobotIds
-		}
-		if len(settings.RoleIds) != 0 {
-			out.RoleIds = settings.RoleIds
-		}
-	}
-	out.Channel = channel.List()
-	out.Status = alert.GetStatus()
-	out.AlertType = alert.getAlertType()
-	if alert.Frequency < 60 {
-		out.Period = fmt.Sprintf("%ds", alert.Frequency)
-	} else {
-		out.Period = fmt.Sprintf("%dm", alert.Frequency/60)
-	}
-	out.AlertDuration = alert.For / alert.Frequency
-	if out.AlertDuration == 0 {
-		out.AlertDuration = 1
-	}
-
-	if err := alert.getCommonAlertMetricDetails(&out); err != nil {
-		return out, errors.Wrap(err, "getCommonAlertMetricDetails")
-	}
-	return out, nil
+	return ret[0], nil
 }
 
 func (alert *SCommonAlert) getCommonAlertMetricDetails(out *monitor.CommonAlertDetails) error {
@@ -767,7 +894,7 @@ func (alert *SCommonAlert) GetCommonAlertMetricDetails() ([]*monitor.CommonAlert
 		setting.Conditions[i] = cond
 	}
 	// side effect, update setting cause of setting.Conditions has changed by GetCommonAlertMetricDetailsFromAlertCondition
-	alert.Settings = jsonutils.Marshal(setting)
+	alert.Settings = setting
 	return ret, nil
 }
 
@@ -786,21 +913,35 @@ func (alert *SCommonAlert) GetCommonAlertMetricDetailsFromAlertCondition(index i
 	return metricDetails
 }
 
-func getCommonAlertMetricDetailsFromCondition(cond *monitor.AlertCondition,
-	metricDetails *monitor.CommonAlertMetricDetails) {
+func getCommonAlertMetricDetailsFromCondition(
+	cond *monitor.AlertCondition,
+	metricDetails *monitor.CommonAlertMetricDetails,
+) {
 	cmp := ""
 	switch cond.Evaluator.Type {
 	case "gt":
-		cmp = ">="
+		cmp = ">"
 	case "eq":
 		cmp = "=="
 	case "lt":
-		cmp = "<="
+		cmp = "<"
+	case "within_range":
+		cmp = "within_range"
+	case "outside_range":
+		cmp = "outside_range"
 	}
 	metricDetails.Comparator = cmp
 
-	if len(cond.Evaluator.Params) != 0 {
-		metricDetails.Threshold = cond.Evaluator.Params[0]
+	// 处理 ranged types
+	if utils.IsInStringArray(cond.Evaluator.Type, validators.EvaluatorRangedTypes) {
+		if len(cond.Evaluator.Params) >= 2 {
+			metricDetails.ThresholdRange = []float64{cond.Evaluator.Params[0], cond.Evaluator.Params[1]}
+		}
+	} else {
+		// 处理默认 types
+		if len(cond.Evaluator.Params) != 0 {
+			metricDetails.Threshold = cond.Evaluator.Params[0]
+		}
 	}
 	metricDetails.Reduce = cond.Reducer.Type
 
@@ -837,6 +978,7 @@ func getCommonAlertMetricDetailsFromCondition(cond *monitor.AlertCondition,
 	metricDetails.DB = db
 	metricDetails.Groupby = groupby
 	metricDetails.Filters = cond.Query.Model.Tags
+	metricDetails.Operator = cond.Operator
 
 	//fill measurement\field desciption info
 	getMetricDescriptionDetails(metricDetails)
@@ -872,6 +1014,9 @@ func getMetricDescriptionDetails(metricDetails *monitor.CommonAlertMetricDetails
 	if len(influxdbMeasurements[0].ResType) != 0 {
 		metricDetails.ResType = influxdbMeasurements[0].ResType
 	}
+	if metricDetails.ResType != "" {
+		metricDetails.ResIdKey = monitor.GetMeasurementTagIdKeyByResTypeWithDefault(metricDetails.ResType)
+	}
 	fields := make([]string, 0)
 	if len(metricDetails.FieldOpt) != 0 {
 		fields = append(fields, strings.Split(metricDetails.Field, metricDetails.FieldOpt)...)
@@ -901,26 +1046,95 @@ func getMetricDescriptionDetails(metricDetails *monitor.CommonAlertMetricDetails
 }
 
 func getExtraFieldDetails(metricDetails *monitor.CommonAlertMetricDetails) {
-	if metricDetails.FieldOpt == monitor.CommonAlertFieldOpt_Division && metricDetails.Threshold < float64(1) {
+	if metricDetails.FieldOpt == string(monitor.CommonAlertFieldOptDivision) && metricDetails.Threshold < float64(1) {
 		metricDetails.Threshold = metricDetails.Threshold * float64(100)
 		metricDetails.FieldDescription.Unit = "%"
 	}
 }
 
-func getQueryEvalType(evalType string) string {
-	typ := ""
+func getQueryEvalType(evalType string) monitor.EvaluatorType {
+	var typ monitor.EvaluatorType
 	switch evalType {
 	case ">=", ">":
-		typ = "gt"
+		typ = monitor.EvaluatorTypeGT
 	case "<=", "<":
-		typ = "lt"
+		typ = monitor.EvaluatorTypeLT
 	case "==":
-		typ = "eq"
+		typ = monitor.EvaluatorTypeEQ
+	case "within_range":
+		typ = monitor.EvaluatorTypeWithinRange
+	case "outside_range":
+		typ = monitor.EvaluatorTypeOutsideRange
 	}
 	return typ
 }
 
-func (man *SCommonAlertManager) toAlertCreatInput(input monitor.CommonAlertCreateInput) monitor.AlertCreateInput {
+// validateCommonAlertQuery 校验 CommonAlertQuery 的 comparator 和 threshold_range
+func validateCommonAlertQuery(query *monitor.CommonAlertQuery) error {
+	if query.ConditionType == monitor.METRIC_QUERY_TYPE_NO_DATA {
+		query.Comparator = "=="
+	}
+	evalType := getQueryEvalType(query.Comparator)
+	if !sets.NewString(append(
+		validators.EvaluatorDefaultTypes,
+		validators.EvaluatorRangedTypes...)...).Has(string(evalType)) {
+		return httperrors.NewInputParameterError("the Comparator is illegal: %s", query.Comparator)
+	}
+	// 验证 ranged types 的参数
+	if utils.IsInStringArray(string(evalType), validators.EvaluatorRangedTypes) {
+		if len(query.ThresholdRange) < 2 {
+			return httperrors.NewInputParameterError("threshold_range or outside_range requires 2 parameters, got %d", len(query.ThresholdRange))
+		}
+		// 确保第一项小于等于第二项
+		if query.ThresholdRange[0] > query.ThresholdRange[1] {
+			return httperrors.NewInputParameterError("threshold_range first value (%v) must be less than or equal to second value (%v)", query.ThresholdRange[0], query.ThresholdRange[1])
+		}
+	}
+	return nil
+}
+
+// validateComparatorAndThreshold 校验字符串形式的 comparator, threshold 和 threshold_range
+func validateComparatorAndThreshold(comparator string, threshold string, thresholdRange []jsonutils.JSONObject) error {
+	var evalType monitor.EvaluatorType
+	if len(comparator) != 0 {
+		evalType = getQueryEvalType(comparator)
+		if !utils.IsInStringArray(string(evalType), append(validators.EvaluatorDefaultTypes, validators.EvaluatorRangedTypes...)) {
+			return httperrors.NewInputParameterError("the Comparator is illegal: %s", comparator)
+		}
+		// 验证 ranged types 的参数
+		if utils.IsInStringArray(string(evalType), validators.EvaluatorRangedTypes) {
+			if len(thresholdRange) < 2 {
+				return httperrors.NewInputParameterError("threshold_range or outside_range requires 2 parameters, got %d", len(thresholdRange))
+			}
+		}
+	}
+	if len(threshold) != 0 {
+		_, err := strconv.ParseFloat(threshold, 64)
+		if err != nil {
+			return httperrors.NewInputParameterError("threshold:%s should be number type", threshold)
+		}
+	}
+	if len(thresholdRange) > 0 {
+		if len(thresholdRange) < 2 {
+			return httperrors.NewInputParameterError("threshold_range requires 2 parameters, got %d", len(thresholdRange))
+		}
+		vals := make([]float64, len(thresholdRange))
+		for i, val := range thresholdRange {
+			parsedVal, err := strconv.ParseFloat(val.String(), 64)
+			if err != nil {
+				return httperrors.NewInputParameterError("threshold_range[%d]: %s should be number type", i, val.String())
+			}
+			vals[i] = parsedVal
+		}
+		// 确保第一项小于等于第二项
+		if vals[0] > vals[1] {
+			return httperrors.NewInputParameterError("threshold_range first value (%v) must be less than or equal to second value (%v)", vals[0], vals[1])
+		}
+	}
+	return nil
+}
+
+func (man *SCommonAlertManager) toAlertCreatInput(input monitor.CommonAlertCreateInput) (monitor.AlertCreateInput, error) {
 	freq, _ := time.ParseDuration(input.Period)
 	ret := new(monitor.AlertCreateInput)
 	ret.Name = input.Name
@@ -935,24 +1149,46 @@ func (man *SCommonAlertManager) toAlertCreatInput(input monitor.CommonAlertCreat
 		if len(metricquery.ConditionType) != 0 {
 			conditionType = metricquery.ConditionType
 		}
+		evalType := getQueryEvalType(metricquery.Comparator)
+		var evaluatorParams []float64
+		// 处理 ranged types (within_range, outside_range)
+		if utils.IsInStringArray(string(evalType), validators.EvaluatorRangedTypes) {
+			if len(metricquery.ThresholdRange) < 2 {
+				return *ret, httperrors.NewInputParameterError("threshold_range or outside_range requires 2 parameters, got %d", len(metricquery.ThresholdRange))
+			}
+			fieldOpt := monitor.CommonAlertFieldOpt(metricquery.FieldOpt)
+			evaluatorParams = []float64{
+				fieldOperatorThreshold(fieldOpt, metricquery.ThresholdRange[0]),
+				fieldOperatorThreshold(fieldOpt, metricquery.ThresholdRange[1]),
+			}
+		} else {
+			// 处理默认 types (gt, lt, eq)
+			fieldOpt := monitor.CommonAlertFieldOpt(metricquery.FieldOpt)
+			evaluatorParams = []float64{fieldOperatorThreshold(fieldOpt, metricquery.Threshold)}
+		}
 		condition := monitor.AlertCondition{
-			Type:    conditionType,
-			Query:   *metricquery.AlertQuery,
-			Reducer: monitor.Condition{Type: metricquery.Reduce},
-			Evaluator: monitor.Condition{Type: getQueryEvalType(metricquery.Comparator),
-				Params: []float64{fieldOperatorThreshold(metricquery.FieldOpt, metricquery.Threshold)}},
-			Operator: "and",
+			Type:      conditionType,
+			Query:     *metricquery.AlertQuery,
+			Reducer:   monitor.Condition{Type: metricquery.Reduce},
+			Evaluator: monitor.Condition{Type: string(evalType), Params: evaluatorParams},
+			Operator:  "and",
+		}
+		if metricquery.Operator != "" {
+			if !sets.NewString("and", "or").Has(metricquery.Operator) {
+				return *ret, httperrors.NewInputParameterError("invalid operator %s", metricquery.Operator)
+			}
+			condition.Operator = metricquery.Operator
 		}
 		if metricquery.FieldOpt != "" {
-			condition.Reducer.Operators = []string{metricquery.FieldOpt}
+			condition.Reducer.Operators = []string{string(metricquery.FieldOpt)}
 		}
 		ret.Settings.Conditions = append(ret.Settings.Conditions, condition)
 	}
-	return *ret
+	return *ret, nil
 }
 
-func fieldOperatorThreshold(opt string, threshold float64) float64 {
-	if opt == monitor.CommonAlertFieldOpt_Division && threshold > 1 {
+func fieldOperatorThreshold(opt monitor.CommonAlertFieldOpt, threshold float64) float64 {
+	if opt == monitor.CommonAlertFieldOptDivision && threshold > 1 {
 		return threshold / float64(100)
 	}
 	return threshold
@@ -1008,11 +1244,8 @@ func (alert *SCommonAlert) ValidateUpdateData(
 			if err != nil {
 				return data, errors.Wrap(err, "metric_query Unmarshal error")
 			}
-			if query.ConditionType == monitor.METRIC_QUERY_TYPE_NO_DATA {
-				query.Comparator = "=="
-			}
-			if !utils.IsInStringArray(getQueryEvalType(query.Comparator), validators.EvaluatorDefaultTypes) {
-				return data, httperrors.NewInputParameterError("the Comparator is illegal: %s", query.Comparator)
+			if err := validateCommonAlertQuery(query); err != nil {
+				return data, err
 			}
 			if _, ok := monitor.AlertReduceFunc[query.Reduce]; !ok {
 				return data, httperrors.NewInputParameterError("the reduce is illegal: %s", query.Reduce)
@@ -1034,7 +1267,7 @@ func (alert *SCommonAlert) ValidateUpdateData(
 		}
 		scope, _ := data.GetString("scope")
 		ownerId := CommonAlertManager.GetOwnerId(ctx, userCred, data)
-		err = CommonAlertManager.ValidateMetricQuery(metricQuery, scope, ownerId)
+		err = CommonAlertManager.ValidateMetricQuery(metricQuery, scope, ownerId, true)
 		if err != nil {
 			return data, errors.Wrap(err, "metric query error")
 		}
@@ -1049,7 +1282,10 @@ func (alert *SCommonAlert) ValidateUpdateData(
 		if err != nil {
 			return data, errors.Wrap(err, "updataInput Unmarshal err")
 		}
-		alertCreateInput := alert.getUpdateAlertInput(*updataInput)
+		alertCreateInput, err := alert.getUpdateAlertInput(*updataInput)
+		if err != nil {
+			return data, errors.Wrap(err, "getUpdateAlertInput")
+		}
 		alertCreateInput, err = AlertManager.ValidateCreateData(ctx, userCred, nil, query, alertCreateInput)
 		if err != nil {
 			return data, err
@@ -1078,9 +1314,22 @@ func (alert *SCommonAlert) PostUpdate(
 	query jsonutils.JSONObject, data jsonutils.JSONObject) {
 	updateInput := new(monitor.CommonAlertUpdateInput)
 	data.Unmarshal(updateInput)
+	if updateInput.DisableNotifyRecovery != nil {
+		if _, err := db.Update(alert, func() error {
+			alert.DisableNotifyRecovery = *updateInput.DisableNotifyRecovery
+			return nil
+		}); err != nil {
+			log.Errorf("update disable_notify_recovery error: %v", err)
+		}
+	}
 	if len(updateInput.Channel) != 0 {
 		if err := alert.UpdateNotification(ctx, userCred, query, data); err != nil {
 			log.Errorf("update notification error: %v", err)
+		}
+		alert.SetChannel(ctx, updateInput.Channel)
+	} else if len(updateInput.SilentPeriod) != 0 {
+		if err := alert.updateNotificationSilentPeriod(updateInput.SilentPeriod); err != nil {
+			log.Errorf("update notification silent_period error: %v", err)
 		}
 	}
 	if _, err := data.GetString("scope"); err == nil {
@@ -1096,7 +1345,7 @@ func (alert *SCommonAlert) PostUpdate(
 		alert.setMetaName(ctx, userCred, updateInput.MetaName)
 	}
 	CommonAlertManager.SetSubscriptionAlert(alert)
-	alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
+	//alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
 }
 
 func (alert *SCommonAlert) UpdateNotification(ctx context.Context, userCred mcclient.TokenCredential,
@@ -1116,23 +1365,22 @@ func (alert *SCommonAlert) UpdateNotification(ctx context.Context, userCred mccl
 	return err
 }
 
-func (alert *SCommonAlert) getUpdateAlertInput(updateInput monitor.CommonAlertUpdateInput) monitor.AlertCreateInput {
+func (alert *SCommonAlert) getUpdateAlertInput(updateInput monitor.CommonAlertUpdateInput) (monitor.AlertCreateInput, error) {
 	input := monitor.CommonAlertCreateInput{
 		CommonMetricInputQuery: updateInput.CommonMetricInputQuery,
 		Period:                 updateInput.Period,
 	}
 	input.AlertDuration = updateInput.AlertDuration
-	alertCreateInput := CommonAlertManager.toAlertCreatInput(input)
-	return alertCreateInput
+	return CommonAlertManager.toAlertCreatInput(input)
 }
 
 func (alert *SCommonAlert) CustomizeDelete(
 	ctx context.Context, userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	alert.SetStatus(userCred, monitor.ALERT_STATUS_DELETING, "")
+	alert.SetStatus(ctx, userCred, monitor.ALERT_STATUS_DELETING, "")
 	err := alert.customizeDeleteNotis(ctx, userCred, query, data)
 	if err != nil {
-		alert.SetStatus(userCred, monitor.ALERT_STATUS_DELETE_FAIL, "")
+		alert.SetStatus(ctx, userCred, monitor.ALERT_STATUS_DELETE_FAIL, "")
 		return errors.Wrap(err, "customizeDeleteNotis")
 	}
 	alert.StartDeleteTask(ctx, userCred)
@@ -1259,21 +1507,15 @@ func (alert *SCommonAlert) PerformConfig(ctx context.Context, userCred mcclient.
 	period, _ := data.GetString("period")
 	comparator, _ := data.GetString("comparator")
 	threshold, _ := data.GetString("threshold")
+	thresholdRange, _ := data.GetArray("threshold_range")
 	if len(period) != 0 {
 		if _, err := time.ParseDuration(period); err != nil {
 			return data, httperrors.NewInputParameterError("Invalid period format: %s", period)
 		}
 	}
-	if len(comparator) != 0 {
-		if !utils.IsInStringArray(getQueryEvalType(comparator), validators.EvaluatorDefaultTypes) {
-			return data, httperrors.NewInputParameterError("the Comparator is illegal: %s", comparator)
-		}
-	}
-	if len(threshold) != 0 {
-		_, err := strconv.ParseFloat(threshold, 64)
-		if err != nil {
-			return data, httperrors.NewInputParameterError("threshold:%s should be number type", threshold)
-		}
+	reason, _ := data.GetString("reason")
+	if err := validateComparatorAndThreshold(comparator, threshold, thresholdRange); err != nil {
+		return data, err
 	}
 	_, err := db.Update(alert, func() error {
 		if len(period) != 0 {
@@ -1282,15 +1524,29 @@ func (alert *SCommonAlert) PerformConfig(ctx context.Context, userCred mcclient.
 		}
 		setting, _ := alert.GetSettings()
 		if len(comparator) != 0 {
-			setting.Conditions[0].Evaluator.Type = getQueryEvalType(comparator)
-
+			evalType := getQueryEvalType(comparator)
+			setting.Conditions[0].Evaluator.Type = string(evalType)
 		}
-		if len(threshold) != 0 {
+		// 处理 ranged types
+		if len(thresholdRange) >= 2 {
+			vals := make([]float64, 2)
+			for i := 0; i < 2 && i < len(thresholdRange); i++ {
+				val, _ := strconv.ParseFloat(thresholdRange[i].String(), 64)
+				vals[i] = fieldOperatorThreshold("", val)
+			}
+			setting.Conditions[0].Evaluator.Params = vals
+		} else if len(threshold) != 0 {
 			val, _ := strconv.ParseFloat(threshold, 64)
-			fmt.Println(threshold)
 			setting.Conditions[0].Evaluator.Params = []float64{fieldOperatorThreshold("", val)}
 		}
-		alert.Settings = jsonutils.Marshal(setting)
+		alert.Settings = setting
+		if len(reason) != 0 {
+			alert.Reason = reason
+		}
+		disableNotifyRecovery, gErr := data.Bool("disable_notify_recovery")
+		if gErr == nil {
+			alert.DisableNotifyRecovery = disableNotifyRecovery
+		}
 		return nil
 	})
 	PerformConfigLog(alert, userCred)
@@ -1307,7 +1563,7 @@ func (alert *SCommonAlert) PerformEnable(ctx context.Context, userCred mcclient.
 	if err != nil {
 		return nil, errors.Wrap(err, "EnabledPerformEnable")
 	}
-	alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
+	//alert.StartUpdateMonitorAlertJointTask(ctx, userCred)
 	return nil, nil
 }
 
@@ -1391,60 +1647,24 @@ func (alert *SCommonAlert) UpdateMonitorResourceJoint(ctx context.Context, userC
 	if err != nil {
 		return errors.Wrapf(err, "TestRunAlert %s", alert.GetName())
 	}
-	resourceIds := make([]string, 0)
-	for _, em := range ret.EvalMatches {
-		resourceKeyId := monitor.MEASUREMENT_TAG_ID[resType]
-		resourceId := em.Tags[resourceKeyId]
-		if len(resourceId) == 0 {
-			continue
+	if len(ret.AlertOKEvalMatches) > 0 {
+		matches := make([]monitor.EvalMatch, len(ret.AlertOKEvalMatches))
+		for i := range ret.AlertOKEvalMatches {
+			matches[i] = *ret.AlertOKEvalMatches[i]
 		}
-		resourceIds = append(resourceIds, resourceId)
-	}
-	deleteJointIds := make([]int64, 0)
-	joints, _ := MonitorResourceAlertManager.GetJoinsByListInput(monitor.MonitorResourceJointListInput{AlertId: alert.GetId()})
-jointLoop:
-	for _, joint := range joints {
-		for i, resId := range resourceIds {
-			if resId == joint.MonitorResourceId {
-				resourceIds = append(resourceIds[0:i], resourceIds[i+1:]...)
-				continue jointLoop
-			}
+		input := &UpdateMonitorResourceAlertInput{
+			AlertId:       alert.GetId(),
+			Matches:       matches,
+			ResType:       resType,
+			AlertState:    string(monitor.AlertStateOK),
+			SendState:     monitor.SEND_STATE_SILENT,
+			TriggerTime:   time.Now(),
+			AlertRecordId: "",
 		}
-		// 排除近期有报警状态的情况：system.uptime
-		if joint.AlertState == monitor.MONITOR_RESOURCE_ALERT_STATUS_ALERTING && time.Now().Sub(joint.TriggerTime).
-			Minutes() < 30 {
-			continue
+		if err := MonitorResourceManager.UpdateMonitorResourceAttachJoint(ctx, userCred, input); err != nil {
+			return errors.Wrap(err, "UpdateMonitorResourceAttachJoint")
 		}
-		deleteJointIds = append(deleteJointIds, joint.RowId)
-	}
-
-	if len(resourceIds) == 0 && len(deleteJointIds) == 0 {
 		return nil
-	}
-	//  sync joints should be deleted
-	if len(deleteJointIds) > 0 {
-		err := MonitorResourceAlertManager.DetachJoint(ctx, userCred, monitor.MonitorResourceJointListInput{JointId: deleteJointIds})
-		if err != nil {
-			return errors.Wrapf(err, "DetachJoint by alert %s(%s)", alert.GetName(), alert.GetId())
-		}
-	}
-
-	if len(resourceIds) > 0 {
-		monitorResources, _ := MonitorResourceManager.GetMonitorResources(monitor.MonitorResourceListInput{ResId: resourceIds})
-		errs := make([]error, 0)
-		for _, monRes := range monitorResources {
-			resDesc := fmt.Sprintf("%s/%s/%s", monRes.ResType, monRes.GetName(), monRes.ResId)
-			if err := monRes.AttachAlert(ctx, userCred, alert.GetId()); err != nil {
-				errs = append(errs, errors.Wrapf(err, "AttachAlert %s to %s", alert.GetName(), resDesc))
-			}
-			if err := monRes.UpdateAlertState(); err != nil {
-				errs = append(errs, errors.Wrapf(err, "UpdateAlertState for monitor resource %s", resDesc))
-			}
-		}
-
-		if len(errs) != 0 {
-			return errors.NewAggregate(errs)
-		}
 	}
 	return nil
 }
@@ -1488,6 +1708,138 @@ func (alert *SCommonAlert) UpdateResType() error {
 		return errors.Wrapf(err, "alert:%s UpdateResType err", alert.Name)
 	}
 	return nil
+}
+
+func (alert *SCommonAlert) GetSilentPeriod() (int64, error) {
+	notis, err := alert.GetNotifications()
+	if err != nil {
+		return 0, errors.Wrap(err, "GetNotifications")
+	}
+	for _, n := range notis {
+		noti, _ := n.GetNotification()
+		if noti != nil && noti.Frequency != 0 {
+			return noti.Frequency, nil
+		}
+	}
+	return 0, nil
+}
+
+func (alert *SCommonAlert) updateNotificationSilentPeriod(silentPeriod string) error {
+	duration, _ := time.ParseDuration(silentPeriod)
+	frequency := int64(duration / time.Second)
+	notis, err := alert.GetNotifications()
+	if err != nil {
+		return errors.Wrap(err, "GetNotifications")
+	}
+	for _, n := range notis {
+		noti, _ := n.GetNotification()
+		if noti != nil {
+			if _, err := db.Update(noti, func() error {
+				noti.Frequency = frequency
+				return nil
+			}); err != nil {
+				return errors.Wrapf(err, "update notification %s frequency", noti.GetId())
+			}
+		}
+	}
+	return nil
+}
+
+func (alert *SCommonAlert) GetAlertRules(silentPeriod int64) ([]*monitor.AlertRecordRule, error) {
+	rules := make([]*monitor.AlertRecordRule, 0)
+	settings, err := alert.GetSettings()
+	if err != nil {
+		return nil, errors.Wrapf(err, "get alert %s settings", alert.GetId())
+	}
+	for index := range settings.Conditions {
+		rule := alert.GetAlertRule(settings, index, silentPeriod)
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+func (alert *SCommonAlert) GetAlertRule(settings *monitor.AlertSetting, index int, silentPeriod int64) *monitor.AlertRecordRule {
+	alertDetails := alert.GetCommonAlertMetricDetailsFromAlertCondition(index, &settings.Conditions[index])
+	rule := &monitor.AlertRecordRule{
+		ResType:         alertDetails.ResType,
+		Metric:          fmt.Sprintf("%s.%s", alertDetails.Measurement, alertDetails.Field),
+		Measurement:     alertDetails.Measurement,
+		Database:        alertDetails.DB,
+		MeasurementDesc: alertDetails.MeasurementDisplayName,
+		Field:           alertDetails.Field,
+		FieldDesc:       alertDetails.FieldDescription.DisplayName,
+		Comparator:      alertDetails.Comparator,
+		Unit:            alertDetails.FieldDescription.Unit,
+		Threshold:       RationalizeValueFromUnit(alertDetails.Threshold, alertDetails.FieldDescription.Unit, ""),
+		ThresholdRange:  alertDetails.ThresholdRange,
+		ConditionType:   alertDetails.ConditionType,
+		Reducer:         alertDetails.Reduce,
+	}
+	if len(rule.ResType) == 0 {
+		if alertDetails.DB == monitor.METRIC_DATABASE_TELE {
+			rule.ResType = monitor.METRIC_RES_TYPE_HOST
+		}
+	}
+	if alert.Frequency < 60 {
+		rule.Period = fmt.Sprintf("%ds", alert.Frequency)
+	} else {
+		rule.Period = fmt.Sprintf("%dm", alert.Frequency/60)
+	}
+	rule.AlertDuration = alert.For / alert.Frequency
+	if rule.AlertDuration == 0 {
+		rule.AlertDuration = 1
+	}
+	if silentPeriod > 0 {
+		rule.SilentPeriod = fmt.Sprintf("%dm", silentPeriod/60)
+	}
+	return rule
+}
+
+func (alert *SCommonAlert) GetResourceAlert(resourceId string, metric string) (*SMonitorResourceAlert, error) {
+	return MonitorResourceAlertManager.GetResourceAlert(alert.GetId(), resourceId, metric)
+}
+
+func (alert *SCommonAlert) IsResourceMetricAlerting(resourceId string, metric string) (bool, error) {
+	ra, err := alert.GetResourceAlert(resourceId, metric)
+	if err != nil {
+		return false, errors.Wrapf(err, "GetResourceAlert")
+	}
+	if ra.AlertState == string(monitor.AlertStateAlerting) {
+		return true, nil
+	}
+	return false, nil
+}
+
+var fileSize = []string{"bps", "Bps", "byte"}
+
+func RationalizeValueFromUnit(value float64, unit string, opt string) string {
+	if utils.IsInStringArray(unit, fileSize) {
+		if unit == "byte" {
+			return (FormatFileSize(value, unit, float64(1024)))
+		}
+		return FormatFileSize(value, unit, float64(1000))
+	}
+	if unit == "%" && monitor.CommonAlertFieldOptDivision == monitor.CommonAlertFieldOpt(opt) {
+		return fmt.Sprintf("%0.2f%s", value*100, unit)
+	}
+	return fmt.Sprintf("%0.2f%s", value, unit)
+}
+
+// 单位转换 保留2位小数
+func FormatFileSize(fileSize float64, unit string, unitsize float64) (size string) {
+	if fileSize < unitsize {
+		return fmt.Sprintf("%.2f%s", fileSize, unit)
+	} else if fileSize < (unitsize * unitsize) {
+		return fmt.Sprintf("%.2fK%s", float64(fileSize)/float64(unitsize), unit)
+	} else if fileSize < (unitsize * unitsize * unitsize) {
+		return fmt.Sprintf("%.2fM%s", float64(fileSize)/float64(unitsize*unitsize), unit)
+	} else if fileSize < (unitsize * unitsize * unitsize * unitsize) {
+		return fmt.Sprintf("%.2fG%s", float64(fileSize)/float64(unitsize*unitsize*unitsize), unit)
+	} else if fileSize < (unitsize * unitsize * unitsize * unitsize * unitsize) {
+		return fmt.Sprintf("%.2fT%s", float64(fileSize)/float64(unitsize*unitsize*unitsize*unitsize), unit)
+	} else { //if fileSize < (1024 * 1024 * 1024 * 1024 * 1024 * 1024)
+		return fmt.Sprintf("%.2fE%s", float64(fileSize)/float64(unitsize*unitsize*unitsize*unitsize*unitsize), unit)
+	}
 }
 
 type SCompanyInfo struct {

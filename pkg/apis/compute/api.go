@@ -15,15 +15,18 @@
 package compute
 
 import (
+	"time"
+
 	"yunion.io/x/jsonutils"
 
 	"yunion.io/x/onecloud/pkg/apis"
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 )
 
 type SchedtagConfig struct {
 	apis.Meta
 
-	// swagger: ignore
+	// swagger:ignore
 	Id string `json:"id"`
 	// 调度策略
 	// required: 必须使用
@@ -32,7 +35,7 @@ type SchedtagConfig struct {
 	// exclude: 禁止使用
 	// enmu: required, prefer, avoid, exclude
 	Strategy string `json:"strategy"`
-	// swagger: ignore
+	// swagger:ignore
 	Weight int `json:"weight"`
 	// 资源类型
 	// hosts: 宿主机
@@ -78,23 +81,35 @@ type NetworkConfig struct {
 
 	// 子网内的IPv6地址
 	// required: false
-	// swagger:ignore
 	Address6 string `json:"address6"`
 
 	// 如果是批量创建，指定每台主机子网内的IPv4地址
 	// required: false
 	Addresses6 []string `json:"addresses6"`
 
+	// 是否要求分配IPv6地址
+	// required: false
+	RequireIPv6 bool `json:"require_ipv6"`
+
+	// 只分配IPv6地址，禁用IPv4
+	// required: false
+	StrictIPv6 bool `json:"strict_ipv6"`
+
 	// 驱动方式
 	// 若指定镜像的网络驱动方式，此参数会被覆盖
 	Driver         string `json:"driver"`
 	BwLimit        int    `json:"bw_limit"`
+	TxBwLimit      int    `json:"tx_bw_limit"`
+	RxBwLimit      int    `json:"rx_bw_limit"`
 	Vip            bool   `json:"vip"`
 	Reserved       bool   `json:"reserved"`
-	NetType        string `json:"net_type"`
 	NumQueues      int    `json:"num_queues"`
 	RxTrafficLimit int64  `json:"rx_traffic_limit"`
 	TxTrafficLimit int64  `json:"tx_traffic_limit"`
+
+	NetType TNetworkType `json:"net_type"`
+
+	IsDefault bool `json:"is_default"`
 
 	// sriov nic
 	SriovDevice *IsolatedDeviceConfig `json:"sriov_device"`
@@ -107,6 +122,13 @@ type NetworkConfig struct {
 	StandbyPortCount int `json:"standby_port_count"`
 	StandbyAddrCount int `json:"standby_addr_count"`
 
+	PortMappings GuestPortMappings `json:"port_mappings"`
+
+	// 计费模式
+	BillingType billing_api.TBillingType `json:"billing_type"`
+	// 计量模式
+	ChargeType billing_api.TNetChargeType `json:"charge_type"`
+
 	// swagger:ignore
 	Project string `json:"project_id"`
 
@@ -114,12 +136,22 @@ type NetworkConfig struct {
 	Domain    string            `json:"domain_id"`
 	Ifname    string            `json:"ifname"`
 	Schedtags []*SchedtagConfig `json:"schedtags"`
+
+	// network secgroups
+	Secgroups []string `json:"secgroups"`
 }
 
 type AttachNetworkInput struct {
 	// 添加的网卡的配置
-	// required: true
+	// required: false
 	Nets []*NetworkConfig `json:"nets"`
+
+	// 添加的网卡的配置
+	// required: false
+	NetDesc []string `json:"net_desc"`
+
+	// 添加后不立即同步配置
+	DisableSyncConfig *bool `json:"disable_sync_config"`
 }
 
 type DiskConfig struct {
@@ -145,7 +177,7 @@ type DiskConfig struct {
 	BackupId string `json:"backup_id"`
 
 	// 磁盘类型
-	// enum: sys, data, swap
+	// enum: ["sys", "data", "swap"]
 	DiskType string `json:"disk_type"`
 
 	Schedtags []*SchedtagConfig `json:"schedtags"`
@@ -156,22 +188,34 @@ type DiskConfig struct {
 	SizeMb int `json:"size"`
 
 	// 文件系统,仅kvm支持自动格式化磁盘,私有云和公有云此参数不会生效
-	// enum: swap, ext2, ext3, ext4, xfs, ntfs, fat, hfsplus
+	// enum: ["swap", "ext2", "ext3", "ext4", "xfs", "ntfs", "fat", "hfsplus"]
 	// requried: false
 	Fs string `json:"fs"`
 
+	// 文件系统特性
+	FsFeatures *DiskFsFeatures `json:"fs_features"`
+
+	// 关机后自动重置磁盘
+	// required: false
+	AutoReset bool `json:"auto_reset"`
+
+	// 是否跟随主机删除而自动删除
+	// 默认跟随主机创建的磁盘为 true
+	// required: false
+	AutoDelete *bool `json:"auto_delete,omitempty"`
+
 	// 磁盘存储格式
-	// enum: qcow2, raw, docker, iso, vmdk, vmdkflatver1, vmdkflatver2, vmdkflat, vmdksparse, vmdksparsever1, vmdksparsever2, vmdksepsparse vhd
+	// enum: ["qcow2", "raw", "docker", "iso", "vmdk", "vmdkflatver1", "vmdkflatver2", "vmdkflat", "vmdksparse", "vmdksparsever1", "vmdksparsever2", "vmdksepsparse", "vhd"]
 	// requried: false
 	Format string `json:"format"`
 
 	// 磁盘驱动方式
-	// enum: virtio, ide, scsi, sata, pvscsi
+	// enum: ["virtio", "ide", "scsi", "sata", "pvscsi"]
 	// requried: false
 	Driver string `json:"driver"`
 
 	// 磁盘缓存模式
-	// enum: writeback, none, writethrough
+	// enum: ["writeback", "none", "writethrough"]
 	// requried: false
 	Cache string `json:"cache"`
 
@@ -256,6 +300,14 @@ type DiskConfig struct {
 
 	// NVNe device
 	NVMEDevice *IsolatedDeviceConfig `json:"nvme_device"`
+
+	// 预分配策略:
+	// off: 关闭预分配，默认关闭
+	// metadata: 精简置备
+	// falloc: 厚置备延迟置零
+	// full: 厚置备快速置零
+	// default: off
+	Preallocation string `json:"preallocation"`
 }
 
 type IsolatedDeviceConfig struct {
@@ -263,10 +315,22 @@ type IsolatedDeviceConfig struct {
 	Id           string `json:"id"`
 	DevType      string `json:"dev_type"`
 	Model        string `json:"model"`
+	SharingMode  string `json:"sharing_mode"`
 	Vendor       string `json:"vendor"`
-	NetworkIndex *int8  `json:"network_index"`
+	NetworkIndex *int   `json:"network_index"`
 	WireId       string `json:"wire_id"`
 	DiskIndex    *int8  `json:"disk_index"`
+	DevicePath   string `json:"device_path"`
+	GpuType      string `json:"gpu_type"`
+	// MemoryMb is the minimum on-device memory in MiB required from the
+	// candidate isolated_device (e.g. NVIDIA GPU VRAM). 0 means no constraint.
+	// The scheduler excludes devices whose memory_size > 0 and is below this
+	// threshold; devices with memory_size == 0 are treated as unknown and
+	// allowed through to avoid penalising hosts that haven't reported yet.
+	MemoryMb int `json:"memory_mb,omitempty"`
+	// Memory request for Devices allocate by Memory size
+	MemoryRequest int `json:"memory_request,omitempty"`
+	SmUtilLimit   int `json:"sm_util_limit,omitempty"`
 }
 
 type BaremetalDiskConfig struct {
@@ -286,6 +350,23 @@ type BaremetalDiskConfig struct {
 	RA           *bool   `json:"ra,omitempty"`
 	WT           *bool   `json:"wt,omitempty"`
 	Direct       *bool   `json:"direct,omitempty"`
+	SoftRaidIdx  *int    `json:"soft_raid_idx"`
+}
+
+type RootDiskMatcherSizeMBRange struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+const (
+	BAREMETAL_SERVER_METATA_ROOT_DISK_MATCHER = "baremetal_root_disk_matcher"
+)
+
+type BaremetalRootDiskMatcher struct {
+	Device      string                      `json:"device"`
+	SizeMB      int64                       `json:"size_mb"`
+	SizeMBRange *RootDiskMatcherSizeMBRange `json:"size_mb_range"`
+	PCIPath     string                      `json:"pci_path"`
 }
 
 type ServerConfigs struct {
@@ -296,7 +377,10 @@ type ServerConfigs struct {
 	PreferRegion string `json:"prefer_region_id"`
 
 	// 调度到指定可用区,优先级低于prefer_host_id
-	PreferZone string `json:"prefer_zone_id"`
+	PreferZone string `json:"prefer_zone_id" yunion-deprecated-by:"prefer_zones"`
+
+	// 调度到指定可用区列表,优先级低于prefer_host_id
+	PreferZones []string `json:"prefer_zones"`
 
 	// 调度使用指定二层网络, 优先级低于prefer_host_id
 	PreferWire string `json:"prefer_wire_id"`
@@ -329,6 +413,12 @@ type ServerConfigs struct {
 	// default: kvm
 	Hypervisor string `json:"hypervisor"`
 
+	// specific qemu version, eg: 4.2.0, 10.0.7
+	QemuVersion string `json:"qemu_version"`
+
+	// swagger: ignore
+	Provider string `json:"provider"`
+
 	// 包年包月资源池
 	// swagger:ignore
 	// emum: shared, prepaid, dedicated
@@ -351,7 +441,7 @@ type ServerConfigs struct {
 	Backup bool `json:"backup"`
 
 	// 设置为 daemon 虚机
-	// default: nil
+	// default: false
 	// required: false
 	IsDaemon *bool `json:"is_daemon"`
 
@@ -373,12 +463,18 @@ type ServerConfigs struct {
 	// required: false
 	Schedtags []*SchedtagConfig `json:"schedtags"`
 
+	// 宿主机路径调度约束，仅检查 auto_create=false 的 host_path
+	HostPathRequirements []apis.HostPathRequirement `json:"host_path_requirements,omitempty"`
+
 	// 透传设备列表
 	// required: false
 	IsolatedDevices []*IsolatedDeviceConfig `json:"isolated_devices"`
 
 	// 裸金属磁盘配置列表
 	BaremetalDiskConfigs []*BaremetalDiskConfig `json:"baremetal_disk_configs"`
+
+	// 裸金属系统盘匹配器
+	BaremetalRootDiskMatcher *BaremetalRootDiskMatcher `json:"baremetal_root_disk_matcher"`
 
 	// 主机组列表, 参数可以是主机组名称或ID,建议使用ID
 	InstanceGroupIds []string `json:"groups"`
@@ -398,10 +494,55 @@ func NewServerConfigs() *ServerConfigs {
 	}
 }
 
+func (c *ServerConfigs) GetPreferZones() []string {
+	if len(c.PreferZones) > 0 {
+		return c.PreferZones
+	}
+	if c.PreferZone != "" {
+		return []string{c.PreferZone}
+	}
+	return nil
+}
+
+func (c *ServerConfigs) HasPreferZone() bool {
+	return len(c.GetPreferZones()) > 0
+}
+
 type DeployConfig struct {
 	Action  string `json:"action"`
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+// KickstartConfig Kickstart/Autoinstall自动化安装配置
+type KickstartConfig struct {
+	// 配置文件内容 (当用户直接提供配置时使用)
+	// required: false
+	Config string `json:"config,omitempty"`
+
+	// 配置文件 URL (当配置文件位于外部服务器时使用)
+	// required: false
+	ConfigURL string `json:"config_url,omitempty"`
+
+	// 操作系统类型 (用于确定内核参数和文件路径)
+	// enum: ["centos", "rhel", "fedora", "openeuler", "ubuntu"]
+	// required: true
+	OSType string `json:"os_type" validate:"required,oneof=centos rhel fedora openeuler ubuntu"`
+
+	// 是否启用 (用于临时禁用而不删除配置)
+	// default: true
+	// required: false
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// 最大重试次数
+	// default: 3
+	// required: false
+	MaxRetries int `json:"max_retries,omitempty"`
+
+	// 安装超时时间 (分钟)
+	// default: 60
+	// required: false
+	TimeoutMinutes int `json:"timeout_minutes,omitempty"`
 }
 
 type ServerCreateInput struct {
@@ -421,15 +562,28 @@ type ServerCreateInput struct {
 	// default: 1
 	VcpuCount int `json:"vcpu_count"`
 
+	// cpu卡槽数
+	// 目前仅vmware支持此参数
+	// default: 1
+	CpuSockets int `json:"cpu_sockets"`
+
+	// 额外分配 cpu 数量
+	// required: false
+	ExtraCpuCount int `json:"extra_cpu_count"`
+
 	// 用户自定义启动脚本
 	// 支持 #cloud-config yaml 格式及shell脚本
 	// 支持特殊user data平台: Aliyun, Qcloud, Azure, Apsara, Ucloud
 	// required: false
 	UserData string `json:"user_data"`
 
-	// swagger: ignore
+	// swagger:ignore
 	// 创建测试数据，不实际创建资源
 	FakeCreate bool `json:"fake_create"`
+
+	// swagger: ignore
+	// 从托管物理机创建虚机记录，不实际创建虚机
+	FakeCreateFromBmImport bool `json:"fake_create_from_bm_import"`
 
 	// swagger:ignore
 	// Deprecated
@@ -453,18 +607,19 @@ type ServerCreateInput struct {
 	Cdrom          string `json:"cdrom"`
 	CdromBootIndex *int8  `json:"cdrom_boot_index"`
 
-	// enum: cirros, vmware, qxl, std
+	// enum: ["cirros", "vmware", "qxl", "std"]
 	// default: std
 	Vga string `json:"vga"`
 
 	// 远程连接协议
-	// enum: vnc, spice
+	// enum: ["vnc", "spice"]
 	// default: vnc
 	Vdi string `json:"vdi"`
 
 	// BIOS类型, 若镜像是Windows，并且支持UEFI,则自动会设置为UEFI
 	// emulate: BIOS, UEFI
-	Bios string `json:"bios"`
+	Bios      string `json:"bios"`
+	EnableTpm bool   `json:"enable_tpm"`
 
 	// Machine类型
 	// emulate: pc, q35
@@ -488,7 +643,7 @@ type ServerCreateInput struct {
 
 	// 关机后执行的操作
 	// terminate: 关机后自动删除
-	// emum: stop, terminate
+	// enum: ["stop", "terminate", "stop_release_gpu"]
 	// default: stop
 	ShutdownBehavior string `json:"shutdown_behavior"`
 
@@ -529,10 +684,14 @@ type ServerCreateInput struct {
 	// 指定此参数后会创建新的弹性公网IP并绑定到新建的虚拟机
 	// 此参数优先级低于public_ip
 	EipBw int `json:"eip_bw,omitzero"`
+	// 弹性公网IP上行带宽
+	EipTxBw int `json:"eip_tx_bw,omitzero"`
+	// 弹性公网IP下行带宽
+	EipRxBw int `json:"eip_rx_bw,omitzero"`
 	// 弹性公网IP线路类型
 	EipBgpType string `json:"eip_bgp_type,omitzero"`
 	// 弹性公网IP计费类型
-	EipChargeType string `json:"eip_charge_type,omitempty"`
+	EipChargeType billing_api.TNetChargeType `json:"eip_charge_type,omitempty"`
 	// 是否跟随主机删除而自动释放
 	EipAutoDellocate bool `json:"eip_auto_dellocate,omitempty"`
 
@@ -558,7 +717,7 @@ type ServerCreateInput struct {
 	// |----                    |-------    |
 	// |traffic                    |按流量计费|
 	// |bandwidth                |按带宽计费|
-	PublicIpChargeType string `json:"public_ip_charge_type,omitempty"`
+	PublicIpChargeType billing_api.TNetChargeType `json:"public_ip_charge_type,omitempty"`
 
 	// 使用主机快照创建虚拟机, 主机快照不会重置密码及秘钥信息
 	// 使用主机快照创建的虚拟机将沿用之前的密码秘钥及安全组信息
@@ -575,6 +734,16 @@ type ServerCreateInput struct {
 	// 安全组Id列表
 	Secgroups []string `json:"secgroups"`
 
+	// 源 IP 检查
+	SrcIpCheck *bool `json:"src_ip_check"`
+	// 源 MAC 检查
+	SrcMacCheck *bool `json:"src_mac_check"`
+
+	// GCP 网络标记(network tags)，仅对 Google 云有效
+	// 传入后可不指定安全组，创建时直接作为实例 tags 下发
+	// required: false
+	NetworkTags []string `json:"network_tags"`
+
 	// swagger:ignore
 	OsType string `json:"os_type"`
 	// swagger:ignore
@@ -584,9 +753,11 @@ type ServerCreateInput struct {
 	// swagger:ignore
 	OsProfile jsonutils.JSONObject `json:"__os_profile__"`
 	// swagger:ignore
-	BillingType string `json:"billing_type"`
+	BillingType billing_api.TBillingType `json:"billing_type"`
 	// swagger:ignore
 	BillingCycle string `json:"billing_cycle"`
+	// 到期释放时间
+	ReleaseAt time.Time `json:"release_at"`
 
 	// swagger:ignore
 	// Deprecated
@@ -602,6 +773,31 @@ type ServerCreateInput struct {
 
 	// 指定用于新建主机的主机镜像ID
 	GuestImageID string `json:"guest_image_id"`
+
+	// Kickstart/Autoinstall自动化安装配置
+	// required: false
+	KickstartConfig *KickstartConfig `json:"kickstart_config,omitempty"`
+
+	Pod *PodCreateInput `json:"pod"`
+}
+
+func (c *KickstartConfig) IsEnabled() bool {
+	if c.Enabled != nil && !*c.Enabled {
+		return false
+	}
+	return true
+}
+
+// ServerUpdateKickstartStatusInput 更新虚拟机 kickstart 状态的输入
+type ServerUpdateKickstartStatusInput struct {
+	// kickstart 状态
+	// enum: ["kickstart_pending", "kickstart_installing", "kickstart_completed", "kickstart_failed"]
+	// required: true
+	Status string `json:"status" validate:"required,oneof=kickstart_pending kickstart_installing kickstart_completed kickstart_failed"`
+
+	// 错误信息（可选）
+	// required: false
+	ErrorMessage string `json:"error_message,omitempty"`
 }
 
 func (input *ServerCreateInput) AfterUnmarshal() {
@@ -640,15 +836,15 @@ type GuestBatchMigrateRequest struct {
 }
 
 type GuestBatchMigrateParams struct {
-	Id              string
-	LiveMigrate     bool
-	SkipCpuCheck    bool
-	SkipKernelCheck bool
-	EnableTLS       *bool
-	RescueMode      bool
-	OldStatus       string
-	MaxBandwidthMb  *int64
-	QuciklyFinish   *bool
+	Id              string `json:"id"`
+	LiveMigrate     bool   `json:"live_migrate"`
+	SkipCpuCheck    bool   `json:"skip_cpu_check"`
+	SkipKernelCheck bool   `json:"skip_kernel_check"`
+	EnableTLS       *bool  `json:"enable_tls"`
+	RescueMode      bool   `json:"rescue_mode"`
+	OldStatus       string `json:"old_status"`
+	MaxBandwidthMb  *int64 `json:"max_bandwidth_mb"`
+	QuciklyFinish   *bool  `json:"quickly_finish"`
 }
 
 type HostLoginInfo struct {

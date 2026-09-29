@@ -276,8 +276,7 @@ func (ident *SIdentityProvider) MarkConnected(ctx context.Context, userCred mccl
 		}
 	}
 	if ident.Status != api.IdentityDriverStatusConnected {
-		logclient.AddSimpleActionLog(ident, logclient.ACT_ENABLE, nil, userCred, true)
-		return ident.SetStatus(userCred, api.IdentityDriverStatusConnected, "")
+		return ident.SetStatus(ctx, userCred, api.IdentityDriverStatusConnected, "")
 	}
 	return nil
 }
@@ -290,9 +289,8 @@ func (ident *SIdentityProvider) MarkDisconnected(ctx context.Context, userCred m
 	if err != nil {
 		return errors.Wrap(err, "UpdateWithLock")
 	}
-	logclient.AddSimpleActionLog(ident, logclient.ACT_DISABLE, reason.Error(), userCred, false)
 	if ident.Status != api.IdentityDriverStatusDisconnected {
-		return ident.SetStatus(userCred, api.IdentityDriverStatusDisconnected, reason.Error())
+		return ident.SetStatus(ctx, userCred, api.IdentityDriverStatusDisconnected, reason.Error())
 	}
 	return nil
 }
@@ -347,6 +345,38 @@ func (ident *SIdentityProvider) PerformConfig(ctx context.Context, userCred mccl
 
 func (manager *SIdentityProviderManager) getDriveInstanceCount(drvName string) (int, error) {
 	return manager.Query().Equals("driver", drvName).CountWithError()
+}
+
+func (manager *SIdentityProviderManager) GetPropertyAttributeNames(ctx context.Context, userCred mcclient.TokenCredential, input api.IdentityProviderPropertyAttributeNamesInput) (jsonutils.JSONObject, error) {
+	var drvName string
+
+	template := input.Template
+	if len(template) > 0 {
+		if _, ok := api.IdpTemplateDriver[template]; !ok {
+			return nil, httperrors.NewInputParameterError("invalid template")
+		}
+		drvName = api.IdpTemplateDriver[template]
+		input.Driver = drvName
+	} else {
+		drvName = input.Driver
+		if len(drvName) == 0 {
+			return nil, httperrors.NewInputParameterError("missing driver")
+		}
+	}
+
+	drvCls := driver.GetDriverClass(drvName)
+	if drvCls == nil {
+		return nil, httperrors.NewInputParameterError("driver %s not supported", drvName)
+	}
+
+	attrs, err := drvCls.AttributeNames(input.Template)
+	if err != nil {
+		return nil, errors.Wrap(err, "AttributeNames")
+	}
+	if len(attrs) == 0 {
+		return jsonutils.NewDict(), nil
+	}
+	return jsonutils.Marshal(attrs), nil
 }
 
 func (manager *SIdentityProviderManager) ValidateCreateData(
@@ -585,10 +615,39 @@ func (manager *SIdentityProviderManager) FetchCustomizeColumns(
 
 	stdRows := manager.SEnabledStatusStandaloneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	domainRows := manager.SDomainizedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	targetDomainIds := make([]string, len(objs))
+	idpIds := make([]string, len(objs))
 	for i := range rows {
 		rows[i].EnabledStatusStandaloneResourceDetails = stdRows[i]
 		rows[i].DomainizedResourceInfo = domainRows[i]
+		idp := objs[i].(*SIdentityProvider)
+		rows[i].SyncIntervalSeconds = idp.getSyncIntervalSeconds()
+		targetDomainIds[i] = idp.TargetDomainId
+		idpIds[i] = idp.Id
 		rows[i] = objs[i].(*SIdentityProvider).getMoreDetails(rows[i])
+	}
+	domainMap, err := db.FetchIdNameMap2(DomainManager, targetDomainIds)
+	if err != nil {
+		log.Errorf("FetchIdNameMap2 error: %s", err)
+	}
+
+	opts := []struct {
+		DomainId string
+		Value    string
+	}{}
+
+	err = WhitelistedConfigManager.Query("domain_id", "value").In("domain_id", idpIds).Equals("option", "url").All(&opts)
+	if err != nil {
+		log.Errorf("FetchModelObjects error: %s", err)
+	}
+	optMap := make(map[string]string)
+	for i := range opts {
+		optMap[opts[i].DomainId] = strings.Trim(opts[i].Value, `"`)
+	}
+
+	for i := range rows {
+		rows[i].TargetDomain = domainMap[targetDomainIds[i]]
+		rows[i].URL = optMap[idpIds[i]]
 	}
 
 	return rows
@@ -601,13 +660,6 @@ func (self *SIdentityProvider) getMoreDetails(out api.IdentityProviderDetails) a
 	out.DomainCount, _ = self.GetDomainCount()
 	out.ProjectCount, _ = self.GetProjectCount()
 	out.GroupCount, _ = self.GetGroupCount()
-	out.SyncIntervalSeconds = self.getSyncIntervalSeconds()
-	if len(self.TargetDomainId) > 0 {
-		domain, _ := DomainManager.FetchDomainById(self.TargetDomainId)
-		if domain != nil {
-			out.TargetDomain = domain.Name
-		}
-	}
 	return out
 }
 
@@ -777,13 +829,6 @@ func (self *SIdentityProvider) ValidateDeleteCondition(ctx context.Context, info
 		return httperrors.NewInvalidStatusError("cannot delete enabled idp")
 	}
 	if self.Driver == api.IdentityDriverLDAP || (self.IsSso.IsTrue() && self.isAutoCreateDomain()) || self.AutoCreateUser.IsTrue() {
-		prjCnt, err := self.GetProjectCount()
-		if err != nil {
-			return httperrors.NewGeneralError(err)
-		}
-		if prjCnt > 0 {
-			return httperrors.NewConflictError("identity provider with projects")
-		}
 		domains, err := self.getLinkedDomains()
 		if err != nil {
 			return httperrors.NewGeneralError(err)
@@ -847,10 +892,7 @@ func (self *SIdentityProvider) Purge(ctx context.Context, userCred mcclient.Toke
 		if self.isSsoIdp() && self.AutoCreateUser.IsFalse() {
 			continue
 		}
-		err = users[i].ValidatePurgeCondition(ctx, nil)
-		if err != nil {
-			db.OpsLog.LogEvent(&users[i], db.ACT_DELETE_FAIL, err, userCred)
-			log.Errorf("users %s ValidatePurgeCondition fail %s", users[i].Name, err)
+		if users[i].IsAdminUser() {
 			continue
 		}
 		err = users[i].Delete(ctx, userCred)
@@ -896,10 +938,10 @@ func (self *SIdentityProvider) Purge(ctx context.Context, userCred mcclient.Toke
 				return errors.Wrap(err, "domains[i].UnlinkIdp")
 			}
 		} else {
-			err = domains[i].ValidatePurgeCondition(ctx)
+			err = domains[i].validateDeleteConditionInternal(ctx, nil, true)
 			if err != nil {
 				db.OpsLog.LogEvent(&domains[i], db.ACT_DELETE_FAIL, err, userCred)
-				return errors.Wrap(err, "domain.ValidatePurgeCondition")
+				return errors.Wrap(err, "domain.ValidateDeleteCondition")
 			}
 			err = domains[i].UnlinkIdp(self.Id)
 			if err != nil {
@@ -937,7 +979,7 @@ func (self *SIdentityProvider) CustomizeDelete(ctx context.Context, userCred mcc
 }
 
 func (self *SIdentityProvider) startDeleteIdentityProviderTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
-	self.SetStatus(userCred, api.IdentityDriverStatusDeleting, "")
+	self.SetStatus(ctx, userCred, api.IdentityDriverStatusDeleting, "")
 
 	task, err := taskman.TaskManager.NewTask(ctx, "IdentityProviderDeleteTask", self, userCred, nil, parentTaskId, "", nil)
 	if err != nil {
@@ -1054,6 +1096,7 @@ func (self *SIdentityProvider) SyncOrCreateUser(ctx context.Context, extId strin
 		return nil, errors.Wrap(err, "db.NewModelObject")
 	}
 	user := userObj.(*SUser)
+	user.SetModelManager(UserManager, user)
 	q := UserManager.RawQuery().Equals("id", userId)
 	err = q.First(user)
 	if err != nil && err != sql.ErrNoRows {
@@ -1086,9 +1129,6 @@ func (self *SIdentityProvider) SyncOrCreateUser(ctx context.Context, extId strin
 			return nil, errors.Wrap(err, "Update")
 		}
 	} else {
-		if syncUserInfo != nil {
-			syncUserInfo(user)
-		}
 		if enableDefault {
 			user.Enabled = tristate.True
 		} else {
@@ -1111,6 +1151,9 @@ func (self *SIdentityProvider) SyncOrCreateUser(ctx context.Context, extId strin
 		}()
 		if err != nil {
 			return nil, errors.Wrap(err, "Insert")
+		}
+		if syncUserInfo != nil {
+			syncUserInfo(user)
 		}
 	}
 	return user, nil
@@ -1166,7 +1209,10 @@ func (manager *SIdentityProviderManager) ListItemFilter(
 					return nil, errors.Wrap(err, "FetchDomainByIdOrName")
 				}
 			}
-			q = q.Equals("domain_id", ssoDomain.Id)
+			q = q.Filter(sqlchemy.OR(
+				sqlchemy.Equals(q.Field("domain_id"), ssoDomain.Id),
+				sqlchemy.IsNullOrEmpty(q.Field("domain_id")),
+			))
 		}
 	}
 	if query.AutoCreateProject != nil {
@@ -1257,6 +1303,7 @@ func (idp *SIdentityProvider) TryUserJoinProject(attrConf api.SIdpAttributeOptio
 	}
 
 	var targetProject *SProject
+	projectFromAttr := false
 	log.Debugf("userTryJoinProject resp %s proj %s", attrs, attrConf.ProjectAttribute)
 	if !consts.GetNonDefaultDomainProjects() {
 		// if non-default-domain-project is disabled, place new project in default domain
@@ -1279,6 +1326,9 @@ func (idp *SIdentityProvider) TryUserJoinProject(attrConf api.SIdpAttributeOptio
 					}
 				}
 			}
+			if targetProject != nil {
+				projectFromAttr = true
+			}
 		}
 	}
 	if targetProject == nil && len(attrConf.DefaultProjectId) > 0 {
@@ -1297,6 +1347,8 @@ func (idp *SIdentityProvider) TryUserJoinProject(attrConf api.SIdpAttributeOptio
 					targetRole, err := RoleManager.FetchRole("", roleName, domainId, "")
 					if err != nil {
 						log.Errorf("fetch role %s fail %s", roleName, err)
+					} else if err := validateIdpJoinRole(targetProject, targetRole, idpJoinAllowsSystemRole(projectFromAttr, true)); err != nil {
+						log.Errorf("skip role %s for idp %s: %s", roleName, idp.Name, err)
 					} else {
 						targetRoles = append(targetRoles, targetRole)
 					}
@@ -1307,6 +1359,8 @@ func (idp *SIdentityProvider) TryUserJoinProject(attrConf api.SIdpAttributeOptio
 			targetRole, err := RoleManager.FetchRoleById(attrConf.DefaultRoleId)
 			if err != nil {
 				log.Errorf("fetch default role %s fail %s", attrConf.DefaultRoleId, err)
+			} else if err := validateIdpJoinRole(targetProject, targetRole, idpJoinAllowsSystemRole(projectFromAttr, false)); err != nil {
+				log.Errorf("skip default role %s for idp %s: %s", targetRole.Name, idp.Name, err)
 			} else {
 				targetRoles = append(targetRoles, targetRole)
 			}

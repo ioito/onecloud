@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,11 +27,14 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
+	"yunion.io/x/onecloud/pkg/hostman/diskutils/fsutils"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
 	"yunion.io/x/onecloud/pkg/util/btrfsutils"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
+	"yunion.io/x/onecloud/pkg/util/xfsutils"
 )
 
 type SKVMGuestDiskPartition struct {
@@ -52,7 +56,7 @@ func NewKVMGuestDiskPartition(devPath, sourceDev string, isLVM bool) *SKVMGuestD
 	res.fs = res.getFsFormat()
 	res.sourceDev = sourceDev
 	res.IsLVMPart = isLVM
-	fileutils2.CleanFailedMountpoints()
+	//fileutils2.CleanFailedMountpoints()
 	mountPath := fmt.Sprintf("/tmp/%s", strings.Replace(devPath, "/", "_", -1))
 	res.SLocalGuestFS = NewLocalGuestFS(mountPath)
 	return res
@@ -66,6 +70,8 @@ func (p *SKVMGuestDiskPartition) GetPhysicalPartitionType() string {
 	idxP := strings.LastIndexByte(dev, 'p')
 	if idxP > 0 {
 		dev = dev[:idxP]
+	} else {
+		dev = strings.TrimRight(dev, "0123456789")
 	}
 	cmd := fmt.Sprintf(`fdisk -l %s | grep "Disk.*label type:"`, dev)
 	output, err := procutils.NewCommand("sh", "-c", cmd).Output()
@@ -91,7 +97,7 @@ func (p *SKVMGuestDiskPartition) IsReadonly() bool {
 }
 
 func (p *SKVMGuestDiskPartition) getFsFormat() string {
-	return fileutils2.GetFsFormat(p.partDev)
+	return fsutils.GetFsFormat(p.partDev)
 }
 
 func (p *SKVMGuestDiskPartition) MountPartReadOnly() bool {
@@ -150,7 +156,7 @@ func (p *SKVMGuestDiskPartition) mount(readonly bool) error {
 	if output, err := procutils.NewCommand("mkdir", "-p", p.mountPath).Output(); err != nil {
 		return errors.Wrapf(err, "mkdir %s failed: %s", p.mountPath, output)
 	}
-	var cmds = []string{"mount", "-t"}
+	var cmds = []string{"mount"}
 	var opt, fsType string
 	if readonly {
 		opt = "ro"
@@ -164,41 +170,76 @@ func (p *SKVMGuestDiskPartition) mount(readonly bool) error {
 	} else if fsType == "hfsplus" && !readonly {
 		opt = "force,rw"
 	}
-	cmds = append(cmds, fsType)
+	if len(fsType) > 0 {
+		cmds = append(cmds, "-t", fsType)
+	}
 	if len(opt) > 0 {
 		cmds = append(cmds, "-o", opt)
 	}
 	cmds = append(cmds, p.partDev, p.mountPath)
+	p.acquireXFS(fsType)
 
 	var err error
-	if fsType == "xfs" {
-		uuids, _ := fileutils2.GetDevUuid(p.partDev)
-		p.uuid, _ = uuids["UUID"]
-		if len(p.uuid) > 0 {
-			LockXfsPartition(p.uuid)
-			defer func() {
-				if err != nil {
-					UnlockXfsPartition(p.uuid)
-				}
-			}()
-		}
-	}
-
 	retrier := func(utils.FibonacciRetrier) (bool, error) {
-		output, err := procutils.NewCommand(cmds[0], cmds[1:]...).Output()
-		if err == nil {
+		var errChan = make(chan error)
+		go func() {
+			output, err := procutils.NewCommand(cmds[0], cmds[1:]...).Output()
+			if err == nil {
+				errChan <- nil
+			} else {
+				log.Errorf("mount fail: %s %s", err, output)
+				time.Sleep(time.Millisecond * time.Duration(100+rand.Intn(400)))
+				errChan <- err
+			}
+		}()
+
+		// mount timeout
+		waitTime := time.Second * 30
+		if fsType == "ntfs-3g" {
+			waitTime = time.Second * 5
+		}
+		select {
+		case err = <-errChan:
+			if err != nil {
+				return false, err
+			}
 			return true, nil
-		} else {
-			log.Errorf("mount fail: %s %s", err, output)
-			time.Sleep(time.Millisecond * time.Duration(100+rand.Intn(400)))
-			return false, errors.Wrap(err, "")
+		case <-time.After(waitTime):
+			if fsType == "ntfs-3g" {
+				if err = procutils.NewCommand("mountpoint", p.mountPath).Run(); err != nil {
+					// mountpath is not a mountpoint
+					return false, err
+				} else {
+					// ntfs already mounted, but maybe in buildroot yunion os Failed to daemonize.
+					return true, nil
+				}
+			} else {
+				return false, errors.Errorf("mount timeout")
+			}
 		}
 	}
 	_, err = utils.NewFibonacciRetrierMaxTries(3, retrier).Start(context.Background())
 	if err != nil {
+		p.releaseXFS(fsType)
 		return errors.Wrap(err, "mount failed")
 	}
-	return nil // errors.Wrapf(err, "mount failed: %s", output)
+	return nil
+}
+
+func (p *SKVMGuestDiskPartition) acquireXFS(fsType string) {
+	if fsType == "xfs" {
+		uuids, _ := fileutils2.GetDevUuid(p.partDev)
+		p.uuid = uuids["UUID"]
+		if len(p.uuid) > 0 {
+			xfsutils.LockXfsPartition(p.uuid)
+		}
+	}
+}
+
+func (p *SKVMGuestDiskPartition) releaseXFS(fsType string) {
+	if fsType == "xfs" && len(p.uuid) > 0 {
+		xfsutils.UnlockXfsPartition(p.uuid)
+	}
 }
 
 func (p *SKVMGuestDiskPartition) fsck() error {
@@ -216,6 +257,9 @@ func (p *SKVMGuestDiskPartition) fsck() error {
 	case "ntfs":
 		checkCmd = []string{"ntfsfix", "-n", p.partDev}
 		fixCmd = []string{"ntfsfix", p.partDev}
+	case "f2fs":
+		checkCmd = []string{"fsck.f2fs", "-f", p.partDev}
+		fixCmd = []string{"fsck.f2fs", "-a", p.partDev}
 	}
 	if len(checkCmd) > 0 {
 		_, err := procutils.NewCommand(checkCmd[0], checkCmd[1:]...).Output()
@@ -261,12 +305,7 @@ func (p *SKVMGuestDiskPartition) Umount() error {
 		return nil
 	}
 
-	defer func() {
-		if p.fs == "xfs" && len(p.uuid) > 0 {
-			UnlockXfsPartition(p.uuid)
-		}
-	}()
-
+	defer p.releaseXFS(p.fs)
 	if p.fs == "btrfs" {
 		// first try unmount btrfs subvols
 		err := btrfsutils.UnmountSubvols(p.mountPath)
@@ -275,14 +314,8 @@ func (p *SKVMGuestDiskPartition) Umount() error {
 		}
 	}
 
-	// check lsof
-	{
-		out, err := procutils.NewCommand("lsof", p.mountPath).Output()
-		if err != nil {
-			log.Warningf("lsof %s fail %s", p.mountPath, err)
-		} else {
-			log.Infof("unmount path %s lsof %s", p.mountPath, string(out))
-		}
+	if _, err := procutils.NewCommand("blockdev", "--flushbufs", p.partDev).Output(); err != nil {
+		log.Warningf("blockdev --flushbufs %s error: %v", p.partDev, err)
 	}
 
 	var tries = 0
@@ -293,17 +326,17 @@ func (p *SKVMGuestDiskPartition) Umount() error {
 		log.Infof("umount %s: %s", p.partDev, p.mountPath)
 		out, err = procutils.NewCommand("umount", p.mountPath).Output()
 		if err == nil {
-			if _, err := procutils.NewCommand("blockdev", "--flushbufs", p.partDev).Output(); err != nil {
-				log.Warningf("blockdev --flushbufs %s error: %v", p.partDev, err)
-			}
 			if err := os.Remove(p.mountPath); err != nil {
 				log.Warningf("remove mount path %s error: %v", p.mountPath, err)
 			}
 			log.Infof("umount %s successfully", p.partDev)
 			return nil
 		} else {
+			lsofout, err := procutils.NewCommand("lsof", p.mountPath).Output()
+			log.Infof("unmount path %s lsof %s", p.mountPath, string(lsofout))
+
 			log.Warningf("failed umount %s: %s %s", p.partDev, err, out)
-			time.Sleep(time.Second * 1)
+			time.Sleep(time.Second * 3)
 		}
 	}
 	return errors.Wrapf(err, "umount %s", p.mountPath)
@@ -318,6 +351,8 @@ func (p *SKVMGuestDiskPartition) Zerofree() {
 			p.zerofreeExt()
 		case "ntfs":
 			p.zerofreeNtfs()
+			// case "xfs":
+			//	p.zerofreeFs("xfs")
 		}
 	}
 }
@@ -354,4 +389,83 @@ func (p *SKVMGuestDiskPartition) zerofreeNtfs() {
 		log.Errorf("zerofree ntfs error: %s", err)
 		return
 	}
+}
+
+func (p *SKVMGuestDiskPartition) zerofreeFs(fs string) {
+	err := p.zerofreeFsInternal(fs)
+	if err != nil {
+		log.Errorf("zerofreeFs %s %s: %s", p.partDev, fs, err)
+	}
+}
+
+func (p *SKVMGuestDiskPartition) zerofreeFsInternal(fs string) error {
+	uuids, _ := fileutils2.GetDevUuid(p.partDev)
+
+	backupDirPath, err := os.MkdirTemp(consts.DeployTempDir(), "backup")
+	if err != nil {
+		return errors.Wrap(err, "MkdirTemp")
+	}
+	defer func() {
+		cmd := []string{"rm", "-fr", backupDirPath}
+		output, err := procutils.NewCommand(cmd[0], cmd[1:]...).Output()
+		if err != nil {
+			log.Errorf("fail to remove %s %s: %s", backupDirPath, output, err)
+		}
+	}()
+	backupPath := filepath.Join(backupDirPath, "backup.tar.gz")
+
+	err = func() error {
+		// mount partition
+		if !p.Mount() {
+			return errors.Wrap(errors.ErrInvalidStatus, "fail to mount")
+		}
+		defer p.Umount()
+
+		// backup
+		cmd := []string{"tar", "-cpzf", backupPath, "--one-file-system", "-C", p.mountPath, "."}
+		output, err := procutils.NewCommand(cmd[0], cmd[1:]...).Output()
+		if err != nil {
+			return errors.Wrapf(err, "exec %s output %s", cmd, output)
+		}
+
+		return nil
+	}()
+	if err != nil {
+		return errors.Wrap(err, "backup")
+	}
+
+	// zero partition
+	output, err := procutils.NewCommand("shred", "-n", "0", "-z", p.partDev).Output()
+	if err != nil {
+		return errors.Wrapf(err, "shred output %s", output)
+	}
+	// make partition
+	uuid := uuids["UUID"]
+	err = fsutils.FormatPartition(p.partDev, fs, uuid, nil)
+	if err != nil {
+		return errors.Wrapf(err, "FormatPartition %s %s %s", p.partDev, fs, uuid)
+	}
+
+	err = func() error {
+		// mount partition
+		if !p.Mount() {
+			return errors.Wrap(errors.ErrInvalidStatus, "fail to mount")
+		}
+		// umount
+		defer p.Umount()
+
+		// copy back data
+		cmd := []string{"tar", "-xpzf", backupPath, "--numeric-owner", "-C", p.mountPath}
+		output, err := procutils.NewCommand(cmd[0], cmd[1:]...).Output()
+		if err != nil {
+			return errors.Wrapf(err, "exec %s output %s", cmd, output)
+		}
+
+		return nil
+	}()
+	if err != nil {
+		return errors.Wrap(err, "restore")
+	}
+
+	return nil
 }

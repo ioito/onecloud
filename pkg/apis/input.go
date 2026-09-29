@@ -14,7 +14,13 @@
 
 package apis
 
-import "time"
+import (
+	"time"
+
+	"yunion.io/x/pkg/util/billing"
+
+	"yunion.io/x/onecloud/pkg/httperrors"
+)
 
 type DomainizedResourceInput struct {
 	// 指定项目归属域名称或ID
@@ -379,13 +385,36 @@ type GetMetadataInput struct {
 type GetMetadataOutput map[string]string
 
 type DistinctFieldInput struct {
-	Field      []string
-	ExtraField []string
+	Field      []string `json:"field"`
+	ExtraField []string `json:"extra_field"`
+}
+
+type DistinctFieldsInput struct {
+	Field         []string `json:"field"`
+	ExtraField    []string `json:"extra_field"`
+	ExtraResource string   `json:"extra_resource"`
 }
 
 type PostpaidExpireInput struct {
-	Duration   string    `json:"duration"`
-	ExpireTime time.Time `json:"expire_time"`
+	Duration string `json:"duration"`
+	// swagger:ignore
+	ExpireTime time.Time `json:"expire_time" yunion-deprecated-by:"release_at"`
+	// 到期释放时间
+	ReleaseAt time.Time `json:"release_at"`
+}
+
+func (input *PostpaidExpireInput) GetReleaseAt() (time.Time, error) {
+	if !input.ReleaseAt.IsZero() {
+		return input.ReleaseAt, nil
+	}
+	if len(input.Duration) == 0 {
+		return time.Time{}, httperrors.NewInputParameterError("missing duration/expire_time")
+	}
+	bc, err := billing.ParseBillingCycle(input.Duration)
+	if err != nil {
+		return time.Time{}, httperrors.NewInputParameterError("invalid duration: %s", input.Duration)
+	}
+	return bc.EndAt(time.Now()), nil
 }
 
 type AutoRenewInput struct {
@@ -394,6 +423,8 @@ type AutoRenewInput struct {
 }
 
 type RenewInput struct {
+	// 续费时长
+	// example: 1d, 1w, 1m
 	Duration string `json:"duration"`
 }
 

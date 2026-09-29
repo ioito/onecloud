@@ -19,17 +19,24 @@ import (
 	"strconv"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/printutils"
 	"yunion.io/x/pkg/util/regutils"
 
+	"yunion.io/x/onecloud/cmd/climc/shell"
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cmdline"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/options"
+	compute_options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
 )
 
 func init() {
+
+	cmd := shell.NewResourceCmd(&modules.ServerNetworkTrafficLogs)
+	cmd.List(new(compute_options.ServerNetworkTrafficLogListOptions))
+
 	type ServerNetworkListOptions struct {
 		options.BaseListOptions
 		Server  string `help:"ID or Name of Server"`
@@ -88,12 +95,14 @@ func init() {
 	})
 
 	type ServerNetworkUpdateOptions struct {
-		SERVER  string `help:"ID or Name of Server"`
-		NETWORK string `help:"ID or Name of Wire"`
-		Mac     string `help:"Mac of NIC"`
-		Driver  string `help:"Driver model of vNIC" choices:"virtio|e1000|vmxnet3|rtl8139"`
-		Index   int64  `help:"Index of NIC" default:"-1"`
-		Ifname  string `help:"Interface name of vNIC on host"`
+		SERVER      string   `help:"ID or Name of Server"`
+		NETWORK     string   `help:"ID or Name of Network"`
+		Mac         string   `help:"Mac of NIC"`
+		Driver      string   `help:"Driver model of vNIC" choices:"virtio|e1000|vmxnet3|rtl8139"`
+		Index       int64    `help:"Index of NIC" default:"-1"`
+		Ifname      string   `help:"Interface name of vNIC on host"`
+		Default     bool     `help:"is default nic?"`
+		PortMapping []string `help:"Network port mapping, e.g. 'port=80,host_port=8080,protocol=<tcp|udp>,host_port_range=<int>-<int>,remote_ips=x.x.x.x|y.y.y.y'" short-token:"p"`
 	}
 	R(&ServerNetworkUpdateOptions{}, "server-network-update", "Update server network settings", func(s *mcclient.ClientSession, args *ServerNetworkUpdateOptions) error {
 		params := jsonutils.NewDict()
@@ -105,6 +114,17 @@ func init() {
 		}
 		if len(args.Ifname) > 0 {
 			params.Add(jsonutils.NewString(args.Ifname), "ifname")
+		}
+		if args.Default {
+			params.Add(jsonutils.JSONTrue, "is_default")
+		}
+		if len(args.PortMapping) > 0 {
+			psm, err := cmdline.ParseNetworkConfigPortMappings(args.PortMapping)
+			if err != nil {
+				return errors.Wrap(err, "parse port mapping")
+			}
+			ps := psm[0]
+			params.Add(jsonutils.Marshal(ps), "port_mappings")
 		}
 		if params.Size() == 0 {
 			return InvalidUpdateError()
@@ -124,7 +144,10 @@ func init() {
 	type ServerNetworkBWOptions struct {
 		SERVER  string `help:"ID or Name of server"`
 		MACORIP string `help:"IP, Mac, or Index of NIC"`
-		BW      int64  `help:"Bandwidth in Mbps"`
+
+		BW int64 `help:"Bandwidth in Mbps"`
+		Tx int64 `help:"Tx bandwidth in Mbps"`
+		Rx int64 `help:"Rx bandwidth in Mbps"`
 	}
 	R(&ServerNetworkBWOptions{}, "server-change-bandwidth", "Change server network bandwidth in Mbps", func(s *mcclient.ClientSession, args *ServerNetworkBWOptions) error {
 		params := jsonutils.NewDict()
@@ -142,6 +165,8 @@ func init() {
 			return fmt.Errorf("Please specify Ip or Mac")
 		}
 		params.Add(jsonutils.NewInt(args.BW), "bandwidth")
+		params.Add(jsonutils.NewInt(args.Tx), "tx_bw_limit")
+		params.Add(jsonutils.NewInt(args.Rx), "rx_bw_limit")
 		server, err := modules.Servers.PerformAction(s, args.SERVER, "change-bandwidth", params)
 		if err != nil {
 			return err
@@ -150,9 +175,55 @@ func init() {
 		return nil
 	})
 
+	type ServerSetPortMappingOptions struct {
+		SERVER      string   `help:"ID or Name of server"`
+		MACORIP     string   `help:"IP, Mac or Index of NIC"`
+		PortMapping []string `help:"Network port mapping, e.g. 'port=80,host_port=8080,protocol=<tcp|udp>,host_port_range=<int>-<int>,remote_ips=x.x.x.x|y.y.y.y'" short-token:"p"`
+	}
+	R(&ServerSetPortMappingOptions{}, "server-set-port-mapping", "Set server NIC port mappings (kvm/pod only): request host to allocate/set host_port, then sync config to host", func(s *mcclient.ClientSession, args *ServerSetPortMappingOptions) error {
+		params := jsonutils.NewDict()
+		if regutils.MatchMacAddr(args.MACORIP) {
+			params.Add(jsonutils.NewString(args.MACORIP), "mac")
+		} else if regutils.MatchIP4Addr(args.MACORIP) {
+			params.Add(jsonutils.NewString(args.MACORIP), "ip_addr")
+		} else if regutils.MatchIP6Addr(args.MACORIP) {
+			params.Add(jsonutils.NewString(args.MACORIP), "ip6_addr")
+		} else if regutils.MatchInteger(args.MACORIP) {
+			index, err := strconv.ParseInt(args.MACORIP, 10, 64)
+			if err != nil {
+				return err
+			}
+			params.Add(jsonutils.NewInt(index), "index")
+		} else if len(args.MACORIP) > 0 {
+			return fmt.Errorf("Please specify IP or Mac or Index of NIC")
+		} else {
+			// 默认第一块网卡
+			params.Add(jsonutils.NewInt(0), "index")
+		}
+		ps := compute.GuestPortMappings{}
+		if len(args.PortMapping) > 0 {
+			psm, err := cmdline.ParseNetworkConfigPortMappings(args.PortMapping)
+			if err != nil {
+				return errors.Wrap(err, "parse port mapping")
+			}
+			for _, mappings := range psm {
+				ps = append(ps, mappings...)
+			}
+		}
+		// 空数组表示清空该网卡的端口映射
+		params.Add(jsonutils.Marshal(ps), "port_mappings")
+		server, err := modules.Servers.PerformAction(s, args.SERVER, "set-port-mapping", params)
+		if err != nil {
+			return err
+		}
+		printObject(server)
+		return nil
+	})
+
 	type ServerAttachNetworkOptions struct {
-		SERVER  string   `help:"ID or Name of server"`
-		NETDESC []string `help:"Network description"`
+		SERVER            string   `help:"ID or Name of server"`
+		DisableSyncConfig bool     `help:"Disable sync config"`
+		NETDESC           []string `help:"Network description"`
 	}
 	R(&ServerAttachNetworkOptions{}, "server-attach-network", "Attach a server to a virtual network", func(s *mcclient.ClientSession, args *ServerAttachNetworkOptions) error {
 		input := compute.AttachNetworkInput{}
@@ -163,6 +234,7 @@ func init() {
 			}
 			input.Nets = append(input.Nets, conf)
 		}
+		input.DisableSyncConfig = &args.DisableSyncConfig
 		params := jsonutils.Marshal(input)
 		srv, err := modules.Servers.PerformAction(s, args.SERVER, "attachnetwork", params)
 		if err != nil {
@@ -176,12 +248,16 @@ func init() {
 		SERVER  string `help:"ID or Name of server"`
 		MACORIP string `help:"Mac Or IP of NIC"`
 		Reserve bool   `help:"Put the release IP address into reserved address pool"`
+		Force   bool   `help:"detach server network by force"`
 	}
-	R(&ServerDetachNetworkOptions{}, "server-detach-network", "Detach the virtual network fron a virtual server", func(s *mcclient.ClientSession, args *ServerDetachNetworkOptions) error {
+	R(&ServerDetachNetworkOptions{}, "server-detach-network", "Detach the virtual network from a virtual server", func(s *mcclient.ClientSession, args *ServerDetachNetworkOptions) error {
 		params := jsonutils.NewDict()
 		// params.Add(jsonutils.NewString(args.NETWORK), "net_id")
 		if args.Reserve {
 			params.Add(jsonutils.JSONTrue, "reserve")
+		}
+		if args.Force {
+			params.Add(jsonutils.JSONTrue, "force")
 		}
 		if regutils.MatchMacAddr(args.MACORIP) {
 			params.Add(jsonutils.NewString(args.MACORIP), "mac")

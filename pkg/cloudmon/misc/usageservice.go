@@ -24,7 +24,7 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
-	"yunion.io/x/onecloud/pkg/apis"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -83,14 +83,17 @@ func UsegReport(ctx context.Context, userCred mcclient.TokenCredential, isStart 
 		}
 		//查询host-type==""的情况，对应onecloud-控制面板-全部 要展示的内容
 		dataList, err = packMetricList(s, dataList, imageUsageFieldsDict, "host-type", "", nowTime)
+		if err != nil {
+			return err
+		}
 		//获取域/项目 虚拟机usage
 		data, err := getDomainAndProjectServerUsage(s, nowTime)
 		if err != nil {
 			return errors.Wrap(err, "getDomainAndProjectServerUsage err")
 		}
 		dataList = append(dataList, data...)
-		//写入influDb
-		urls, err := s.GetServiceURLs(apis.SERVICE_TYPE_INFLUXDB, options.Options.SessionEndpointType)
+		// 写入 influxdb 或者 VictoriaMetrics
+		urls, err := tsdb.GetDefaultServiceSourceURLs(s, options.Options.SessionEndpointType)
 		if err != nil {
 			return errors.Wrap(err, "GetServiceURLs")
 		}

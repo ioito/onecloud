@@ -25,39 +25,56 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 	_ "yunion.io/x/sqlchemy/backends"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/apis/identity"
+	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/cloudcommon"
 	common_app "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/cachesync"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/elect"
 	"yunion.io/x/onecloud/pkg/cloudcommon/etcd"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
+	_ "yunion.io/x/onecloud/pkg/compute/container_drivers/device"
+	_ "yunion.io/x/onecloud/pkg/compute/container_drivers/lifecycle"
+	_ "yunion.io/x/onecloud/pkg/compute/container_drivers/volume_mount"
 	_ "yunion.io/x/onecloud/pkg/compute/guestdrivers"
 	_ "yunion.io/x/onecloud/pkg/compute/hostdrivers"
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/compute/options"
-	_ "yunion.io/x/onecloud/pkg/compute/policy"
+	"yunion.io/x/onecloud/pkg/compute/policy"
 	_ "yunion.io/x/onecloud/pkg/compute/regiondrivers"
 	_ "yunion.io/x/onecloud/pkg/compute/storagedrivers"
-	"yunion.io/x/onecloud/pkg/compute/tasks"
+	_ "yunion.io/x/onecloud/pkg/compute/tasks"
+	cloudaccount_tasks "yunion.io/x/onecloud/pkg/compute/tasks/cloudaccount"
 	"yunion.io/x/onecloud/pkg/controller/autoscaling"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 )
 
 func StartService() {
+	StartServiceWithJobs(nil)
+}
+
+func StartServiceWithJobs(jobs func(cron *cronman.SCronJobManager)) {
+	StartServiceWithJobsAndApp(jobs, nil)
+}
+
+func StartServiceWithJobsAndApp(jobs func(cron *cronman.SCronJobManager), appCllback func(app *appsrv.Application)) {
 	opts := &options.Options
 	commonOpts := &options.Options.CommonOptions
 	baseOpts := &options.Options.BaseOptions
 	dbOpts := &options.Options.DBOptions
 	common_options.ParseOptions(opts, os.Args, "region.conf", api.SERVICE_TYPE)
+	policy.Init()
 
 	if opts.PortV2 > 0 {
 		log.Infof("Port V2 %d is specified, use v2 port", opts.PortV2)
@@ -69,16 +86,16 @@ func StartService() {
 	})
 	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
 
-	serviceUrl, err := auth.GetServiceURL(api.SERVER_TYPE_V2, opts.Region, "", identity.EndpointInterfaceInternal)
+	serviceUrl, err := auth.GetServiceURL(apis.SERVICE_TYPE_REGION, opts.Region, "", identity.EndpointInterfaceInternal, httputils.POST)
 	if err != nil {
 		log.Fatalf("unable to get service url: %v", err)
 	}
 	log.Infof("serviceUrl: %s", serviceUrl)
 	taskman.SetServiceUrl(serviceUrl)
-	err = taskman.UpdateWorkerCount(opts.TaskWorkerCount)
-	if err != nil {
-		log.Fatalf("failed update task manager worker count %s", err)
-	}
+	// err = taskman.UpdateWorkerCount(opts.TaskWorkerCount)
+	// if err != nil {
+	//	log.Fatalf("failed update task manager worker count %s", err)
+	// }
 
 	err = esxi.InitEsxiConfig(opts.EsxiOptions)
 	if err != nil {
@@ -99,21 +116,32 @@ func StartService() {
 
 	cloudcommon.InitDB(dbOpts)
 
-	InitHandlers(app)
+	InitHandlers(app, opts.IsSlaveNode)
+	if appCllback != nil {
+		appCllback(app)
+	}
 
 	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
 	defer cloudcommon.CloseDB()
 
+	if !opts.IsSlaveNode {
+		cancelFunc := startMasterTasks(opts, dbOpts, jobs)
+		defer cancelFunc()
+	}
+
+	common_app.ServeForever(app, baseOpts)
+}
+
+func startMasterTasks(opts *options.ComputeOptions, dbOpts *common_options.DBOptions, jobs func(cron *cronman.SCronJobManager)) context.CancelFunc {
 	setInfluxdbRetentionPolicy()
 
-	models.InitSyncWorkers(options.Options.CloudSyncWorkerCount)
-	tasks.InitCloudproviderSyncWorkers(options.Options.CloudProviderSyncWorkerCount)
+	models.InitSyncWorkers(opts.CloudSyncWorkerCount, opts.CloudAccountProbeWorkerCount, opts.CloudAccountSyncProbeWorkerCount)
+	cloudaccount_tasks.InitCloudproviderSyncWorkers(opts.CloudProviderSyncWorkerCount)
 
 	var (
-		electObj        *elect.Elect
-		ctx, cancelFunc = context.WithCancel(context.Background())
+		electObj *elect.Elect
 	)
-	defer cancelFunc()
+	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	if opts.LockmanMethod == common_options.LockMethodEtcd {
 		etcdCfg, err := elect.NewEtcdConfigFromDBOptions(dbOpts)
@@ -137,10 +165,15 @@ func StartService() {
 		}
 	}
 
-	if !opts.IsSlaveNode {
-		db.StartTenantCacheSync(app.GetContext(), opts.TenantCacheExpireSeconds)
+	cronFunc := func() {
+		err := taskman.TaskManager.InitializeData()
+		if err != nil {
+			log.Fatalf("TaskManager.InitializeData fail %s", err)
+		}
 
-		cron := cronman.InitCronJobManager(true, options.Options.CronJobWorkerCount)
+		cachesync.StartTenantCacheSync(opts.TenantCacheExpireSeconds)
+
+		cron := cronman.InitCronJobManager(true, options.Options.CronJobWorkerCount, options.Options.TimeZone)
 		cron.AddJobAtIntervals("CleanPendingDeleteServers", time.Duration(opts.PendingDeleteCheckSeconds)*time.Second, models.GuestManager.CleanPendingDeleteServers)
 		cron.AddJobAtIntervals("CleanPendingDeleteDisks", time.Duration(opts.PendingDeleteCheckSeconds)*time.Second, models.DiskManager.CleanPendingDeleteDisks)
 		if opts.PrepaidExpireCheck {
@@ -149,15 +182,17 @@ func StartService() {
 		if opts.PrepaidAutoRenew {
 			cron.AddJobAtIntervals("AutoRenewPrepaidServers", time.Duration(opts.PrepaidAutoRenewHours)*time.Hour, models.GuestManager.AutoRenewPrepaidServer)
 		}
+
 		cron.AddJobAtIntervals("CleanExpiredPostpaidElasticCaches", time.Duration(opts.PrepaidExpireCheckSeconds)*time.Second, models.ElasticcacheManager.DeleteExpiredPostpaids)
 		cron.AddJobAtIntervals("CleanExpiredPostpaidDBInstances", time.Duration(opts.PrepaidExpireCheckSeconds)*time.Second, models.DBInstanceManager.DeleteExpiredPostpaids)
 		cron.AddJobAtIntervals("CleanExpiredPostpaidServers", time.Duration(opts.PrepaidExpireCheckSeconds)*time.Second, models.GuestManager.DeleteExpiredPostpaidServers)
 		cron.AddJobAtIntervals("CleanExpiredPostpaidNatGateways", time.Duration(opts.PrepaidExpireCheckSeconds)*time.Second, models.NatGatewayManager.DeleteExpiredPostpaids)
 		cron.AddJobAtIntervals("CleanExpiredPostpaidNas", time.Duration(opts.PrepaidExpireCheckSeconds)*time.Second, models.FileSystemManager.DeleteExpiredPostpaids)
 
-		if !opts.EnableHostHealthCheck {
-			cron.AddJobAtIntervals("StartHostPingDetectionTask", time.Duration(opts.HostOfflineDetectionInterval)*time.Second, models.HostManager.PingDetectionTask)
-		}
+		cron.AddJobAtIntervals("StartHostPingDetectionTask", time.Duration(opts.HostOfflineDetectionInterval)*time.Second, models.HostManager.PingDetectionTask)
+		cron.AddJobAtIntervals("StartLbagentHbDetectionTask", time.Duration(opts.LbagentOfflineDetectionInterval)*time.Second, models.LoadbalancerAgentManager.HbDetectionTask)
+
+		cron.AddJobAtIntervals("RefreshCloudproviderHostStatus", time.Duration(opts.ManagedHostSyncStatusIntervalSeconds)*time.Second, models.RefreshCloudproviderHostStatus)
 
 		cron.AddJobAtIntervalsWithStartRun("CalculateQuotaUsages", time.Duration(opts.CalculateQuotaUsageIntervalSeconds)*time.Second, models.QuotaManager.CalculateQuotaUsages, true)
 		cron.AddJobAtIntervalsWithStartRun("CalculateRegionQuotaUsages", time.Duration(opts.CalculateQuotaUsageIntervalSeconds)*time.Second, models.RegionQuotaManager.CalculateQuotaUsages, true)
@@ -168,23 +203,21 @@ func StartService() {
 		cron.AddJobAtIntervalsWithStartRun("AutoSyncCloudaccountStatusTask", time.Duration(opts.CloudAutoSyncIntervalSeconds)*time.Second, models.CloudaccountManager.AutoSyncCloudaccountStatusTask, true)
 		cron.AddJobAtIntervalsWithStartRun("SyncCapacityUsedForEsxiStorage", time.Duration(opts.SyncStorageCapacityUsedIntervalMinutes)*time.Minute, models.StorageManager.SyncCapacityUsedForEsxiStorage, true)
 
-		cron.AddJobAtIntervalsWithStartRun("AutoSyncExtDiskSnapshot", time.Duration(opts.SyncExtDiskSnapshotIntervalMinutes)*time.Minute, models.DiskManager.AutoSyncExtDiskSnapshot, true)
-
 		cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
 
 		cron.AddJobEveryFewHour("AutoDiskSnapshot", 1, 5, 0, models.DiskManager.AutoDiskSnapshot, false)
+		cron.AddJobEveryFewHour("AutoServerSnapshot", 1, 10, 0, models.InstanceSnapshotManager.AutoServerSnapshot, false)
 		cron.AddJobEveryFewHour("SnapshotsCleanup", 1, 35, 0, models.SnapshotManager.CleanupSnapshots, false)
+		cron.AddJobEveryFewHour("InstanceSnapshotsCleanup", 1, 35, 0, models.InstanceSnapshotManager.CleanupInstanceSnapshots, false)
 
 		cron.AddJobEveryFewHour("AutoCleanImageCache", 1, 5, 0, models.CachedimageManager.AutoCleanImageCaches, false)
 
 		cron.AddJobAtIntervalsWithStartRun("SyncSkus", time.Duration(opts.ServerSkuSyncIntervalMinutes)*time.Minute, models.SyncServerSkus, true)
-		cron.AddJobAtIntervalsWithStartRun("SyncManagedWafGroups", time.Duration(opts.ServerSkuSyncIntervalMinutes)*time.Minute, models.SyncWafGroups, true)
 
 		cron.AddJobEveryFewDays("SyncDBInstanceSkus", opts.SyncSkusDay, opts.SyncSkusHour, 0, 0, models.SyncDBInstanceSkus, true)
 		cron.AddJobEveryFewDays("SyncNatSkus", opts.SyncSkusDay, opts.SyncSkusHour, 0, 0, models.SyncNatSkus, true)
 		cron.AddJobEveryFewDays("SyncNasSkus", opts.SyncSkusDay, opts.SyncSkusHour, 0, 0, models.SyncNasSkus, true)
 		cron.AddJobEveryFewDays("SyncElasticCacheSkus", opts.SyncSkusDay, opts.SyncSkusHour, 0, 0, models.SyncElasticCacheSkus, true)
-		cron.AddJobEveryFewDays("StorageSnapshotsRecycle", 1, 2, 0, 0, models.StorageManager.StorageSnapshotsRecycle, false)
 
 		cron.AddJobEveryFewDays("SnapshotDataCleaning", 1, 0, 0, 0, models.SnapshotManager.DataCleaning, true)
 
@@ -192,14 +225,23 @@ func StartService() {
 
 		cron.AddJobEveryFewHour("InspectAllTemplate", 1, 0, 0, models.GuestTemplateManager.InspectAllTemplate, true)
 
-		cron.AddJobEveryFewHour("CheckBillingResourceExpireAt", 1, 0, 0, models.CheckBillingResourceExpireAt, true)
-		go cron.Start2(ctx, electObj)
+		cron.AddJobEveryFewHour("CheckBillingResourceExpireAt", opts.ExpiredReleaseNotifyHour, 0, 0, models.CheckBillingResourceExpireAt, false)
+		cron.AddJobEveryFewDays(
+			"CleanRecycleDiskFiles", 1, 3, 0, 0, models.StoragesCleanRecycleDiskfiles, false)
 
+		cron.AddJobAtIntervalsWithStartRun("TaskCleanupJob", time.Duration(options.Options.TaskArchiveIntervalMinutes)*time.Minute, taskman.TaskManager.TaskCleanupJob, true)
+
+		if jobs != nil {
+			jobs(cron)
+		}
 		// init auto scaling controller
 		autoscaling.ASController.Init(options.Options.SASControllerOptions, cron)
+
+		go cron.Start2(ctx, electObj)
 	}
 
-	common_app.ServeForever(app, baseOpts)
+	go cronFunc()
+	return cancelFunc
 }
 
 func initDefaultEtcdClient(opts *common_options.DBOptions) error {

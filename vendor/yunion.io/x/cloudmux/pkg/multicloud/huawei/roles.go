@@ -15,9 +15,13 @@
 package huawei
 
 import (
+	"fmt"
+	"net/url"
+
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
+	api "yunion.io/x/cloudmux/pkg/apis/cloudid"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
@@ -44,8 +48,8 @@ func (role *SRole) GetDescription() string {
 	return role.DescriptionCn
 }
 
-func (role *SRole) GetPolicyType() string {
-	return "System"
+func (role *SRole) GetPolicyType() api.TPolicyType {
+	return api.PolicyTypeSystem
 }
 
 func (role *SRole) GetGlobalId() string {
@@ -64,7 +68,7 @@ func (role *SRole) Delete() error {
 	return cloudprovider.ErrNotImplemented
 }
 
-func (self *SHuaweiClient) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+func (self *SHuaweiClient) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
 	roles, err := self.GetRoles("", "")
 	if err != nil {
 		return nil, errors.Wrap(err, "GetRoles")
@@ -76,24 +80,41 @@ func (self *SHuaweiClient) GetISystemCloudpolicies() ([]cloudprovider.ICloudpoli
 	return ret, nil
 }
 
+// https://console.huaweicloud.com/apiexplorer/#/openapi/IAM/doc?api=KeystoneListPermissions
 func (self *SHuaweiClient) GetRoles(domainId, name string) ([]SRole, error) {
-	params := map[string]string{}
+	query := url.Values{}
 	if len(domainId) > 0 {
-		params["domain_id"] = self.ownerId
+		query.Set("domain_id", self.ownerId)
 	}
 	if len(name) > 0 {
-		params["name"] = name
+		query.Set("name", name)
 	}
 
-	client, err := self.newGeneralAPIClient()
-	if err != nil {
-		return nil, errors.Wrap(err, "newGeneralAPIClient")
-	}
+	query.Set("type", "domain")
 
-	roles := []SRole{}
-	err = doListAllWithNextLink(client.Roles.List, params, &roles)
-	if err != nil {
-		return nil, errors.Wrap(err, "doListAllWithOffset")
+	query.Set("per_page", "300")
+	page := 1
+	query.Set("page", fmt.Sprintf("%d", page))
+	ret := []SRole{}
+	for {
+		resp, err := self.list(SERVICE_IAM_V3, "", "roles", query)
+		if err != nil {
+			return nil, err
+		}
+		part := struct {
+			Roles       []SRole
+			TotalNumber int
+		}{}
+		err = resp.Unmarshal(&part)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, part.Roles...)
+		if len(ret) >= part.TotalNumber || len(part.Roles) == 0 {
+			break
+		}
+		page++
+		query.Set("page", fmt.Sprintf("%d", page))
 	}
-	return roles, nil
+	return ret, nil
 }

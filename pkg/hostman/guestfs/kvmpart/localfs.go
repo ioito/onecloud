@@ -16,10 +16,10 @@ package kvmpart
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"yunion.io/x/log"
@@ -47,34 +47,131 @@ func (f *SLocalGuestFS) SupportSerialPorts() bool {
 	return false
 }
 
+func (f *SLocalGuestFS) CopyFile(src, dest string) error {
+	destPath := path.Join(f.GetMountPath(), dest)
+	out, err := procutils.NewCommand("cp", "-f", src, destPath).Output()
+	if err != nil {
+		return errors.Wrapf(err, "failed to copy %s to %s: %s", src, dest, out)
+	}
+	return nil
+}
+
+func (f *SLocalGuestFS) ExecCommand(name string, args ...string) ([]string, error) {
+	newArgs := append([]string{f.GetMountPath(), name}, args...)
+	out, err := procutils.NewCommand("chroot", newArgs...).Output()
+	lines := make([]string, 0)
+	for _, line := range strings.Split(string(out), "\n") {
+		lines = append(lines, strings.TrimSpace(line))
+	}
+	return lines, err
+}
+
 func (f *SLocalGuestFS) GetLocalPath(sPath string, caseInsensitive bool) string {
+	p, err := f.resolveLocalPath(sPath, caseInsensitive, false)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+func (f *SLocalGuestFS) resolveLocalPath(sPath string, caseInsensitive bool, allowMissingLast bool) (string, error) {
 	if sPath == "." {
 		sPath = ""
 	}
-	var fullPath = f.mountPath
-	pathSegs := strings.Split(sPath, "/")
-	for _, seg := range pathSegs {
-		if len(seg) > 0 {
-			var realSeg string
-			files, _ := ioutil.ReadDir(fullPath)
-			for _, file := range files {
-				var f = file.Name()
-				if f == seg || (caseInsensitive && strings.ToLower(f) == strings.ToLower(seg)) ||
-					(seg[len(seg)-1] == '*' && (strings.HasPrefix(f, seg[:len(seg)-1]) ||
-						(caseInsensitive && strings.HasPrefix(strings.ToLower(f),
-							strings.ToLower(seg[:len(seg)-1]))))) {
-					realSeg = f
-					break
-				}
+	mount := filepath.Clean(f.mountPath)
+	fullPath := mount
+	segs := strings.Split(sPath, "/")
+	for i, seg := range segs {
+		if len(seg) == 0 || seg == "." {
+			continue
+		}
+		if seg == ".." {
+			parent := filepath.Dir(fullPath)
+			if !fileutils2.IsPathInside(mount, parent) {
+				return "", errors.Errorf("path %q is outside mount", sPath)
 			}
-			if len(realSeg) > 0 {
-				fullPath = path.Join(fullPath, realSeg)
-			} else {
-				return ""
+			fullPath = parent
+			continue
+		}
+		isLast := i == len(segs)-1
+		realSeg, fi, err := f.lookupSeg(fullPath, seg, caseInsensitive)
+		if err != nil {
+			return "", err
+		}
+		if realSeg == "" {
+			if allowMissingLast && isLast {
+				joined := filepath.Join(fullPath, seg)
+				if !fileutils2.IsPathInside(mount, joined) {
+					return "", errors.Errorf("path %q is outside mount", sPath)
+				}
+				return joined, nil
+			}
+			return "", errors.Errorf("path %q not found", sPath)
+		}
+		next := filepath.Join(fullPath, realSeg)
+		if !fileutils2.IsPathInside(mount, next) {
+			return "", errors.Errorf("path %q is outside mount", sPath)
+		}
+		if fi != nil && !isLast {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return "", errors.Errorf("path %q traverses a symlink", sPath)
+			}
+			if !fi.IsDir() {
+				return "", errors.Errorf("path %q traverses a non-directory", sPath)
 			}
 		}
+		fullPath = next
 	}
-	return fullPath
+	if !fileutils2.IsPathInside(mount, fullPath) {
+		return "", errors.Errorf("path %q is outside mount", sPath)
+	}
+	return fullPath, nil
+}
+
+func (f *SLocalGuestFS) lookupSeg(dir, seg string, caseInsensitive bool) (string, os.FileInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	var realSeg string
+	for _, entry := range entries {
+		name := entry.Name()
+		match := name == seg
+		if !match && caseInsensitive && strings.EqualFold(name, seg) {
+			match = true
+		}
+		if !match && len(seg) > 0 && seg[len(seg)-1] == '*' {
+			prefix := seg[:len(seg)-1]
+			match = strings.HasPrefix(name, prefix) ||
+				(caseInsensitive && strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)))
+		}
+		if match {
+			realSeg = name
+			break
+		}
+	}
+	if realSeg == "" {
+		return "", nil, nil
+	}
+	fi, err := os.Lstat(filepath.Join(dir, realSeg))
+	if err != nil {
+		return "", nil, err
+	}
+	return realSeg, fi, nil
+}
+
+func (f *SLocalGuestFS) mustRegularDir(p string) error {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return errors.Errorf("%s is a symlink", p)
+	}
+	if !fi.IsDir() {
+		return errors.Errorf("%s is not a directory", p)
+	}
+	return nil
 }
 
 func (f *SLocalGuestFS) Remove(path string, caseInsensitive bool) {
@@ -88,16 +185,25 @@ func (f *SLocalGuestFS) Mkdir(sPath string, mode int, caseInsensitive bool) erro
 	segs := strings.Split(sPath, "/")
 	sPath = ""
 	pPath := f.GetLocalPath("/", caseInsensitive)
+	if err := f.mustRegularDir(pPath); err != nil {
+		return err
+	}
 	for _, s := range segs {
 		if len(s) > 0 {
 			sPath = path.Join(sPath, s)
 			vPath := f.GetLocalPath(sPath, caseInsensitive)
 			if len(vPath) == 0 {
+				if err := f.mustRegularDir(pPath); err != nil {
+					return err
+				}
 				if err := os.Mkdir(path.Join(pPath, s), os.FileMode(mode)); err != nil {
 					return err
 				}
 				pPath = f.GetLocalPath(sPath, caseInsensitive)
 			} else {
+				if err := f.mustRegularDir(vPath); err != nil {
+					return err
+				}
 				pPath = vPath
 			}
 		}
@@ -108,7 +214,11 @@ func (f *SLocalGuestFS) Mkdir(sPath string, mode int, caseInsensitive bool) erro
 func (f *SLocalGuestFS) ListDir(sPath string, caseInsensitive bool) []string {
 	sPath = f.GetLocalPath(sPath, caseInsensitive)
 	if len(sPath) > 0 {
-		files, err := ioutil.ReadDir(sPath)
+		if err := f.mustRegularDir(sPath); err != nil {
+			log.Errorln(err)
+			return nil
+		}
+		files, err := os.ReadDir(sPath)
 		if err != nil {
 			log.Errorln(err)
 			return nil
@@ -139,46 +249,23 @@ func (f *SLocalGuestFS) Zerofiles(dir string, caseInsensitive bool) error {
 }
 
 func (f *SLocalGuestFS) Passwd(account, password string, caseInsensitive bool) error {
-	var proc = procutils.NewCommand("chroot", f.mountPath, "passwd", account)
-	stdin, err := proc.StdinPipe()
-	if err != nil {
-		return err
-	}
-	defer stdin.Close()
+	var proc = exec.Command("chroot", f.mountPath, "passwd", account)
 
-	outb, err := proc.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	defer outb.Close()
+	passwordInput := fmt.Sprintf("%s\n%s\n", password, password)
+	proc.Stdin = strings.NewReader(passwordInput)
 
-	errb, err := proc.StderrPipe()
+	out, err := proc.CombinedOutput()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed change passwd %s", out)
 	}
-	defer errb.Close()
-
-	if err := proc.Start(); err != nil {
-		return err
-	}
-	io.WriteString(stdin, fmt.Sprintf("%s\n", password))
-	io.WriteString(stdin, fmt.Sprintf("%s\n", password))
-	stdoutPut, err := ioutil.ReadAll(outb)
-	if err != nil {
-		return err
-	}
-	stderrOutPut, err := ioutil.ReadAll(errb)
-	if err != nil {
-		return err
-	}
-	log.Infof("Passwd %s %s", stdoutPut, stderrOutPut)
-	return proc.Wait()
+	log.Infof("Passwd %s", out)
+	return nil
 }
 
 func (f *SLocalGuestFS) Stat(usrDir string, caseInsensitive bool) os.FileInfo {
 	sPath := f.GetLocalPath(usrDir, caseInsensitive)
 	if len(sPath) > 0 {
-		fileInfo, err := os.Stat(sPath)
+		fileInfo, err := os.Lstat(sPath)
 		if err != nil {
 			log.Errorln(err)
 		}
@@ -196,6 +283,9 @@ func (f *SLocalGuestFS) Symlink(src string, dst string, caseInsensitive bool) er
 		f.Remove(dst, caseInsensitive)
 	}
 	dir = f.GetLocalPath(dir, caseInsensitive)
+	if err := f.mustRegularDir(dir); err != nil {
+		return err
+	}
 	dst = path.Join(dir, path.Base(dst))
 	return os.Symlink(src, dst)
 }
@@ -211,6 +301,9 @@ func (f *SLocalGuestFS) Exists(sPath string, caseInsensitive bool) bool {
 func (f *SLocalGuestFS) Chown(sPath string, uid, gid int, caseInsensitive bool) error {
 	sPath = f.GetLocalPath(sPath, caseInsensitive)
 	if len(sPath) > 0 {
+		if fileutils2.IsSymlink(sPath) {
+			return errors.Errorf("cannot chown symlink %s", sPath)
+		}
 		return os.Chown(sPath, uid, gid)
 	}
 	return nil
@@ -219,8 +312,53 @@ func (f *SLocalGuestFS) Chown(sPath string, uid, gid int, caseInsensitive bool) 
 func (f *SLocalGuestFS) Chmod(sPath string, mode uint32, caseInsensitive bool) error {
 	sPath = f.GetLocalPath(sPath, caseInsensitive)
 	if len(sPath) > 0 {
+		if fileutils2.IsSymlink(sPath) {
+			return errors.Errorf("cannot chmod symlink %s", sPath)
+		}
 		return os.Chmod(sPath, os.FileMode(mode))
 	}
+	return nil
+}
+
+func (f *SLocalGuestFS) updateUserEtcShadow(username string) error {
+	sPath := f.GetLocalPath("/etc/shadow", false)
+	if !fileutils2.Exists(sPath) {
+		return nil
+	}
+	if fileutils2.IsSymlink(sPath) {
+		return errors.Errorf("cannot update symlink %s", sPath)
+	}
+	contentBytes, err := fileutils2.FileGetContentsNoFollow(sPath)
+	if err != nil {
+		return errors.Wrap(err, "read /etc/shadow")
+	}
+	content := string(contentBytes)
+
+	var (
+		minimumDays = "0"     // -m 0
+		maximumDays = "99999" // -M 99999
+	)
+
+	lines := strings.Split(string(content), "\n")
+	for i, line := range lines {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 7 && fields[0] == username {
+			fields[3] = minimumDays
+			fields[4] = maximumDays
+			fields[5] = "" // password warning period
+			fields[6] = "" // password inactivity period
+			fields[7] = "" // account expiration date
+			line = strings.Join(fields, ":")
+			lines[i] = line
+			break
+		}
+	}
+	newContent := strings.Join(lines, "\n")
+	err = fileutils2.FilePutContentsNoFollow(sPath, newContent, false)
+	if err != nil {
+		return errors.Wrapf(err, "read %s, put %s to /etc/shadow", content, newContent)
+	}
+
 	return nil
 }
 
@@ -228,11 +366,9 @@ func (f *SLocalGuestFS) CheckOrAddUser(user, homeDir string, isSys bool) (realHo
 	var exist bool
 	if exist, realHomeDir, err = f.checkUser(user); err != nil || exist {
 		if exist {
-			cmd := []string{"chage", "-R", f.mountPath, "-E", "-1", "-m", "0", "-M", "99999", "-I", "-1", user}
-			command := procutils.NewCommand(cmd[0], cmd[1:]...)
-			_, err = command.Output()
+			err = f.updateUserEtcShadow(user)
 			if err != nil {
-				err = errors.Wrap(err, "chage")
+				err = errors.Wrap(err, "updateUserEtcShadow")
 				return
 			}
 			if !f.Exists(realHomeDir, false) {
@@ -303,27 +439,28 @@ func (f *SLocalGuestFS) FileGetContents(sPath string, caseInsensitive bool) ([]b
 }
 
 func (f *SLocalGuestFS) FileGetContentsByPath(sPath string) ([]byte, error) {
-	if len(sPath) > 0 {
-		return ioutil.ReadFile(sPath)
+	if len(sPath) == 0 {
+		return nil, fmt.Errorf("Cann't find local path")
 	}
-	return nil, fmt.Errorf("Cann't find local path")
+	if fileutils2.IsSymlink(sPath) {
+		return nil, errors.Errorf("cannot read symlink %s", sPath)
+	}
+	return fileutils2.FileGetContentsNoFollow(sPath)
 }
 
 func (f *SLocalGuestFS) FilePutContents(sPath, content string, modAppend, caseInsensitive bool) error {
-	sFilePath := f.GetLocalPath(sPath, caseInsensitive)
-	if len(sFilePath) > 0 {
-		sPath = sFilePath
-	} else {
-		dirPath := f.GetLocalPath(path.Dir(sPath), caseInsensitive)
-		if len(dirPath) > 0 {
-			sPath = path.Join(dirPath, path.Base(sPath))
-		}
+	target, err := f.resolveLocalPath(sPath, caseInsensitive, true)
+	if err != nil {
+		return err
 	}
-	if len(sPath) > 0 {
-		return fileutils2.FilePutContents(sPath, content, modAppend)
-	} else {
-		return fmt.Errorf("Can't put content to empty Path")
+	if fileutils2.IsSymlink(target) {
+		return errors.Errorf("cannot write through symlink %s", sPath)
 	}
+	parent := filepath.Dir(target)
+	if err := f.mustRegularDir(parent); err != nil {
+		return err
+	}
+	return fileutils2.FilePutContentsNoFollow(target, content, modAppend)
 }
 
 func (f *SLocalGuestFS) GenerateSshHostKeys() error {

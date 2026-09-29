@@ -159,7 +159,7 @@ func jsonRequest(client *sdk.Client, domain, apiVersion, apiName string, params 
 			}
 			for _, code := range []string{"404 Not Found", "EntityNotExist.Role", "EntityNotExist.Group"} {
 				if strings.Contains(err.Error(), code) {
-					return nil, errors.Wrapf(cloudprovider.ErrNotFound, err.Error())
+					return nil, errors.Wrapf(cloudprovider.ErrNotFound, "%s", err.Error())
 				}
 			}
 			for _, code := range []string{
@@ -236,11 +236,11 @@ func _jsonRequest(client *sdk.Client, domain string, version string, apiName str
 	if body.Contains("Code") {
 		code, _ := body.GetString("Code")
 		if len(code) > 0 && !utils.IsInStringArray(code, []string{"200"}) {
-			return nil, fmt.Errorf(body.String())
+			return nil, fmt.Errorf("%s", body.String())
 		}
 	}
 	if body.Contains("errorKey") {
-		return nil, errors.Errorf(body.String())
+		return nil, errors.Errorf("%s", body.String())
 	}
 	return body, nil
 }
@@ -256,23 +256,26 @@ func (self *SApsaraClient) getDefaultClient(regionId string) (*sdk.Client, error
 		regionId,
 		&sdk.Config{
 			HttpTransport: transport,
-			Transport: cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+			Transport: cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 				params, err := url.ParseQuery(req.URL.RawQuery)
 				if err != nil {
 					return nil, errors.Wrapf(err, "ParseQuery(%s)", req.URL.RawQuery)
 				}
 				action := params.Get("OpenApiAction")
+				if len(action) == 0 {
+					action = params.Get("Action")
+				}
 				service := strings.ToLower(params.Get("Product"))
-				respCheck := func(resp *http.Response) {
+				respCheck := func(resp *http.Response) error {
 					if self.cpcfg.UpdatePermission != nil {
 						body, err := ioutil.ReadAll(resp.Body)
 						if err != nil {
-							return
+							return nil
 						}
 						resp.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 						obj, err := jsonutils.Parse(body)
 						if err != nil {
-							return
+							return nil
 						}
 						ret := struct {
 							AsapiErrorCode string `json:"asapiErrorCode"`
@@ -286,14 +289,15 @@ func (self *SApsaraClient) getDefaultClient(regionId string) (*sdk.Client, error
 							self.cpcfg.UpdatePermission(service, action)
 						}
 					}
+					return nil
 				}
-				if self.cpcfg.ReadOnly {
+				if self.cpcfg.ReadOnly && len(action) > 0 {
 					for _, prefix := range []string{"Get", "List", "Describe"} {
 						if strings.HasPrefix(action, prefix) {
 							return respCheck, nil
 						}
 					}
-					return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, action)
+					return nil, errors.Wrapf(cloudprovider.ErrAccountReadOnly, "%s", action)
 				}
 				return respCheck, nil
 			}),
@@ -353,7 +357,7 @@ func (self *SApsaraClient) ossRequest(apiName string, params map[string]string) 
 	//	params["Params"] = jsonutils.Marshal(pm).String()
 	//}
 	if _, ok := params["RegionId"]; !ok {
-		params["RegionId"] = self.cpcfg.DefaultRegion
+		params["RegionId"] = self.cpcfg.RegionId
 	}
 	params["ProductName"] = "oss"
 	params["OpenApiAction"] = apiName
@@ -371,8 +375,8 @@ func (self *SApsaraClient) trialRequest(apiName string, params map[string]string
 
 func (self *SApsaraClient) fetchRegions() error {
 	params := map[string]string{"AcceptLanguage": "zh-CN"}
-	if len(self.cpcfg.DefaultRegion) > 0 {
-		params["RegionId"] = self.cpcfg.DefaultRegion
+	if len(self.cpcfg.RegionId) > 0 {
+		params["RegionId"] = self.cpcfg.RegionId
 	}
 	body, err := self.ecsRequest("DescribeRegions", params)
 	if err != nil {
@@ -405,7 +409,7 @@ func (client *SApsaraClient) getOssClient(endpoint string) (*oss.Client, error) 
 	// oss use no timeout client so as to send/download large files
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
 	transport, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if client.cpcfg.ReadOnly {
 			if req.Method == "GET" || req.Method == "HEAD" {
 				return nil, nil
@@ -443,6 +447,7 @@ func (self *SApsaraClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 		return nil, err
 	}
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = self.GetAccountId()
 	subAccount.Name = self.cpcfg.Name
 	subAccount.Account = self.accessKey
 	if self.organizationId != "1" {
@@ -456,8 +461,8 @@ func (self *SApsaraClient) GetAccountId() string {
 	return self.cpcfg.URL
 }
 
-func (self *SApsaraClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.iregions
+func (self *SApsaraClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return self.iregions, nil
 }
 
 func (self *SApsaraClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
@@ -519,6 +524,7 @@ func (region *SApsaraClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -527,6 +533,7 @@ func (region *SApsaraClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_QUOTA + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_IPV6_GATEWAY + cloudprovider.READ_ONLY_SUFFIX,
 		cloudprovider.CLOUD_CAPABILITY_TABLESTORE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_SNAPSHOT_POLICY,
 	}
 	return caps
 }

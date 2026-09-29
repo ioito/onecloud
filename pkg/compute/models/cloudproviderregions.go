@@ -179,7 +179,7 @@ func (self *SCloudproviderregion) PostUpdate(ctx context.Context, userCred mccli
 }
 
 func (manager *SCloudproviderregion) ValidateCreateData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
-	return nil, httperrors.NewForbiddenError("not allow to create")
+	return nil, httperrors.NewForbiddenError("not allowed to create")
 }
 
 func (self *SCloudproviderregion) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
@@ -218,27 +218,26 @@ func (manager *SCloudproviderregionManager) QueryRelatedRegionIds(cloudAccounts 
 	return q.Distinct().SubQuery()
 }
 
-func (manager *SCloudproviderregionManager) FetchByIds(providerId string, regionId string) *SCloudproviderregion {
+func (manager *SCloudproviderregionManager) FetchByIds(providerId string, regionId string) (*SCloudproviderregion, error) {
 	q := manager.Query().Equals("cloudprovider_id", providerId).Equals("cloudregion_id", regionId)
 	obj, err := db.NewModelObject(manager)
 	if err != nil {
-		log.Errorf("db.NewModelObject fail %s", err)
-		return nil
+		return nil, errors.Wrapf(err, "NewModelObject")
 	}
 	err = q.First(obj)
 	if err != nil {
-		if err != sql.ErrNoRows {
-			log.Errorf("q.First fail %s", err)
-		}
-		return nil
+		return nil, errors.Wrapf(err, "First")
 	}
-	return obj.(*SCloudproviderregion)
+	return obj.(*SCloudproviderregion), nil
 }
 
-func (manager *SCloudproviderregionManager) FetchByIdsOrCreate(providerId string, regionId string) *SCloudproviderregion {
-	cpr := manager.FetchByIds(providerId, regionId)
-	if cpr != nil {
-		return cpr
+func (manager *SCloudproviderregionManager) FetchByIdsOrCreate(providerId string, regionId string) (*SCloudproviderregion, error) {
+	cpr, err := manager.FetchByIds(providerId, regionId)
+	if err == nil {
+		return cpr, nil
+	}
+	if errors.Cause(err) != sql.ErrNoRows {
+		return nil, errors.Wrapf(err, "FetchByIds")
 	}
 	cpr = &SCloudproviderregion{}
 	cpr.SetModelManager(manager, cpr)
@@ -248,12 +247,11 @@ func (manager *SCloudproviderregionManager) FetchByIdsOrCreate(providerId string
 	cpr.Enabled = true
 	cpr.SyncStatus = api.CLOUD_PROVIDER_SYNC_STATUS_IDLE
 
-	err := manager.TableSpec().Insert(context.Background(), cpr)
+	err = manager.TableSpec().Insert(context.Background(), cpr)
 	if err != nil {
-		log.Errorf("insert fail %s", err)
-		return nil
+		return nil, errors.Wrapf(err, "Insert")
 	}
-	return cpr
+	return cpr, nil
 }
 
 func (self *SCloudproviderregion) markStartingSync(userCred mcclient.TokenCredential, syncRange *SSyncRange) error {
@@ -319,7 +317,7 @@ func (self *SCloudproviderregion) markEndSync(ctx context.Context, userCred mccl
 	if err != nil {
 		return errors.Wrapf(err, "GetProvider")
 	}
-	err = provider.markEndSyncWithLock(ctx, userCred)
+	err = provider.markEndSyncWithLock(ctx, userCred, *deepSync)
 	if err != nil {
 		return errors.Wrapf(err, "markEndSyncWithLock")
 	}
@@ -582,6 +580,15 @@ func (manager *SCloudproviderregionManager) QueryDistinctExtraField(q *sqlchemy.
 	return q, httperrors.ErrNotFound
 }
 
+func (manager *SCloudproviderregionManager) QueryDistinctExtraFields(q *sqlchemy.SQuery, resource string, fields []string) (*sqlchemy.SQuery, error) {
+	var err error
+	q, err = manager.SManagedResourceBaseManager.QueryDistinctExtraFields(q, resource, fields)
+	if err == nil {
+		return q, nil
+	}
+	return q, httperrors.ErrNotFound
+}
+
 func (cpr *SCloudproviderregion) setCapabilities(ctx context.Context, userCred mcclient.TokenCredential, capa []string) error {
 	return CloudproviderCapabilityManager.setRegionCapabilities(ctx, userCred, cpr.CloudproviderId, cpr.CloudregionId, capa)
 }
@@ -621,4 +628,19 @@ func (manager *SCloudproviderregionManager) ListItemExportKeys(ctx context.Conte
 	}
 
 	return q, nil
+}
+
+func (manager *SCloudproviderregionManager) FetchCloudproviderRegions(filter func(q *sqlchemy.SQuery) (*sqlchemy.SQuery, error)) ([]SCloudproviderregion, error) {
+	q := manager.Query()
+	var err error
+	q, err = filter(q)
+	if err != nil {
+		return nil, errors.Wrap(err, "filter")
+	}
+	ret := make([]SCloudproviderregion, 0)
+	err = db.FetchModelObjects(manager, q, &ret)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+	return ret, nil
 }

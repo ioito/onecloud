@@ -242,7 +242,7 @@ func (f *ResourceHandlers) fetchExportQuery(query jsonutils.JSONObject) (jsonuti
 func (f *ResourceHandlers) doList(ctx context.Context, session *mcclient.ClientSession, module modulebase.IBaseManager, query jsonutils.JSONObject, w http.ResponseWriter, r *http.Request) {
 	query, export, err := f.fetchExportQuery(query)
 	if err != nil {
-		httperrors.InvalidInputError(ctx, w, err.Error())
+		httperrors.InvalidInputError(ctx, w, "%s", err.Error())
 		return
 	}
 
@@ -274,9 +274,44 @@ func (f *ResourceHandlers) getHandler(ctx context.Context, w http.ResponseWriter
 		httperrors.GeneralServerError(ctx, w, err)
 		return
 	}
-	obj, e := req.Mod1().Get(req.Session(), req.ResID(), req.Query())
+	query := req.Query()
+	export := sExport{}
+	if req.ResName() == "ai_proxy_usage" && req.ResID() == "events" {
+		var err error
+		query, export, err = f.fetchExportQuery(query)
+		if err != nil {
+			httperrors.InvalidInputError(ctx, w, "%s", err.Error())
+			return
+		}
+		if len(export.ExportFormat) > 0 {
+			if queryDict, ok := query.(*jsonutils.JSONDict); ok {
+				if v, err := queryDict.GetString("export_limit"); err == nil && v != "" && !queryDict.Contains("limit") {
+					queryDict.Set("limit", jsonutils.NewString(v))
+				}
+				queryDict.Remove("export_limit")
+			}
+		}
+	}
+	obj, e := req.Mod1().Get(req.Session(), req.ResID(), query)
 	if e != nil {
 		httperrors.GeneralServerError(ctx, w, e)
+		return
+	}
+	if len(export.ExportFormat) > 0 {
+		data, err := getExportData(obj)
+		if err != nil {
+			httperrors.GeneralServerError(ctx, w, err)
+			return
+		}
+		w.Header().Set("Content-Description", "File Transfer")
+		w.Header().Set("Content-Transfer-Encoding", "binary")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		fileName := fmt.Sprintf("export-%s", req.Mod1().KeyString())
+		if len(export.ExportFileName) > 0 {
+			fileName = export.ExportFileName
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.xlsx\"", fileName))
+		excelutils.Export(data, export.Keys, export.Texts, w)
 		return
 	}
 	if req.ResID() == "splitable-export" {
@@ -293,6 +328,16 @@ func (f *ResourceHandlers) getHandler(ctx context.Context, w http.ResponseWriter
 		}
 	}
 	appsrv.SendJSON(w, obj)
+}
+
+func getExportData(obj jsonutils.JSONObject) ([]jsonutils.JSONObject, error) {
+	if exports, ok := obj.(*jsonutils.JSONArray); ok {
+		return exports.GetArray()
+	}
+	if data, err := obj.GetArray("data"); err == nil {
+		return data, nil
+	}
+	return nil, fmt.Errorf("missing export data")
 }
 
 // * get spec
@@ -323,7 +368,7 @@ func (f *ResourceHandlers) getSpecHandler(ctx context.Context, w http.ResponseWr
 	// list in 1 context
 	query, export, err := f.fetchExportQuery(query)
 	if err != nil {
-		httperrors.InvalidInputError(ctx, w, err.Error())
+		httperrors.InvalidInputError(ctx, w, "%s", err.Error())
 		return
 	}
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
@@ -367,7 +412,7 @@ func (f *ResourceHandlers) getJointHandler(ctx context.Context, w http.ResponseW
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	if e != nil {
-		httperrors.NotFoundError(ctx, w, fmt.Sprintf("resource %s-%s not exist", req.ResName(), req.ResName2()))
+		httperrors.NotFoundError(ctx, w, "resource %s-%s not exist", req.ResName(), req.ResName2())
 		return
 	}
 	obj, e := jmod.Get(session, req.ResID(), req.ResID2(), req.Query())
@@ -525,7 +570,7 @@ func (f *ResourceHandlers) attachHandler(ctx context.Context, w http.ResponseWri
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	if e != nil {
-		httperrors.NotFoundError(ctx, w, fmt.Sprintf("resource %s-%s not exists", req.ResName(), req.ResName2()))
+		httperrors.NotFoundError(ctx, w, "resource %s-%s not exists", req.ResName(), req.ResName2())
 		return
 	}
 	obj, e := jmod.Attach(session, req.ResID(), req.ResID2(), body)
@@ -644,12 +689,13 @@ func (f *ResourceHandlers) updateJointHandler(ctx context.Context, w http.Respon
 	session := req.Session()
 	module := req.Mod1()
 	module2 := req.Mod2()
+	query := req.Query()
 	body := req.Body()
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	var obj jsonutils.JSONObject
 	if e == nil { // update joint
-		obj, e = jmod.Update(session, req.ResID(), req.ResID2(), nil, body)
+		obj, e = jmod.Update(session, req.ResID(), req.ResID2(), query, body)
 	} else { // update in context
 		obj, e = module2.PutInContext(session, req.ResID2(), body, module, req.ResID())
 	}
@@ -669,12 +715,13 @@ func (f *ResourceHandlers) patchJointHandler(ctx context.Context, w http.Respons
 	session := req.Session()
 	module := req.Mod1()
 	module2 := req.Mod2()
+	query := req.Query()
 	body := req.Body()
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	var obj jsonutils.JSONObject
 	if e == nil { // update joint
-		obj, e = jmod.Patch(session, req.ResID(), req.ResID2(), nil, body)
+		obj, e = jmod.Patch(session, req.ResID(), req.ResID2(), query, body)
 	} else { // update in context
 		obj, e = module2.PatchInContext(session, req.ResID2(), body, module, req.ResID())
 	}

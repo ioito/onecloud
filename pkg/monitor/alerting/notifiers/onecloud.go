@@ -17,6 +17,7 @@ package notifiers
 import (
 	"context"
 	"fmt"
+	"html/template"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
@@ -44,6 +45,74 @@ import (
 	"yunion.io/x/onecloud/pkg/monitor/models"
 	"yunion.io/x/onecloud/pkg/monitor/options"
 )
+
+// generateMonitorTitle 生成监控告警的标题
+func generateMonitorTitle(suffix string, data interface{}) string {
+	// 将 interface{} 转换为 map 以便访问字段
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	// 获取字段值
+	priority, _ := dataMap["priority"].(string)
+	name, _ := dataMap["name"].(string)
+	isRecovery, _ := dataMap["is_recovery"].(bool)
+	noData, _ := dataMap["no_data"].(bool)
+
+	// 根据语言设置级别文本
+	var level string
+	if suffix == "cn" {
+		level = "普通"
+		if priority == string(notify.NotifyPriorityImportant) {
+			level = "重要"
+		} else if priority == string(notify.NotifyPriorityCritical) {
+			level = "致命"
+		}
+	} else {
+		level = "Normal"
+		if priority == string(notify.NotifyPriorityImportant) {
+			level = "Important"
+		} else if priority == string(notify.NotifyPriorityCritical) {
+			level = "Critical"
+		}
+	}
+
+	// 根据语言和状态设置提示消息
+	var hintMsg string
+	if suffix == "cn" {
+		hintMsg = "发生告警"
+		if isRecovery {
+			hintMsg = "告警已恢复"
+		} else if noData {
+			hintMsg = "暂无数据"
+		}
+	} else {
+		hintMsg = "Alerting"
+		if isRecovery {
+			hintMsg = "Alarm recovered"
+		} else if noData {
+			hintMsg = "No data available"
+		}
+	}
+
+	return fmt.Sprintf("[%s] [%s] %s", level, hintMsg, name)
+}
+
+// monitorTitleLangFunc 实现 LangSuffixFunc 接口，用于生成监控标题
+type monitorTitleLangFunc struct{}
+
+func (f *monitorTitleLangFunc) Call(langSuffix string, data interface{}) string {
+	return generateMonitorTitle(langSuffix, data)
+}
+
+// getMonitorTemplateFuncs 根据语言后缀创建监控模板函数映射
+// 注意：这里返回的函数实现了 LangSuffixFunc 接口，langSuffix 会在 getTemplate 中动态传入
+func getMonitorTemplateFuncs() template.FuncMap {
+	return template.FuncMap{
+		"monitorTitle": &monitorTitleLangFunc{},
+	}
+}
 
 const (
 	SUFFIX = "onecloudNotifier"
@@ -115,63 +184,60 @@ func getAdminSession() *mcclient.ClientSession {
 	return auth.GetAdminSession(context.Background(), options.Options.Region)
 }
 
-func GetNotifyTemplateConfig(ctx *alerting.EvalContext) monitor.NotificationTemplateConfig {
-	priority := notify.NotifyPriorityNormal
-	level := "普通"
-	switch ctx.Rule.Level {
-	case "", "normal":
-		priority = notify.NotifyPriorityNormal
-	case "important":
-		priority = notify.NotifyPriorityImportant
-		level = "重要"
-	case "fatal", "critical":
-		priority = notify.NotifyPriorityCritical
-		level = "致命"
-	}
-	topic := fmt.Sprintf("[%s]", level)
-
-	isRecovery := false
-	if ctx.Rule.State == monitor.AlertStateOK {
-		isRecovery = true
-		topic = fmt.Sprintf("%s %s 告警已恢复", topic, ctx.GetRuleTitle())
-	} else if ctx.NoDataFound {
-		topic = fmt.Sprintf("%s %s 暂无数据", topic, ctx.GetRuleTitle())
-	} else {
-		topic = fmt.Sprintf("%s %s 发生告警", topic, ctx.GetRuleTitle())
-	}
-	config := ctx.GetNotificationTemplateConfig()
-	config.Title = topic
-	config.Level = level
-	config.Priority = string(priority)
-	config.IsRecovery = isRecovery
-	return config
+func GetNotifyTemplateConfig(ctx *alerting.EvalContext, isRecoverd bool, matches []*monitor.EvalMatch) monitor.NotificationTemplateConfig {
+	return getNotifyTemplateConfigOfLang(ctx, matches, isRecoverd, language.Chinese)
 }
 
-func GetNotifyTemplateConfigOfEN(ctx *alerting.EvalContext) monitor.NotificationTemplateConfig {
+func getNotifyTemplateConfigOfLang(ctx *alerting.EvalContext,
+	matches []*monitor.EvalMatch, isRecovered bool, lang language.Tag) monitor.NotificationTemplateConfig {
 	priority := notify.NotifyPriorityNormal
-	level := "Normal"
+	levelNormal := "普通"
+	levelImportant := "重要"
+	levelCritial := "致命"
+	msgRecovered := "告警已恢复"
+	msgNoData := "暂无数据"
+	msgAlerting := "发生告警"
+
+	transMap := map[string]string{
+		levelNormal:    "Normal",
+		levelImportant: "Important",
+		levelCritial:   "Critical",
+		msgRecovered:   "Alarm recovered",
+		msgNoData:      "No data available",
+		msgAlerting:    "Alerting",
+	}
+	trans := func(input string) string {
+		if lang == language.English {
+			return transMap[input]
+		}
+		return input
+	}
+
+	level := levelNormal
 	switch ctx.Rule.Level {
 	case "", "normal":
 		priority = notify.NotifyPriorityNormal
 	case "important":
 		priority = notify.NotifyPriorityImportant
-		level = "Important"
+		level = levelImportant
 	case "fatal", "critical":
 		priority = notify.NotifyPriorityCritical
-		level = "Critical"
+		level = levelCritial
 	}
-	topic := fmt.Sprintf("[%s]", level)
+	topic := fmt.Sprintf("[%s]", trans(level))
 
 	isRecovery := false
-	if ctx.Rule.State == monitor.AlertStateOK {
+	var hintMsg string
+	if ctx.Rule.State == monitor.AlertStateOK || isRecovered {
 		isRecovery = true
-		topic = fmt.Sprintf("%s %s Alarm recovered", topic, ctx.GetRuleTitle())
+		hintMsg = msgRecovered
 	} else if ctx.NoDataFound {
-		topic = fmt.Sprintf("%s %s No data available", topic, ctx.GetRuleTitle())
+		hintMsg = msgNoData
 	} else {
-		topic = fmt.Sprintf("%s %s Alarm", topic, ctx.GetRuleTitle())
+		hintMsg = msgAlerting
 	}
-	config := ctx.GetNotificationTemplateConfig()
+	topic = fmt.Sprintf("%s [%s] %s", topic, trans(hintMsg), ctx.GetRuleTitle())
+	config := ctx.GetNotificationTemplateConfig(matches)
 	config.Title = topic
 	config.Level = level
 	config.Priority = string(priority)
@@ -209,7 +275,7 @@ func (oc *OneCloudNotifier) Notify(ctx *alerting.EvalContext, _ jsonutils.JSONOb
 	}
 
 	if len(oc.Setting.RobotIds) != 0 {
-		withLangTag := appctx.WithLangTag(context.Background(), language.English)
+		withLangTag := appctx.WithLangTag(ctx.Ctx, language.English)
 		langNotifyGroup.Go(func() error {
 			return oc.notifyByContextLang(withLangTag, ctx, []string{})
 		})
@@ -226,7 +292,7 @@ func (oc *OneCloudNotifier) notifyByUserIds(ctx *alerting.EvalContext, userIds [
 		ids := langIdsMap[lang]
 		langTag, _ := language.Parse(lang)
 		langStr := i18nTable.LookupByLang(langTag, SUFFIX)
-		langContext := appctx.WithLangTag(context.Background(), getLangBystr(langStr))
+		langContext := appctx.WithLangTag(ctx.Ctx, getLangBystr(langStr))
 		errGrp.Go(func() error {
 			return oc.notifyByContextLang(langContext, ctx, ids)
 		})
@@ -249,30 +315,41 @@ func getLangBystr(str string) language.Tag {
 }
 
 func (oc *OneCloudNotifier) notifyByContextLang(ctx context.Context, evalCtx *alerting.EvalContext, uids []string) error {
-	var config monitor.NotificationTemplateConfig
-	lang := appctx.Lang(ctx)
-	switch lang {
-	case language.English:
-		config = GetNotifyTemplateConfigOfEN(evalCtx)
-	default:
-		config = GetNotifyTemplateConfig(evalCtx)
+	errs := []error{}
+	if evalCtx.Rule.State == monitor.AlertStatePending {
+		log.Warningf("skip notify rule because state is pending: %s", jsonutils.Marshal(evalCtx.Rule))
+		return nil
 	}
+	if len(evalCtx.GetEvalMatches()) > 0 {
+		if err := oc.notifyMatchesByContextLang(ctx, evalCtx, evalCtx.GetEvalMatches(), uids, false); err != nil {
+			errs = append(errs, errors.Wrapf(err, "notify alerting matches"))
+		}
+	}
+	if evalCtx.HasRecoveredMatches() && !evalCtx.Rule.DisableNotifyRecovery {
+		if err := oc.notifyMatchesByContextLang(ctx, evalCtx, evalCtx.GetRecoveredMatches(), uids, true); err != nil {
+			errs = append(errs, errors.Wrapf(err, "notify recovered matches"))
+		}
+	}
+	return errors.NewAggregate(errs)
+}
+
+func (oc *OneCloudNotifier) notifyMatchesByContextLang(
+	ctx context.Context,
+	evalCtx *alerting.EvalContext,
+	matches []*monitor.EvalMatch,
+	uids []string,
+	isRecoverd bool) error {
+	lang := appctx.Lang(ctx)
+	config := getNotifyTemplateConfigOfLang(evalCtx, matches, isRecoverd, lang)
 	oc.filterMatchTagsForConfig(&config, ctx)
 
-	contentConfig := oc.buildContent(config)
+	templateFuncs := getMonitorTemplateFuncs()
 
+	// 对于 Mobile 渠道，需要构建 content，因为 sendMobileImpl 会直接使用 msg.Msg
+	// 对于其他渠道，content 会通过 DEFAULT 模板文件根据语言环境构建，这里不需要构建
 	var content string
-	var err error
-	switch oc.Setting.Channel {
-	case string(notify.NotifyByEmail):
-		content, err = contentConfig.GenerateEmailMarkdown()
-	case string(notify.NotifyByMobile):
+	if oc.Setting.Channel == string(notify.NotifyByMobile) {
 		content = oc.newRemoteMobileContent(&config, evalCtx, lang)
-	default:
-		content, err = contentConfig.GenerateMarkdown()
-	}
-	if err != nil {
-		return errors.Wrap(err, "build content")
 	}
 
 	msg := notify.SNotifyMessage{
@@ -285,7 +362,7 @@ func (oc *OneCloudNotifier) notifyByContextLang(ctx context.Context, evalCtx *al
 	}
 
 	factory := new(sendBodyFactory)
-	sendImp := factory.newSendnotify(evalCtx, oc, msg, config)
+	sendImp := factory.newSendnotify(evalCtx, oc, msg, config, templateFuncs)
 
 	return sendImp.send()
 }
@@ -336,9 +413,18 @@ func (oc *OneCloudNotifier) newMeterRemoteMobileContent(config *monitor.Notifica
 		typ = "预算"
 		config.Title = MOBILE_DEFAULT_TOPIC_CN
 	}
-	customizeConfig := new(monitor.MeterCustomizeConfig)
-	evalCtx.Rule.CustomizeConfig.Unmarshal(customizeConfig)
-	return mobileContent(customizeConfig.Name, typ)
+	var name string
+	if evalCtx.Rule.CustomizeConfig != nil {
+		customizeConfig := new(monitor.MeterCustomizeConfig)
+		if err := evalCtx.Rule.CustomizeConfig.Unmarshal(customizeConfig); err == nil {
+			name = customizeConfig.Name
+		}
+	}
+	// 兼容旧数据：如果 CustomizeConfig 为 nil 或解析失败，使用 Rule.Name 作为后备值
+	if name == "" {
+		name = evalCtx.Rule.Name
+	}
+	return mobileContent(name, typ)
 }
 
 func GetUserLangIdsMap(ids []string) (map[string][]string, error) {
@@ -396,12 +482,13 @@ type sendBodyFactory struct {
 
 func (f *sendBodyFactory) newSendnotify(evalCtx *alerting.EvalContext, notifier *OneCloudNotifier,
 	message notify.SNotifyMessage,
-	config monitor.NotificationTemplateConfig) Isendnotify {
+	config monitor.NotificationTemplateConfig, templateFuncs template.FuncMap) iSendnotify {
 	def := new(sendnotifyBase)
 	def.OneCloudNotifier = notifier
 	def.evalCtx = *evalCtx
 	def.msg = message
 	def.config = config
+	def.templateFuncs = templateFuncs
 	// 系统内置报警处理
 	if len(notifier.Setting.UserIds) == 0 && len(notifier.Setting.RobotIds) == 0 {
 		sys := new(sendSysImpl)
@@ -426,16 +513,17 @@ func (f *sendBodyFactory) newSendnotify(evalCtx *alerting.EvalContext, notifier 
 	}
 }
 
-type Isendnotify interface {
+type iSendnotify interface {
 	send() error
 	execNotifyFunc() error
 }
 
 type sendnotifyBase struct {
 	*OneCloudNotifier
-	evalCtx alerting.EvalContext
-	msg     notify.SNotifyMessage
-	config  monitor.NotificationTemplateConfig
+	evalCtx       alerting.EvalContext
+	msg           notify.SNotifyMessage
+	config        monitor.NotificationTemplateConfig
+	templateFuncs template.FuncMap
 }
 
 func (s *sendnotifyBase) send() error {
@@ -444,10 +532,10 @@ func (s *sendnotifyBase) send() error {
 }
 
 func (s *sendnotifyBase) execNotifyFunc() error {
-	notifyclient.RawNotifyWithCtx(s.Ctx, s.msg.Uid, false, notify.TNotifyChannel(s.Setting.Channel),
+	notifyclient.RawNotifyWithCtxAndTemplateFuncs(s.Ctx, s.msg.Uid, false, notify.TNotifyChannel(s.Setting.Channel),
 		notify.TNotifyPriority(s.msg.Priority),
 		"DEFAULT",
-		jsonutils.Marshal(&s.config))
+		jsonutils.Marshal(&s.config), s.templateFuncs)
 	return nil
 }
 
@@ -460,8 +548,9 @@ func (s *sendUserImpl) send() error {
 }
 
 func (s *sendUserImpl) execNotifyFunc() error {
-	return notifyclient.NotifyAllWithoutRobotWithCtx(s.Ctx, s.msg.Uid, false, notify.TNotifyPriority(s.msg.Priority),
-		"DEFAULT", jsonutils.Marshal(&s.config))
+	return notifyclient.NotifyAllWithoutRobotWithCtxAndTemplateFuncs(
+		s.Ctx, s.msg.Uid, false, s.msg.Priority,
+		"DEFAULT", jsonutils.Marshal(&s.config), s.templateFuncs)
 }
 
 type sendSysImpl struct {
@@ -473,8 +562,8 @@ func (s *sendSysImpl) send() error {
 }
 
 func (s *sendSysImpl) execNotifyFunc() error {
-	notifyclient.SystemNotifyWithCtx(s.Ctx, notify.TNotifyPriority(s.msg.Priority), "DEFAULT",
-		jsonutils.Marshal(&s.config))
+	notifyclient.SystemNotifyWithCtxAndTemplateFuncs(s.Ctx, s.msg.Priority, "DEFAULT",
+		jsonutils.Marshal(&s.config), s.templateFuncs)
 	return nil
 }
 
@@ -487,10 +576,11 @@ func (s *sendMobileImpl) send() error {
 	if err != nil {
 		return err
 	}
-	notifyclient.RawNotifyWithCtx(s.Ctx, s.msg.Uid, false, notify.TNotifyChannel(s.Setting.Channel),
-		notify.TNotifyPriority(s.msg.Priority),
+	notifyclient.RawNotifyWithCtxAndTemplateFuncs(s.Ctx, s.msg.Uid, false, notify.TNotifyChannel(s.Setting.Channel),
+		s.msg.Priority,
 		s.msg.Topic,
-		msgObj)
+		msgObj,
+		s.templateFuncs)
 	return nil
 }
 
@@ -503,25 +593,27 @@ func (s *sendRobotImpl) send() error {
 }
 
 func (s *sendRobotImpl) execNotifyFunc() error {
-	return notifyclient.NotifyRobotWithCtx(s.Ctx, s.msg.Robots, notify.TNotifyPriority(s.msg.Priority),
-		"DEFAULT", jsonutils.Marshal(&s.config))
+	return notifyclient.NotifyRobotWithCtxAndTemplateFuncs(s.Ctx, s.msg.Robots, s.msg.Priority,
+		"DEFAULT", jsonutils.Marshal(&s.config), s.templateFuncs)
 }
 
-func SendNotifyInfo(base *sendnotifyBase, imp Isendnotify) error {
-	tmpMatches := base.config.Matches
-	batch := 10
+func SendNotifyInfo(base *sendnotifyBase, imp iSendnotify) error {
+	/*tmpMatches := base.config.Matches
+	batch := 100
 	for i := 0; i < len(tmpMatches); i += batch {
 		split := i + batch
 		if split > len(tmpMatches) {
 			split = len(tmpMatches)
 		}
 		base.config.Matches = tmpMatches[i:split]
-		base.config.ResourceName = base.evalCtx.GetResourceNameOfMathes(base.config.Matches)
+		base.config.ResourceName = base.evalCtx.GetResourceNameOfMatches(base.config.Matches)
 		err := imp.execNotifyFunc()
 		if err != nil {
 			return err
 		}
 
 	}
-	return nil
+	return nil*/
+	base.config.ResourceName = base.evalCtx.GetResourceNameOfMatches(base.config.Matches)
+	return imp.execNotifyFunc()
 }

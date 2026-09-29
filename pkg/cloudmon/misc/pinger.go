@@ -16,6 +16,7 @@ package misc
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -25,8 +26,8 @@ import (
 	"yunion.io/x/pkg/util/netutils"
 	"yunion.io/x/pkg/util/rbacscope"
 
-	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -48,11 +49,21 @@ func PingProbe(ctx context.Context, userCred mcclient.TokenCredential, isStart b
 		networks := []api.NetworkDetails{}
 		for {
 			params := map[string]interface{}{
-				"offset":     len(networks),
-				"limit":      "10",
-				"cloud_env":  api.CLOUD_ENV_ON_PREMISE,
+				"offset": len(networks),
+				"limit":  "10",
+				"provider": []string{
+					api.CLOUD_PROVIDER_ONECLOUD,
+				},
 				"scope":      rbacscope.ScopeSystem,
 				"is_classic": true,
+				"server_type": []string{
+					string(api.NETWORK_TYPE_GUEST),
+					string(api.NETWORK_TYPE_BAREMETAL),
+					string(api.NETWORK_TYPE_CONTAINER),
+					string(api.NETWORK_TYPE_PXE),
+					string(api.NETWORK_TYPE_IPMI),
+					string(api.NETWORK_TYPE_EIP),
+				},
 			}
 			resp, err := compute.Networks.List(s, jsonutils.Marshal(params))
 			if err != nil {
@@ -73,12 +84,12 @@ func PingProbe(ctx context.Context, userCred mcclient.TokenCredential, isStart b
 			network := sNetwork{networks[i]}
 			m, err := pingProbeNetwork(s, network)
 			if err != nil {
-				log.Errorf("pingProbeNetwork")
+				log.Errorf("pingProbeNetwork network %s(%s-%s) fail %s", network.Name, network.GuestIpStart, network.GuestIpEnd, err)
 				continue
 			}
 			metrics = append(metrics, m...)
 		}
-		urls, err := s.GetServiceURLs(apis.SERVICE_TYPE_INFLUXDB, options.Options.SessionEndpointType)
+		urls, err := tsdb.GetDefaultServiceSourceURLs(s, options.Options.SessionEndpointType)
 		if err != nil {
 			return errors.Wrap(err, "GetServiceURLs")
 		}
@@ -99,9 +110,11 @@ func getNetworkAddrMap(s *mcclient.ClientSession, netId string) (map[string]api.
 		return nil, errors.Wrap(err, "GetSpecific addresses")
 	}
 	addrList := make([]api.SNetworkUsedAddress, 0)
-	err = addrListJson.Unmarshal(&addrList, "addresses")
-	if err != nil {
-		return nil, errors.Wrap(err, "Unmarshal addreses")
+	if addrListJson.Contains("addresses") {
+		err = addrListJson.Unmarshal(&addrList, "addresses")
+		if err != nil {
+			return nil, errors.Wrap(err, "Unmarshal addreses")
+		}
 	}
 	addrMap := make(map[string]api.SNetworkUsedAddress)
 	for i := range addrList {
@@ -146,6 +159,7 @@ func pingProbeNetwork(s *mcclient.ClientSession, net sNetwork) ([]influxdb.SMetr
 		return nil, errors.Wrap(err, "getNetworkAddrMap")
 	}
 
+	reserveIps := make([]string, 0)
 	now := time.Now().UTC()
 	for addr := addrStart; addr <= addrEnd; addr = addr.StepUp() {
 		addrStr := addr.String()
@@ -154,15 +168,16 @@ func pingProbeNetwork(s *mcclient.ClientSession, net sNetwork) ([]influxdb.SMetr
 		if allocated {
 			if netAddr.OwnerType == api.RESERVEDIP_RESOURCE_TYPES {
 				loss := pingResult.Loss()
-				status := api.RESERVEDIP_STATUS_OFFLINE
 				if loss < 100 {
-					status = api.RESERVEDIP_STATUS_ONLINE
-				}
-				params := jsonutils.NewDict()
-				params.Add(jsonutils.NewString(status), "status")
-				_, err := compute.ReservedIPs.Update(s, netAddr.OwnerId, params)
-				if err != nil {
-					log.Errorf("update reserved ip %s status fail: %s", addrStr, err)
+					log.Debugf("Reserved address %s continues responding ping, extend reserving the address", addrStr)
+					reserveIps = append(reserveIps, addrStr)
+				} else {
+					params := jsonutils.NewDict()
+					params.Add(jsonutils.NewString(api.RESERVEDIP_STATUS_OFFLINE), "status")
+					_, err := compute.ReservedIPs.Update(s, netAddr.OwnerId, params)
+					if err != nil {
+						log.Errorf("update reserved ip %s status fail: %s", addrStr, err)
+					}
 				}
 			} else {
 				// send metrics
@@ -214,17 +229,23 @@ func pingProbeNetwork(s *mcclient.ClientSession, net sNetwork) ([]influxdb.SMetr
 			if loss < 100 {
 				// reserve ip
 				log.Debugf("Free address %s is responding ping, reserve the address", addrStr)
-				params := jsonutils.NewDict()
-				params.Add(jsonutils.NewStringArray([]string{addrStr}), "ips")
-				params.Add(jsonutils.NewString("ping detect online free IP"), "notes")
-				params.Add(jsonutils.NewString(api.RESERVEDIP_STATUS_ONLINE), "status")
-				_, err = compute.Networks.PerformAction(s, net.Id, "reserve-ip", params)
-				if err != nil {
-					log.Errorf("failed to reserve ip %s: %s", addrStr, err)
-				}
+				reserveIps = append(reserveIps, addrStr)
 			}
 		}
 		log.Debugf("%s %s allocated %v", addrStr, netAddr, allocated)
+	}
+	if len(reserveIps) > 0 {
+		params := jsonutils.NewDict()
+		params.Add(jsonutils.NewStringArray(reserveIps), "ips")
+		params.Add(jsonutils.NewString("ping detected online free IP"), "notes")
+		params.Add(jsonutils.NewString(api.RESERVEDIP_STATUS_ONLINE), "status")
+		if options.Options.PingReserveIPTimeoutHours > 0 {
+			params.Add(jsonutils.NewString(fmt.Sprintf("%dH", options.Options.PingReserveIPTimeoutHours)), "duration")
+		}
+		_, err = compute.Networks.PerformAction(s, net.Id, "reserve-ip", params)
+		if err != nil {
+			log.Errorf("failed to reserve ip %#v: %s", reserveIps, err)
+		}
 	}
 	return metrics, nil
 }

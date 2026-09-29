@@ -19,10 +19,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	olog "log"
 	"math/rand"
 	"net"
@@ -77,6 +77,8 @@ type Application struct {
 	isTLS bool
 
 	enableProfiling bool
+
+	allowTLS1x bool
 }
 
 const (
@@ -91,13 +93,13 @@ const (
 
 var quitHandlerRegisted bool
 
-func NewApplication(name string, connMax int, db bool) *Application {
+func NewApplication(name string, connMax int, queueSize int, db bool) *Application {
 	app := Application{name: name,
 		context:           ctx.CtxWithTime(),
 		connMax:           connMax,
-		session:           NewWorkerManager("HttpRequestWorkerManager", connMax, DEFAULT_BACKLOG, db),
-		readSession:       NewWorkerManager("HttpGetRequestWorkerManager", connMax, DEFAULT_BACKLOG, db),
-		systemSession:     NewWorkerManager("InternalHttpRequestWorkerManager", 1, DEFAULT_BACKLOG, false),
+		session:           NewWorkerManager("HttpRequestWorkerManager", connMax, connMax*queueSize, db),
+		readSession:       NewWorkerManager("HttpGetRequestWorkerManager", connMax, connMax*queueSize, db),
+		systemSession:     NewWorkerManager("InternalHttpRequestWorkerManager", 1, queueSize, false),
 		roots:             make(map[string]*RadixNode),
 		rootLock:          &sync.RWMutex{},
 		idleTimeout:       DEFAULT_IDLE_TIMEOUT,
@@ -135,6 +137,12 @@ func (app *Application) OnException(exception func(method, path string, body jso
 func (app *Application) SetDefaultTimeout(to time.Duration) *Application {
 	log.Infof("adjust application default timeout to %f seconds", to.Seconds())
 	app.processTimeout = to
+	return app
+}
+
+func (app *Application) AllowTLS1x() *Application {
+	log.Infof("Allow TLS1.0&1.1")
+	app.allowTLS1x = true
 	return app
 }
 
@@ -217,6 +225,12 @@ type loggingResponseWriter struct {
 	data   []byte
 }
 
+func (lrw *loggingResponseWriter) Flush() {
+	if fw, ok := lrw.ResponseWriter.(http.Flusher); ok {
+		fw.Flush()
+	}
+}
+
 func (lrw *loggingResponseWriter) Write(data []byte) (int, error) {
 	lrw.data = data
 	return lrw.ResponseWriter.Write(data)
@@ -289,7 +303,7 @@ func (app *Application) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if lrw.status >= 500 && app.exception != nil {
 		url := fmt.Sprintf("%d %s (%s) %.2fms", lrw.status, r.URL.String(), remote, duration)
-		app.exception(r.Method, url, params.Body, errors.Errorf(string(lrw.data)))
+		app.exception(r.Method, url, params.Body, errors.Errorf("%s", string(lrw.data)))
 	}
 }
 
@@ -360,6 +374,7 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 	w.Header().Set("Server", "Yunion AppServer/Go/2018.4")
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if app.isTLS {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 	}
@@ -378,7 +393,7 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 				fw:     newResponseWriterChannel(w),
 				r:      r,
 				segs:   segs,
-				to:     hand.FetchProcessTimeout(r),
+				to:     hand.fetchProcessTimeout(r),
 				cancel: nil,
 			}
 
@@ -393,7 +408,7 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 				defer task.cancel()
 			}
 			task.ctx = appctx.WithRequestLang(task.ctx, r)
-			session := hand.workerMan
+			session := hand.fetchWorkerManager(r)
 			if session == nil {
 				if r.Method == "GET" || r.Method == "HEAD" {
 					session = app.readSession
@@ -405,11 +420,11 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 			task.appParams.Request = r
 			task.appParams.Response = w
 			if r.Body != nil && r.ContentLength > 0 && getContentType(r) == ContentTypeJson {
-				data, _ := ioutil.ReadAll(r.Body)
+				data, _ := io.ReadAll(r.Body)
 				task.appParams.Body, _ = jsonutils.Parse(data)
-				r.Body = ioutil.NopCloser(bytes.NewBuffer(data))
+				r.Body = io.NopCloser(bytes.NewBuffer(data))
 			}
-			session.Run(
+			inqueue := session.Run(
 				task,
 				currentWorker,
 				func(err error) {
@@ -417,13 +432,17 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 					task.fw.closeChannels()
 				},
 			)
-			runErr := task.fw.wait(task.ctx, currentWorker)
-			if runErr != nil {
-				switch je := runErr.(type) {
-				case *httputils.JSONClientError:
-					httperrors.GeneralServerError(task.ctx, w, je)
-				default:
-					httperrors.InternalServerError(task.ctx, w, "Internal server error")
+			if !inqueue {
+				httperrors.TooManyRequestsError(task.ctx, w, "Request queue is full")
+			} else {
+				runErr := task.fw.wait(task.ctx, currentWorker)
+				if runErr != nil {
+					switch je := runErr.(type) {
+					case *httputils.JSONClientError:
+						httperrors.GeneralServerError(task.ctx, w, je)
+					default:
+						httperrors.InternalServerError(task.ctx, w, "Internal server error")
+					}
 				}
 			}
 			task.fw.closeChannels()
@@ -434,7 +453,7 @@ func (app *Application) defaultHandle(w http.ResponseWriter, r *http.Request, ri
 		}
 	} else if !isCors {
 		ctx := appctx.WithRequestLang(context.TODO(), r)
-		httperrors.NotFoundError(ctx, w, "Handler not found")
+		httperrors.NotFoundError(ctx, w, "Handler %s not found", "/"+strings.Join(segs, "/"))
 	}
 	return nil, nil
 }
@@ -447,12 +466,12 @@ func (app *Application) AddDefaultHandler(method string, prefix string, handler 
 }
 
 func (app *Application) addDefaultHandlers() {
-	app.AddDefaultHandler("GET", "/version", VersionHandler, "version")
-	app.AddDefaultHandler("GET", "/stats", StatisticHandler, "stats")
-	app.AddDefaultHandler("POST", "/ping", PingHandler, "ping")
-	app.AddDefaultHandler("GET", "/ping", PingHandler, "ping")
-	app.AddDefaultHandler("GET", "/worker_stats", WorkerStatsHandler, "worker_stats")
-	app.AddDefaultHandler("GET", "/process_stats", ProcessStatsHandler, "process_stats")
+	app.AddDefaultHandler("GET", "/version", WhitelistFilter(VersionHandler), "version")
+	app.AddDefaultHandler("GET", "/stats", WhitelistFilter(StatisticHandler), "stats")
+	app.AddDefaultHandler("POST", "/ping", WhitelistFilter(PingHandler), "ping")
+	app.AddDefaultHandler("GET", "/ping", WhitelistFilter(PingHandler), "ping")
+	app.AddDefaultHandler("GET", "/worker_stats", WhitelistFilter(WorkerStatsHandler), "worker_stats")
+	app.AddDefaultHandler("GET", "/process_stats", WhitelistFilter(ProcessStatsHandler), "process_stats")
 }
 
 func timeoutHandle(h http.Handler) http.HandlerFunc {
@@ -468,12 +487,32 @@ func timeoutHandle(h http.Handler) http.HandlerFunc {
 }
 
 func (app *Application) initServer(addr string) *http.Server {
+	return InitHTTPServer(app, addr)
+}
+
+func InitHTTPServer(app *Application, addr string) *http.Server {
 	/* db := AppContextDB(app.context)
 	if db != nil {
 		db.SetMaxIdleConns(app.connMax + 1)
 		db.SetMaxOpenConns(app.connMax + 1)
 	}
 	*/
+
+	cipherSuites := []uint16{}
+	for _, suite := range tls.CipherSuites() {
+		if !strings.HasSuffix(suite.Name, "_SHA") {
+			cipherSuites = append(cipherSuites, suite.ID)
+		}
+	}
+
+	minTLSVer := uint16(tls.VersionTLS12)
+	if app.allowTLS1x {
+		minTLSVer = tls.VersionTLS10
+	}
+	tlsConf := &tls.Config{
+		CipherSuites: cipherSuites,
+		MinVersion:   minTLSVer,
+	}
 
 	s := &http.Server{
 		Addr:              addr,
@@ -486,6 +525,8 @@ func (app *Application) initServer(addr string) *http.Server {
 		// fix aliyun elb healt check tls error
 		// issue like: https://github.com/megaease/easegress/issues/481
 		ErrorLog: olog.New(io.Discard, "", olog.LstdFlags),
+
+		TLSConfig: tlsConf,
 	}
 	return s
 }
@@ -593,28 +634,13 @@ func (app *Application) listenAndServeInternal(s *http.Server, certFile, keyFile
 	}
 }
 
-func isJsonContentType(r *http.Request) bool {
-	contType := strings.ToLower(r.Header.Get("Content-Type"))
-	if strings.HasPrefix(contType, "application/json") {
-		return true
-	}
-	return false
-}
-
-func isFormContentType(r *http.Request) bool {
-	contType := strings.ToLower(r.Header.Get("Content-Type"))
-	if strings.HasPrefix(contType, "application/json") {
-		return true
-	}
-	return false
-}
-
 type TContentType string
 
 const (
-	ContentTypeJson    = TContentType("Json")
-	ContentTypeForm    = TContentType("Form")
-	ContentTypeUnknown = TContentType("Unknown")
+	ContentTypeJson        = TContentType("Json")
+	ContentTypeForm        = TContentType("Form")
+	ContentTypeOctetStream = TContentType("OctetStream")
+	ContentTypeUnknown     = TContentType("Unknown")
 )
 
 func getContentType(r *http.Request) TContentType {
@@ -630,6 +656,7 @@ func getContentType(r *http.Request) TContentType {
 	for k, v := range map[string]TContentType{
 		"application/json":                  ContentTypeJson,
 		"application/x-www-form-urlencoded": ContentTypeForm,
+		"application/octet-stream":          ContentTypeOctetStream,
 	} {
 		if strings.HasPrefix(contType, k) {
 			return v
@@ -645,7 +672,6 @@ func FetchEnv(ctx context.Context, w http.ResponseWriter, r *http.Request) (para
 	if err != nil {
 		log.Errorf("Parse query string %s failed: %v", r.URL.RawQuery, err)
 	}
-	//var body jsonutils.JSONObject = nil
 	if r.Method == "PUT" || r.Method == "POST" || r.Method == "DELETE" || r.Method == "PATCH" {
 		switch getContentType(r) {
 		case ContentTypeJson:
@@ -664,6 +690,7 @@ func FetchEnv(ctx context.Context, w http.ResponseWriter, r *http.Request) (para
 			if err != nil {
 				log.Warningf("Parse query string %s failed: %v", r.PostForm.Encode(), err)
 			}
+		case ContentTypeOctetStream:
 		default:
 			log.Warningf("%s invalid contentType with header %v", r.URL.String(), r.Header)
 		}

@@ -17,11 +17,13 @@ package hostmetrics
 import (
 	"context"
 	"fmt"
+	"io"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/cadvisor/utils/sysfs"
 	"github.com/shirou/gopsutil/host"
 	psnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
@@ -30,13 +32,17 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
 	"yunion.io/x/pkg/util/netutils"
+	"yunion.io/x/pkg/utils"
 
+	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/guestman"
 	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/hostman/hostinfo/hostconsts"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
+	"yunion.io/x/onecloud/pkg/util/pod/stats"
+	"yunion.io/x/onecloud/pkg/util/timeutils2"
 )
 
 const (
@@ -53,15 +59,33 @@ type SHostMetricsCollector struct {
 
 var hostMetricsCollector *SHostMetricsCollector
 
-func Init() {
+type IHostInfo interface {
+	GetContainerStatsProvider() stats.ContainerStatsProvider
+	HasContainerNvidiaGpu() bool
+	HasContainerVastaitechGpu() bool
+	HasContainerCphAmdGpu() bool
+	GetNvidiaGpuIndexMemoryMap() map[string]int
+	GetNvidiaGpuIndexByDeviceIds(ids []string) map[string]int
+	ReportHostDmesg(data []compute.SKmsgEntry) error
+}
+
+var hostDmesgCollector *SHostDmesgCollector
+
+func Init(hostInfo IHostInfo) {
 	if hostMetricsCollector == nil {
-		hostMetricsCollector = NewHostMetricsCollector()
+		hostMetricsCollector = NewHostMetricsCollector(hostInfo)
+	}
+	if hostDmesgCollector == nil {
+		hostDmesgCollector = NewHostDmesgCollector(hostInfo)
 	}
 }
 
 func Start() {
 	if hostMetricsCollector != nil {
 		go hostMetricsCollector.Start()
+	}
+	if options.HostOptions.EnableDmesgCollect {
+		timeutils2.AddTimeout(30*time.Second, hostDmesgCollector.Start)
 	}
 }
 
@@ -88,14 +112,15 @@ func (m *SHostMetricsCollector) runMain() {
 	elapse := timeBegin.Sub(m.LastCollectTime)
 	if elapse < time.Second*time.Duration(m.ReportInterval) {
 		return
-	} else {
-		m.LastCollectTime = timeBegin
 	}
-	m.runMonitor()
+
+	m.runMonitor(timeBegin, m.LastCollectTime)
+
+	m.LastCollectTime = timeBegin
 }
 
-func (m *SHostMetricsCollector) runMonitor() {
-	reportData := m.collectReportData()
+func (m *SHostMetricsCollector) runMonitor(now, last time.Time) {
+	reportData := m.collectReportData(now, last)
 	if options.HostOptions.EnableTelegraf && len(reportData) > 0 {
 		m.reportUsageToTelegraf(reportData)
 	}
@@ -110,7 +135,8 @@ func (m *SHostMetricsCollector) reportUsageToTelegraf(data string) {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 204 {
-		log.Errorf("upload guest metric failed %d", res.StatusCode)
+		resBody, _ := io.ReadAll(res.Body)
+		log.Errorf("upload guest metric failed with %d %s, data: %s", res.StatusCode, string(resBody), data)
 		timestamp := time.Now().UnixNano()
 		for _, line := range strings.Split(data, "\n") {
 			m.waitingReportData = append(m.waitingReportData,
@@ -133,18 +159,18 @@ func (m *SHostMetricsCollector) reportUsageToTelegraf(data string) {
 	}
 }
 
-func (m *SHostMetricsCollector) collectReportData() string {
+func (m *SHostMetricsCollector) collectReportData(now, last time.Time) string {
 	if len(m.waitingReportData) > 60 {
 		m.waitingReportData = m.waitingReportData[1:]
 	}
-	return m.guestMonitor.CollectReportData()
+	return m.guestMonitor.CollectReportData(now, last)
 }
 
-func NewHostMetricsCollector() *SHostMetricsCollector {
+func NewHostMetricsCollector(hostInfo IHostInfo) *SHostMetricsCollector {
 	return &SHostMetricsCollector{
 		ReportInterval:    options.HostOptions.ReportInterval,
-		waitingReportData: make([]string, 0),
-		guestMonitor:      NewGuestMonitorCollector(),
+		waitingReportData: make([]string, 0, 10),
+		guestMonitor:      NewGuestMonitorCollector(hostInfo),
 	}
 }
 
@@ -152,13 +178,15 @@ type SGuestMonitorCollector struct {
 	monitors       map[string]*SGuestMonitor
 	prevPids       map[string]int
 	prevReportData map[string]*GuestMetrics
+	hostInfo       IHostInfo
 }
 
-func NewGuestMonitorCollector() *SGuestMonitorCollector {
+func NewGuestMonitorCollector(hostInfo IHostInfo) *SGuestMonitorCollector {
 	return &SGuestMonitorCollector{
 		monitors:       make(map[string]*SGuestMonitor, 0),
 		prevPids:       make(map[string]int, 0),
 		prevReportData: make(map[string]*GuestMetrics, 0),
+		hostInfo:       hostInfo,
 	}
 }
 
@@ -166,38 +194,105 @@ func (s *SGuestMonitorCollector) GetGuests() map[string]*SGuestMonitor {
 	var err error
 	gms := make(map[string]*SGuestMonitor, 0)
 	guestmanager := guestman.GetGuestManager()
+
+	var podStats []stats.PodStats = nil
+	var nvidiaGpuMetrics []NvidiaGpuProcessMetrics = nil
+	var vastaitechGpuMetrics []VastaitechGpuProcessMetrics = nil
+	var cphAmdGpuMetrics []CphAmdGpuProcessMetrics = nil
+	var gpuPodProcs = s.collectGpuPodsProcesses()
+
 	guestmanager.Servers.Range(func(k, v interface{}) bool {
-		guest := v.(*guestman.SKVMGuestInstance)
-		if !guest.IsValid() {
+		instance, ok := v.(guestman.GuestRuntimeInstance)
+		if !ok {
 			return false
 		}
-		pid := guest.GetPid()
-		if pid > 0 {
-			guestName := guest.Desc.Name
-			guestId := guest.GetId()
-			nicsDesc := guest.Desc.Nics
-			vcpuCount := guest.Desc.Cpu
-			gm, ok := s.monitors[guestId]
-			if ok && gm.Pid == pid {
-				delete(s.monitors, guestId)
-				gm.UpdateVmName(guestName)
-				gm.UpdateNicsDesc(nicsDesc)
-				gm.UpdateCpuCount(int(vcpuCount))
-			} else {
-				delete(s.monitors, guestId)
-				gm, err = NewGuestMonitor(guestName, guestId, pid, nicsDesc, int(vcpuCount))
-				if err != nil {
-					log.Errorf("NewGuestMonitor for %s(%s), pid: %d, nics: %#v", guestName, guestId, pid, nicsDesc)
+		if !instance.IsValid() {
+			return false
+		}
+		hypervisor := instance.GetHypervisor()
+		guestId := instance.GetId()
+		guestName := instance.GetDesc().Name
+		nicsDesc := instance.GetDesc().Nics
+		vcpuCount := instance.GetDesc().Cpu
+		switch hypervisor {
+		case compute.HYPERVISOR_KVM:
+			guest := instance.(*guestman.SKVMGuestInstance)
+			pid := guest.GetPid()
+			if pid > 0 {
+				gm, ok := s.monitors[guestId]
+				if ok && gm.Pid == pid {
+					delete(s.monitors, guestId)
+					gm.UpdateVmName(guestName)
+					gm.UpdateNicsDesc(nicsDesc)
+					gm.UpdateCpuCount(int(vcpuCount))
+					gm.MemMB = instance.GetDesc().Mem
+				} else {
+					delete(s.monitors, guestId)
+					gm, err = NewGuestMonitor(instance, guestName, guestId, pid, nicsDesc, int(vcpuCount))
+					if err != nil {
+						log.Errorf("NewGuestMonitor for %s(%s), pid: %d, nics: %#v", guestName, guestId, pid, nicsDesc)
+						return true
+					}
+				}
+				gm.ScalingGroupId = guest.GetDesc().ScalingGroupId
+				gm.Tenant = guest.GetDesc().Tenant
+				gm.TenantId = guest.GetDesc().TenantId
+				gm.DomainId = guest.GetDesc().DomainId
+				gm.ProjectDomain = guest.GetDesc().ProjectDomain
+
+				gms[guestId] = gm
+			}
+			return true
+		case compute.HYPERVISOR_POD:
+			if podStats == nil {
+				var err error
+				csp := s.hostInfo.GetContainerStatsProvider()
+				if csp == nil {
+					log.Warningf("container stats provider is not ready")
 					return true
 				}
+				podStats, err = csp.ListPodCPUAndMemoryStats()
+				if err != nil {
+					log.Errorf("ListPodCPUAndMemoryStats: %s", err)
+					return true
+				}
+				if s.hostInfo.HasContainerNvidiaGpu() {
+					nvidiaGpuMetrics, err = GetNvidiaGpuProcessMetrics()
+					if err != nil {
+						log.Errorf("GetNvidiaGpuProcessMetrics %s", err)
+					}
+				}
+				if s.hostInfo.HasContainerVastaitechGpu() {
+					vastaitechGpuMetrics, err = GetVastaitechGpuProcessMetrics()
+					if err != nil {
+						log.Errorf("GetVastaitechGpuProcessMetrics %s", err)
+					}
+				}
+				if s.hostInfo.HasContainerCphAmdGpu() {
+					cphAmdGpuMetrics, err = GetCphAmdGpuProcessMetrics()
+					if err != nil {
+						log.Errorf("GetCphAmdGpuProcessMetrics %s", err)
+					}
+				}
 			}
-			gm.ScalingGroupId = guest.Desc.ScalingGroupId
-			gm.Tenant = guest.Desc.Tenant
-			gm.TenantId = guest.Desc.TenantId
-			gm.DomainId = guest.Desc.DomainId
-			gm.ProjectDomain = guest.Desc.ProjectDomain
 
-			gms[guestId] = gm
+			podStat, podProcs := GetPodStatsById(podStats, gpuPodProcs, guestId)
+			if podStat != nil {
+				gm, err := NewGuestPodMonitor(
+					instance, guestName, guestId, podStat,
+					nvidiaGpuMetrics, vastaitechGpuMetrics, cphAmdGpuMetrics,
+					s.hostInfo, podProcs, nicsDesc, int(vcpuCount),
+				)
+				if err != nil {
+					return true
+				}
+
+				gm.UpdateByInstance(instance)
+				gms[guestId] = gm
+				return true
+			} else {
+				delete(s.monitors, guestId)
+			}
 		}
 		return true
 	})
@@ -205,7 +300,7 @@ func (s *SGuestMonitorCollector) GetGuests() map[string]*SGuestMonitor {
 	return gms
 }
 
-func (s *SGuestMonitorCollector) CollectReportData() (ret string) {
+func (s *SGuestMonitorCollector) CollectReportData(now, last time.Time) (ret string) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorln(r)
@@ -216,21 +311,22 @@ func (s *SGuestMonitorCollector) CollectReportData() (ret string) {
 	s.cleanedPrevData(gms)
 	reportData := make(map[string]*GuestMetrics)
 	for _, gm := range gms {
-		prevUsage, _ := s.prevReportData[gm.Id]
+		prevUsage := s.prevReportData[gm.Id]
 		reportData[gm.Id] = s.collectGmReport(gm, prevUsage)
 		s.prevPids[gm.Id] = gm.Pid
 	}
-	s.saveNicTraffics(reportData, gms)
+	s.saveNicTraffics(reportData, gms, now, last)
 
 	s.prevReportData = reportData
 	ret = s.toTelegrafReportData(reportData)
 	return
 }
 
-func (s *SGuestMonitorCollector) saveNicTraffics(reportData map[string]*GuestMetrics, gms map[string]*SGuestMonitor) {
+func (s *SGuestMonitorCollector) saveNicTraffics(reportData map[string]*GuestMetrics, gms map[string]*SGuestMonitor, now, last time.Time) {
 	guestman.GetGuestManager().TrafficLock.Lock()
 	defer guestman.GetGuestManager().TrafficLock.Unlock()
-	var guestNicsTraffics = make(map[string]map[string]compute.SNicTrafficRecord)
+	isReset := now.Day() != last.Day() // across day
+	var guestNicsTraffics = compute.NewGuestNicTrafficSyncInput(now, isReset)
 	for guestId, data := range reportData {
 		gm := gms[guestId]
 		guestTrafficRecord, err := guestman.GetGuestManager().GetGuestTrafficRecord(gm.Id)
@@ -238,15 +334,16 @@ func (s *SGuestMonitorCollector) saveNicTraffics(reportData map[string]*GuestMet
 			log.Errorf("failed get guest traffic record %s", err)
 			continue
 		}
-		guestTraffics := make(map[string]compute.SNicTrafficRecord)
+		guestTrafficsToSend := make(map[string]*compute.SNicTrafficRecord)
+		guestTrafficsToSave := make(map[string]*compute.SNicTrafficRecord)
 		for i := range gm.Nics {
-			if gm.Nics[i].RxTrafficLimit <= 0 && gm.Nics[i].TxTrafficLimit <= 0 {
+			if gm.Nics[i].ChargeType != billing_api.NET_CHARGE_TYPE_BY_TRAFFIC {
 				continue
 			}
 
 			var nicIo *NetIOMetric
 			for j := range data.VmNetio {
-				if gm.Nics[i].Index == int8(data.VmNetio[j].Meta.Index) {
+				if gm.Nics[i].Mac == data.VmNetio[j].Meta.Mac {
 					nicIo = data.VmNetio[j]
 					break
 				}
@@ -255,51 +352,49 @@ func (s *SGuestMonitorCollector) saveNicTraffics(reportData map[string]*GuestMet
 				log.Warningf("failed found report data for nic %s", gm.Nics[i].Ifname)
 				continue
 			}
+			nicHasBeenSetDown := false
 			nicTraffic := compute.SNicTrafficRecord{}
-			for index, record := range guestTrafficRecord {
-				if index == strconv.Itoa(nicIo.Meta.Index) {
+			for mac, record := range guestTrafficRecord {
+				if mac == nicIo.Meta.Mac {
 					nicTraffic.RxTraffic += record.RxTraffic
 					nicTraffic.TxTraffic += record.TxTraffic
+					nicHasBeenSetDown = record.HasBeenSetDown
 				}
 			}
 
-			if gm.Nics[i].RxTrafficLimit > 0 || gm.Nics[i].TxTrafficLimit > 0 {
-				var nicDown, nicHasBeenSetDown = false, false
-				if nicTraffic.RxTraffic >= gm.Nics[i].RxTrafficLimit || nicTraffic.RxTraffic >= gm.Nics[i].TxTrafficLimit {
-					// record traffic excced, nic must has been set down
-					nicHasBeenSetDown = true
-				}
-				if gm.Nics[i].RxTrafficLimit > 0 {
-					nicTraffic.RxTraffic += int64(nicIo.TimeDiff * nicIo.BPSRecv / 8)
-					if nicTraffic.RxTraffic >= gm.Nics[i].RxTrafficLimit {
-						// nic down
-						nicDown = true
-					}
-				}
-				if gm.Nics[i].TxTrafficLimit > 0 {
-					nicTraffic.TxTraffic += int64(nicIo.TimeDiff * nicIo.BPSSent / 8)
-					if nicTraffic.TxTraffic >= gm.Nics[i].TxTrafficLimit {
-						// nic down
-						nicDown = true
-					}
-				}
-				guestTraffics[strconv.Itoa(nicIo.Meta.Index)] = nicTraffic
-				if !nicHasBeenSetDown && nicDown {
-					log.Infof("guest %s nic %d traffic exceed, set nic down", gm.Id, nicIo.Meta.Index)
-					gm.SetNicDown(nicIo.Meta.Index)
-				}
+			var nicDown = false
+			nicTraffic.RxTraffic += int64(nicIo.TimeDiff * nicIo.BPSRecv / 8)
+			if gm.Nics[i].RxTrafficLimit > 0 && nicTraffic.RxTraffic >= gm.Nics[i].RxTrafficLimit {
+				// nic down
+				nicDown = true
+			}
+			nicTraffic.TxTraffic += int64(nicIo.TimeDiff * nicIo.BPSSent / 8)
+			if gm.Nics[i].TxTrafficLimit > 0 && nicTraffic.TxTraffic >= gm.Nics[i].TxTrafficLimit {
+				// nic down
+				nicDown = true
+			}
+			if !nicHasBeenSetDown && nicDown {
+				log.Infof("guest %s nic %d traffic exceed tx: %d, tx_limit: %d, rx: %d, rx_limit: %d, set nic down", gm.Id, nicIo.Meta.Index, nicTraffic.TxTraffic, gm.Nics[i].TxTrafficLimit, nicTraffic.RxTraffic, gm.Nics[i].RxTrafficLimit)
+				gm.SetNicDown(gm.Nics[i].Mac)
+				nicTraffic.HasBeenSetDown = true
+			}
+
+			guestTrafficsToSend[nicIo.Meta.Mac] = &nicTraffic
+			if gm.Nics[i].BillingType == billing_api.BILLING_TYPE_PREPAID || !isReset {
+				guestTrafficsToSave[nicIo.Meta.Mac] = &nicTraffic
 			}
 		}
-		if len(guestTraffics) == 0 {
-			continue
+		if len(guestTrafficsToSend) > 0 {
+			guestNicsTraffics.Traffic[gm.Id] = guestTrafficsToSend
 		}
-		guestNicsTraffics[gm.Id] = guestTraffics
-		if err = guestman.GetGuestManager().SaveGuestTrafficRecord(gm.Id, guestTraffics); err != nil {
-			log.Errorf("failed save guest %s traffic record %v", gm.Id, guestTraffics)
-			continue
+		if len(guestTrafficsToSave) > 0 {
+			if err = guestman.GetGuestManager().SaveGuestTrafficRecord(gm.Id, guestTrafficsToSave); err != nil {
+				log.Errorf("failed save guest %s traffic record %v", gm.Id, guestTrafficsToSave)
+				continue
+			}
 		}
 	}
-	if len(guestNicsTraffics) > 0 {
+	if len(guestNicsTraffics.Traffic) > 0 {
 		guestman.SyncGuestNicsTraffics(guestNicsTraffics)
 	}
 }
@@ -307,21 +402,29 @@ func (s *SGuestMonitorCollector) saveNicTraffics(reportData map[string]*GuestMet
 func (s *SGuestMonitorCollector) toTelegrafReportData(data map[string]*GuestMetrics) string {
 	ret := []string{}
 	for guestId, report := range data {
-		var vmName, vmIp, scalingGroupId, tenant, tenantId, domainId, projectDomain string
+		var vmName, vmIp, vmIp6, scalingGroupId, tenant, tenantId, domainId, projectDomain, hypervisor string
 		if gm, ok := s.monitors[guestId]; ok {
 			vmName = gm.Name
 			vmIp = gm.Ip
+			vmIp6 = gm.Ip6
 			scalingGroupId = gm.ScalingGroupId
 			tenant = gm.Tenant
 			tenantId = gm.TenantId
 			domainId = gm.DomainId
 			projectDomain = gm.ProjectDomain
+			hypervisor = gm.Hypervisor
 		}
 
 		tags := map[string]string{
-			"id": guestId, "vm_id": guestId, "vm_name": vmName, "vm_ip": vmIp,
+			"id": guestId, "vm_id": guestId, "vm_name": vmName, "hypervisor": hypervisor,
 			"is_vm": "true", hostconsts.TELEGRAF_TAG_KEY_BRAND: hostconsts.TELEGRAF_TAG_ONECLOUD_BRAND,
 			hostconsts.TELEGRAF_TAG_KEY_RES_TYPE: "guest",
+		}
+		if len(vmIp) > 0 {
+			tags["vm_ip"] = vmIp
+		}
+		if len(vmIp6) > 0 {
+			tags["vm_ip6"] = vmIp6
 		}
 		if len(scalingGroupId) > 0 {
 			tags["vm_scaling_group_id"] = scalingGroupId
@@ -358,10 +461,46 @@ func (s *SGuestMonitorCollector) cleanedPrevData(gms map[string]*SGuestMonitor) 
 }
 
 type GuestMetrics struct {
-	VmCpu    *CpuMetric     `json:"vm_cpu"`
-	VmMem    *MemMetric     `json:"vm_mem"`
-	VmNetio  []*NetIOMetric `json:"vm_netio"`
-	VmDiskio *DiskIOMetric  `json:"vm_diskio"`
+	VmCpu      *CpuMetric     `json:"vm_cpu"`
+	VmMem      *MemMetric     `json:"vm_mem"`
+	VmNetio    []*NetIOMetric `json:"vm_netio"`
+	VmDiskio   *DiskIOMetric  `json:"vm_diskio"`
+	PodMetrics *PodMetrics    `json:"pod_metrics"`
+}
+
+func (d *GuestMetrics) mapToStatStr(m map[string]interface{}) string {
+	var statArr = []string{}
+	for k, v := range m {
+		if vs, ok := v.(string); ok && len(vs) == 0 {
+			continue
+		}
+		statArr = append(statArr, fmt.Sprintf("%s=%v", k, v))
+	}
+	return strings.Join(statArr, ",")
+}
+
+func (d *GuestMetrics) netioToTelegrafData(measurement string, tagStr string) []string {
+	res := []string{}
+	for i := range d.VmNetio {
+		netTagMap := d.VmNetio[i].ToTag()
+		for k, v := range netTagMap {
+			if len(k) == 0 || len(v) == 0 {
+				continue
+			}
+			tagStr = fmt.Sprintf("%s,%s=%s", tagStr, k, v)
+		}
+		res = append(res, fmt.Sprintf("%s,%s %s", measurement, tagStr, d.mapToStatStr(d.VmNetio[i].ToMap())))
+	}
+	return res
+}
+
+func (d *GuestMetrics) toVmTelegrafData(tagStr string) []string {
+	var res = []string{}
+	res = append(res, fmt.Sprintf("%s,%s %s", "vm_cpu", tagStr, d.mapToStatStr(d.VmCpu.ToMap())))
+	res = append(res, fmt.Sprintf("%s,%s %s", "vm_mem", tagStr, d.mapToStatStr(d.VmMem.ToMap())))
+	res = append(res, fmt.Sprintf("%s,%s %s", "vm_diskio", tagStr, d.mapToStatStr(d.VmDiskio.ToMap())))
+	res = append(res, d.netioToTelegrafData("vm_netio", tagStr)...)
+	return res
 }
 
 func (d *GuestMetrics) toTelegrafData(tags map[string]string) []string {
@@ -370,23 +509,11 @@ func (d *GuestMetrics) toTelegrafData(tags map[string]string) []string {
 		tagArr = append(tagArr, fmt.Sprintf("%s=%s", k, strings.ReplaceAll(v, " ", "+")))
 	}
 	tagStr := strings.Join(tagArr, ",")
-
-	mapToStatStr := func(m map[string]interface{}) string {
-		var statArr = []string{}
-		for k, v := range m {
-			statArr = append(statArr, fmt.Sprintf("%s=%v", k, v))
-		}
-		return strings.Join(statArr, ",")
+	if d.PodMetrics == nil {
+		return d.toVmTelegrafData(tagStr)
+	} else {
+		return d.toPodTelegrafData(tagStr)
 	}
-
-	var res = []string{}
-	res = append(res, fmt.Sprintf("%s,%s %s", "vm_cpu", tagStr, mapToStatStr(d.VmCpu.ToMap())))
-	res = append(res, fmt.Sprintf("%s,%s %s", "vm_mem", tagStr, mapToStatStr(d.VmMem.ToMap())))
-	res = append(res, fmt.Sprintf("%s,%s %s", "vm_diskio", tagStr, mapToStatStr(d.VmDiskio.ToMap())))
-	for i := range d.VmNetio {
-		res = append(res, fmt.Sprintf("%s,%s %s", "vm_netio", tagStr, mapToStatStr(d.VmNetio[i].ToMap())))
-	}
-	return res
 }
 
 func (s *SGuestMonitorCollector) collectGmReport(
@@ -395,6 +522,19 @@ func (s *SGuestMonitorCollector) collectGmReport(
 	if prevUsage == nil {
 		prevUsage = new(GuestMetrics)
 	}
+
+	if !gm.HasPodMetrics() {
+		return s.collectGuestMetrics(gm, prevUsage)
+	} else {
+		if isPodContainerStopped(prevUsage, gm.podStat) {
+			log.Infof("pod %s(%s) has container(s) stopped, clear previous usage", gm.Name, gm.Id)
+			prevUsage = new(GuestMetrics)
+		}
+		return s.collectPodMetrics(gm, prevUsage)
+	}
+}
+
+func (s *SGuestMonitorCollector) collectGuestMetrics(gm *SGuestMonitor, prevUsage *GuestMetrics) *GuestMetrics {
 	gmData := new(GuestMetrics)
 	gmData.VmCpu = gm.Cpu()
 	gmData.VmMem = gm.Mem()
@@ -435,7 +575,7 @@ func (s *SGuestMonitorCollector) reportDiskIo(cur, prev *DiskIOMetric) {
 func (s *SGuestMonitorCollector) addNetio(curInfo, prevInfo []*NetIOMetric) {
 	for _, v1 := range curInfo {
 		for _, v2 := range prevInfo {
-			if v1.Meta.Ip == v2.Meta.Ip {
+			if v1.Meta.Mac == v2.Meta.Mac {
 				s.reportNetIo(v1, v2)
 			}
 		}
@@ -473,39 +613,148 @@ func (s *SGuestMonitorCollector) reportNetIo(cur, prev *NetIOMetric) {
 }
 
 type SGuestMonitor struct {
-	Name           string
-	Id             string
-	Pid            int
-	Nics           []*desc.SGuestNetwork
-	CpuCnt         int
-	Ip             string
-	Process        *process.Process
-	ScalingGroupId string
-	Tenant         string
-	TenantId       string
-	DomainId       string
-	ProjectDomain  string
+	Name                    string
+	Id                      string
+	Pid                     int
+	Nics                    []*desc.SGuestNetwork
+	CpuCnt                  int
+	MemMB                   int64
+	Ip                      string
+	Ip6                     string
+	Process                 *process.Process
+	ScalingGroupId          string
+	Tenant                  string
+	TenantId                string
+	DomainId                string
+	ProjectDomain           string
+	podStat                 *stats.PodStats
+	nvidiaGpuMetrics        []NvidiaGpuProcessMetrics
+	nvidiaGpuIndexMemoryMap map[string]int
+	nvidiaGpuAssigned       []nvidiaGpuAssignedQuota
+	vastaitechGpuMetrics    []VastaitechGpuProcessMetrics
+	cphAmdGpuMetrics        []CphAmdGpuProcessMetrics
+	instance                guestman.GuestRuntimeInstance
+	sysFs                   sysfs.SysFs
+
+	Hypervisor string `json:"hypervisor"`
 }
 
-func NewGuestMonitor(name, id string, pid int, nics []*desc.SGuestNetwork, cpuCount int,
-) (*SGuestMonitor, error) {
-	var ip string
-	if len(nics) >= 1 {
-		ip = nics[0].Ip
-	}
+func NewGuestMonitor(instance guestman.GuestRuntimeInstance, name, id string, pid int, nics []*desc.SGuestNetwork, cpuCount int) (*SGuestMonitor, error) {
 	proc, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return nil, err
 	}
-	return &SGuestMonitor{name, id, pid, nics, cpuCount, ip, proc, "", "", "", "", ""}, nil
+	return newGuestMonitor(instance, name, id, proc, nics, cpuCount)
 }
 
-func (m *SGuestMonitor) SetNicDown(index int) {
-	guest, ok := guestman.GetGuestManager().GetServer(m.Id)
+func NewGuestPodMonitor(
+	instance guestman.GuestRuntimeInstance, name, id string, stat *stats.PodStats,
+	nvidiaGpuMetrics []NvidiaGpuProcessMetrics, vastaitechGpuMetrics []VastaitechGpuProcessMetrics, cphAmdGpuMetrics []CphAmdGpuProcessMetrics,
+	hostInstance IHostInfo, podProcs map[string]struct{}, nics []*desc.SGuestNetwork, cpuCount int,
+) (*SGuestMonitor, error) {
+	m, err := newGuestMonitor(instance, name, id, nil, nics, cpuCount)
+	if err != nil {
+		return nil, errors.Wrap(err, "new pod GuestMonitor")
+	}
+	m.podStat = stat
+	podDesc := instance.GetDesc()
+
+	hasNvGpu := false
+	hasCphAmdGpu := false
+	hasVastaitechGpu := false
+	nvAssignInputs := make([]nvidiaGpuAssignInput, 0)
+	for i := range podDesc.IsolatedDevices {
+		if !utils.IsInStringArray(podDesc.IsolatedDevices[i].SharingMode, compute.VIRTUAL_SHARING_MODES) {
+			continue
+		}
+		vendorId := strings.Split(podDesc.IsolatedDevices[i].VendorDeviceId, ":")[0]
+		switch vendorId {
+		case compute.NVIDIA_VENDOR_ID:
+			hasNvGpu = true
+			nvAssignInputs = append(nvAssignInputs, nvidiaGpuAssignInput{
+				Id:          podDesc.IsolatedDevices[i].Id,
+				MemoryLimit: podDesc.IsolatedDevices[i].MemoryLimit,
+			})
+		case compute.AMD_VENDOR_ID:
+			hasCphAmdGpu = true
+		case compute.VASTAITECH_VENDOR_ID:
+			hasVastaitechGpu = true
+		}
+	}
+
+	if hasNvGpu {
+		m.nvidiaGpuMetrics = GetPodNvidiaGpuMetrics(nvidiaGpuMetrics, podProcs)
+		m.nvidiaGpuIndexMemoryMap = hostInstance.GetNvidiaGpuIndexMemoryMap()
+		nvDevIds := make([]string, 0, len(nvAssignInputs))
+		for i := range nvAssignInputs {
+			nvDevIds = append(nvDevIds, nvAssignInputs[i].Id)
+		}
+		indexById := hostInstance.GetNvidiaGpuIndexByDeviceIds(nvDevIds)
+		m.nvidiaGpuAssigned = buildNvidiaGpuAssignedQuotas(nvAssignInputs, indexById, m.nvidiaGpuIndexMemoryMap)
+	}
+	if hasVastaitechGpu {
+		m.vastaitechGpuMetrics = GetPodVastaitechGpuMetrics(vastaitechGpuMetrics, podProcs)
+	}
+	if hasCphAmdGpu {
+		m.cphAmdGpuMetrics = GetPodCphAmdGpuMetrics(cphAmdGpuMetrics, podProcs)
+	}
+	return m, nil
+}
+
+func newGuestMonitor(instance guestman.GuestRuntimeInstance, name, id string, proc *process.Process, nics []*desc.SGuestNetwork, cpuCount int) (*SGuestMonitor, error) {
+	var ip, ip6 string
+	if len(nics) >= 1 {
+		for i := range nics {
+			if len(ip) == 0 && len(nics[i].Ip) > 0 {
+				ip = nics[i].Ip
+			}
+			if len(ip6) == 0 && len(nics[i].Ip6) > 0 {
+				ip6 = nics[i].Ip6
+			}
+		}
+	}
+	pid := 0
+	if proc != nil {
+		pid = int(proc.Pid)
+	}
+	return &SGuestMonitor{
+		Name:     name,
+		Id:       id,
+		Pid:      pid,
+		Nics:     nics,
+		CpuCnt:   cpuCount,
+		Ip:       ip,
+		Ip6:      ip6,
+		Process:  proc,
+		instance: instance,
+		sysFs:    sysfs.NewRealSysFs(),
+
+		Hypervisor: instance.GetDesc().GetHypervisor(),
+	}, nil
+}
+
+func (m *SGuestMonitor) UpdateByInstance(instance guestman.GuestRuntimeInstance) {
+	guestName := instance.GetDesc().Name
+	nicsDesc := instance.GetDesc().Nics
+	vcpuCount := instance.GetDesc().Cpu
+	m.UpdateVmName(guestName)
+	m.UpdateNicsDesc(nicsDesc)
+	m.UpdateCpuCount(int(vcpuCount))
+	m.MemMB = instance.GetDesc().Mem
+	m.ScalingGroupId = instance.GetDesc().ScalingGroupId
+	m.Tenant = instance.GetDesc().Tenant
+	m.TenantId = instance.GetDesc().TenantId
+	m.DomainId = instance.GetDesc().DomainId
+	m.ProjectDomain = instance.GetDesc().ProjectDomain
+	m.Hypervisor = instance.GetDesc().GetHypervisor()
+}
+
+func (m *SGuestMonitor) SetNicDown(mac string) {
+	guest, ok := guestman.GetGuestManager().GetKVMServer(m.Id)
 	if !ok {
 		return
 	}
-	if err := guest.SetNicDown(int8(index)); err != nil {
+	if err := guest.SetNicDown(mac); err != nil {
 		log.Errorf("guest %s SetNicDown failed %s", m.Id, err)
 	}
 }
@@ -580,7 +829,7 @@ func (m *SGuestMonitor) Netio() []*NetIOMetric {
 		var ifname = nic.Ifname
 		var nicStat *psnet.IOCountersStat
 		if nic.Driver == "vfio-pci" {
-			if guest, ok := guestman.GetGuestManager().GetServer(m.Id); ok {
+			if guest, ok := guestman.GetGuestManager().GetKVMServer(m.Id); ok {
 				dev, err := guest.GetSriovDeviceByNetworkIndex(nic.Index)
 				if err != nil {
 					log.Errorf("failed get sriov deivce by network index %s", err)
@@ -609,26 +858,45 @@ func (m *SGuestMonitor) Netio() []*NetIOMetric {
 		data := new(NetIOMetric)
 
 		ip := nic.Ip
-		ipv4, _ := netutils.NewIPV4Addr(ip)
-		if netutils.IsExitAddress(ipv4) {
-			data.Meta.IpType = "external"
+		if len(ip) > 0 {
+			ipv4, _ := netutils.NewIPV4Addr(ip)
+			if netutils.IsExitAddress(ipv4) {
+				data.Meta.IpType = "external"
+			} else {
+				data.Meta.IpType = "internal"
+			}
 		} else {
-			data.Meta.IpType = "internal"
+			data.Meta.IpType = "none"
 		}
+
 		data.Meta.Ip = ip
+		data.Meta.Ip6 = nic.Ip6
 		data.Meta.Index = i
+		data.Meta.Mac = nic.Mac
 		data.Meta.Ifname = ifname
 		data.Meta.NetId = nic.NetId
 		data.Meta.Uptime, _ = host.Uptime()
 
-		data.BytesSent = nicStat.BytesRecv
-		data.BytesRecv = nicStat.BytesSent
-		data.PacketsRecv = nicStat.PacketsSent
-		data.PacketsSent = nicStat.PacketsRecv
-		data.ErrIn = nicStat.Errout
-		data.ErrOut = nicStat.Errin
-		data.DropIn = nicStat.Dropout
-		data.DropOut = nicStat.Dropin
+		if nic.Driver == "vfio-pci" {
+			data.BytesSent = nicStat.BytesSent
+			data.BytesRecv = nicStat.BytesRecv
+			data.PacketsRecv = nicStat.PacketsRecv
+			data.PacketsSent = nicStat.PacketsSent
+			data.ErrIn = nicStat.Errin
+			data.ErrOut = nicStat.Errout
+			data.DropIn = nicStat.Dropin
+			data.DropOut = nicStat.Dropout
+		} else {
+			data.BytesSent = nicStat.BytesRecv
+			data.BytesRecv = nicStat.BytesSent
+			data.PacketsRecv = nicStat.PacketsSent
+			data.PacketsSent = nicStat.PacketsRecv
+			data.ErrIn = nicStat.Errout
+			data.ErrOut = nicStat.Errin
+			data.DropIn = nicStat.Dropout
+			data.DropOut = nicStat.Dropin
+		}
+
 		res = append(res, data)
 	}
 	return res
@@ -672,13 +940,31 @@ func (n *NetIOMetric) ToMap() map[string]interface{} {
 	}
 }
 
+func (n *NetIOMetric) ToTag() map[string]string {
+	tags := map[string]string{
+		"interface":      fmt.Sprintf("eth%d", n.Meta.Index),
+		"host_interface": n.Meta.Ifname,
+		"mac":            n.Meta.Mac,
+		"ip_type":        n.Meta.IpType,
+	}
+	if len(n.Meta.Ip) > 0 {
+		tags["ip"] = n.Meta.Ip
+	}
+	if len(n.Meta.Ip6) > 0 {
+		tags["ip6"] = n.Meta.Ip6
+	}
+	return tags
+}
+
 type NetMeta struct {
 	IpType string `json:"ip_type"`
 	Ip     string `json:"ip"`
+	Mac    string `json:"mac"`
 	Index  int    `json:"index"`
 	Ifname string `json:"ifname"`
 	NetId  string `json:"net_id"`
 	Uptime uint64 `json:"uptime"`
+	Ip6    string `json:"ip6"`
 }
 
 func (m *SGuestMonitor) Cpu() *CpuMetric {

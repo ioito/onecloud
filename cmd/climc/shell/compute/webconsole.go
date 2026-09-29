@@ -32,6 +32,11 @@ import (
 
 func init() {
 	handleResult := func(s *mcclient.ClientSession, opt o.WebConsoleOptions, obj jsonutils.JSONObject) error {
+		if obj.Contains("access_url") {
+			accessUrl, _ := obj.GetString("access_url")
+			fmt.Println("AccessURL:", accessUrl)
+			return nil
+		}
 		if opt.WebconsoleUrl == "" {
 			resp, err := identity.ServicesV3.GetSpecific(s, "common", "config", nil)
 			if err != nil {
@@ -117,7 +122,7 @@ func init() {
 		if err != nil {
 			return err
 		}
-		ret, err := webconsole.WebConsole.DoSshConnect(s, args.IP, params)
+		ret, err := webconsole.WebConsole.DoSshConnect(s, args.ID, params)
 		if err != nil {
 			return err
 		}
@@ -132,5 +137,22 @@ func init() {
 		}
 		handleResult(s, args.WebConsoleOptions, ret)
 		return nil
+	})
+
+	R(&o.WebConsoleServerRdpOptions{}, "webconsole-server-rdp", "Connect server remote graphic console by rdp", func(s *mcclient.ClientSession, args *o.WebConsoleServerRdpOptions) error {
+		ret, err := webconsole.WebConsole.DoServerRDPConnect(s, args.ID, jsonutils.Marshal(map[string]interface{}{"webconsole": args}))
+		if err != nil {
+			return err
+		}
+		handleResult(s, args.WebConsoleOptions, ret)
+		return nil
+	})
+
+	R(&o.WebConsoleContainerExecOptions{}, "webconsole-container-exec", "Container exec", func(s *mcclient.ClientSession, args *o.WebConsoleContainerExecOptions) error {
+		ret, err := webconsole.WebConsole.DoContainerExec(s, jsonutils.Marshal(map[string]interface{}{"container_id": args.ID}))
+		if err != nil {
+			return err
+		}
+		return handleResult(s, args.WebConsoleOptions, ret)
 	})
 }
