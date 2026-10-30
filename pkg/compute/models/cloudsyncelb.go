@@ -74,6 +74,9 @@ func syncRegionLoadbalancerHealthChecks(
 		return remoteRegion.GetILoadBalancerHealthChecks()
 	}()
 	if err != nil {
+		if errors.Cause(err) == cloudprovider.ErrNotImplemented || errors.Cause(err) == cloudprovider.ErrNotSupported {
+			return
+		}
 		msg := fmt.Sprintf("GetILoadBalancerHealthChecks for region %s provider %s failed %s", remoteRegion.GetName(), provider.Name, err)
 		log.Errorln(msg)
 		return
@@ -142,41 +145,44 @@ func syncRegionLoadbalancers(
 		log.Errorln(msg)
 		return
 	}
-	func() {
+	localLbs, remoteLbs, result := func() ([]SLoadbalancer, []cloudprovider.ICloudLoadbalancer, compare.SyncResult) {
 		defer syncResults.AddSqlCost(LoadbalancerManager)()
-
-		localLbs, remoteLbs, result := LoadbalancerManager.SyncLoadbalancers(ctx, userCred, provider, localRegion, lbs, syncRange.Xor)
-
-		syncResults.Add(LoadbalancerManager, result)
-
-		msg := result.Result()
-		log.Infof("SyncLoadbalancers for region %s provider %s result: %s", localRegion.Name, provider.Name, msg)
-		if result.IsError() {
-			return
-		}
-		db.OpsLog.LogEvent(provider, db.ACT_SYNC_LB_COMPLETE, msg, userCred)
-
-		for i := 0; i < len(localLbs); i++ {
-			func() {
-				lockman.LockObject(ctx, &localLbs[i])
-				defer lockman.ReleaseObject(ctx, &localLbs[i])
-
-				syncLbPeripherals(ctx, userCred, provider, &localLbs[i], remoteLbs[i])
-			}()
-		}
+		return LoadbalancerManager.SyncLoadbalancers(ctx, userCred, provider, localRegion, lbs, syncRange.Xor)
 	}()
+
+	syncResults.Add(LoadbalancerManager, result)
+
+	msg := result.Result()
+	log.Infof("SyncLoadbalancers for region %s provider %s result: %s", localRegion.Name, provider.Name, msg)
+	if result.IsError() {
+		return
+	}
+	db.OpsLog.LogEvent(provider, db.ACT_SYNC_LB_COMPLETE, msg, userCred)
+
+	// 集合对齐后，各 LB 外设（eip/backend/listener/secgroup）有限并行
+	lbTasks := make([]func(context.Context), 0, len(localLbs))
+	for i := 0; i < len(localLbs); i++ {
+		i := i
+		lbTasks = append(lbTasks, func(ctx context.Context) {
+			lockman.LockObject(ctx, &localLbs[i])
+			defer lockman.ReleaseObject(ctx, &localLbs[i])
+
+			syncLbPeripherals(ctx, userCred, syncResults, provider, &localLbs[i], remoteLbs[i])
+		})
+	}
+	runSyncTasksParallel(ctx, lbTasks)
 }
 
-func syncLbPeripherals(ctx context.Context, userCred mcclient.TokenCredential, provider *SCloudprovider, local *SLoadbalancer, remote cloudprovider.ICloudLoadbalancer) {
+func syncLbPeripherals(ctx context.Context, userCred mcclient.TokenCredential, syncResults SSyncResultSet, provider *SCloudprovider, local *SLoadbalancer, remote cloudprovider.ICloudLoadbalancer) {
 	err := syncLoadbalancerEips(ctx, userCred, provider, local, remote)
 	if err != nil {
 		log.Errorf("syncLoadbalancerEips for loadbalancer %s provider %s error %s", local.Name, provider.Name, err)
 	}
-	err = syncLoadbalancerBackendgroups(ctx, userCred, SSyncResultSet{}, provider, local, remote)
+	err = syncLoadbalancerBackendgroups(ctx, userCred, syncResults, provider, local, remote)
 	if err != nil {
 		log.Errorf("syncLoadbalancerBackendgroups for loadbalancer %s provider %s error: %v", local.Name, provider.Name, err)
 	}
-	err = syncLoadbalancerListeners(ctx, userCred, SSyncResultSet{}, provider, local, remote)
+	err = syncLoadbalancerListeners(ctx, userCred, syncResults, provider, local, remote)
 	if err != nil {
 		log.Errorf("syncLoadbalancerListeners for loadbalancer %s provider %s error: %v", local.Name, provider.Name, err)
 	}

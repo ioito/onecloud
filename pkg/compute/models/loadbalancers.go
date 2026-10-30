@@ -1437,7 +1437,7 @@ func (lb *SLoadbalancer) SyncWithCloudLoadbalancer(ctx context.Context, userCred
 	if err != nil {
 		return errors.Wrapf(err, "syncWithCloudLoadbalancer")
 	}
-	syncLbPeripherals(ctx, userCred, provider, lb, ext)
+	syncLbPeripherals(ctx, userCred, NewSSyncResultSet(), provider, lb, ext)
 	return nil
 }
 

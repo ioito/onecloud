@@ -162,9 +162,11 @@ type ComputeOptions struct {
 	CloudProviderSyncWorkerCount     int `help:"how many current providers synchronize their regions, practically no limit" default:"10"`
 	CloudAccountProbeWorkerCount     int `help:"how many workers for auto cloud account status probe" default:"10"`
 	CloudAccountSyncProbeWorkerCount int `help:"how many workers for cloud account sync probe before resource sync" default:"10"`
-	CloudAutoSyncIntervalSeconds     int `help:"frequency to check auto sync tasks" default:"300"`
-	DefaultSyncIntervalSeconds       int `help:"minimal synchronization interval, default 15 minutes" default:"900"`
-	MaxCloudAccountErrorCount        int `help:"maximal consecutive error count allow for a cloud account" default:"5"`
+	// 单 region DoSync 内：资源类型波次 / zone / host / VM·LB·RDS 实例外设 的并发上限；独立于 CloudSyncWorkerCount，禁止复用 region worker 池
+	CloudRegionResourceSyncConcurrency int `help:"max concurrent resource-type / zone / host / vm-lb-rds peripheral sync tasks within one region DoSync" default:"3"`
+	CloudAutoSyncIntervalSeconds       int `help:"frequency to check auto sync tasks" default:"300"`
+	DefaultSyncIntervalSeconds         int `help:"minimal synchronization interval, default 15 minutes" default:"900"`
+	MaxCloudAccountErrorCount          int `help:"maximal consecutive error count allow for a cloud account" default:"5"`
 
 	EnableSyncName bool `help:"enable name sync" default:"true"`
 
